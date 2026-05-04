@@ -7,8 +7,14 @@ export function hookInstall(): void {
   if (existsSync(CLAUDE_SETTINGS_PATH)) {
     // Backup original before modifying
     const backupPath = CLAUDE_SETTINGS_PATH + '.bak';
-    writeFileSync(backupPath, readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
-    settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+    writeFileSync(backupPath, readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'), { mode: 0o600 });
+    try {
+      settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+    } catch (err) {
+      console.error(chalk.red(`settings.json 解析失败: ${err}`));
+      console.error('请检查 ~/.claude/settings.json 格式是否正确');
+      process.exit(1);
+    }
   }
 
   if (settings.hooks?.SessionStart?.includes('cc-bridge')) {
@@ -40,7 +46,14 @@ export function hookUninstall(): void {
     return;
   }
 
-  const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+  let settings: any;
+  try {
+    settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+  } catch (err) {
+    console.error(chalk.red(`settings.json 解析失败: ${err}`));
+    console.error('请检查 ~/.claude/settings.json 格式是否正确');
+    process.exit(1);
+  }
   if (settings.hooks?.SessionStart?.includes('cc-bridge')) {
     if (Array.isArray(settings.hooks.SessionStart)) {
       settings.hooks.SessionStart = settings.hooks.SessionStart.filter(
@@ -65,7 +78,14 @@ export function hookStatus(): void {
     return;
   }
 
-  const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+  let settings: any;
+  try {
+    settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+  } catch (err) {
+    console.error(chalk.red(`settings.json 解析失败: ${err}`));
+    console.error('请检查 ~/.claude/settings.json 格式是否正确');
+    process.exit(1);
+  }
   const installed = settings.hooks?.SessionStart?.includes('cc-bridge');
 
   console.log(`Hook 状态: ${installed ? chalk.green('已安装') : chalk.red('未安装')}`);

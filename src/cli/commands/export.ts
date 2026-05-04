@@ -25,7 +25,11 @@ export async function exportSession(
   const [uuid, entry] = match;
   const format = opts.format ?? 'markdown';
   const outputFile = opts.output ?? `./export-${uuid.slice(0, 8)}.${format === 'markdown' ? 'md' : format}`;
-  const maxMessages = opts.maxMessages ? parseInt(opts.maxMessages, 10) : undefined;
+  const maxMessages = opts.maxMessages ? (() => {
+    const n = parseInt(opts.maxMessages, 10);
+    if (isNaN(n)) throw new CCBridgeError('E005', `无效的消息数: ${opts.maxMessages}`);
+    return n;
+  })() : undefined;
 
   console.log(chalk.blue(`导出会话: ${entry.title ?? uuid}`));
 

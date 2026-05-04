@@ -27,15 +27,13 @@ export function feishuCmd(
       feishuStatus(registry);
       break;
     default:
-      console.error(`未知子命令: ${subcommand}`);
-      process.exit(1);
+      throw new CCBridgeError('E005', `未知子命令: ${subcommand}`);
   }
 }
 
 function feishuList(registry: RegistryManager, caller?: string): void {
   if (!caller) {
-    console.error('错误: 缺少调用者身份，请检查 cc-connect [[commands]] 配置');
-    process.exit(1);
+    throw new CCBridgeError('E019', '缺少调用者身份，请检查 cc-connect [[commands]] 配置');
   }
 
   let sessions = Object.entries(registry.sessions)
@@ -75,14 +73,12 @@ function feishuList(registry: RegistryManager, caller?: string): void {
 
 function feishuSwitch(registry: RegistryManager, caller: string | undefined, target: string): void {
   if (!target) {
-    console.error('用法: /bridge switch <UUID或短前缀>');
-    process.exit(1);
+    throw new CCBridgeError('E005', '用法: /bridge switch <UUID或短前缀>');
   }
 
   const match = registry.findByPrefix(target);
   if (!match) {
-    console.error(`未找到匹配 "${target}" 的会话`);
-    process.exit(1);
+    throw new CCBridgeError('E002', `未找到匹配 "${target}" 的会话`);
   }
 
   const [uuid, entry] = match;
@@ -104,8 +100,7 @@ function feishuSwitch(registry: RegistryManager, caller: string | undefined, tar
 function feishuResume(registry: RegistryManager, target: string): void {
   const match = registry.findByPrefix(target);
   if (!match) {
-    console.error(`未找到匹配 "${target}" 的会话`);
-    process.exit(1);
+    throw new CCBridgeError('E002', `未找到匹配 "${target}" 的会话`);
   }
 
   const [uuid] = match;

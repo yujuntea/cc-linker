@@ -18,5 +18,5 @@ export function loadCache(cachePath?: string): FileCache {
 export function saveCache(cache: FileCache, cachePath?: string): void {
   const path = cachePath ?? SCAN_CACHE_PATH;
   const obj = Object.fromEntries(cache);
-  writeFileSync(path, JSON.stringify(obj, null, 2));
+  writeFileSync(path, JSON.stringify(obj, null, 2), { mode: 0o600 });
 }

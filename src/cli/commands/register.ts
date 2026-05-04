@@ -1,15 +1,12 @@
 import { RegistryManager } from '../../registry';
 import { OriginSchema } from '../../registry/types';
 import { CCBridgeError } from '../../utils/errors';
+import { isValidUUID } from '../../utils/validation';
 
 interface RegisterOptions {
   origin?: string;
   cwd?: string;
   source?: string;
-}
-
-function isValidUUID(str: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
 }
 
 export async function registerSession(

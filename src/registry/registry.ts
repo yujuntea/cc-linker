@@ -24,7 +24,7 @@ export class RegistryManager {
 
   private ensureDir(): void {
     mkdirSync(this.basePath, { recursive: true, mode: 0o700 });
-    mkdirSync(this.backupDir, { recursive: true });
+    mkdirSync(this.backupDir, { recursive: true, mode: 0o700 });
   }
 
   private load(): Registry {

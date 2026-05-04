@@ -17,7 +17,7 @@ export async function withLock<T>(
 
   // Ensure file exists for lockfile
   if (!existsSync(filePath)) {
-    writeFileSync(filePath, '');
+    writeFileSync(filePath, '', { mode: 0o600 });
   }
 
   let release: (() => Promise<void>) | null = null;
