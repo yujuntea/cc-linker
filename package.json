@@ -1,0 +1,32 @@
+{
+  "name": "cc-bridge",
+  "version": "0.1.0",
+  "description": "Bridge cc-connect and Claude Code CLI sessions",
+  "main": "src/index.ts",
+  "bin": {
+    "cc-bridge": "src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --compile --outfile dist/cc-bridge",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/inquirer": "^9.0.9",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "chalk": "^5.6.2",
+    "cli-table3": "^0.6.5",
+    "commander": "^14.0.3",
+    "inquirer": "^13.4.2",
+    "proper-lockfile": "^4.1.2",
+    "zod": "^4.4.2"
+  }
+}
