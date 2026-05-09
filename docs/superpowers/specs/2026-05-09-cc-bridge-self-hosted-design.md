@@ -1,6 +1,6 @@
 # cc-bridge 自建方案 Phase 1 实现设计
 
-> 版本：v1.0
+> 版本：v1.2
 > 日期：2026-05-09
 > 基于：产品设计文档 v2.2
 > 状态：已确认
@@ -37,6 +37,7 @@
 - 新增字段：`project_dir`、`jsonl_path`、`pending_jsonl_resolve`、`last_error`、`feishu_session_id`、`feishu_user_id`
 - 新增状态枚举：`'provisioning' | 'active' | 'archived' | 'degraded' | 'corrupted'`
 - 更新 Zod schema 匹配新类型
+- 旧 `registry.json` 迁移策略：Schema 对未知旧字段使用 `.strip()` 或 `.passthrough()` 平滑兼容，避免旧文件加载失败
 
 ### 重构 `src/utils/config.ts`
 
@@ -58,9 +59,16 @@
 
 ### 更新 CLI 命令
 
-- `resume.ts`：provisioning/degraded 先触发 repair
-- `init.ts` / `sync.ts`：检测 owner.lock，运行时拒绝写入
+- `resume.ts`：第 1 轮仅实现**状态检测 + 友好提示**，不触发真正的 repair
+  - `active/archived` → 允许恢复
+  - `provisioning` → 提示"会话仍在创建中，请稍后重试"
+  - `degraded` → 提示"会话处于降级状态，原因: xxx"
+  - `corrupted` → 拒绝恢复
+- `resume.ts`：真正的 repair 逻辑留到第 5 轮 Reconciler / Repair 能力就绪后再接入；若检测到 `owner.lock` 且 repair 会写状态，则拒绝离线直写
+- `init.ts` / `sync.ts` / `clean.ts`：检测 owner.lock，运行时拒绝写入
+- `repair.ts`（如实现）：检测 owner.lock，运行时拒绝写入
 - `scanner/index.ts`：移除 cc-connect 扫描
+- `registry.ts`：更新 merge 调用链，移除对 cc-connect scanner 的依赖
 
 ### 完成标准
 
@@ -82,6 +90,8 @@ interface SessionManager {
   cleanupIdleSessions(idleTimeoutMs: number): void;
 }
 ```
+
+> `listSessions()` 仅表示 Session Manager **当前在内存中跟踪的活跃进程/活跃会话**，用于进程管理与调试；它**不替代** Registry 的全量会话查询。`/bridge status`、`/bridge list` 这类用户可见统计应直接读取 Registry。
 
 ### 实现要点
 
@@ -108,6 +118,8 @@ interface SessionManager {
 - 加载/保存 `~/.cc-bridge/user-mapping.json`
 - 三种 entry 类型：session、pending_new_session、pending_new_session_claimed
 - `compareAndSwap(openId, expectedEntry, newEntry)` — 原子 CAS 抢占
+- CAS 必须在独占文件锁内执行，基于 `mapping.version + entry.type + claimedByMessageId` 判定
+- CAS 成功后递增 `mapping.version`，防止 ABA / 丢更新
 - owner 校验（配置指定 vs 自动绑定）
 - pending_new_session_claimed 超时回滚
 
@@ -130,9 +142,11 @@ interface SessionManager {
 - 消息原子写入：write(temp) → rename()
 - 状态流转：pending → processing → replied → done/failed
 - 入站幂等：receipts/<messageId>.json
-- 出站幂等：deliveries/<messageId>.json（sending/sent）
+- 出站幂等：deliveries/<messageId>.json（sending/sent + stable requestUuid）
 - Target Snapshot：入队时固化目标
+- Snapshot 枚举至少包括：`session`、`new_session_claim`、`new_session_creating`、`no_target`
 - 串行键：session_uuid / new:<open_id>
+- claim 键：`claim:<open_id>`，用于将 `pending_new_session` 原子切换到 `pending_new_session_claimed`
 - 队列上限 100，超限拒绝
 - 归档清理：done 24h/1000条、failed 7d/200条
 
@@ -141,8 +155,12 @@ interface SessionManager {
 - WSClient 长连接接收 im.message.receive_v1
 - Client 发送回复（im.v1.message.create）
 - WSClient 回调：私聊校验 + owner 校验 + 幂等 + spool 落盘（<100ms）
+- `im.v1.message.create` 必须带稳定 `uuid`；建议 `sha256(messageId + ":" + chunkIndex)`
 - Dispatcher：扫描 spool → 按并发调度 → handleCommand / handleChat → 回复 → finalize
+- 当 mapping 已为 `pending_new_session_claimed` 时，普通文本应生成 `new_session_creating` 快照并返回“新会话正在创建”提示
 - 命令处理：/bridge help/list/new/switch/resume/status
+- `/bridge new` 解析完 `cwd` 后，必须执行 `security.allowed_roots` / `security.denied_roots` 校验
+- 命中高风险目录时，按 `security.confirm_risky_actions` 执行二次确认或直接拒绝
 - 错误兜底、超长回复分片
 
 ### 完成标准
@@ -158,6 +176,7 @@ interface SessionManager {
 - owner.lock 获取/释放
 - 运行中只有主进程可写状态文件
 - CLI 写命令检测 lock → 拒绝
+- 写命令范围包括：`init/sync/clean/resume(带 repair)/repair`
 
 ### `src/runtime/reconciler.ts`
 
@@ -171,7 +190,7 @@ interface SessionManager {
 
 ### `cc-bridge start` 命令
 
-- startupReconcile → 获取 owner.lock → 启动 WSClient → 启动 Dispatcher
+- 获取 owner.lock → startupReconcile → 启动 WSClient → 启动 Dispatcher
 - SIGINT/SIGTERM 优雅停机
 
 ### 完成标准
@@ -188,6 +207,8 @@ interface SessionManager {
 | 竞态 | /bridge switch 后排队消息正确路由 |
 | 连续消息 | 两条普通文本不创建两个新会话 |
 | 崩溃恢复 | 回复成功后 kill → 重启不重复回复 |
+| 出站幂等 | 飞书发送超时但服务端可能已收 → 重试不重复回复 |
+| 锁冲突 | 服务运行时执行 init/sync/clean/resume-repair → 被 owner.lock 拒绝 |
 | jsonl_path 延迟 | 新会话 provisioning → 后台补齐 |
 | 列表快照过期 | 10 分钟后序号参数 → 提示重新 list |
 | 超时 | Claude 5 分钟无输出 → kill → 飞书提示 |
