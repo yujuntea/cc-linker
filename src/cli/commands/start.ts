@@ -109,17 +109,10 @@ export async function start(registry: RegistryManager): Promise<void> {
       },
     });
 
-    // Wire event dispatcher to WSClient's internal event handling
-    // The SDK internally dispatches events through handleEventData
-    // We intercept by patching the handler
-    const originalHandleEventData = wsClient.handleEventData.bind(wsClient);
-    wsClient.handleEventData = async (data: any) => {
-      await eventDispatcher.invoke(data);
-      return originalHandleEventData(data);
-    };
-
-    // Start WSClient
-    wsClient.start();
+    // Start WSClient with event dispatcher (official SDK API)
+    // SDK source confirms: start() expects { eventDispatcher } and internally uses
+    // handleEventData → eventDispatcher.invoke() for event dispatching
+    wsClient.start({ eventDispatcher });
   }
 
   console.log(chalk.green('✅ cc-bridge 已启动'));

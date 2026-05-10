@@ -208,8 +208,9 @@ export class FeishuBot {
       return;
     }
 
-    // C4: Use HOME as default cwd for Feishu messages (not process.cwd())
-    const cwd = process.env.HOME ?? '/';
+    // I4: Use cwd from mapping entry (set by /bridge new), fallback to HOME
+    const mappingEntry = this.userManager.getEntry(msg.openId);
+    const cwd = mappingEntry?.cwd || process.env.HOME || '/';
 
     const targetUuid = msg.target.sessionUuid ?? null;
     const isNew = !targetUuid;
@@ -309,7 +310,7 @@ export class FeishuBot {
       }
     }
 
-    // Set pending_new_session
+    // Set pending_new_session with cwd
     const currentEntry = this.userManager.getEntry(msg.openId);
     if (!currentEntry || currentEntry.type === 'session' || currentEntry.type === 'pending_new_session') {
       const swapped = await this.userManager.compareAndSwap(
@@ -319,6 +320,7 @@ export class FeishuBot {
           type: 'pending_new_session',
           sessionUuid: null,
           createdAt: new Date().toISOString(),
+          cwd: normalizedCwd,
         }
       );
 
