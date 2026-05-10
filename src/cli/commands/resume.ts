@@ -5,7 +5,8 @@ import chalk from 'chalk';
 import { RegistryManager } from '../../registry';
 import { CCBridgeError } from '../../utils/errors';
 import { formatOrigin, formatTimeAgo } from '../output';
-import { CLAUDE_PROJECTS_DIR, RUNTIME_OWNER_LOCK_PATH } from '../../utils/paths';
+import { CLAUDE_PROJECTS_DIR } from '../../utils/paths';
+import { StateCoordinator } from '../../runtime/state-coordinator';
 import { config } from '../../utils/config';
 
 interface ResumeOptions {
@@ -55,10 +56,8 @@ export async function resume(registry: RegistryManager, target?: string, opts: R
     throw new CCBridgeError(err.code as any, msg);
   }
 
-  // 检测 owner.lock：如果存在 lock 且 repair 会写状态，则拒绝离线直写
-  if (existsSync(RUNTIME_OWNER_LOCK_PATH)) {
-    throw new CCBridgeError('E013', 'Bot 进程正在运行，请使用飞书命令恢复会话，而非直接 CLI 操作');
-  }
+  // 检测 owner.lock：Bot 进程正在运行时拒绝离线直写
+  StateCoordinator.assertNotRunning();
 
   // Verify JSONL exists
   if (entry.jsonl_path && !existsSync(entry.jsonl_path)) {

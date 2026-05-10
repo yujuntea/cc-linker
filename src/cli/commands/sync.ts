@@ -1,8 +1,8 @@
 import chalk from 'chalk';
+import { existsSync } from 'fs';
 import { RegistryManager } from '../../registry';
 import { syncBeforeCommand } from '../../scanner';
-import { existsSync } from 'fs';
-import { RUNTIME_OWNER_LOCK_PATH } from '../../utils/paths';
+import { StateCoordinator } from '../../runtime/state-coordinator';
 
 interface SyncOptions {
   scan?: boolean;
@@ -11,10 +11,9 @@ interface SyncOptions {
 }
 
 export async function sync(registry: RegistryManager, opts: SyncOptions): Promise<void> {
-  // 运行时拒绝写入
-  if (existsSync(RUNTIME_OWNER_LOCK_PATH)) {
-    console.log(chalk.yellow('⚠️  Bot 进程正在运行，sync 仅执行只读扫描'));
-    opts.scan = true;
+  // 运行时拒绝写入（除非是只读扫描）
+  if (!opts.scan) {
+    StateCoordinator.assertNotRunning();
   }
 
   console.log(chalk.blue('🔄 Syncing sessions...'));

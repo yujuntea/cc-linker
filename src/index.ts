@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import { RegistryManager } from './registry';
 import { syncBeforeCommand } from './scanner';
 import { handleError } from './utils/errors';
+import { StateCoordinator } from './runtime/state-coordinator';
 import { init } from './cli/commands/init';
 import { list } from './cli/commands/list';
 import { resume } from './cli/commands/resume';
@@ -14,6 +15,7 @@ import { registerSession } from './cli/commands/register';
 import { exportSession } from './cli/commands/export';
 import { search } from './cli/commands/search';
 import { clean } from './cli/commands/clean';
+import { start } from './cli/commands/start';
 
 const program = new Command();
 
@@ -142,6 +144,14 @@ program
   .action((opts) => withSync(async (registry) => {
     await clean(registry, opts);
   }, !opts.sync));
+
+program
+  .command('start')
+  .description('启动飞书 Bot 进程')
+  .action(() => withSync(async (registry) => {
+    StateCoordinator.assertNotRunning();
+    await start(registry);
+  }, true));
 
 // Parse and handle errors
 program.parseAsync(process.argv).catch(handleError);

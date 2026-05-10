@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import { existsSync } from 'fs';
 import { RegistryManager } from '../../registry';
 import { CCBridgeError } from '../../utils/errors';
-import { RUNTIME_OWNER_LOCK_PATH } from '../../utils/paths';
+import { StateCoordinator } from '../../runtime/state-coordinator';
 
 interface CleanOptions {
   dryRun?: boolean;
@@ -11,9 +11,7 @@ interface CleanOptions {
 
 export async function clean(registry: RegistryManager, opts: CleanOptions = {}): Promise<void> {
   // 运行时拒绝写入
-  if (existsSync(RUNTIME_OWNER_LOCK_PATH)) {
-    throw new CCBridgeError('E013', 'Bot 进程正在运行，无法执行 clean');
-  }
+  StateCoordinator.assertNotRunning();
 
   const olderThanDays = opts.olderThan ? (() => {
     const n = parseInt(opts.olderThan, 10);

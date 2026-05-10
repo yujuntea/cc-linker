@@ -1,14 +1,11 @@
 import chalk from 'chalk';
-import { existsSync } from 'fs';
 import { RegistryManager } from '../../registry';
 import { syncBeforeCommand } from '../../scanner';
-import { RUNTIME_OWNER_LOCK_PATH } from '../../utils/paths';
+import { StateCoordinator } from '../../runtime/state-coordinator';
 
 export async function init(registry: RegistryManager): Promise<void> {
   // 运行时拒绝写入
-  if (existsSync(RUNTIME_OWNER_LOCK_PATH)) {
-    console.log(chalk.yellow('⚠️  Bot 进程正在运行，init 仅执行扫描，不会修改 registry'));
-  }
+  StateCoordinator.assertNotRunning();
 
   const isFresh = Object.keys(registry.sessions).length === 0;
   if (isFresh) {

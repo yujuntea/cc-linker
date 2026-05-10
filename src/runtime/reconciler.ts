@@ -1,0 +1,127 @@
+import { RegistryManager } from '../registry';
+import { UserManager, ListSnapshotManager } from '../feishu';
+import { SpoolQueue } from '../queue/spool';
+import { RUNTIME_SESSION_EVENTS_DIR } from '../utils/paths';
+import { existsSync, readdirSync, readFileSync, unlinkSync, statSync } from 'fs';
+import { join } from 'path';
+import { logger } from '../utils/logger';
+
+export interface ReconcileResult {
+  recoveredProcessing: number;
+  rolledBackClaims: number;
+  mergedEvents: number;
+  expiredSnapshots: number;
+  expiredFiles: number;
+}
+
+/**
+ * Startup reconciler: runs after acquiring owner.lock.
+ * Recovers from crashes, cleans up stale state, merges events.
+ */
+export async function startupReconcile(opts: {
+  registry: RegistryManager;
+  userManager: UserManager;
+  listSnapshotManager: ListSnapshotManager;
+  spoolQueue: SpoolQueue;
+}): Promise<ReconcileResult> {
+  const result: ReconcileResult = {
+    recoveredProcessing: 0,
+    rolledBackClaims: 0,
+    mergedEvents: 0,
+    expiredSnapshots: 0,
+    expiredFiles: 0,
+  };
+
+  logger.info('启动协调器开始...');
+
+  // 1. Recover processing → pending
+  result.recoveredProcessing = opts.spoolQueue.recoverProcessing();
+
+  // 2. Roll back timed-out pending_new_session_claimed
+  result.rolledBackClaims = await opts.userManager.rollbackTimedOutClaims();
+
+  // 3. Merge session-events into registry
+  result.mergedEvents = await mergeSessionEvents(opts.registry);
+
+  // 4. Clean expired snapshots
+  result.expiredSnapshots = cleanExpiredSnapshots(opts.listSnapshotManager);
+
+  // 5. Clean expired spool files
+  const cleanup = opts.spoolQueue.cleanup();
+  result.expiredFiles = cleanup.cleaned + cleanup.failed + cleanup.receipts + cleanup.deliveries;
+
+  logger.info(
+    `启动协调器完成: ` +
+    `${result.recoveredProcessing} processing恢复, ` +
+    `${result.rolledBackClaims} claims回滚, ` +
+    `${result.mergedEvents} events归并, ` +
+    `${result.expiredSnapshots + result.expiredFiles} 过期文件清理`
+  );
+
+  return result;
+}
+
+/**
+ * Merge session discovery events into the registry.
+ * Events are written by the session-start hook.
+ */
+async function mergeSessionEvents(registry: RegistryManager): Promise<number> {
+  if (!existsSync(RUNTIME_SESSION_EVENTS_DIR)) return 0;
+
+  let merged = 0;
+
+  for (const file of readdirSync(RUNTIME_SESSION_EVENTS_DIR)) {
+    if (!file.endsWith('.json')) continue;
+
+    const path = join(RUNTIME_SESSION_EVENTS_DIR, file);
+    try {
+      const raw = readFileSync(path, 'utf8');
+      const event = JSON.parse(raw) as { sessionId: string; cwd: string; discoveredAt: string };
+
+      const existing = registry.get(event.sessionId);
+      if (!existing) {
+        // New session discovery
+        registry.upsert(event.sessionId, {
+          origin: 'cli',
+          cwd: event.cwd,
+          created_at: event.discoveredAt,
+          last_active: event.discoveredAt,
+        });
+        merged++;
+      } else if (existing.status === 'corrupted') {
+        // JSONL was missing before, now we know the session exists
+        registry.upsert(event.sessionId, {
+          status: 'active',
+          cwd: event.cwd,
+          last_active: event.discoveredAt,
+        });
+        merged++;
+      }
+
+      // Remove processed event file
+      unlinkSync(path);
+    } catch (err) {
+      logger.warn(`处理 session event 失败: ${file}: ${err}`);
+    }
+  }
+
+  if (merged > 0) {
+    await registry.flush();
+  }
+
+  return merged;
+}
+
+/**
+ * Clean expired list snapshots.
+ */
+function cleanExpiredSnapshots(listSnapshotManager: ListSnapshotManager): number {
+  // If the snapshot file exists but is expired, clearSnapshot removes it.
+  // If it doesn't exist, nothing to clean.
+  const snapshot = listSnapshotManager.loadSnapshot();
+  if (!snapshot) {
+    return 0; // nothing to clean
+  }
+  // Snapshot is valid (not expired) — leave it
+  return 0;
+}
