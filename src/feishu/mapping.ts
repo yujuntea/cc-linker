@@ -16,6 +16,7 @@ export interface MappingEntry {
   lastActiveAt?: string;
   claimedByMessageId?: string;
   claimedAt?: string;
+  defaultProvider?: string; // User's default model alias (user-level config)
 }
 
 export interface UserMapping {
@@ -29,7 +30,7 @@ const DEFAULT_MAPPING: UserMapping = {
   entries: {},
 };
 
-export const PENDING_CLAIMED_TIMEOUT_MS = 60 * 1000; // 1 minute
+export const PENDING_CLAIMED_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 export type ClaimPendingResult =
   | { status: 'claimed'; entry: MappingEntry; version: number }
@@ -309,6 +310,7 @@ function entriesMatch(
     if (a.claimedByMessageId !== b.claimedByMessageId) return false;
     if ((a.claimedAt ?? '') !== (b.claimedAt ?? '')) return false;
   }
+  // Note: defaultProvider is intentionally NOT compared — it's a user preference, not session state
   return true;
 }
 

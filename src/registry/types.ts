@@ -27,6 +27,7 @@ export const SessionEntrySchema = z.object({
   message_count: z.number(),
   last_message_preview: z.string(),
   status: StatusSchema.optional(),
+  lastKnownProvider: z.string().nullable().optional(), // Display-only: what model was used when session was created
 });
 export type SessionEntry = z.infer<typeof SessionEntrySchema>;
 
