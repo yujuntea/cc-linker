@@ -216,6 +216,11 @@ async function createBotRuntime(
 
   const appId = config.get<string>('feishu_bot.app_id', '');
   const appSecret = config.get<string>('feishu_bot.app_secret', '');
+  const ownerOpenId = config.get<string>('feishu_bot.owner_open_id', '');
+
+  if (!ownerOpenId) {
+    log('WARN', '⚠️  feishu_bot.owner_open_id 未配置！任何知道 Bot 的人都可以使用，可能存在严重安全风险');
+  }
 
   let wsClient: any = null;
   let client: any = null;

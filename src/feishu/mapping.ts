@@ -284,7 +284,10 @@ export class UserManager {
     return rolledBack;
   }
 
-  /** Validate if an openId matches the configured owner */
+  /** Validate if an openId matches the configured owner.
+   *  WARNING: If owner_open_id is not configured, this returns true for ALL users.
+   *  A startup warning is emitted in createBotRuntime() when this happens.
+   */
   validateOwner(openId: string): boolean {
     const ownerOpenId = config.get<string>('feishu_bot.owner_open_id', '');
     if (!ownerOpenId) return true;
