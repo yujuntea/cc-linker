@@ -1,6 +1,8 @@
 # cc-linker
 
-> 让飞书 Bot 和终端（Claude Code CLI）之间的对话切换，像切换设备一样无缝。
+> 让手机聊天应用和终端（Claude Code CLI）之间的对话切换，像切换设备一样无缝。
+>
+> **目前已接入飞书**，更多聊天平台持续扩展中。
 
 [![npm version](https://img.shields.io/npm/v/cc-linker)](https://www.npmjs.com/package/cc-linker)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -15,22 +17,26 @@
 - **飞书快速提问，终端深度调试** — 在飞书里快速问了个 API 用法，发现需要本地调试，终端 `cc-linker resume` 切换到同一会话继续让 Claude 帮你写代码
 - **多项目并行，会话不乱** — 同时在 `project-a` 和 `project-b` 两个目录与 Claude 对话，`/list` 清晰展示每个会话的目录和状态，卡片按钮一键切换不混淆
 
-**cc-linker 就是解决这些痛点的桥接工具。** 它在你电脑上维护一个统一的会话注册表，让飞书 Bot 和 Claude Code CLI 共享同一套会话状态——无论你在哪个端发起对话，都能无缝切换到另一端继续。
+**cc-linker 就是解决这些痛点的桥接工具。** 它在你电脑上维护一个统一的会话注册表，让手机聊天应用和 Claude Code CLI 共享同一套会话状态——无论你在哪个端发起对话，都能无缝切换到另一端继续。
+
+> **当前已接入飞书**，更多聊天平台持续扩展中。
 
 ## ✨ 核心特性
 
 | 特性 | 说明 |
 |------|------|
-| 🔄 **跨端无缝切换** | 飞书发起的对话，终端一键恢复（含上下文和目录）；终端创建的会话，飞书随时查看 |
-| 💬 **流式卡片交互** | 飞书中实时看到 Claude 的 thinking 和回复，不再是"转圈等待" |
+| 🔄 **跨端无缝切换** | 聊天应用发起的对话，终端一键恢复（含上下文和目录）；终端创建的会话，聊天应用随时查看 |
+| 💬 **流式卡片交互** | 聊天应用中实时看到 Claude 的 thinking 和回复，不再是"转圈等待" |
 | 📋 **统一会话管理** | 自动扫描、增量同步，无需手动维护会话列表 |
-| 🎛 **多模型切换** | 在飞书卡片中一键切换模型，无需改配置 |
+| 🎛 **多模型切换** | 在卡片中一键切换模型，无需改配置 |
 | 🛡 **持久化不丢消息** | 文件级消息队列，进程崩溃、重启后消息不丢失 |
 | 🚀 **3 步上手** | `install → setup → start`，5 分钟完成配置 |
 
 ## 📸 效果展示
 
-### 飞书端体验
+### 聊天应用端体验（飞书）
+
+> 当前已支持飞书，更多平台开发中。
 
 <table>
   <tr>
@@ -92,19 +98,19 @@ cc-linker setup
 交互式向导会引导你完成：
 - 初始化会话注册表
 - 安装 Claude Code 自动注册钩子
-- 配置飞书 Bot（App ID + App Secret + 开机自启）
+- 配置聊天应用 Bot（当前仅飞书：App ID + App Secret + 开机自启）
 
-> **仅需终端侧功能？** 运行 `cc-linker setup --skip-feishu` 跳过飞书配置。
+> **仅需终端侧功能？** 运行 `cc-linker setup --skip-feishu` 跳过聊天应用配置。
 
 ### 3. 开始使用
 
 | 场景 | 操作 |
 |------|------|
-| 飞书中给 Bot 发消息 | 直接对话，流式卡片实时更新 |
+| 聊天应用中给 Bot 发消息（飞书） | 直接对话，流式卡片实时更新 |
 | 终端查看所有会话 | `cc-linker list` |
 | 终端恢复某个会话 | `cc-linker resume <UUID>` |
-| 飞书切换会话 | `/switch <序号>` |
-| 飞书创建新会话 | `/new <路径> -- <提示词>` |
+| 聊天应用切换会话（飞书） | `/switch <序号>` |
+| 聊天应用创建新会话（飞书） | `/new <路径> -- <提示词>` |
 
 ## 📋 命令参考
 
@@ -121,7 +127,7 @@ cc-linker clean                     # 清理无效记录
 cc-linker status                    # 查看桥接状态
 ```
 
-### 飞书 Bot 命令
+### 聊天应用 Bot 命令（飞书）
 
 在飞书私聊中给 Bot 发送：
 
@@ -148,7 +154,9 @@ cc-linker status                    # 查看桥接状态
 | `cc-linker daemon uninstall` | 移除开机自启 |
 | `cc-linker daemon status` | 查看后台服务状态 |
 
-## 🔧 飞书开放平台配置
+## 🔧 接入飞书（第一个支持的聊天平台）
+
+cc-linker 的架构设计支持接入多种聊天应用，**飞书是第一个已实现的平台**。后续可扩展支持其他 IM 平台。
 
 在配置飞书 Bot 前，需要在 [飞书开放平台](https://open.feishu.cn/app) 创建应用并配置权限。
 
@@ -215,8 +223,8 @@ fallback_to_text = true
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  Claude Code CLI    ←→  Registry  ←→  飞书 Bot       │
-│  (session JSONL)    (registry.json)  (WebSocket)     │
+│  Claude Code CLI    ←→  Registry  ←→  聊天应用 Bot    │
+│  (session JSONL)    (registry.json)  (当前: 飞书)     │
 │                          ↑                           │
 │                   SessionStart hook                  │
 └──────────────────────────────────────────────────────┘

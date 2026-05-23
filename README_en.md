@@ -1,6 +1,8 @@
 # cc-linker
 
-> Seamless switching between Feishu Bot and terminal (Claude Code CLI) conversations — like switching devices.
+> Seamless switching between mobile chat apps and terminal (Claude Code CLI) conversations — like switching devices.
+>
+> **Currently supports Feishu**, with more chat platforms coming soon.
 
 [![npm version](https://img.shields.io/npm/v/cc-linker)](https://www.npmjs.com/package/cc-linker)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -15,22 +17,26 @@ Have you ever found yourself in these situations:
 - **Quick questions on Feishu, deep debugging on terminal** — Ask a quick API usage question on Feishu, realize you need local debugging, and switch to the same session on terminal to keep coding with Claude
 - **Multiple projects, sessions stay organized** — Talk to Claude across `project-a` and `project-b` simultaneously, use `/list` to clearly see each session's directory and status, and switch with one click without getting confused
 
-**cc-linker is the bridge tool that solves these pain points.** It maintains a unified session registry on your machine, allowing Feishu Bot and Claude Code CLI to share the same session state — no matter which side you start a conversation on, you can seamlessly switch to the other.
+**cc-linker is the bridge tool that solves these pain points.** It maintains a unified session registry on your machine, allowing mobile chat apps and Claude Code CLI to share the same session state — no matter which side you start a conversation on, you can seamlessly switch to the other.
+
+> **Currently supports Feishu**, with more chat platforms coming soon.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| Seamless cross-device switching | Resume Feishu sessions on terminal (with context & directory), view terminal sessions on Feishu |
-| Streaming card interaction | See Claude's thinking and replies in real-time on Feishu — no more "spinning wait" |
+| Seamless cross-device switching | Chat app sessions resumed on terminal (with context & directory); terminal sessions visible in chat app |
+| Streaming card interaction | See Claude's thinking and replies in real-time in your chat app — no more "spinning wait" |
 | Unified session management | Auto-scan, incremental sync, no manual session list maintenance needed |
-| Multi-model switching | One-click model switch in Feishu cards, no config changes required |
+| Multi-model switching | One-click model switch in cards, no config changes required |
 | Persistent message queue | File-level message queue survives crashes and restarts |
 | 3-step setup | `install → setup → start`, ready in 5 minutes |
 
 ## Showcase
 
-### Feishu Experience
+### Chat App Experience (Feishu)
+
+> Currently supports Feishu, more platforms coming soon.
 
 <table>
   <tr>
@@ -92,19 +98,19 @@ cc-linker setup
 The interactive wizard guides you through:
 - Initializing the session registry
 - Installing the Claude Code auto-register hook
-- Configuring the Feishu Bot (App ID + App Secret + auto-start)
+- Configuring the chat app Bot (currently Feishu only: App ID + App Secret + auto-start)
 
-> **Need terminal-only features?** Run `cc-linker setup --skip-feishu` to skip Feishu configuration.
+> **Need terminal-only features?** Run `cc-linker setup --skip-feishu` to skip chat app configuration.
 
 ### 3. Start Using
 
 | Scenario | Action |
 |----------|--------|
-| Send message to Bot on Feishu | Direct conversation, streaming card updates in real-time |
+| Send message in chat app (Feishu) | Direct conversation, streaming card updates in real-time |
 | View all sessions on terminal | `cc-linker list` |
 | Resume a session on terminal | `cc-linker resume <UUID>` |
-| Switch session on Feishu | `/switch <index>` |
-| Create new session on Feishu | `/new <path> -- <prompt>` |
+| Switch session in chat app (Feishu) | `/switch <index>` |
+| Create new session in chat app (Feishu) | `/new <path> -- <prompt>` |
 
 ## Command Reference
 
@@ -121,7 +127,7 @@ cc-linker clean                     # Clean up invalid records
 cc-linker status                    # Check bridge status
 ```
 
-### Feishu Bot Commands
+### Chat App Bot Commands (Feishu)
 
 Send these in a Feishu private chat with the Bot:
 
@@ -148,7 +154,9 @@ Send these in a Feishu private chat with the Bot:
 | `cc-linker daemon uninstall` | Remove auto-start on boot |
 | `cc-linker daemon status` | Check background service status |
 
-## Feishu Open Platform Configuration
+## Feishu Integration (First Supported Platform)
+
+cc-linker's architecture supports multiple chat apps — **Feishu is the first implemented platform**. More IM platforms can be added in the future.
 
 Before configuring the Feishu Bot, you need to create an app and set permissions on the [Feishu Open Platform](https://open.feishu.cn/app).
 
@@ -215,8 +223,8 @@ fallback_to_text = true
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  Claude Code CLI    ←→  Registry  ←→  Feishu Bot     │
-│  (session JSONL)    (registry.json)  (WebSocket)     │
+│  Claude Code CLI    ←→  Registry  ←→  Chat App Bot   │
+│  (session JSONL)    (registry.json)  (Current: Feishu)│
 │                          ↑                           │
 │                   SessionStart hook                  │
 └──────────────────────────────────────────────────────┘
