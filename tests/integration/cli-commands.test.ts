@@ -56,7 +56,7 @@ describe('CLI Commands Integration', () => {
   function run(args: string): string {
     try {
       return execSync(`bun run src/index.ts ${args}`, {
-        cwd: '/Users/wuyujun/Git/cc-bridge',
+        cwd: '/Users/wuyujun/Git/cc-linker',
         env,
         encoding: 'utf8',
       });
@@ -79,7 +79,7 @@ describe('CLI Commands Integration', () => {
 
     const customEnv = { ...env, CC_LINKER_DIR: customDir };
     const output = execSync('bun run src/index.ts init', {
-      cwd: '/Users/wuyujun/Git/cc-bridge',
+      cwd: '/Users/wuyujun/Git/cc-linker',
       env: customEnv,
       encoding: 'utf8',
     });
