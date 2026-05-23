@@ -19,13 +19,17 @@ import { start, stop } from './cli/commands/start';
 import { initFeishu } from './cli/commands/init-feishu';
 import { setup } from './cli/commands/setup';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { version } = require('../package.json');
 
 const program = new Command();
 
 program
   .name('cc-linker')
-  .description('飞书 ↔ Claude Code CLI 桥接工具')
-  .version('0.2.0');
+  .description('手机聊天应用 ↔ Claude Code CLI 桥接工具')
+  .version(version);
 
 // Helper to run sync before command
 async function withSync(fn: (registry: RegistryManager) => Promise<void>, skipSync = false) {
