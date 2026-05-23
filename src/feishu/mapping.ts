@@ -13,12 +13,14 @@ export interface MappingEntry {
   createdAt: string;
   casToken?: string; // I3: Unique CAS token to prevent ABA race (auto-generated)
   cwd?: string; // I4: Working directory for new sessions (set by /bridge new)
+  lastActiveAt?: string;
   claimedByMessageId?: string;
   claimedAt?: string;
 }
 
 export interface UserMapping {
   version: number;
+  ownerOpenId?: string;
   entries: Record<string, MappingEntry>;
 }
 
@@ -28,6 +30,12 @@ const DEFAULT_MAPPING: UserMapping = {
 };
 
 export const PENDING_CLAIMED_TIMEOUT_MS = 60 * 1000; // 1 minute
+
+export type ClaimPendingResult =
+  | { status: 'claimed'; entry: MappingEntry; version: number }
+  | { status: 'creating'; entry: MappingEntry; version: number }
+  | { status: 'no_pending'; entry: MappingEntry | null; version: number }
+  | { status: 'unauthorized'; version: number };
 
 export class UserManager {
   private mappingPath: string;
@@ -73,6 +81,11 @@ export class UserManager {
     return mapping.entries[openId];
   }
 
+  getVersion(): number {
+    this.ensureFile();
+    return this.loadMapping().version;
+  }
+
   /**
    * Compare-And-Swap: atomically update an openId's entry.
    */
@@ -105,7 +118,10 @@ export class UserManager {
         if (!newValue.casToken) {
           newValue.casToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
         }
-        mapping.entries[openId] = newValue;
+        mapping.entries[openId] = {
+          ...newValue,
+          lastActiveAt: newValue.lastActiveAt ?? new Date().toISOString(),
+        };
       } else {
         delete mapping.entries[openId];
       }
@@ -118,6 +134,113 @@ export class UserManager {
     });
 
     return result;
+  }
+
+  async claimPendingNewSession(openId: string, messageId: string): Promise<ClaimPendingResult> {
+    if (!this.validateOwner(openId)) {
+      return { status: 'unauthorized', version: this.getVersion() };
+    }
+
+    let outcome: ClaimPendingResult = { status: 'no_pending', entry: null, version: this.getVersion() };
+
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const current = mapping.entries[openId] ?? null;
+
+      if (!current || (current.type !== 'pending_new_session' && current.type !== 'pending_new_session_claimed')) {
+        outcome = { status: 'no_pending', entry: current, version: mapping.version };
+        return;
+      }
+
+      if (current.type === 'pending_new_session_claimed') {
+        outcome = { status: 'creating', entry: current, version: mapping.version };
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const claimedEntry: MappingEntry = {
+        ...current,
+        type: 'pending_new_session_claimed',
+        claimedByMessageId: messageId,
+        claimedAt: now,
+        lastActiveAt: now,
+        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      };
+
+      mapping.entries[openId] = claimedEntry;
+      mapping.version++;
+      this.saveMapping(mapping);
+      outcome = { status: 'claimed', entry: claimedEntry, version: mapping.version };
+    });
+
+    return outcome;
+  }
+
+  async rollbackClaim(openId: string, messageId: string): Promise<boolean> {
+    let rolledBack = false;
+
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const current = mapping.entries[openId];
+      if (!current || current.type !== 'pending_new_session_claimed') {
+        return;
+      }
+      if (current.claimedByMessageId !== messageId) {
+        return;
+      }
+
+      mapping.entries[openId] = {
+        ...current,
+        type: 'pending_new_session',
+        sessionUuid: null,
+        lastActiveAt: new Date().toISOString(),
+        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        claimedByMessageId: undefined,
+        claimedAt: undefined,
+      };
+      mapping.version++;
+      this.saveMapping(mapping);
+      rolledBack = true;
+    });
+
+    return rolledBack;
+  }
+
+  async bindSessionToClaim(openId: string, messageId: string, sessionUuid: string, cwd: string): Promise<boolean> {
+    let bound = false;
+
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const current = mapping.entries[openId];
+      if (!current) {
+        return;
+      }
+
+      const claimMatches =
+        current.type === 'pending_new_session_claimed' &&
+        current.claimedByMessageId === messageId;
+
+      if (!claimMatches) {
+        return;
+      }
+
+      mapping.entries[openId] = {
+        type: 'session',
+        sessionUuid,
+        cwd,
+        createdAt: current.createdAt,
+        lastActiveAt: new Date().toISOString(),
+        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      };
+      mapping.version++;
+      this.saveMapping(mapping);
+      bound = true;
+    });
+
+    return bound;
   }
 
   /**
@@ -161,9 +284,9 @@ export class UserManager {
 
   /** Validate if an openId matches the configured owner */
   validateOwner(openId: string): boolean {
-    const ownerUserId = config.get<string>('feishu_bot.owner_user_id', '');
-    if (!ownerUserId) return true;
-    return openId === ownerUserId;
+    const ownerOpenId = config.get<string>('feishu_bot.owner_open_id', '');
+    if (!ownerOpenId) return true;
+    return openId === ownerOpenId;
   }
 }
 
@@ -176,13 +299,15 @@ function entriesMatch(
   if (a === null || b === null) return false;
   if (a.type !== b.type) return false;
   if (a.sessionUuid !== b.sessionUuid) return false;
+  if ((a.cwd ?? '') !== (b.cwd ?? '')) return false;
   // I3: Compare CAS token — treat both undefined/empty as matching (backward compat)
   const tokenA = a.casToken || '';
   const tokenB = b.casToken || '';
   if (tokenA !== tokenB) return false;
-  // For claimed entries, also verify claimedBy
+  // For claimed entries, also verify claimedBy and claimedAt
   if (a.type === 'pending_new_session_claimed' && b.type === 'pending_new_session_claimed') {
     if (a.claimedByMessageId !== b.claimedByMessageId) return false;
+    if ((a.claimedAt ?? '') !== (b.claimedAt ?? '')) return false;
   }
   return true;
 }

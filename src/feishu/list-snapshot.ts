@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, unlinkS
 import { join } from 'path';
 import { LIST_SNAPSHOT_PATH } from '../utils/paths';
 import { logger } from '../utils/logger';
+import { config } from '../utils/config';
 
 export interface ListSnapshot {
   /** OpenId -> session list entries */
@@ -17,8 +18,6 @@ export interface ListSnapshotEntry {
   uuid: string;
   title: string;
 }
-
-const LIST_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 export class ListSnapshotManager {
   private snapshotPath: string;
@@ -62,10 +61,11 @@ export class ListSnapshotManager {
     try {
       const raw = readFileSync(this.snapshotPath, 'utf8');
       const snapshot = JSON.parse(raw) as ListSnapshot;
+      const ttlMs = Math.max(1, config.get<number>('queue.list_snapshot_ttl_minutes', 10)) * 60 * 1000;
 
       // Check TTL
       const age = Date.now() - new Date(snapshot.createdAt).getTime();
-      if (age >= LIST_SNAPSHOT_TTL_MS) {
+      if (age >= ttlMs) {
         logger.debug(`列表快照已过期 (${Math.round(age / 1000)}s)`);
         return null;
       }

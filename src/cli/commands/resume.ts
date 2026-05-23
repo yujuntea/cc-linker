@@ -1,5 +1,6 @@
 import { existsSync, readdirSync } from 'fs';
 import { join } from 'path';
+import { SPOOL_PROCESSING_DIR } from '../../utils/paths';
 import inquirer from 'inquirer';
 import chalk from 'chalk';
 import { RegistryManager } from '../../registry';
@@ -8,6 +9,7 @@ import { formatOrigin, formatTimeAgo } from '../output';
 import { CLAUDE_PROJECTS_DIR } from '../../utils/paths';
 import { StateCoordinator } from '../../runtime/state-coordinator';
 import { config } from '../../utils/config';
+import { repairJsonlLastPrompt } from '../../utils/jsonl-repair';
 
 interface ResumeOptions {
   search?: string;
@@ -16,6 +18,7 @@ interface ResumeOptions {
   dryRun?: boolean;
   confirm?: boolean;
   cwd?: string;
+  force?: boolean;
 }
 
 // 状态错误码映射
@@ -43,6 +46,8 @@ export async function resume(registry: RegistryManager, target?: string, opts: R
   let entry = registry.get(uuid);
   if (!entry) throw new CCBridgeError('E002', '会话不存在');
 
+  entry = await attemptRepairSession(registry, uuid, entry);
+
   // 状态检测
   const status = entry.status ?? 'active';
   if (status === 'archived') {
@@ -56,8 +61,24 @@ export async function resume(registry: RegistryManager, target?: string, opts: R
     throw new CCBridgeError(err.code as any, msg);
   }
 
-  // 检测 owner.lock：Bot 进程正在运行时拒绝离线直写
-  StateCoordinator.assertNotRunning();
+  // Check if target session is actively being processed by the bot
+  const busy = isSessionBusy(uuid);
+  if (busy) {
+    if (opts.force) {
+      console.log(chalk.yellow(`⚠️ 会话 ${uuid.slice(0, 8)} 正在被 Bot 处理，--force 跳过冲突警告`));
+    } else {
+      const { confirmed } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirmed',
+        message: `会话 ${uuid.slice(0, 8)} 正在被 Bot 处理，同时用 CLI 恢复可能导致状态冲突。继续？`,
+        default: false,
+      }]);
+      if (!confirmed) return;
+    }
+  } else if (StateCoordinator.isLocked()) {
+    // Bot is running but not processing this session — safe to resume
+    console.log(chalk.dim('Bot 正在运行，但未处理此会话，可安全恢复'));
+  }
 
   // Verify JSONL exists
   if (entry.jsonl_path && !existsSync(entry.jsonl_path)) {
@@ -108,6 +129,15 @@ export async function resume(registry: RegistryManager, target?: string, opts: R
   }
 
   console.log(chalk.green(`恢复会话: ${entry.title ?? uuid}`));
+
+  // Repair JSONL last-prompt before resume to ensure Feishu messages are visible
+  if (entry.jsonl_path && existsSync(entry.jsonl_path)) {
+    const repaired = repairJsonlLastPrompt(entry.jsonl_path);
+    if (repaired) {
+      console.log(chalk.dim('已修复会话历史元数据'));
+    }
+  }
+
   process.chdir(targetCwd);
   const result = Bun.spawnSync([claudeBin, '--resume', uuid], {
     stdin: 'inherit',
@@ -189,4 +219,46 @@ function findJsonlFile(uuid: string): string | null {
     }
   } catch {}
   return null;
+}
+
+async function attemptRepairSession(
+  registry: RegistryManager,
+  uuid: string,
+  entry: NonNullable<ReturnType<RegistryManager['get']>>,
+): Promise<NonNullable<ReturnType<RegistryManager['get']>>> {
+  const currentStatus = entry.status ?? 'active';
+  if (!['provisioning', 'degraded'].includes(currentStatus)) {
+    return entry;
+  }
+
+  if (entry.jsonl_path && existsSync(entry.jsonl_path)) {
+    registry.upsert(uuid, {
+      status: 'active',
+      pending_jsonl_resolve: false,
+      last_error: null,
+    });
+    await registry.flush();
+    return registry.get(uuid) ?? entry;
+  }
+
+  const found = findJsonlFile(uuid);
+  if (!found) {
+    return entry;
+  }
+
+  registry.upsert(uuid, {
+    jsonl_path: found,
+    status: 'active',
+    pending_jsonl_resolve: false,
+    last_error: null,
+  });
+  await registry.flush();
+  return registry.get(uuid) ?? entry;
+}
+
+/** Check if the bot is currently processing a message for this session */
+function isSessionBusy(sessionUuid: string): boolean {
+  if (!existsSync(SPOOL_PROCESSING_DIR)) return false;
+  const prefix = `${sessionUuid}:`;
+  return readdirSync(SPOOL_PROCESSING_DIR).some(f => f.startsWith(prefix));
 }

@@ -1,7 +1,7 @@
 import { RegistryManager } from '../registry';
 import { UserManager, ListSnapshotManager } from '../feishu';
 import { SpoolQueue } from '../queue/spool';
-import { RUNTIME_SESSION_EVENTS_DIR, LIST_SNAPSHOT_PATH } from '../utils/paths';
+import { RUNTIME_SESSION_EVENTS_DIR, LIST_SNAPSHOT_PATH, CLAUDE_PROJECTS_DIR } from '../utils/paths';
 import { existsSync, readdirSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { logger } from '../utils/logger';
@@ -31,6 +31,7 @@ export interface ReconcileResult {
   mergedEvents: number;
   expiredSnapshots: number;
   expiredFiles: number;
+  repairedSessions: number;
 }
 
 /**
@@ -49,42 +50,42 @@ export async function startupReconcile(opts: {
     mergedEvents: 0,
     expiredSnapshots: 0,
     expiredFiles: 0,
+    repairedSessions: 0,
   };
 
   logger.info('启动协调器开始...');
 
   // 0. Clean stray .tmp files from crashed atomic writes
-  const spoolDirs = [
-    opts.spoolQueue['pendingDir'],
-    opts.spoolQueue['processingDir'],
-    opts.spoolQueue['doneDir'],
-    opts.spoolQueue['failedDir'],
-    opts.spoolQueue['receiptsDir'],
-    opts.spoolQueue['deliveriesDir'],
-  ];
-  result.expiredFiles += cleanupTmpFiles(spoolDirs);
+  result.expiredFiles += cleanupTmpFiles(opts.spoolQueue.getSpoolDirs());
 
-  // 1. Recover processing → pending
+  // 1. Finalize messages that were already sent to Feishu before a crash.
+  result.expiredFiles += opts.spoolQueue.finalizeDeliveredMessages();
+
+  // 2. Recover processing → pending
   result.recoveredProcessing = opts.spoolQueue.recoverProcessing();
 
-  // 2. Roll back timed-out pending_new_session_claimed
+  // 3. Roll back timed-out pending_new_session_claimed
   result.rolledBackClaims = await opts.userManager.rollbackTimedOutClaims();
 
-  // 3. Merge session-events into registry
+  // 4. Merge session-events into registry
   result.mergedEvents = await mergeSessionEvents(opts.registry);
 
-  // 4. Clean expired snapshots
+  // 5. Clean expired snapshots
   result.expiredSnapshots = cleanExpiredSnapshots(opts.listSnapshotManager);
 
-  // 5. Clean expired spool files
+  // 6. Repair provisioning/degraded sessions: try to find missing jsonl_path
+  result.repairedSessions = await repairProvisioningSessions(opts.registry);
+
+  // 7. Clean expired spool files
   const cleanup = opts.spoolQueue.cleanup();
-  result.expiredFiles = cleanup.cleaned + cleanup.failed + cleanup.receipts + cleanup.deliveries;
+  result.expiredFiles += cleanup.cleaned + cleanup.failed + cleanup.receipts + cleanup.deliveries;
 
   logger.info(
     `启动协调器完成: ` +
     `${result.recoveredProcessing} processing恢复, ` +
     `${result.rolledBackClaims} claims回滚, ` +
     `${result.mergedEvents} events归并, ` +
+    `${result.repairedSessions} 会话修复, ` +
     `${result.expiredSnapshots + result.expiredFiles} 过期文件清理`
   );
 
@@ -154,6 +155,59 @@ async function mergeSessionEvents(registry: RegistryManager): Promise<number> {
   }
 
   return merged;
+}
+
+/**
+ * Repair provisioning/degraded sessions by searching for missing jsonl files.
+ */
+async function repairProvisioningSessions(registry: RegistryManager): Promise<number> {
+  let repaired = 0;
+
+  for (const [uuid, entry] of Object.entries(registry.sessions)) {
+    const status = entry.status ?? 'active';
+    if (status !== 'provisioning' && status !== 'degraded') continue;
+
+    // If jsonl_path exists and file is present, mark as active
+    if (entry.jsonl_path && existsSync(entry.jsonl_path)) {
+      registry.upsert(uuid, {
+        status: 'active',
+        pending_jsonl_resolve: false,
+        last_error: null,
+      });
+      repaired++;
+      continue;
+    }
+
+    // Try to find the jsonl file in projects directory
+    const found = findJsonlFile(uuid);
+    if (found) {
+      registry.upsert(uuid, {
+        jsonl_path: found,
+        status: 'active',
+        pending_jsonl_resolve: false,
+        last_error: null,
+      });
+      repaired++;
+    }
+  }
+
+  if (repaired > 0) {
+    await registry.flush();
+    logger.info(`修复 ${repaired} 个 provisioning/degraded 会话`);
+  }
+
+  return repaired;
+}
+
+function findJsonlFile(uuid: string): string | null {
+  try {
+    const projects = readdirSync(CLAUDE_PROJECTS_DIR);
+    for (const project of projects) {
+      const jsonlPath = join(CLAUDE_PROJECTS_DIR, project, `${uuid}.jsonl`);
+      if (existsSync(jsonlPath)) return jsonlPath;
+    }
+  } catch {}
+  return null;
 }
 
 /**

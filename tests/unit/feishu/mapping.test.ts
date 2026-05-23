@@ -4,6 +4,7 @@ import { ListSnapshotManager } from '../../../src/feishu/list-snapshot';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { config } from '../../../src/utils/config';
 
 describe('UserManager', () => {
   let tmpDir: string;
@@ -14,6 +15,7 @@ describe('UserManager', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'user-mapping-test-'));
     mappingPath = join(tmpDir, 'user-mapping.json');
     userManager = new UserManager(mappingPath);
+    (config as any).data.feishu_bot.owner_open_id = '';
   });
 
   afterEach(() => {
@@ -225,14 +227,17 @@ describe('ListSnapshotManager', () => {
   let tmpDir: string;
   let snapshotPath: string;
   let manager: ListSnapshotManager;
+  let originalSnapshotTtlMinutes: number;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'list-snapshot-test-'));
     snapshotPath = join(tmpDir, 'list-snapshot.json');
     manager = new ListSnapshotManager(snapshotPath);
+    originalSnapshotTtlMinutes = (config as any).data.queue.list_snapshot_ttl_minutes;
   });
 
   afterEach(() => {
+    (config as any).data.queue.list_snapshot_ttl_minutes = originalSnapshotTtlMinutes;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -276,6 +281,20 @@ describe('ListSnapshotManager', () => {
 
     expect(manager.loadSnapshot()).toBeNull();
     expect(manager.resolveIndex(1)).toBeNull();
+  });
+
+  it('uses configured snapshot TTL', () => {
+    manager.saveSnapshot('ou_user1', [
+      { index: 1, uuid: 'uuid-1', title: 'Session 1' },
+    ]);
+
+    const raw = readFileSync(snapshotPath, 'utf8');
+    const data = JSON.parse(raw);
+    data.createdAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    writeFileSync(snapshotPath, JSON.stringify(data, null, 2));
+
+    (config as any).data.queue.list_snapshot_ttl_minutes = 1;
+    expect(manager.loadSnapshot()).toBeNull();
   });
 
   it('returns null when openId does not match', () => {

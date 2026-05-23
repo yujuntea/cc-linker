@@ -5,13 +5,13 @@ import {
 import { join } from 'path';
 import {
   SPOOL_DIR, SPOOL_PENDING_DIR, SPOOL_PROCESSING_DIR,
-  SPOOL_DONE_DIR, SPOOL_FAILED_DIR, SPOOL_RECEIPTS_DIR, SPOOL_DELIVERIES_DIR
+  SPOOL_REPLIED_DIR, SPOOL_DONE_DIR, SPOOL_FAILED_DIR, SPOOL_RECEIPTS_DIR, SPOOL_DELIVERIES_DIR
 } from '../utils/paths';
 import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 
 // Message states
-export type SpoolStatus = 'pending' | 'processing' | 'done' | 'failed';
+export type SpoolStatus = 'pending' | 'processing' | 'replied' | 'done' | 'failed';
 
 // Target snapshot types
 export type TargetSnapshotType = 'session' | 'new_session_claim' | 'new_session_creating' | 'no_target';
@@ -20,6 +20,10 @@ export interface TargetSnapshot {
   type: TargetSnapshotType;
   sessionUuid?: string;
   openId?: string;
+  cwd?: string;
+  claimMessageId?: string;
+  claimedByMessageId?: string;
+  mappingVersion?: number;
 }
 
 export interface SpoolMessage {
@@ -32,6 +36,9 @@ export interface SpoolMessage {
   createdAt: string;
   updatedAt: string;
   replyMessageId?: string; // outbound Feishu message ID
+  responseText?: string;
+  retryCount?: number;
+  nextAttemptAt?: string;
   error?: string;
 }
 
@@ -44,14 +51,23 @@ export interface Delivery {
   spoolMessageId: string;
   status: 'sending' | 'sent';
   requestUuid: string;
+  updatedAt: string;
+  chunkCount: number;
+  chunks?: Array<{
+    index: number;
+    requestUuid: string;
+    status: 'sending' | 'sent';
+    feishuMessageId?: string;
+  }>;
   createdAt: string;
 }
 
-const MAX_QUEUE_SIZE = 100;
+const DEFAULT_MAX_QUEUE_SIZE = 100;
 
 export class SpoolQueue {
   private pendingDir: string;
   private processingDir: string;
+  private repliedDir: string;
   private doneDir: string;
   private failedDir: string;
   private receiptsDir: string;
@@ -60,6 +76,7 @@ export class SpoolQueue {
   constructor(baseDir?: string) {
     this.pendingDir = baseDir ? join(baseDir, 'pending') : SPOOL_PENDING_DIR;
     this.processingDir = baseDir ? join(baseDir, 'processing') : SPOOL_PROCESSING_DIR;
+    this.repliedDir = baseDir ? join(baseDir, 'replied') : SPOOL_REPLIED_DIR;
     this.doneDir = baseDir ? join(baseDir, 'done') : SPOOL_DONE_DIR;
     this.failedDir = baseDir ? join(baseDir, 'failed') : SPOOL_FAILED_DIR;
     this.receiptsDir = baseDir ? join(baseDir, 'receipts') : SPOOL_RECEIPTS_DIR;
@@ -69,7 +86,7 @@ export class SpoolQueue {
   }
 
   private ensureDirs(): void {
-    for (const dir of [this.pendingDir, this.processingDir, this.doneDir, this.failedDir, this.receiptsDir, this.deliveriesDir]) {
+    for (const dir of [this.pendingDir, this.processingDir, this.repliedDir, this.doneDir, this.failedDir, this.receiptsDir, this.deliveriesDir]) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
   }
@@ -97,16 +114,52 @@ export class SpoolQueue {
   }
 
   /** Record outbound delivery (idempotent) */
-  recordDelivery(spoolMessageId: string, status: 'sending' | 'sent', requestUuid: string): void {
+  recordDelivery(
+    spoolMessageId: string,
+    status: 'sending' | 'sent',
+    requestUuid: string,
+    chunkIndex = 0,
+    feishuMessageId?: string,
+    totalChunks?: number,
+  ): void {
     const path = join(this.deliveriesDir, `${spoolMessageId}.json`);
     const existing = this.getDelivery(spoolMessageId);
+    const chunks = existing?.chunks ? [...existing.chunks] : [];
+    const currentChunk = chunks.find(chunk => chunk.index === chunkIndex);
+
+    if (currentChunk) {
+      currentChunk.status = status;
+      currentChunk.requestUuid = requestUuid;
+      currentChunk.feishuMessageId = feishuMessageId ?? currentChunk.feishuMessageId;
+    } else {
+      chunks.push({
+        index: chunkIndex,
+        requestUuid,
+        status,
+        feishuMessageId,
+      });
+    }
+
+    const chunkCount = totalChunks ?? existing?.chunkCount ?? Math.max(chunkIndex + 1, chunks.length);
+    const allChunksSent =
+      chunkCount > 0 &&
+      chunks.length >= chunkCount &&
+      chunks.filter(chunk => chunk.status === 'sent').length >= chunkCount;
+
     const delivery: Delivery = {
       spoolMessageId,
-      status,
-      requestUuid,
+      status: allChunksSent ? 'sent' : 'sending',
+      requestUuid: existing?.requestUuid ?? requestUuid,
+      updatedAt: new Date().toISOString(),
+      chunkCount,
+      chunks,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
     };
     this.writeAtomic(path, delivery);
+  }
+
+  hasSentDelivery(spoolMessageId: string): boolean {
+    return this.getDelivery(spoolMessageId)?.status === 'sent';
   }
 
   /**
@@ -130,7 +183,7 @@ export class SpoolQueue {
     // Queue size check (after claiming receipt to avoid TOCTOU)
     const pendingCount = readdirSync(this.pendingDir).length;
     const processingCount = readdirSync(this.processingDir).length;
-    const maxSize = config.get<number>('queue.max_queue_size', MAX_QUEUE_SIZE);
+    const maxSize = config.get<number>('queue.max_pending', DEFAULT_MAX_QUEUE_SIZE);
     if (pendingCount + processingCount >= maxSize) {
       logger.warn(`队列已满 (${pendingCount + processingCount}/${maxSize})，拒绝: ${msg.messageId}`);
       // Revert receipt
@@ -151,8 +204,21 @@ export class SpoolQueue {
 
   /** Get next pending message for a serial key */
   claimNext(serialKey: string): SpoolMessage | null {
-    const files = readdirSync(this.pendingDir);
-    const match = files.find(f => f.startsWith(`${serialKey}:`));
+    const active = readdirSync(this.processingDir).some(f => f.startsWith(`${serialKey}:`));
+    if (active) {
+      return null;
+    }
+
+    const now = Date.now();
+    const match = readdirSync(this.pendingDir)
+      .filter(f => f.startsWith(`${serialKey}:`))
+      .map(file => ({
+        file,
+        msg: this.readSpoolMessage(join(this.pendingDir, file)),
+      }))
+      .filter((entry): entry is { file: string; msg: SpoolMessage } => entry.msg !== null)
+      .filter(entry => !entry.msg.nextAttemptAt || new Date(entry.msg.nextAttemptAt).getTime() <= now)
+      .sort((a, b) => a.msg.createdAt.localeCompare(b.msg.createdAt))[0]?.file;
     if (!match) return null;
 
     const srcPath = join(this.pendingDir, match);
@@ -196,51 +262,42 @@ export class SpoolQueue {
 
   /** Mark message as done (move to done dir) */
   markDone(messageId: string, serialKey: string, replyMessageId?: string): void {
-    const files = readdirSync(this.processingDir);
-    // Precise match: filename format is `${serialKey}:${messageId}.json`
-    const expectedName = `${serialKey}:${messageId}.json`;
-    const match = files.find(f => f === expectedName);
-    if (!match) return;
-
-    const srcPath = join(this.processingDir, match);
-    const msg = this.readSpoolMessage(srcPath);
-    if (!msg) return;
-
-    msg.status = 'done';
-    msg.replyMessageId = replyMessageId;
-    msg.updatedAt = new Date().toISOString();
-
-    const destPath = join(this.doneDir, match);
-    try {
-      renameSync(srcPath, destPath);
-    } catch {
-      return; // already moved by another worker
-    }
-    this.writeAtomic(destPath, msg);
+    this.moveMessage(messageId, serialKey, [this.repliedDir, this.processingDir], this.doneDir, 'done', replyMessageId);
   }
 
   /** Mark message as failed (move to failed dir) */
   markFailed(messageId: string, serialKey: string, error: string): void {
-    const files = readdirSync(this.processingDir);
-    const expectedName = `${serialKey}:${messageId}.json`;
-    const match = files.find(f => f === expectedName);
-    if (!match) return;
+    this.moveMessage(messageId, serialKey, [this.processingDir], this.failedDir, 'failed', undefined, { error });
+  }
 
-    const srcPath = join(this.processingDir, match);
-    const msg = this.readSpoolMessage(srcPath);
-    if (!msg) return;
+  markReplied(messageId: string, serialKey: string, replyMessageId?: string): void {
+    this.moveMessage(messageId, serialKey, [this.processingDir], this.repliedDir, 'replied', replyMessageId);
+  }
 
-    msg.status = 'failed';
-    msg.error = error;
-    msg.updatedAt = new Date().toISOString();
+  updateProcessingMessage(messageId: string, serialKey: string, patch: Partial<SpoolMessage>): SpoolMessage | null {
+    const path = join(this.processingDir, `${serialKey}:${messageId}.json`);
+    if (!existsSync(path)) return null;
 
-    const destPath = join(this.failedDir, match);
-    try {
-      renameSync(srcPath, destPath);
-    } catch {
-      return; // already moved by another worker
-    }
-    this.writeAtomic(destPath, msg);
+    const msg = this.readSpoolMessage(path);
+    if (!msg) return null;
+
+    Object.assign(msg, patch, {
+      updatedAt: new Date().toISOString(),
+    });
+    this.writeAtomic(path, msg);
+    return msg;
+  }
+
+  requeueForRetry(messageId: string, serialKey: string, error: string, delayMs: number): SpoolMessage | null {
+    const moved = this.moveMessage(messageId, serialKey, [this.processingDir], this.pendingDir, 'pending');
+    if (!moved) return null;
+
+    moved.retryCount = (moved.retryCount ?? 0) + 1;
+    moved.error = error;
+    moved.nextAttemptAt = new Date(Date.now() + delayMs).toISOString();
+    moved.updatedAt = new Date().toISOString();
+    this.writeAtomic(join(this.pendingDir, `${serialKey}:${messageId}.json`), moved);
+    return moved;
   }
 
   /** List all pending messages */
@@ -253,9 +310,18 @@ export class SpoolQueue {
     return this.listFromDir(this.processingDir);
   }
 
+  listReplied(): SpoolMessage[] {
+    return this.listFromDir(this.repliedDir);
+  }
+
   /** Get total queue size */
   queueSize(): number {
     return readdirSync(this.pendingDir).length + readdirSync(this.processingDir).length;
+  }
+
+  /** Get all spool directory paths (for reconciler cleanup) */
+  getSpoolDirs(): string[] {
+    return [this.pendingDir, this.processingDir, this.repliedDir, this.doneDir, this.failedDir, this.receiptsDir, this.deliveriesDir];
   }
 
   /** Archive cleanup: done 24h, failed 7d, receipts/deliveries TTL */
@@ -265,12 +331,12 @@ export class SpoolQueue {
     let receiptCleaned = 0;
     let deliveryCleaned = 0;
 
-    const doneAfterHours = config.get<number>('queue.archive_done_after_hours', 24);
-    const doneMaxCount = 1000;
-    const failedAfterDays = config.get<number>('queue.archive_failed_after_days', 7);
-    const failedMaxCount = 200;
-    const receiptTtlHours = 24;
-    const deliveryTtlDays = 7;
+    const doneAfterHours = config.get<number>('queue.done_retention_hours', 24);
+    const doneMaxCount = config.get<number>('queue.done_max_files', 1000);
+    const failedAfterDays = config.get<number>('queue.failed_retention_days', 7);
+    const failedMaxCount = config.get<number>('queue.failed_max_files', 200);
+    const receiptTtlHours = config.get<number>('queue.receipt_retention_days', 7) * 24;
+    const deliveryTtlDays = config.get<number>('queue.delivery_retention_days', 7);
 
     // Cleanup done: first by age, then by count if still over limit
     const doneFiles = readdirSync(this.doneDir).sort();
@@ -365,8 +431,10 @@ export class SpoolQueue {
 
       const destPath = join(this.pendingDir, file);
       try {
+        // Write updated status first, then rename — ensures crash-safety:
+        // if crash after rename, the file in pending/ already has status=pending.
+        this.writeAtomic(srcPath, msg);
         renameSync(srcPath, destPath);
-        this.writeAtomic(destPath, msg);
       } catch (err) {
         logger.warn(`recoverProcessing 失败: ${srcPath}: ${err}`);
         continue;
@@ -378,6 +446,27 @@ export class SpoolQueue {
       logger.info(`恢复 ${recovered} 条 processing → pending 消息`);
     }
     return recovered;
+  }
+
+  finalizeDeliveredMessages(): number {
+    let finalized = 0;
+    for (const dir of [this.processingDir, this.repliedDir]) {
+      for (const file of readdirSync(dir)) {
+        const msg = this.readSpoolMessage(join(dir, file));
+        if (!msg) continue;
+        if (!this.hasSentDelivery(msg.messageId)) continue;
+
+        const updated = this.moveMessage(msg.messageId, msg.serialKey, [dir], this.doneDir, 'done', msg.replyMessageId);
+        if (updated) {
+          finalized++;
+        }
+      }
+    }
+
+    if (finalized > 0) {
+      logger.info(`完成 ${finalized} 条已发送消息的 finalize`);
+    }
+    return finalized;
   }
 
   // Private helpers
@@ -405,6 +494,44 @@ export class SpoolQueue {
     const tmp = path + '.tmp';
     writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
     renameSync(tmp, path);
+  }
+
+  private moveMessage(
+    messageId: string,
+    serialKey: string,
+    sourceDirs: string[],
+    targetDir: string,
+    status: SpoolStatus,
+    replyMessageId?: string,
+    extraPatch?: Record<string, unknown>,
+  ): SpoolMessage | null {
+    const expectedName = `${serialKey}:${messageId}.json`;
+
+    for (const sourceDir of sourceDirs) {
+      const srcPath = join(sourceDir, expectedName);
+      if (!existsSync(srcPath)) continue;
+
+      const msg = this.readSpoolMessage(srcPath);
+      if (!msg) return null;
+
+      msg.status = status;
+      msg.replyMessageId = replyMessageId ?? msg.replyMessageId;
+      msg.updatedAt = new Date().toISOString();
+      if (extraPatch) Object.assign(msg, extraPatch);
+
+      const destPath = join(targetDir, expectedName);
+      try {
+        // Write updated status to source first, then rename — crash-safe:
+        // if crash after rename, the file in target/ already has correct status.
+        this.writeAtomic(srcPath, msg);
+        renameSync(srcPath, destPath);
+      } catch {
+        return null;
+      }
+      return msg;
+    }
+
+    return null;
   }
 }
 

@@ -11,10 +11,8 @@ interface SyncOptions {
 }
 
 export async function sync(registry: RegistryManager, opts: SyncOptions): Promise<void> {
-  // 运行时拒绝写入（除非是只读扫描）
-  if (!opts.scan) {
-    StateCoordinator.assertNotRunning();
-  }
+  // 运行时拒绝写入
+  StateCoordinator.assertNotRunning();
 
   console.log(chalk.blue('🔄 Syncing sessions...'));
 
@@ -33,11 +31,7 @@ export async function sync(registry: RegistryManager, opts: SyncOptions): Promis
     console.log(`   Cleaned ${toClean.length} invalid sessions`);
   }
 
-  if (opts.scan) {
-    await syncBeforeCommand(registry, undefined, undefined, true, opts.force);
-  } else {
-    await syncBeforeCommand(registry, undefined, undefined, false, opts.force);
-  }
+  await syncBeforeCommand(registry, undefined, undefined, false, opts.force);
 
   const sessions = Object.values(registry.sessions);
   const afterKeys = new Set(Object.keys(registry.sessions));
@@ -49,12 +43,9 @@ export async function sync(registry: RegistryManager, opts: SyncOptions): Promis
   const removedSessions = [...beforeKeys].filter(k => !afterKeys.has(k)).length;
 
   console.log(`   Found ${feishu} feishu sessions, ${cli} Claude Code sessions`);
-  if (!opts.scan) {
-    console.log(`   New sessions registered: ${newSessions}`);
-    console.log(`   Sessions updated: ${updatedSessions}`);
-  }
+  console.log(`   New sessions registered: ${newSessions}`);
+  console.log(`   Sessions updated: ${updatedSessions}`);
   if (opts.clean) console.log(`   Sessions cleaned: ${removedSessions}`);
 
-  const label = opts.scan ? 'Scan' : 'Sync';
-  console.log(chalk.green(`✅ ${label} complete. Total registered: ${sessions.length}`));
+  console.log(chalk.green(`✅ Sync complete. Total registered: ${sessions.length}`));
 }

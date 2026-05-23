@@ -15,7 +15,9 @@ import { registerSession } from './cli/commands/register';
 import { exportSession } from './cli/commands/export';
 import { search } from './cli/commands/search';
 import { clean } from './cli/commands/clean';
-import { start } from './cli/commands/start';
+import { start, stop } from './cli/commands/start';
+import { initFeishu } from './cli/commands/init-feishu';
+import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
 
 const program = new Command();
 
@@ -64,6 +66,7 @@ program
   .option('-n, --dry-run', '只显示命令，不执行')
   .option('--no-confirm', '跳过 CWD 变更提示')
   .option('--cwd <path>', '手动指定工作目录')
+  .option('-f, --force', '跳过 Bot 运行冲突警告')
   .option('--no-sync', '跳过自动同步')
   .action((target, opts) => withSync(async (registry) => {
     await resume(registry, target, opts);
@@ -148,10 +151,28 @@ program
 program
   .command('start')
   .description('启动飞书 Bot 进程')
-  .action(() => withSync(async (registry) => {
-    StateCoordinator.assertNotRunning();
-    await start(registry);
+  .option('-d, --daemon', '后台运行（写入 PID 文件）')
+  .action((opts) => withSync(async (registry) => {
+    if (!opts.daemon) {
+      StateCoordinator.assertNotRunning();
+    }
+    await start(registry, { daemon: opts.daemon });
   }, true));
+
+program
+  .command('stop')
+  .description('停止后台运行的 Bot 服务')
+  .action(() => stop());
+
+const daemonCmd = program.command('daemon').description('管理后台 Bot 服务（开机自启）');
+daemonCmd.command('install').description('配置开机自动启动').action(() => installDaemon());
+daemonCmd.command('uninstall').description('移除开机自动启动').action(() => uninstallDaemon());
+daemonCmd.command('status').description('查看后台服务状态').action(() => daemonServiceStatus());
+
+program
+  .command('init-feishu')
+  .description('交互式配置飞书集成（App ID + App Secret + Owner）')
+  .action(() => initFeishu());
 
 // Parse and handle errors
 program.parseAsync(process.argv).catch(handleError);

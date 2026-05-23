@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { FeishuBot } from '../../src/feishu/bot';
+import { FeishuBot, FeishuReplyFn } from '../../src/feishu/bot';
 import { UserManager, ListSnapshotManager } from '../../src/feishu';
 import { SpoolQueue } from '../../src/queue/spool';
 import { ClaudeSessionManager } from '../../src/proxy/session';
@@ -7,6 +7,8 @@ import { StateCoordinator } from '../../src/runtime/state-coordinator';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { RegistryManager } from '../../src/registry';
+import { config } from '../../src/utils/config';
 
 /**
  * Round 6: End-to-end tests + fault injection
@@ -15,9 +17,9 @@ import { tmpdir } from 'os';
 describe('Round 6: E2E + Fault Injection', () => {
   let tmpDir: string;
 
-  function createBot(opts?: { replyFn?: (text: string) => Promise<string | null> }) {
+  function createBot(opts?: { replyFn?: FeishuReplyFn }) {
     const replies: string[] = [];
-    const replyFn = opts?.replyFn ?? (async (text: string) => {
+    const replyFn: FeishuReplyFn = opts?.replyFn ?? (async (text: string) => {
       replies.push(text);
       return `reply-${replies.length}`;
     });
@@ -26,16 +28,18 @@ describe('Round 6: E2E + Fault Injection', () => {
     const listSnapshotManager = new ListSnapshotManager(join(tmpDir, 'list-snapshot.json'));
     const spoolQueue = new SpoolQueue(tmpDir);
     const sessionManager = new ClaudeSessionManager();
+    const registry = new RegistryManager(tmpDir);
 
     const bot = new FeishuBot({
       userManager,
       listSnapshotManager,
       spoolQueue,
+      registry,
       sessionManager,
       replyFn,
     });
 
-    return { bot, replies, userManager, listSnapshotManager, spoolQueue, sessionManager };
+    return { bot, replies, userManager, listSnapshotManager, spoolQueue, sessionManager, registry };
   }
 
   function p2pMessage(openId: string, messageId: string, text: string) {
@@ -50,6 +54,9 @@ describe('Round 6: E2E + Fault Injection', () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'e2e-test-'));
+    (config as any).data.feishu_bot.owner_open_id = '';
+    (config as any).data.security.allowed_roots = [];
+    (config as any).data.security.denied_roots = [];
   });
 
   afterEach(() => {
@@ -77,20 +84,33 @@ describe('Round 6: E2E + Fault Injection', () => {
   // 2. Race condition: /bridge switch queues messages correctly
   // ============================================================
   it('竞态: switch 后排队消息正确路由', async () => {
-    const { bot, replies, spoolQueue, userManager } = createBot();
+    const { bot, replies, spoolQueue, userManager, registry } = createBot();
 
     // First, establish a session
     await bot.onMessage(p2pMessage('ou_user1', 'msg-init', '/bridge new /tmp/test'));
     await bot.dispatch();
     expect(replies.length).toBeGreaterThanOrEqual(1);
 
+    registry.upsert('abc-12345-uuid', {
+      origin: 'cli',
+      cwd: '/tmp/existing',
+      project_name: 'existing',
+      title: 'Existing Session',
+      message_count: 2,
+      last_active: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+      last_message_preview: 'hello',
+      jsonl_path: null,
+    });
+    await registry.flush();
+
     // Now switch to a specific session
-    await bot.onMessage(p2pMessage('ou_user1', 'msg-switch', '/bridge switch abc-123'));
+    await bot.onMessage(p2pMessage('ou_user1', 'msg-switch', '/bridge switch abc-12345'));
     await bot.dispatch();
 
     // Verify mapping was updated
     const entry = userManager.getEntry('ou_user1');
-    expect(entry?.sessionUuid).toBe('abc-123');
+    expect(entry?.sessionUuid).toBe('abc-12345-uuid');
 
     // Send a chat message — should route to the switched session target
     await bot.onMessage(p2pMessage('ou_user1', 'msg-chat', 'hello world'));
@@ -151,7 +171,7 @@ describe('Round 6: E2E + Fault Injection', () => {
   // 5. Outbound idempotency: send timeout but server received → retry doesn't duplicate
   // ============================================================
   it('出站幂等: 飞书发送超时但服务端可能已收 → 重试不重复回复', async () => {
-    const { spoolQueue, userManager } = createBot();
+    const { spoolQueue } = createBot();
 
     // Simulate a delivery that was sent but ack was lost
     const msg = {

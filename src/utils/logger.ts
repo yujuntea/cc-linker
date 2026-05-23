@@ -2,6 +2,18 @@ import { appendFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { HOOK_LOG_PATH } from './paths';
 
+/** Format date as local time string: YYYY-MM-DD HH:mm:ss */
+export function formatLocalTime(date: Date = new Date()): string {
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hour = pad(date.getHours());
+  const minute = pad(date.getMinutes());
+  const second = pad(date.getSeconds());
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+}
+
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const LOG_LEVELS: Record<LogLevel, number> = {
@@ -23,7 +35,7 @@ class Logger {
   }
 
   private format(level: LogLevel, message: string): string {
-    return `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}`;
+    return `[${formatLocalTime()}] [${level.toUpperCase()}] ${message}`;
   }
 
   debug(message: string): void {

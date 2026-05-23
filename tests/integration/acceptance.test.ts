@@ -220,9 +220,9 @@ describe('Acceptance Tests', () => {
     });
 
     describe('4.4 sync', () => {
-      it('--scan 只扫描不写入', () => {
+      it('--scan 扫描并写入', () => {
         const output = runOk('sync --scan');
-        expect(output).toContain('Scan complete');
+        expect(output).toContain('Sync complete');
       });
     });
 

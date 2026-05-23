@@ -175,11 +175,11 @@ describe('CLI Commands Integration', () => {
     expect(output).toContain('Sync complete');
   });
 
-  it('sync --scan does not write to registry', () => {
+  it('sync --scan scans and writes to registry', () => {
     run('init');
     const output = run('sync --scan');
-    expect(output).toContain('Scan complete');
-    expect(output).not.toContain('New sessions registered');
+    expect(output).toContain('Sync complete');
+    expect(output).toContain('New sessions registered');
   });
 
   it('sync --force forces full rescan', () => {

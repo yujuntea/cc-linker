@@ -20,11 +20,14 @@ export const LIST_SNAPSHOT_PATH = join(CC_BRIDGE_DIR, 'list-snapshot.json');
 // Runtime paths
 export const RUNTIME_OWNER_LOCK_PATH = join(CC_BRIDGE_DIR, 'owner.lock');
 export const RUNTIME_SESSION_EVENTS_DIR = join(CC_BRIDGE_DIR, 'session-events');
+export const RUNTIME_PID_FILE = join(CC_BRIDGE_DIR, 'cc-bridge.pid');
+export const RUNTIME_LOG_FILE = join(CC_BRIDGE_DIR, 'cc-bridge.log');
 
 // Spool queue paths
 export const SPOOL_DIR = join(CC_BRIDGE_DIR, 'spool');
 export const SPOOL_PENDING_DIR = join(SPOOL_DIR, 'pending');
 export const SPOOL_PROCESSING_DIR = join(SPOOL_DIR, 'processing');
+export const SPOOL_REPLIED_DIR = join(SPOOL_DIR, 'replied');
 export const SPOOL_DONE_DIR = join(SPOOL_DIR, 'done');
 export const SPOOL_FAILED_DIR = join(SPOOL_DIR, 'failed');
 export const SPOOL_RECEIPTS_DIR = join(SPOOL_DIR, 'receipts');

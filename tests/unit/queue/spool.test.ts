@@ -70,6 +70,38 @@ describe('SpoolQueue', () => {
     expect(spool.queueSize()).toBe(1); // still in processing
   });
 
+  it('does not claim another message with the same serialKey while one is processing', () => {
+    const msg1 = {
+      messageId: 'msg-1',
+      openId: 'ou_user1',
+      text: 'first',
+      target: { type: 'session' as const },
+      serialKey: 'uuid-1',
+      status: 'pending' as const,
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    };
+    const msg2 = {
+      messageId: 'msg-2',
+      openId: 'ou_user1',
+      text: 'second',
+      target: { type: 'session' as const },
+      serialKey: 'uuid-1',
+      status: 'pending' as const,
+      createdAt: '2026-01-01T00:00:01Z',
+      updatedAt: '2026-01-01T00:00:01Z',
+    };
+
+    spool.enqueue(msg1);
+    spool.enqueue(msg2);
+
+    expect(spool.claimNext('uuid-1')?.messageId).toBe('msg-1');
+    expect(spool.claimNext('uuid-1')).toBeNull();
+
+    spool.markDone('msg-1', 'uuid-1', 'reply-1');
+    expect(spool.claimNext('uuid-1')?.messageId).toBe('msg-2');
+  });
+
   it('marks message as done', () => {
     const msg = {
       messageId: 'msg-1',
@@ -159,5 +191,38 @@ describe('SpoolQueue', () => {
     const d2 = spool.getDelivery('msg-1');
     expect(d2?.status).toBe('sent');
     expect(d2?.createdAt).toBe(createdBefore); // preserved
+  });
+
+  it('does not mark multi-chunk delivery as sent until all chunks are sent', () => {
+    spool.recordDelivery('msg-2', 'sending', 'uuid-1', 0, undefined, 2);
+    spool.recordDelivery('msg-2', 'sent', 'uuid-1', 0, 'reply-1', 2);
+
+    const partial = spool.getDelivery('msg-2');
+    expect(partial?.status).toBe('sending');
+    expect(partial?.chunkCount).toBe(2);
+
+    spool.recordDelivery('msg-2', 'sent', 'uuid-2', 1, 'reply-2', 2);
+    const completed = spool.getDelivery('msg-2');
+    expect(completed?.status).toBe('sent');
+  });
+
+  it('does not finalize partially-sent multi-chunk messages', () => {
+    const msg = {
+      messageId: 'msg-3',
+      openId: 'ou_user1',
+      text: 'hello',
+      target: { type: 'session' as const },
+      serialKey: 'uuid-3',
+      status: 'pending' as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    spool.enqueue(msg);
+    spool.claimNext('uuid-3');
+    spool.recordDelivery('msg-3', 'sent', 'uuid-1', 0, 'reply-1', 2);
+
+    expect(spool.finalizeDeliveredMessages()).toBe(0);
+    expect(spool.listProcessing()).toHaveLength(1);
   });
 });
