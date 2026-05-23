@@ -231,6 +231,22 @@ export class FeishuBot {
     return this.running || this.activeWorkers.size > 0;
   }
 
+  /** Resolve the user's defaultProvider to a Claude settings file path */
+  private getSettingsPathForUser(openId: string): string | undefined {
+    const entry = this.userManager.getEntry(openId);
+    if (entry?.defaultProvider) {
+      const provider = this.providerManager.resolve(entry.defaultProvider);
+      if (provider) return provider.path;
+    }
+    return undefined;
+  }
+
+  /** Get the current provider alias for a user (for registry.lastKnownProvider) */
+  private getCurrentProviderAliasForUser(openId: string): string | null {
+    const entry = this.userManager.getEntry(openId);
+    return entry?.defaultProvider ?? null;
+  }
+
   /** Handle card action callback from Feishu (card.action.trigger via WSClient) */
   async handleCardAction(payload: FeishuBotCardAction): Promise<string | null> {
     const { open_id: openId, action, message } = payload;
@@ -422,7 +438,8 @@ export class FeishuBot {
   private async handleChatNonStreaming(
     msg: SpoolMessage, sessionUuid: string, cwd: string, currentEntry: any,
   ): Promise<void> {
-    const result = await this.sessionManager.sendMessage(sessionUuid, msg.text, cwd, false, msg.serialKey);
+    const settingsPath = this.getSettingsPathForUser(msg.openId);
+    const result = await this.sessionManager.sendMessage(sessionUuid, msg.text, cwd, false, msg.serialKey, settingsPath);
 
     this.spoolQueue.updateProcessingMessage(msg.messageId, msg.serialKey, {
       responseText: result.response || '(空回复)',
@@ -478,6 +495,7 @@ export class FeishuBot {
     }
 
     try {
+      const settingsPath = this.getSettingsPathForUser(msg.openId);
       const result = await this.sessionManager.sendStreamingMessage(
         sessionUuid, msg.text, cwd,
         (chunk: StreamChunk) => {
@@ -490,7 +508,7 @@ export class FeishuBot {
             text, elapsed
           ).catch(e => logger.warn(`Stream: update failed: ${e}`));
         },
-        false, msg.serialKey,
+        false, msg.serialKey, settingsPath,
       );
 
       // Finalize card
@@ -578,6 +596,7 @@ export class FeishuBot {
     }
 
     try {
+      const settingsPath = this.getSettingsPathForUser(msg.openId);
       const result = await this.sessionManager.sendStreamingMessage(
         null, prompt, cwd,
         (chunk: StreamChunk) => {
@@ -590,7 +609,7 @@ export class FeishuBot {
             text, elapsed
           ).catch(e => logger.warn(`Stream: update failed: ${e}`));
         },
-        true, `new:${msg.openId}`,
+        true, `new:${msg.openId}`, settingsPath,
       );
 
       if (!result.sessionId) {
@@ -647,6 +666,7 @@ export class FeishuBot {
         pending_jsonl_resolve: !result.jsonlPath,
         last_error: result.error ?? null,
         feishu_user_id: msg.openId,
+        lastKnownProvider: this.getCurrentProviderAliasForUser(msg.openId),
       });
       await this.registry.flush();
 
@@ -971,7 +991,8 @@ export class FeishuBot {
     claimMessageId: string,
     prompt = msg.text,
   ): Promise<void> {
-    const result = await this.sessionManager.sendMessage(null, prompt, cwd, true, `new:${msg.openId}`);
+    const settingsPath = this.getSettingsPathForUser(msg.openId);
+    const result = await this.sessionManager.sendMessage(null, prompt, cwd, true, `new:${msg.openId}`, settingsPath);
 
     if (!result.sessionId) {
       await this.userManager.rollbackClaim(msg.openId, claimMessageId);
@@ -1009,6 +1030,7 @@ export class FeishuBot {
       pending_jsonl_resolve: !result.jsonlPath,
       last_error: result.error ?? null,
       feishu_user_id: msg.openId,
+      lastKnownProvider: this.getCurrentProviderAliasForUser(msg.openId),
     });
     await this.registry.flush();
 
