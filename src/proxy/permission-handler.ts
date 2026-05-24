@@ -3,7 +3,7 @@ import { logger } from '../utils/logger';
 export interface PermissionPrompt {
   toolName: string;
   toolInput: Record<string, unknown>;
-  suggestions: Array<{ destination: string; rule: string }>;
+  suggestions: unknown[];
   index: number;
   isResolved: boolean;
 }
@@ -37,7 +37,7 @@ export class PermissionHandler {
   async canUseTool(
     toolName: string,
     input: Record<string, unknown>,
-    options: { signal: AbortSignal },
+    options: { signal: AbortSignal; suggestions?: unknown[] },
   ): Promise<PermissionResult> {
     // Auto-approve AskUserQuestion (clarifying questions)
     if (toolName === 'AskUserQuestion') {
@@ -59,7 +59,7 @@ export class PermissionHandler {
     const prompt: PermissionPrompt = {
       toolName,
       toolInput: input,
-      suggestions: [],
+      suggestions: options.suggestions ?? [],
       index,
       isResolved: false,
     };
@@ -75,6 +75,7 @@ export class PermissionHandler {
           logger.warn(`Permission prompt #${index} (${toolName}) timed out after ${this.timeoutMs}ms, auto-denying`);
           prompt.isResolved = true;
           this.resolveFns.delete(index);
+          this.pendingPrompts.delete(index);
           resolve({ behavior: 'deny', message: '权限确认超时，已自动拒绝' });
         }
       }, this.timeoutMs);
@@ -84,6 +85,7 @@ export class PermissionHandler {
         if (!prompt.isResolved) {
           prompt.isResolved = true;
           this.resolveFns.delete(index);
+          this.pendingPrompts.delete(index);
           clearTimeout(timer);
           resolve({ behavior: 'deny', message: '会话已中止' });
         }
@@ -123,10 +125,20 @@ export class PermissionHandler {
 
     prompt.isResolved = true;
     this.resolveFns.delete(index);
+    this.pendingPrompts.delete(index);
   }
 
   /** Get pending permission by index (for card interaction lookup) */
   getPendingPermission(index: number): PermissionPrompt | undefined {
     return this.pendingPrompts.get(index);
+  }
+
+  /** Get count of unresolved permission prompts */
+  getUnresolvedCount(): number {
+    let count = 0;
+    for (const prompt of this.pendingPrompts.values()) {
+      if (!prompt.isResolved) count++;
+    }
+    return count;
   }
 }

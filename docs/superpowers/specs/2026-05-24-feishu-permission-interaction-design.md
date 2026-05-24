@@ -30,7 +30,7 @@
 ### 2.2 架构概览
 
 ```
-飞书用户 → FeishuBot.handleChat() → ClaudeSessionManager._doSDKMessage()
+飞书用户 → FeishuBot.handleChat() → ClaudeSessionManager.sendSDKMessage()
                                            │
                               ┌────────────┼────────────┐
                               │            │            │
@@ -55,50 +55,68 @@
 
 **文件：** `src/proxy/session.ts`
 
-**变更：** 新增 `_doSDKMessage()` 方法，替代现有的 `_doStreamingMessage()` 和 `_doSendMessage()`
+**变更：** 新增 `sendSDKMessage()` 方法，复用现有的 `acquireSessionLock`/`acquireSlot` 并发控制，返回结果和 `PermissionHandler` 实例供调用方管理权限交互。
 
 **核心逻辑：**
 ```typescript
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
-async _doSDKMessage(
+async sendSDKMessage(
   sessionId: string | null,
   text: string,
   cwd: string,
   onProgress: (chunk: StreamChunk) => void,
-  onPermissionRequest: (prompt: PermissionPrompt) => Promise<boolean>,
-  isNew: boolean,
+  onPermissionRequest: (prompt: PermissionPrompt) => void,
+  isNew?: boolean,
+  lockKey?: string,
   settingsPath?: string,
-): Promise<SendMessageResult> {
-  const handler = new PermissionHandler(onPermissionRequest);
-  
-  for await (const message of query({
-    prompt: text,
-    options: {
-      permissionMode: config.get('claude.permission_mode', 'acceptEdits'),
-      canUseTool: handler.canUseTool.bind(handler),
-      cwd: expandPath(cwd),
-      allowedTools: config.get('claude.allowed_tools', []),
-      disallowedTools: config.get('claude.disallowed_tools', []),
-      // 其他 SDK 配置...
-    },
-  })) {
-    if (message.type === 'stream_event') {
-      streamAdapter.adaptSDKMessage(message, onProgress);
-    } else if (message.type === 'result') {
-      return buildResult(message);
+): Promise<{ result: SendMessageResult; handler: PermissionHandler }> {
+  const resolvedLockKey = lockKey ?? sessionId ?? '__new__';
+  await this.acquireSessionLock(resolvedLockKey);
+  await this.acquireSlot();
+
+  const handler = new PermissionHandler({
+    allowedTools: config.get('claude.allowed_tools', []),
+    disallowedTools: config.get('claude.disallowed_tools', []),
+    timeoutMs: config.get('sdk.timeout_ms', 600_000),
+  });
+  handler.onPermissionRequest = onPermissionRequest;
+
+  try {
+    for await (const message of query({
+      prompt: text,
+      options: {
+        permissionMode: config.get('sdk.permission_mode', 'acceptEdits'),
+        canUseTool: handler.canUseTool.bind(handler),
+        cwd: expandPath(cwd),
+        allowedTools: config.get('claude.allowed_tools', []),
+        disallowedTools: config.get('claude.disallowed_tools', []),
+        pathToClaudeCodeExecutable: config.get('sdk.claude_executable', 'claude'),
+        ...(sessionId && !isNew ? { resume: sessionId } : {}),
+        ...(settingsPath ? { settings: settingsPath } : {}),
+      },
+    })) {
+      if (message.type === 'stream_event') {
+        streamAdapter.adaptSDKMessage(message, onProgress);
+      } else if (message.type === 'result') {
+        return { result: buildResult(message), handler };
+      }
     }
+  } finally {
+    this.releaseSlot();
+    this.releaseSessionLock(resolvedLockKey);
   }
 }
 ```
 
-**会话恢复：** SDK 支持 `--resume`，行为与 CLI 一致
+**会话恢复：** SDK 支持 `resume` 选项，行为与 CLI 的 `--resume` 一致
 ```typescript
 options: {
-  sessionId: sessionId ?? undefined,
-  // 或 resume: sessionId
+  ...(sessionId && !isNew ? { resume: sessionId } : {}),
 }
 ```
+
+**并发控制：** `sendSDKMessage` 复用现有的 `acquireSessionLock` + `acquireSlot` 机制，与 `sendMessage` / `sendStreamingMessage` 保持一致，确保同一 session 串行执行且全局并发不超过 `max_concurrent_sessions`。
 
 ### 3.2 PermissionHandler（新模块）
 
@@ -228,25 +246,34 @@ async updatePermissionResult(approved: boolean): Promise<void>
 
 **新增：** 卡片按钮点击事件处理（飞书 Interactive Card Callback）
 
+Bot 中维护 `activePermissionHandlers: Map<string, PermissionHandler>`，以 `openId` 为 key 存储当前活跃的权限 handler。当用户点击权限卡片按钮时，从该 Map 中取出 handler 并解析决策：
+
 ```typescript
-private async handleCardInteraction(event: CardInteractionEvent): Promise<void> {
-  const { value } = event.action;
-  if (value.type === 'permission_approve' || value.type === 'permission_deny') {
-    const approved = value.type === 'permission_approve';
-    const handler = this.getActivePermissionHandler(value.index);
-    handler.resolveUserDecision(value.index, approved);
-    await this.cardUpdater.updatePermissionResult(approved);
+private activePermissionHandlers = new Map<string, PermissionHandler>();
+
+private async handlePermissionCardAction(
+  openId: string,
+  approved: boolean,
+  index: number,
+  cardMessageId?: string,
+): Promise<string | null> {
+  const handler = this.activePermissionHandlers.get(openId);
+  if (!handler) {
+    return '权限确认已过期，请重试';
   }
+  handler.resolveUserDecision(index, approved);
+  // 更新权限卡片状态（通过 CardUpdater patch）
+  return approved ? '✅ 已允许，Claude 将继续执行' : '❌ 已拒绝，Claude 将尝试其他方式';
 }
 ```
 
-**注意：** 飞书卡片按钮点击通过 Webhook 回调传递，需要在 bot 启动时注册交互回调 URL。
+**注意：** 飞书卡片按钮点击通过 Webhook 回调传递，需要在 bot 启动时注册交互回调 URL。`sendSDKMessage` 返回的 `PermissionHandler` 实例由调用方（Bot）存入该 Map，消息处理完成后清理。
 
 ## 4. 集成点
 
 | 文件 | 变更类型 | 说明 |
 |------|----------|------|
-| `src/proxy/session.ts` | 重写 | 新增 `_doSDKMessage()`，废弃旧的 spawn 方法 |
+| `src/proxy/session.ts` | 重写 | 新增 `sendSDKMessage()`，复用 lock/slot 机制，返回 `PermissionHandler` |
 | `src/proxy/permission-handler.ts` | 新增 | 实现 `canUseTool` 回调 |
 | `src/proxy/stream-adapter.ts` | 新增 | SDK 消息流 → StreamChunk 适配 |
 | `src/feishu/card-updater.ts` | 扩展 | 新增权限卡片方法 |
@@ -279,8 +306,9 @@ CC_LINKER_SDK_TIMEOUT_MS=600000
 ## 6. 迁移策略
 
 ### Phase 1：双引擎并行
-- 保留旧的 CLI spawn 方法
-- 新增 SDK 方法，通过配置开关切换
+- 保留旧的 CLI spawn 方法（`sendMessage` / `sendStreamingMessage`）
+- 新增 `sendSDKMessage`，通过 `sdk.enabled` 开关切换
+- `sdk.enabled` 同时覆盖流式和非流式路径（优先于 `stream.enabled` 的旧逻辑）
 - 验证 SDK 方法的基本功能
 
 ### Phase 2：SDK 为主

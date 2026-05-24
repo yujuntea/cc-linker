@@ -79,7 +79,7 @@ describe('PermissionHandler', () => {
     expect(result.message).toContain('拒绝');
   });
 
-  test('cleanPending keeps resolved entries with isResolved flag', async () => {
+  test('cleanPending removes resolved entries', async () => {
     const handler = new PermissionHandler({ allowedTools: [] });
     handler.onPermissionRequest = () => {};
 
@@ -88,11 +88,13 @@ describe('PermissionHandler', () => {
     });
 
     expect(handler.getPendingPermission(0)).not.toBeNull();
+    expect(handler.getUnresolvedCount()).toBe(1);
 
     handler.resolveUserDecision(0, true);
 
-    // After resolution, pending should still exist but isResolved flag set
+    // After resolution, entry is cleaned up
     const pending = handler.getPendingPermission(0);
-    expect(pending?.isResolved).toBe(true);
+    expect(pending).toBeUndefined();
+    expect(handler.getUnresolvedCount()).toBe(0);
   });
 });

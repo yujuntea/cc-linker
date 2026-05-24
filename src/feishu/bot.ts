@@ -664,12 +664,14 @@ export class FeishuBot {
         async (prompt: PermissionPrompt) => {
           if (!this.feishuClient || cardInitFailed) return;
           try {
+            // Store handler BEFORE await to avoid race condition where user clicks
+            // the card before we've stored the handler reference
+            this.activePermissionHandlers.set(msg.openId, handler);
             const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
             const actionText = this.getPermissionActionText(prompt);
             await permCardUpdater.createPermissionCard(
               msg.openId, prompt.toolName, actionText, prompt.index,
             );
-            this.activePermissionHandlers.set(msg.openId, handler);
           } catch (err: any) {
             logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
           }
@@ -727,7 +729,12 @@ export class FeishuBot {
       this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
       this.spoolQueue.markFailed(msg.messageId, msg.serialKey, String(err));
     } finally {
-      this.activePermissionHandlers.delete(msg.openId);
+      // Only delete handler when all permission prompts are resolved.
+      // If a prompt is still awaiting user input, keep the handler so the click can resolve.
+      const handler = this.activePermissionHandlers.get(msg.openId);
+      if (handler && handler.getUnresolvedCount() === 0) {
+        this.activePermissionHandlers.delete(msg.openId);
+      }
     }
   }
 
@@ -927,12 +934,14 @@ export class FeishuBot {
         async (prompt: PermissionPrompt) => {
           if (!this.feishuClient || cardInitFailed) return;
           try {
+            // Store handler BEFORE await to avoid race condition where user clicks
+            // the card before we've stored the handler reference
+            this.activePermissionHandlers.set(msg.openId, handler);
             const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
             const actionText = this.getPermissionActionText(prompt);
             await permCardUpdater.createPermissionCard(
               msg.openId, prompt.toolName, actionText, prompt.index,
             );
-            this.activePermissionHandlers.set(msg.openId, handler);
           } catch (err: any) {
             logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
           }
@@ -1027,7 +1036,12 @@ export class FeishuBot {
       this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
       this.spoolQueue.markFailed(msg.messageId, msg.serialKey, String(err));
     } finally {
-      this.activePermissionHandlers.delete(msg.openId);
+      // Only delete handler when all permission prompts are resolved.
+      // If a prompt is still awaiting user input, keep the handler so the click can resolve.
+      const handler = this.activePermissionHandlers.get(msg.openId);
+      if (handler && handler.getUnresolvedCount() === 0) {
+        this.activePermissionHandlers.delete(msg.openId);
+      }
     }
   }
 

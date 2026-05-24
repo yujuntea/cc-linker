@@ -691,6 +691,32 @@ export class ClaudeSessionManager {
     let lastResult: any = null;
     let hasError = false;
 
+    // Timeout protection: hard timeout + stale timeout (matching CLI spawn behavior)
+    const abortController = new AbortController();
+    const staleTimeout = config.get<number>('runtime.stale_timeout_ms', 5 * 60 * 1000);
+    const hardTimeout = config.get<number>('runtime.hard_timeout_ms', 30 * 60 * 1000);
+    let staleTimer: ReturnType<typeof setTimeout> | null = null;
+    let hardTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const resetStaleTimer = () => {
+      if (staleTimer) clearTimeout(staleTimer);
+      staleTimer = setTimeout(() => {
+        if (!abortController.signal.aborted) {
+          logger.warn(`SDK: stale timeout (${staleTimeout}ms no output), aborting`);
+          abortController.abort();
+        }
+      }, staleTimeout);
+    };
+
+    hardTimer = setTimeout(() => {
+      if (!abortController.signal.aborted) {
+        logger.warn(`SDK: hard timeout (${hardTimeout}ms), aborting`);
+        abortController.abort();
+      }
+    }, hardTimeout);
+
+    resetStaleTimer();
+
     try {
       for await (const message of query({
         prompt: text,
@@ -701,10 +727,12 @@ export class ClaudeSessionManager {
           allowedTools: config.get<string[]>('claude.allowed_tools', []),
           disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
           pathToClaudeCodeExecutable: claudeExecutable,
+          abortController,
           ...(sessionId && !isNew ? { resume: sessionId } : {}),
           ...(settingsPath && existsSync(settingsPath) ? { settings: settingsPath } : {}),
         },
       })) {
+        resetStaleTimer();
         adapter.adapt(message as SDKMessage, (chunk: SDKStreamChunk) => {
           if (chunk.type === 'result') {
             lastResult = chunk;
@@ -718,6 +746,8 @@ export class ClaudeSessionManager {
         }
       }
     } catch (err: any) {
+      if (staleTimer) clearTimeout(staleTimer);
+      if (hardTimer) clearTimeout(hardTimer);
       logger.error(`SDK: query failed: ${err.message}`);
       this.releaseSlot();
       this.releaseSessionLock(resolvedLockKey);
@@ -734,6 +764,9 @@ export class ClaudeSessionManager {
         handler,
       };
     }
+
+    if (staleTimer) clearTimeout(staleTimer);
+    if (hardTimer) clearTimeout(hardTimer);
 
     const durationMs = Date.now() - startTime;
     this.releaseSlot();

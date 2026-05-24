@@ -18,7 +18,7 @@
 | `src/utils/config.ts` | Modify | Add `sdk` config section |
 | `src/proxy/stream-adapter.ts` | Create | SDK message → StreamChunk adapter |
 | `src/proxy/permission-handler.ts` | Create | `canUseTool` callback + permission resolution |
-| `src/proxy/session.ts` | Modify | Add `_doSDKMessage()` method |
+ | `src/proxy/session.ts` | Modify | Add `sendSDKMessage()` method with lock/slot and PermissionHandler return |
 | `src/feishu/card-updater.ts` | Modify | Add `createPermissionCard()`, `updatePermissionCard()` |
 | `src/feishu/bot.ts` | Modify | Wire permission handler into streaming flow, handle card interactions |
 | `tests/unit/proxy/stream-adapter.test.ts` | Create | StreamAdapter tests |
@@ -624,6 +624,7 @@ import { PermissionHandler, type PermissionPrompt } from './permission-handler';
   /**
    * Send a message using the Anthropic Agent SDK.
    * Supports interactive permission approval via canUseTool callback.
+   * Returns both the result and the PermissionHandler (for external card resolution).
    */
   async sendSDKMessage(
     sessionId: string | null,
@@ -631,11 +632,21 @@ import { PermissionHandler, type PermissionPrompt } from './permission-handler';
     cwd: string,
     onProgress: (chunk: StreamChunk) => void,
     onPermissionRequest: (prompt: PermissionPrompt) => void,
-    isNew: boolean,
+    isNew?: boolean,
+    lockKey?: string,
     settingsPath?: string,
-  ): Promise<SendMessageResult> {
+  ): Promise<{ result: SendMessageResult; handler: PermissionHandler }> {
+    const resolvedLockKey = lockKey ?? sessionId ?? '__new__';
+    await this.acquireSessionLock(resolvedLockKey);
+    await this.acquireSlot();
+
     const expandedCwd = expandPath(cwd);
-    if (!expandedCwd) return this._errorResult('cwd is empty', sessionId);
+    if (!expandedCwd) {
+      const errResult = this._errorResult('cwd is empty', sessionId);
+      this.releaseSlot();
+      this.releaseSessionLock(resolvedLockKey);
+      return { result: errResult, handler: new PermissionHandler({ allowedTools: [], disallowedTools: [] }) };
+    }
 
     const startTime = Date.now();
     const adapter = new StreamAdapter();
@@ -683,28 +694,38 @@ import { PermissionHandler, type PermissionPrompt } from './permission-handler';
       }
     } catch (err: any) {
       logger.error(`SDK: query failed: ${err.message}`);
+      this.releaseSlot();
+      this.releaseSessionLock(resolvedLockKey);
       return {
-        response: `Claude SDK 执行失败: ${err.message}`,
-        costUsd: 0,
-        durationMs: Date.now() - startTime,
-        sessionId: sessionId ?? '',
-        jsonlPath: null,
-        sessionStatus: 'degraded',
-        error: err.message,
+        result: {
+          response: `Claude SDK 执行失败: ${err.message}`,
+          costUsd: 0,
+          durationMs: Date.now() - startTime,
+          sessionId: sessionId ?? '',
+          jsonlPath: null,
+          sessionStatus: 'degraded',
+          error: err.message,
+        },
+        handler,
       };
     }
 
     const durationMs = Date.now() - startTime;
+    this.releaseSlot();
+    this.releaseSessionLock(resolvedLockKey);
 
     if (!lastResult) {
       return {
-        response: hasError ? 'Claude 执行失败' : '(空回复)',
-        costUsd: 0,
-        durationMs,
-        sessionId: sessionId ?? '',
-        jsonlPath: null,
-        sessionStatus: hasError ? 'degraded' : 'active',
-        error: hasError ? 'no_result_returned' : undefined,
+        result: {
+          response: hasError ? 'Claude 执行失败' : '(空回复)',
+          costUsd: 0,
+          durationMs,
+          sessionId: sessionId ?? '',
+          jsonlPath: null,
+          sessionStatus: hasError ? 'degraded' : 'active',
+          error: hasError ? 'no_result_returned' : undefined,
+        },
+        handler,
       };
     }
 
@@ -720,15 +741,18 @@ import { PermissionHandler, type PermissionPrompt } from './permission-handler';
     }
 
     return {
-      response: lastResult.result ?? (hasError ? 'Claude 执行失败' : '(空回复)'),
-      costUsd: lastResult.total_cost_usd ?? 0,
-      durationMs: lastResult.duration_ms ?? durationMs,
-      sessionId: resolvedSessionId,
-      jsonlPath,
-      sessionStatus,
-      error: hasError ? (lastResult.errors?.join('; ') ?? 'unknown_error') : undefined,
-      tokensIn: lastResult.usage?.input_tokens,
-      tokensOut: lastResult.usage?.output_tokens,
+      result: {
+        response: lastResult.result ?? (hasError ? 'Claude 执行失败' : '(空回复)'),
+        costUsd: lastResult.total_cost_usd ?? 0,
+        durationMs: lastResult.duration_ms ?? durationMs,
+        sessionId: resolvedSessionId,
+        jsonlPath,
+        sessionStatus,
+        error: hasError ? (lastResult.errors?.join('; ') ?? 'unknown_error') : undefined,
+        tokensIn: lastResult.usage?.input_tokens,
+        tokensOut: lastResult.usage?.output_tokens,
+      },
+      handler,
     };
   }
 ```
@@ -745,7 +769,7 @@ Expected: PASS (may need minor type adjustments)
 
 ```bash
 git add src/proxy/session.ts
-git commit -m "feat: add sendSDKMessage to ClaudeSessionManager"
+git commit -m "feat: add sendSDKMessage to ClaudeSessionManager with lock/slot and PermissionHandler return"
 ```
 
 ---
@@ -849,6 +873,11 @@ git commit -m "feat: add sendSDKMessage to ClaudeSessionManager"
     };
   }
 
+  /** Allow external code to set cardMessageId for permission card patching */
+  setCardMessageId(messageId: string): void {
+    this.cardMessageId = messageId;
+  }
+
   private getToolActionLabel(toolName: string): string {
     const labels: Record<string, string> = {
       Bash: 'Bash 命令',
@@ -895,32 +924,49 @@ import { type PermissionPrompt } from '../proxy/permission-handler';
 - [ ] **Step 2: Add active handler tracking (line 79, after `activeWorkers`)**
 
 ```typescript
-  private activePermissionHandlers = new Map<string, { handler: any; cardMessageId: string | null }>();
+  private activePermissionHandlers = new Map<string, PermissionHandler>();
 ```
 
 - [ ] **Step 3: Modify `handleChatStreaming` to use SDK when enabled (around line 401)**
 
-Replace the streaming path condition:
+Replace the handleChat session case routing:
 ```typescript
 // OLD:
 if (config.get<boolean>('stream.enabled', false)) {
   await this.handleChatStreaming(msg, sessionUuid, cwd, currentEntry);
+} else {
+  await this.handleChatNonStreaming(msg, sessionUuid, cwd, currentEntry);
 }
 
 // NEW:
 const useSDK = config.get<boolean>('sdk.enabled', false);
 if (useSDK) {
-  await this.handleChatStreamingSDK(msg, sessionUuid, cwd, currentEntry);
+  await this.handleChatSDK(msg, sessionUuid, cwd, currentEntry);
 } else if (config.get<boolean>('stream.enabled', false)) {
   await this.handleChatStreaming(msg, sessionUuid, cwd, currentEntry);
+} else {
+  await this.handleChatNonStreaming(msg, sessionUuid, cwd, currentEntry);
 }
 ```
 
-- [ ] **Step 4: Add `handleChatStreamingSDK` method (after `handleChatStreaming`, around line 579)**
+同样修改 `new_session_claim` 分支（`handleChat` 中）和 `handleNew` 方法末尾的路由：
+```typescript
+// In handleChat new_session_claim branch AND handleNew (when prompt is provided):
+const useSDK = config.get<boolean>('sdk.enabled', false);
+if (useSDK) {
+  await this.createSessionFromPromptSDK(msg, msg.target.cwd ?? claimResult.entry.cwd ?? '', claimMessageId, msg.text);
+} else if (config.get<boolean>('stream.enabled', false)) {
+  await this.createSessionFromPromptStreaming(msg, msg.target.cwd ?? claimResult.entry.cwd ?? '', claimMessageId, msg.text);
+} else {
+  await this.createSessionFromPrompt(msg, msg.target.cwd ?? claimResult.entry.cwd ?? '', claimMessageId, msg.text);
+}
+```
+
+- [ ] **Step 4: Add `handleChatSDK` method (after `handleChatStreaming`, around line 579)**
 
 ```typescript
-  /** Streaming path using Agent SDK (supports permission interaction) */
-  private async handleChatStreamingSDK(
+  /** SDK path for chat messages (supports permission interaction, works with or without streaming cards) */
+  private async handleChatSDK(
     msg: SpoolMessage, sessionUuid: string, cwd: string, currentEntry: any,
   ): Promise<void> {
     const startTime = Date.now();
@@ -947,7 +993,7 @@ if (useSDK) {
 
     try {
       const settingsPath = this.getSettingsPathForUser(msg.openId);
-      const result = await this.sessionManager.sendSDKMessage(
+      const { result, handler } = await this.sessionManager.sendSDKMessage(
         sessionUuid, msg.text, cwd,
         (chunk: StreamChunk) => {
           if (cardInitFailed || !cardUpdater) return;
@@ -970,10 +1016,8 @@ if (useSDK) {
             permissionCardMessageId = await permCardUpdater.createPermissionCard(
               msg.openId, prompt.toolName, actionText, prompt.index,
             );
-            this.activePermissionHandlers.set(msg.messageId, {
-              handler: this.sessionManager,
-              cardMessageId: permissionCardMessageId,
-            });
+            // Store handler reference for card interaction resolution (keyed by openId)
+            this.activePermissionHandlers.set(msg.openId, handler);
           } catch (err: any) {
             logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
           }
@@ -1035,7 +1079,7 @@ if (useSDK) {
       this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
       this.spoolQueue.markFailed(msg.messageId, msg.serialKey, String(err));
     } finally {
-      this.activePermissionHandlers.delete(msg.messageId);
+      this.activePermissionHandlers.delete(msg.openId);
     }
   }
 
@@ -1053,7 +1097,9 @@ if (useSDK) {
   }
 ```
 
-- [ ] **Step 5: Also apply SDK switch to `createSessionFromPromptStreaming` (around line 611)**
+- [ ] **Step 5: Rename SDK method in `createSessionFromPrompt` and apply SDK switch (around line 611)**
+
+Rename the SDK streaming method to `createSessionFromPromptSDK` for consistency:
 
 Replace the call:
 ```typescript
@@ -1065,7 +1111,7 @@ const result = await this.sessionManager.sendStreamingMessage(
 const useSDK = config.get<boolean>('sdk.enabled', false);
 let result;
 if (useSDK) {
-  result = await this.sessionManager.sendSDKMessage(
+  const { result: sdkResult, handler } = await this.sessionManager.sendSDKMessage(
     null, prompt, cwd,
     (chunk: StreamChunk) => {
       if (cardInitFailed || !cardUpdater) return;
@@ -1085,12 +1131,14 @@ if (useSDK) {
         await permCardUpdater.createPermissionCard(
           msg.openId, prompt.toolName, actionText, prompt.index,
         );
+        this.activePermissionHandlers.set(msg.openId, handler);
       } catch (err: any) {
         logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
       }
     },
     true, `new:${msg.openId}`, settingsPath,
   );
+  result = sdkResult;
 } else {
   result = await this.sessionManager.sendStreamingMessage(
     null, prompt, cwd, ...
@@ -1122,58 +1170,16 @@ git commit -m "feat: wire SDK streaming path into FeishuBot with permission inte
 
 - [ ] **Step 1: Update `handleCardAction` to handle permission buttons (around line 252)**
 
-Replace the `default` case in `handleCardAction` switch:
+First update the `FeishuBotCardAction` type to allow object values:
 ```typescript
-// OLD default case:
-default: {
-  const reply = `未知操作: ${tag}`;
-  await this.replyFn(reply, { messageId, openId, requestUuid: uniqueUuid() });
-  return reply;
-}
-
-// NEW default case:
-default: {
-  // Check if this is a permission card interaction
-  const valueObj = typeof value === 'object' ? value as Record<string, unknown> : null;
-  if (valueObj && (valueObj.type === 'permission_approve' || valueObj.type === 'permission_deny')) {
-    const approved = valueObj.type === 'permission_approve';
-    const index = valueObj.index as number;
-
-    // Find the session manager and resolve the decision
-    const entry = this.activePermissionHandlers.get(openId);
-    if (entry) {
-      // Resolve via the handler stored in session manager
-      // The handler reference needs to be accessible - we store it differently
-      // Actually, we need to look up the handler by the current active session
-      const sessions = this.sessionManager.listSessions();
-      if (sessions.length > 0) {
-        // The permission handler is managed internally by sendSDKMessage
-        // We need a different approach: store handler reference in activePermissionHandlers
-      }
-    }
-
-    // Update the card to show result
-    if (this.feishuClient) {
-      const cardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
-      // We need the cardMessageId - store it differently
-      await cardUpdater.updatePermissionCard(approved);
-    }
-
-    return approved ? '已允许' : '已拒绝';
-  }
-
-  const reply = `未知操作: ${tag}`;
-  await this.replyFn(reply, { messageId, openId, requestUuid: uniqueUuid() });
-  return reply;
-}
+export type FeishuBotCardAction = {
+  open_id: string;
+  action: { tag: string; value: string | Record<string, unknown> };
+  message: { message_id: string };
+};
 ```
 
-Wait, there's a design issue here. The `PermissionHandler` instance is created inside `sendSDKMessage` and its `canUseTool` callback is passed to the SDK. When the user clicks a button in Feishu, we need to call `handler.resolveUserDecision()`, but the handler is not accessible from `handleCardAction`.
-
-Let me fix the design: store the `PermissionHandler` reference in `activePermissionHandlers` so we can resolve from card interactions.
-
-**Revised Step 1:** Modify `handleCardAction`:
-
+Then modify `handleCardAction` to check for permission interactions before the switch:
 ```typescript
   /** Handle card action callback from Feishu (card.action.trigger via WSClient) */
   async handleCardAction(payload: FeishuBotCardAction): Promise<string | null> {
@@ -1186,8 +1192,8 @@ Let me fix the design: store the `PermissionHandler` reference in `activePermiss
       return null;
     }
 
-    // Check for permission card interactions
-    const valueObj = typeof value === 'object' ? value as Record<string, unknown> : null;
+    // Check for permission card interactions first
+    const valueObj = typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
     if (valueObj && (valueObj.type === 'permission_approve' || valueObj.type === 'permission_deny')) {
       return await this.handlePermissionCardAction(
         openId, valueObj.type === 'permission_approve', valueObj.index as number, messageId,
@@ -1210,22 +1216,21 @@ Let me fix the design: store the `PermissionHandler` reference in `activePermiss
     index: number,
     messageId?: string,
   ): Promise<string | null> {
-    // Find the active permission handler for this user
-    const handlerInfo = this.activePermissionHandlers.get(openId);
-    if (!handlerInfo) {
+    // Find the active permission handler for this user (keyed by openId)
+    const handler = this.activePermissionHandlers.get(openId);
+    if (!handler) {
       logger.warn(`Permission card: no active handler for ${openId}`);
       return '权限确认已过期，请重试';
     }
 
-    // Resolve the decision
-    handlerInfo.handler.resolveUserDecision(index, approved);
+    // Resolve the decision via the PermissionHandler
+    handler.resolveUserDecision(index, approved);
 
-    // Update the permission card
-    if (this.feishuClient && handlerInfo.cardMessageId) {
+    // Update the permission card if we have the card message ID
+    if (this.feishuClient && messageId) {
       try {
         const cardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
-        // Set the card message ID so updatePermissionCard works
-        (cardUpdater as any).cardMessageId = handlerInfo.cardMessageId;
+        cardUpdater.setCardMessageId(messageId);
         await cardUpdater.updatePermissionCard(approved);
       } catch (err: any) {
         logger.warn(`Permission card: update failed: ${err}`);
@@ -1236,58 +1241,7 @@ Let me fix the design: store the `PermissionHandler` reference in `activePermiss
   }
 ```
 
-- [ ] **Step 3: Update `handleChatStreamingSDK` to store handler reference (modify the permission callback)**
-
-In Task 7 Step 4, change the `onPermissionRequest` callback to store the handler:
-```typescript
-        async (prompt: PermissionPrompt) => {
-          if (!this.feishuClient || cardInitFailed) return;
-          try {
-            const permCardUpdater = new CardUpdater(this.feishuClient, {
-              throttle_ms: 0,
-            });
-            const actionText = this.getPermissionActionText(prompt);
-            permissionCardMessageId = await permCardUpdater.createPermissionCard(
-              msg.openId, prompt.toolName, actionText, prompt.index,
-            );
-            // Store handler reference for card interaction resolution
-            // We need access to the PermissionHandler - pass it differently
-            this.activePermissionHandlers.set(msg.openId, {
-              handler: permCardUpdater, // temporary, fix in next step
-              cardMessageId: permissionCardMessageId,
-            });
-          } catch (err: any) {
-            logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
-          }
-        },
-```
-
-Actually, the cleanest approach is to have `sendSDKMessage` return the `PermissionHandler` instance, or pass it via a different mechanism. Let me restructure:
-
-**Revised approach:** Add a `getPermissionHandler()` method to `ClaudeSessionManager` that returns the active handler.
-
-- [ ] **Step 3 (revised): Add `getPermissionHandler` to session manager (Task 5 area)**
-
-In `src/proxy/session.ts`, add after `listSessions()`:
-```typescript
-  /** Get the active permission handler for SDK sessions (for card interaction) */
-  getActivePermissionHandler(): PermissionHandler | null {
-    return this.activePermissionHandler ?? null;
-  }
-```
-
-And in `_doSDKMessage` / `sendSDKMessage`, store `this.activePermissionHandler = handler;` before the query loop, and clean it up in finally.
-
-- [ ] **Step 4 (revised): Update handler storage in bot**
-
-```typescript
-            this.activePermissionHandlers.set(msg.openId, {
-              handler: this.sessionManager.getActivePermissionHandler()!,
-              cardMessageId: permissionCardMessageId,
-            });
-```
-
-- [ ] **Step 5: Verify typecheck**
+- [ ] **Step 3: Verify typecheck**
 
 ```bash
 bun run typecheck
@@ -1295,10 +1249,10 @@ bun run typecheck
 
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/feishu/bot.ts src/proxy/session.ts
+git add src/feishu/bot.ts
 git commit -m "feat: handle permission card button clicks in FeishuBot"
 ```
 
@@ -1410,6 +1364,6 @@ No "TBD", "TODO", or vague patterns found. All steps contain concrete code.
 
 ### 4. Potential Issues
 
-- **Task 8 has a design iteration**: The initial `handleCardAction` approach needed revision to properly store/retrieve the `PermissionHandler` reference. The revised approach uses `getActivePermissionHandler()` on the session manager.
+- **PermissionHandler lifecycle**: `sendSDKMessage` returns the `PermissionHandler` instance; the caller (FeishuBot) stores it in `activePermissionHandlers` keyed by `openId`. This avoids singleton state on `ClaudeSessionManager` and correctly handles concurrent sessions from different users.
 - **SDK permission_request message type**: The spec mentions `permission_request` as a message type. If the SDK doesn't emit this type explicitly (permissions are handled purely via `canUseTool` callback), the `StreamAdapter` test for it may need adjustment. The adapter handles it but it may be a no-op in practice.
 - **AskUserQuestion handling**: Currently auto-approved with passthrough. The full implementation for interactive clarifying questions (multi-choice cards) is deferred — this is intentional for scope management.

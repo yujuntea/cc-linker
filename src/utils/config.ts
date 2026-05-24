@@ -64,6 +64,12 @@ interface ConfigData {
     allowed_tools: string[];
     disallowed_tools: string[];
   };
+  sdk: {
+    enabled: boolean;
+    permission_mode: string;
+    timeout_ms: number;
+    claude_executable: string;
+  };
 }
 
 const DEFAULTS: ConfigData = {
@@ -126,6 +132,12 @@ const DEFAULTS: ConfigData = {
     allowed_tools: [],
     disallowed_tools: [],
   },
+  sdk: {
+    enabled: false,
+    permission_mode: 'acceptEdits',
+    timeout_ms: 600_000,
+    claude_executable: 'claude',
+  },
 };
 
 function cloneDefaults(): ConfigData {
@@ -140,6 +152,7 @@ function cloneDefaults(): ConfigData {
     hook: { ...DEFAULTS.hook },
     stream: { ...DEFAULTS.stream },
     claude: { ...DEFAULTS.claude },
+    sdk: { ...DEFAULTS.sdk },
   };
 }
 
@@ -209,6 +222,10 @@ export class ConfigManager {
       ['CC_LINKER_STREAM_MAX_CARD_BYTES', 'stream', 'max_card_bytes'],
       ['CC_LINKER_STREAM_FALLBACK_TO_TEXT', 'stream', 'fallback_to_text'],
       ['CC_LINKER_CLAUDE_PERMISSION_MODE', 'claude', 'permission_mode'],
+      ['CC_LINKER_SDK_ENABLED', 'sdk', 'enabled'],
+      ['CC_LINKER_SDK_PERMISSION_MODE', 'sdk', 'permission_mode'],
+      ['CC_LINKER_SDK_TIMEOUT_MS', 'sdk', 'timeout_ms'],
+      ['CC_LINKER_SDK_CLAUDE_EXECUTABLE', 'sdk', 'claude_executable'],
     ];
 
     // Parse array env vars for Claude tools
