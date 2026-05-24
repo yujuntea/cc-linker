@@ -78,6 +78,8 @@ Have you ever found yourself in these situations:
 
 ### 1. Install
 
+**Prerequisites**: Node.js >= 20 or Bun >= 1.0.
+
 ```bash
 # Install globally via npm
 npm install -g cc-linker

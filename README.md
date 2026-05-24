@@ -78,6 +78,8 @@
 
 ### 1. 安装
 
+**前置要求**：Node.js >= 20 或 Bun >= 1.0。
+
 ```bash
 # npm 全局安装
 npm install -g cc-linker

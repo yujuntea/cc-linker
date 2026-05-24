@@ -39,6 +39,7 @@
     "typecheck": "tsc --noEmit"
   },
   "engines": {
+    "node": ">=20",
     "bun": ">=1.0.0"
   },
   "type": "module",
