@@ -101,6 +101,116 @@ export class CardUpdater {
     return truncateBytes(content, this.maxCardBytes);
   }
 
+  /** Create a permission request card with Allow/Deny buttons */
+  async createPermissionCard(
+    openId: string,
+    toolName: string,
+    action: string,
+    promptIndex: number,
+  ): Promise<string> {
+    const card = this.buildPermissionCard(toolName, action, promptIndex);
+    const resp = await this.client.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data: {
+        receive_id: openId,
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+    });
+    const messageId = resp.data?.message_id ?? null;
+    if (!messageId) throw new Error('Failed to create permission card');
+    this.cardMessageId = messageId;
+    this.state = 'processing';
+    this.lastPatchAt = Date.now();
+    return messageId;
+  }
+
+  /** Update existing permission card with result */
+  async updatePermissionCard(approved: boolean): Promise<void> {
+    const card = approved
+      ? this.buildPermissionResultCard(true)
+      : this.buildPermissionResultCard(false);
+    await this.patchCard(card);
+  }
+
+  /** Allow external code to set cardMessageId for permission card patching */
+  setCardMessageId(messageId: string): void {
+    this.cardMessageId = messageId;
+  }
+
+  private buildPermissionCard(
+    toolName: string,
+    action: string,
+    promptIndex: number,
+  ): Record<string, unknown> {
+    const actionLabel = this.getToolActionLabel(toolName);
+    return {
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: '🔐 需要权限确认' },
+        template: 'orange',
+      },
+      elements: [
+        {
+          tag: 'markdown',
+          content: `Claude 想要执行以下操作：\n\n**${actionLabel}：**\n\`\`\`\n${esc(action)}\n\`\`\``,
+        },
+        {
+          tag: 'action',
+          actions: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '✅ 允许' },
+              type: 'primary',
+              value: { type: 'permission_approve', index: promptIndex },
+            },
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '❌ 拒绝' },
+              type: 'default',
+              value: { type: 'permission_deny', index: promptIndex },
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  private buildPermissionResultCard(approved: boolean): Record<string, unknown> {
+    return {
+      config: { wide_screen_mode: true },
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: approved ? '✅ 已允许' : '❌ 已拒绝',
+        },
+        template: approved ? 'green' : 'red',
+      },
+      elements: [
+        {
+          tag: 'markdown',
+          content: approved
+            ? '操作已被允许，Claude 将继续执行。'
+            : '操作已被拒绝，Claude 将尝试其他方式。',
+        },
+      ],
+    };
+  }
+
+  private getToolActionLabel(toolName: string): string {
+    const labels: Record<string, string> = {
+      Bash: 'Bash 命令',
+      Edit: '文件编辑',
+      Write: '文件写入',
+      Read: '文件读取',
+      Glob: '文件搜索',
+      Grep: '内容搜索',
+      WebFetch: '网络请求',
+      WebSearch: '网络搜索',
+    };
+    return labels[toolName] ?? toolName;
+  }
+
   dispose(): void {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null; }
   }
