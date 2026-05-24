@@ -7,6 +7,7 @@ import { ClaudeSessionManager } from '../proxy/session';
 import { sessionManager as defaultSessionManager } from '../proxy/session';
 import { StreamChunk } from '../proxy/stream-parser';
 import { CardUpdater } from './card-updater';
+import { PermissionHandler, type PermissionPrompt } from '../proxy/permission-handler';
 import { RegistryManager } from '../registry';
 import { syncBeforeCommand } from '../scanner';
 import { config } from '../utils/config';
@@ -36,7 +37,7 @@ export type FeishuReplyFn = (
 /** Card action callback payload from Feishu WSClient (card.action.trigger event) */
 export type FeishuBotCardAction = {
   open_id: string;
-  action: { tag: string; value: string };
+  action: { tag: string; value: string | Record<string, unknown> };
   message: { message_id: string };
 };
 
@@ -77,6 +78,7 @@ export class FeishuBot {
   private running = false;
   private stopRequested = false;
   private activeWorkers = new Set<Promise<void>>();
+  private activePermissionHandlers = new Map<string, PermissionHandler>();
 
   constructor(opts: {
     userManager: UserManager;
@@ -259,7 +261,15 @@ export class FeishuBot {
       return null;
     }
 
-    const sessionId = value;
+    // Check for permission card interactions first
+    const valueObj = typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
+    if (valueObj && (valueObj.type === 'permission_approve' || valueObj.type === 'permission_deny')) {
+      return await this.handlePermissionCardAction(
+        openId, valueObj.type === 'permission_approve', valueObj.index as number, messageId,
+      );
+    }
+
+    const sessionId = value as string;
 
     switch (tag) {
       case 'help': {
@@ -301,6 +311,34 @@ export class FeishuBot {
         return reply;
       }
     }
+  }
+
+  /** Handle permission card button click */
+  private async handlePermissionCardAction(
+    openId: string,
+    approved: boolean,
+    index: number,
+    messageId?: string,
+  ): Promise<string | null> {
+    const handler = this.activePermissionHandlers.get(openId);
+    if (!handler) {
+      logger.warn(`Permission card: no active handler for ${openId}`);
+      return '权限确认已过期，请重试';
+    }
+
+    handler.resolveUserDecision(index, approved);
+
+    if (this.feishuClient && messageId) {
+      try {
+        const cardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
+        cardUpdater.setCardMessageId(messageId);
+        await cardUpdater.updatePermissionCard(approved);
+      } catch (err: any) {
+        logger.warn(`Permission card: update failed: ${err}`);
+      }
+    }
+
+    return approved ? '✅ 已允许，Claude 将继续执行' : '❌ 已拒绝，Claude 将尝试其他方式';
   }
 
   /** Claim one message from pending queue */
@@ -398,7 +436,10 @@ export class FeishuBot {
         const currentEntry = this.registry.get(sessionUuid);
         const cwd = msg.target.cwd || currentEntry?.cwd || process.env.HOME || '/';
 
-        if (config.get<boolean>('stream.enabled', false)) {
+        const useSDK = config.get<boolean>('sdk.enabled', false);
+        if (useSDK) {
+          await this.handleChatSDK(msg, sessionUuid, cwd, currentEntry);
+        } else if (config.get<boolean>('stream.enabled', false)) {
           await this.handleChatStreaming(msg, sessionUuid, cwd, currentEntry);
         } else {
           await this.handleChatNonStreaming(msg, sessionUuid, cwd, currentEntry);
@@ -420,7 +461,10 @@ export class FeishuBot {
           return;
         }
 
-        if (config.get<boolean>('stream.enabled', false)) {
+        const useSDK = config.get<boolean>('sdk.enabled', false);
+        if (useSDK) {
+          await this.createSessionFromPromptSDK(msg, msg.target.cwd ?? claimResult.entry.cwd ?? '', claimMessageId, msg.text);
+        } else if (config.get<boolean>('stream.enabled', false)) {
           await this.createSessionFromPromptStreaming(msg, msg.target.cwd ?? claimResult.entry.cwd ?? '', claimMessageId, msg.text);
         } else {
           await this.createSessionFromPrompt(msg, msg.target.cwd ?? claimResult.entry.cwd ?? '', claimMessageId, msg.text);
@@ -578,6 +622,128 @@ export class FeishuBot {
     }
   }
 
+  /** SDK path for chat messages (supports permission interaction) */
+  private async handleChatSDK(
+    msg: SpoolMessage, sessionUuid: string, cwd: string, currentEntry: any,
+  ): Promise<void> {
+    const startTime = Date.now();
+    let thinking = '';
+    let text = '';
+    let cardUpdater: CardUpdater | null = null;
+    let cardMessageId: string | null = null;
+    let cardInitFailed = false;
+
+    try {
+      if (this.feishuClient) {
+        cardUpdater = new CardUpdater(this.feishuClient, {
+          throttle_ms: config.get<number>('stream.throttle_ms', 1500),
+          max_card_bytes: config.get<number>('stream.max_card_bytes', 25000),
+          show_thinking: config.get<boolean>('stream.show_thinking', true),
+        });
+        cardMessageId = await cardUpdater.startProcessing(msg.openId);
+      }
+    } catch (err: any) {
+      logger.warn(`SDK Stream: 发送处理中卡片失败: ${err}`);
+      cardInitFailed = true;
+    }
+
+    try {
+      const settingsPath = this.getSettingsPathForUser(msg.openId);
+      const { result, handler } = await this.sessionManager.sendSDKMessage(
+        sessionUuid, msg.text, cwd,
+        (chunk: StreamChunk) => {
+          if (cardInitFailed || !cardUpdater) return;
+          if (chunk.type === 'thinking') thinking += chunk.content;
+          else if (chunk.type === 'text') text += chunk.content;
+          const elapsed = Date.now() - startTime;
+          cardUpdater.updateStream(
+            config.get<boolean>('stream.show_thinking', true) ? thinking : '',
+            text, elapsed
+          ).catch(e => logger.warn(`SDK Stream: update failed: ${e}`));
+        },
+        async (prompt: PermissionPrompt) => {
+          if (!this.feishuClient || cardInitFailed) return;
+          try {
+            const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
+            const actionText = this.getPermissionActionText(prompt);
+            await permCardUpdater.createPermissionCard(
+              msg.openId, prompt.toolName, actionText, prompt.index,
+            );
+            this.activePermissionHandlers.set(msg.openId, handler);
+          } catch (err: any) {
+            logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
+          }
+        },
+        false, msg.serialKey, settingsPath,
+      );
+
+      if (cardUpdater) {
+        if (cardUpdater.shouldFallbackToText(text)) {
+          const truncated = cardUpdater.truncateContent(text);
+          await cardUpdater.complete(truncated, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+          const remainder = text.slice(truncated.length);
+          if (remainder && config.get<boolean>('stream.fallback_to_text', true)) {
+            for (const chunk of splitReplyText(remainder, 3900)) {
+              await this.replyFn(chunk, { messageId: msg.messageId, openId: msg.openId });
+            }
+          }
+        } else {
+          await cardUpdater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+        }
+        cardMessageId = cardUpdater.getCardMessageId();
+        cardUpdater.dispose();
+      }
+
+      this.registry.upsert(sessionUuid, {
+        cwd, last_active: new Date().toISOString(), last_message_preview: preview(msg.text),
+        last_error: result.error ?? null,
+        status: result.sessionStatus === 'degraded' ? 'degraded' : 'active',
+        jsonl_path: result.jsonlPath ?? undefined,
+        pending_jsonl_resolve: result.jsonlPath ? false : currentEntry?.pending_jsonl_resolve,
+        message_count: (currentEntry?.message_count ?? 0) + 1,
+      });
+      await this.registry.flush();
+
+      this.spoolQueue.updateProcessingMessage(msg.messageId, msg.serialKey, { responseText: result.response || '(空回复)' });
+      if (cardMessageId) {
+        this.spoolQueue.recordDelivery(msg.messageId, 'sent', stableUuid(msg.messageId, 0), 0, cardMessageId, 1);
+      }
+      this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+
+      const jlPath = result.jsonlPath ?? currentEntry?.jsonl_path;
+      if (jlPath) { try { repairJsonlLastPrompt(jlPath); } catch {} }
+    } catch (err: any) {
+      if (cardUpdater) {
+        await cardUpdater.error(err.message ?? 'Unknown error');
+        cardMessageId = cardUpdater.getCardMessageId();
+        cardUpdater.dispose();
+      } else if (!cardInitFailed) {
+        await this.replyFn(`处理失败: ${err.message}`, { messageId: msg.messageId, openId: msg.openId });
+      }
+      if (cardMessageId) {
+        this.spoolQueue.recordDelivery(msg.messageId, 'sent', stableUuid(msg.messageId, 0), 0, cardMessageId, 1);
+      }
+      this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+      this.spoolQueue.markFailed(msg.messageId, msg.serialKey, String(err));
+    } finally {
+      this.activePermissionHandlers.delete(msg.openId);
+    }
+  }
+
+  private getPermissionActionText(prompt: PermissionPrompt): string {
+    if (prompt.toolName === 'Bash') {
+      return (prompt.toolInput as any).command ?? String(prompt.toolInput);
+    }
+    if (prompt.toolName === 'Edit' || prompt.toolName === 'Write') {
+      return (prompt.toolInput as any).file_path ?? String(prompt.toolInput);
+    }
+    if (prompt.toolName === 'WebFetch') {
+      return (prompt.toolInput as any).url ?? String(prompt.toolInput);
+    }
+    return JSON.stringify(prompt.toolInput);
+  }
+
   /** Streaming path for new session creation */
   private async createSessionFromPromptStreaming(
     msg: SpoolMessage,
@@ -716,6 +882,155 @@ export class FeishuBot {
     }
   }
 
+  /** SDK path for new session creation (supports permission interaction) */
+  private async createSessionFromPromptSDK(
+    msg: SpoolMessage,
+    cwd: string,
+    claimMessageId: string,
+    prompt: string,
+  ): Promise<void> {
+    const startTime = Date.now();
+    let thinking = '';
+    let text = '';
+    let cardUpdater: CardUpdater | null = null;
+    let cardMessageId: string | null = null;
+    let cardInitFailed = false;
+
+    try {
+      if (this.feishuClient) {
+        cardUpdater = new CardUpdater(this.feishuClient, {
+          throttle_ms: config.get<number>('stream.throttle_ms', 1500),
+          max_card_bytes: config.get<number>('stream.max_card_bytes', 25000),
+          show_thinking: config.get<boolean>('stream.show_thinking', true),
+        });
+        cardMessageId = await cardUpdater.startProcessing(msg.openId);
+      }
+    } catch (err: any) {
+      logger.warn(`SDK Stream: 发送处理中卡片失败: ${err}`);
+      cardInitFailed = true;
+    }
+
+    try {
+      const settingsPath = this.getSettingsPathForUser(msg.openId);
+      const { result, handler } = await this.sessionManager.sendSDKMessage(
+        null, prompt, cwd,
+        (chunk: StreamChunk) => {
+          if (cardInitFailed || !cardUpdater) return;
+          if (chunk.type === 'thinking') thinking += chunk.content;
+          else if (chunk.type === 'text') text += chunk.content;
+          const elapsed = Date.now() - startTime;
+          cardUpdater.updateStream(
+            config.get<boolean>('stream.show_thinking', true) ? thinking : '',
+            text, elapsed
+          ).catch(e => logger.warn(`SDK Stream: update failed: ${e}`));
+        },
+        async (prompt: PermissionPrompt) => {
+          if (!this.feishuClient || cardInitFailed) return;
+          try {
+            const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
+            const actionText = this.getPermissionActionText(prompt);
+            await permCardUpdater.createPermissionCard(
+              msg.openId, prompt.toolName, actionText, prompt.index,
+            );
+            this.activePermissionHandlers.set(msg.openId, handler);
+          } catch (err: any) {
+            logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
+          }
+        },
+        true, `new:${msg.openId}`, settingsPath,
+      );
+
+      if (!result.sessionId) {
+        await this.userManager.rollbackClaim(msg.openId, claimMessageId);
+        if (cardUpdater) {
+          await cardUpdater.error(result.error ?? 'Claude 未返回 session_id');
+          cardMessageId = cardUpdater.getCardMessageId();
+          cardUpdater.dispose();
+        }
+        throw new Error(result.error || `Claude 未返回 session_id (响应: ${result.response})`);
+      }
+
+      const now = new Date().toISOString();
+      const bound = await this.userManager.bindSessionToClaim(msg.openId, claimMessageId, result.sessionId, cwd);
+      if (!bound) {
+        if (cardUpdater) {
+          await cardUpdater.error('新会话已创建，但映射绑定失败');
+          cardMessageId = cardUpdater.getCardMessageId();
+          cardUpdater.dispose();
+        }
+        throw new Error('新会话已创建，但映射绑定失败');
+      }
+
+      if (cardUpdater) {
+        if (cardUpdater.shouldFallbackToText(text)) {
+          const truncated = cardUpdater.truncateContent(text);
+          await cardUpdater.complete(truncated, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+          const remainder = text.slice(truncated.length);
+          if (remainder && config.get<boolean>('stream.fallback_to_text', true)) {
+            for (const chunk of splitReplyText(remainder, 3900)) {
+              await this.replyFn(chunk, { messageId: msg.messageId, openId: msg.openId });
+            }
+          }
+        } else {
+          await cardUpdater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+        }
+        cardMessageId = cardUpdater.getCardMessageId();
+        cardUpdater.dispose();
+      }
+
+      this.registry.upsert(result.sessionId, {
+        origin: 'feishu',
+        cwd,
+        project_name: basename(cwd),
+        title: buildSessionTitle(prompt),
+        message_count: Math.max(this.registry.get(result.sessionId)?.message_count ?? 0, 1),
+        created_at: this.registry.get(result.sessionId)?.created_at ?? now,
+        last_active: now,
+        last_message_preview: preview(prompt),
+        status: result.sessionStatus,
+        jsonl_path: result.jsonlPath,
+        pending_jsonl_resolve: !result.jsonlPath,
+        last_error: result.error ?? null,
+        feishu_user_id: msg.openId,
+        lastKnownProvider: this.getCurrentProviderAliasForUser(msg.openId),
+      });
+      await this.registry.flush();
+
+      this.spoolQueue.updateProcessingMessage(msg.messageId, msg.serialKey, {
+        responseText: result.response || '(空回复)',
+        target: {
+          type: 'session',
+          sessionUuid: result.sessionId,
+          cwd,
+          openId: msg.openId,
+          mappingVersion: this.userManager.getVersion(),
+        },
+      });
+      if (cardMessageId) {
+        this.spoolQueue.recordDelivery(msg.messageId, 'sent', stableUuid(msg.messageId, 0), 0, cardMessageId, 1);
+      }
+      this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+
+      if (result.jsonlPath) { try { repairJsonlLastPrompt(result.jsonlPath); } catch {} }
+    } catch (err: any) {
+      if (cardUpdater) {
+        await cardUpdater.error(err.message ?? 'Unknown error');
+        cardMessageId = cardUpdater.getCardMessageId();
+        cardUpdater.dispose();
+      } else if (!cardInitFailed) {
+        await this.replyFn(`创建失败: ${err.message}`, { messageId: msg.messageId, openId: msg.openId });
+      }
+      if (cardMessageId) {
+        this.spoolQueue.recordDelivery(msg.messageId, 'sent', stableUuid(msg.messageId, 0), 0, cardMessageId, 1);
+      }
+      this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+      this.spoolQueue.markFailed(msg.messageId, msg.serialKey, String(err));
+    } finally {
+      this.activePermissionHandlers.delete(msg.openId);
+    }
+  }
+
   private async handleList(msg: SpoolMessage): Promise<void> {
     await this.doCardList(msg.openId, msg.messageId, msg);
   }
@@ -808,7 +1123,10 @@ export class FeishuBot {
       return;
     }
 
-    if (config.get<boolean>('stream.enabled', false)) {
+    const useSDK = config.get<boolean>('sdk.enabled', false);
+    if (useSDK) {
+      await this.createSessionFromPromptSDK(msg, cwd, msg.messageId, prompt);
+    } else if (config.get<boolean>('stream.enabled', false)) {
       await this.createSessionFromPromptStreaming(msg, cwd, msg.messageId, prompt);
     } else {
       await this.createSessionFromPrompt(msg, cwd, msg.messageId, prompt);
