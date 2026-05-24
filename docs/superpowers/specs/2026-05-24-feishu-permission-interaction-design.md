@@ -266,6 +266,7 @@ engine = "sdk"  # "cli" (旧) | "sdk" (新)
 # SDK 特定配置
 permission_mode = "acceptEdits"  # default | acceptEdits | plan | auto | dontAsk | bypassPermissions
 timeout_ms = 600000  # 权限确认超时（10分钟）
+claude_executable = "claude"  # SDK 使用的 Claude 可执行文件路径（编译后二进制场景必需）
 ```
 
 **环境变量：**
@@ -302,6 +303,44 @@ CC_LINKER_SDK_TIMEOUT_MS=600000
 | 飞书卡片交互延迟 | 低 | 卡片更新有节流机制 |
 | 认证方式变化 | 低 | SDK 使用相同的环境变量 |
 | 飞书回调 URL 配置 | 中 | 需要配置交互式卡片回调 URL |
+| **编译后二进制找不到 SDK 嵌入的 Claude** | **高** | **使用 `pathToClaudeCodeExecutable: "claude"` 依赖系统安装** |
+
+## 7.1 关键技术风险：编译后二进制
+
+**问题：** cc-linker 使用 `bun run build` 编译成独立二进制（`dist/cc-linker`）。
+SDK 嵌入的平台特定 Claude 二进制在 `bun build --compile` 后无法通过 `require.resolve` 找到（Bun 的 `$bunfs` 虚拟文件系统限制）。
+
+**解决方案：** 使用 `pathToClaudeCodeExecutable` 选项指向系统安装的 `claude`：
+
+```typescript
+import { query } from '@anthropic-ai/claude-agent-sdk';
+
+for await (const message of query({
+  prompt: text,
+  options: {
+    pathToClaudeCodeExecutable: config.get('sdk.claude_executable', 'claude'),
+    // ... 其他配置
+  }
+})) { ... }
+```
+
+**前提条件：** 用户系统必须已安装 `claude` 命令行工具（`npm install -g @anthropic-ai/claude-code`）。
+这与 cc-linker 现有要求一致（CLI spawn 模式也需要系统安装 claude）。
+
+**替代方案（不推荐）：** 使用 `extractFromBunfs()` 提取嵌入的二进制到临时目录。
+需要 SDK v0.3.144+，且需要修改构建流程，复杂度较高。
+
+## 7.2 Bun 运行时兼容性
+
+SDK 明确支持 Bun 运行时：
+- 自动检测运行时，无需额外配置
+- 可选参数 `executable: 'bun'`（通常不需要）
+- 唯一的限制是编译后二进制场景（见 7.1）
+
+## 7.3 计费变化
+
+从 2026年6月15日起，Agent SDK 和 `claude -p` 使用独立的 Agent SDK 积分池，
+与交互式使用量分开。这不影响技术可行性，但需要在运营层面关注。
 
 ## 8. 测试策略
 
