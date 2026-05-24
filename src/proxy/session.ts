@@ -4,6 +4,9 @@ import { CLAUDE_PROJECTS_DIR, expandPath } from '../utils/paths';
 import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { StreamParser, StreamChunk, ResultChunk } from './stream-parser';
+import { StreamAdapter, type SDKStreamChunk } from './stream-adapter';
+import { PermissionHandler, type PermissionPrompt } from './permission-handler';
+import { query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 export interface ClaudeSession {
   sessionId: string;
@@ -643,6 +646,138 @@ export class ClaudeSessionManager {
       error: hasError ? (baseError || 'unknown_error') : undefined,
       tokensIn: lastResult?.usage?.input_tokens,
       tokensOut: lastResult?.usage?.output_tokens,
+    };
+  }
+
+  /**
+   * Send a message using the Anthropic Agent SDK.
+   * Supports interactive permission approval via canUseTool callback.
+   */
+  async sendSDKMessage(
+    sessionId: string | null,
+    text: string,
+    cwd: string,
+    onProgress: (chunk: StreamChunk) => void,
+    onPermissionRequest: (prompt: PermissionPrompt) => void,
+    isNew?: boolean,
+    lockKey?: string,
+    settingsPath?: string,
+  ): Promise<{ result: SendMessageResult; handler: PermissionHandler }> {
+    const resolvedLockKey = lockKey ?? sessionId ?? '__new__';
+    await this.acquireSessionLock(resolvedLockKey);
+    await this.acquireSlot();
+
+    const expandedCwd = expandPath(cwd);
+    if (!expandedCwd) {
+      this.releaseSlot();
+      this.releaseSessionLock(resolvedLockKey);
+      const errResult = this._errorResult('cwd is empty', sessionId);
+      return { result: errResult, handler: new PermissionHandler({ allowedTools: [], disallowedTools: [] }) };
+    }
+
+    const startTime = Date.now();
+    const adapter = new StreamAdapter();
+
+    const handler = new PermissionHandler({
+      allowedTools: config.get<string[]>('claude.allowed_tools', []),
+      disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
+      timeoutMs: config.get<number>('sdk.timeout_ms', 600_000),
+    });
+    handler.onPermissionRequest = onPermissionRequest;
+
+    const permissionMode = config.get<string>('sdk.permission_mode', 'acceptEdits');
+    const claudeExecutable = config.get<string>('sdk.claude_executable', 'claude');
+
+    let lastResult: any = null;
+    let hasError = false;
+
+    try {
+      for await (const message of query({
+        prompt: text,
+        options: {
+          permissionMode: permissionMode as any,
+          canUseTool: handler.canUseTool.bind(handler),
+          cwd: expandedCwd,
+          allowedTools: config.get<string[]>('claude.allowed_tools', []),
+          disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
+          pathToClaudeCodeExecutable: claudeExecutable,
+          ...(sessionId && !isNew ? { resume: sessionId } : {}),
+          ...(settingsPath && existsSync(settingsPath) ? { settings: settingsPath } : {}),
+        },
+      })) {
+        adapter.adapt(message as SDKMessage, (chunk: SDKStreamChunk) => {
+          if (chunk.type === 'result') {
+            lastResult = chunk;
+          } else if (chunk.type !== 'permission_request') {
+            onProgress(chunk);
+          }
+        });
+
+        if (message.type === 'result' && message.subtype !== 'success') {
+          hasError = true;
+        }
+      }
+    } catch (err: any) {
+      logger.error(`SDK: query failed: ${err.message}`);
+      this.releaseSlot();
+      this.releaseSessionLock(resolvedLockKey);
+      return {
+        result: {
+          response: `Claude SDK 执行失败: ${err.message}`,
+          costUsd: 0,
+          durationMs: Date.now() - startTime,
+          sessionId: sessionId ?? '',
+          jsonlPath: null,
+          sessionStatus: 'degraded',
+          error: err.message,
+        },
+        handler,
+      };
+    }
+
+    const durationMs = Date.now() - startTime;
+    this.releaseSlot();
+    this.releaseSessionLock(resolvedLockKey);
+
+    if (!lastResult) {
+      return {
+        result: {
+          response: hasError ? 'Claude 执行失败' : '(空回复)',
+          costUsd: 0,
+          durationMs,
+          sessionId: sessionId ?? '',
+          jsonlPath: null,
+          sessionStatus: hasError ? 'degraded' : 'active',
+          error: hasError ? 'no_result_returned' : undefined,
+        },
+        handler,
+      };
+    }
+
+    const resolvedSessionId = (lastResult.session_id as string) || (sessionId ?? '');
+    let jsonlPath: string | null = null;
+    let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasError ? 'degraded' : 'active';
+
+    if (isNew && resolvedSessionId) {
+      jsonlPath = await resolveJsonlPath(resolvedSessionId);
+      if (!jsonlPath && sessionStatus === 'active') {
+        sessionStatus = 'provisioning';
+      }
+    }
+
+    return {
+      result: {
+        response: (lastResult.result as string) ?? (hasError ? 'Claude 执行失败' : '(空回复)'),
+        costUsd: (lastResult.total_cost_usd as number) ?? 0,
+        durationMs: (lastResult.duration_ms as number) ?? durationMs,
+        sessionId: resolvedSessionId,
+        jsonlPath,
+        sessionStatus,
+        error: hasError ? ((lastResult.errors as string[])?.join('; ') ?? 'unknown_error') : undefined,
+        tokensIn: (lastResult.usage as any)?.input_tokens,
+        tokensOut: (lastResult.usage as any)?.output_tokens,
+      },
+      handler,
     };
   }
 
