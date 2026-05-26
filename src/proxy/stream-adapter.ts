@@ -16,20 +16,9 @@ export class StreamAdapter {
     message: SDKMessage,
     onChunk: (chunk: SDKStreamChunk) => void,
   ): void {
-    if (message.type === 'system') {
-      // Handle permission_denied as a permission request
-      if ((message as any).subtype === 'permission_denied') {
-        const msg = message as any;
-        onChunk({
-          type: 'permission_request',
-          toolName: msg.tool_name ?? '',
-          toolInput: {},
-          suggestions: [],
-        });
-        return;
-      }
-      return;
-    }
+    // SDK system messages (including permission_denied notifications) are handled
+    // internally by the canUseTool callback and do not need to be forwarded.
+    if (message.type === 'system') return;
     if (message.type === 'assistant') return;
 
     if (message.type === 'stream_event') {
@@ -54,14 +43,14 @@ export class StreamAdapter {
       onChunk({
         type: 'result',
         result: msg.result ?? '',
-        session_id: message.session_id ?? '',
-        total_cost_usd: message.total_cost_usd ?? 0,
-        duration_ms: message.duration_ms ?? 0,
-        stop_reason: message.stop_reason ?? null,
-        subtype: message.subtype,
-        is_error: message.is_error,
+        session_id: msg.session_id ?? '',
+        total_cost_usd: msg.total_cost_usd ?? 0,
+        duration_ms: msg.duration_ms ?? 0,
+        stop_reason: msg.stop_reason ?? null,
+        subtype: msg.subtype,
+        is_error: msg.is_error,
         errors: msg.errors,
-        usage: message.usage as any,
+        usage: msg.usage,
       });
       return;
     }

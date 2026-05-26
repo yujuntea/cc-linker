@@ -264,8 +264,14 @@ export class FeishuBot {
     // Check for permission card interactions first
     const valueObj = typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
     if (valueObj && (valueObj.type === 'permission_approve' || valueObj.type === 'permission_deny')) {
+      const index = Number(valueObj.index);
+      const handlerId = typeof valueObj.handlerId === 'string' ? valueObj.handlerId : '';
+      if (!Number.isInteger(index)) {
+        logger.warn(`Permission card: invalid index ${valueObj.index}`);
+        return '参数错误，请重试';
+      }
       return await this.handlePermissionCardAction(
-        openId, valueObj.type === 'permission_approve', valueObj.index as number, messageId,
+        openId, valueObj.type === 'permission_approve', index, handlerId, messageId,
       );
     }
 
@@ -318,15 +324,19 @@ export class FeishuBot {
     openId: string,
     approved: boolean,
     index: number,
+    handlerId: string,
     messageId?: string,
   ): Promise<string | null> {
-    const handler = this.activePermissionHandlers.get(openId);
+    const handler = this.activePermissionHandlers.get(handlerId);
     if (!handler) {
-      logger.warn(`Permission card: no active handler for ${openId}`);
+      logger.warn(`Permission card: no active handler for handlerId=${handlerId}`);
       return '权限确认已过期，请重试';
     }
 
-    handler.resolveUserDecision(index, approved);
+    const resolved = handler.resolveUserDecision(index, approved);
+    if (!resolved) {
+      return '权限确认已过期，请重试';
+    }
 
     if (this.feishuClient && messageId) {
       try {
@@ -632,6 +642,7 @@ export class FeishuBot {
     let cardUpdater: CardUpdater | null = null;
     let cardMessageId: string | null = null;
     let cardInitFailed = false;
+    let currentHandler: PermissionHandler | null = null;
 
     try {
       if (this.feishuClient) {
@@ -661,23 +672,33 @@ export class FeishuBot {
             text, elapsed
           ).catch(e => logger.warn(`SDK Stream: update failed: ${e}`));
         },
-        async (prompt: PermissionPrompt) => {
-          if (!this.feishuClient || cardInitFailed) return;
+        async (prompt: PermissionPrompt, sdkHandler: PermissionHandler) => {
+          if (!this.feishuClient || cardInitFailed) {
+            // Cannot show card — deny immediately rather than hanging until timeout
+            sdkHandler.resolveUserDecision(prompt.index, false);
+            return;
+          }
+          const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
+          const actionText = this.getPermissionActionText(prompt);
+          // Store handler BEFORE await so user clicks during card creation are handled
+          this.activePermissionHandlers.set(sdkHandler.getHandlerId(), sdkHandler);
           try {
-            // Store handler BEFORE await to avoid race condition where user clicks
-            // the card before we've stored the handler reference
-            this.activePermissionHandlers.set(msg.openId, handler);
-            const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
-            const actionText = this.getPermissionActionText(prompt);
             await permCardUpdater.createPermissionCard(
-              msg.openId, prompt.toolName, actionText, prompt.index,
+              msg.openId, prompt.toolName, actionText, prompt.index, sdkHandler.getHandlerId(),
             );
           } catch (err: any) {
             logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
+            // Auto-deny if card cannot be shown to user
+            sdkHandler.resolveUserDecision(prompt.index, false);
+            // Clean up immediately if no more pending prompts
+            if (sdkHandler.getUnresolvedCount() === 0) {
+              this.activePermissionHandlers.delete(sdkHandler.getHandlerId());
+            }
           }
         },
         false, msg.serialKey, settingsPath,
       );
+      currentHandler = handler;
 
       if (cardUpdater) {
         if (cardUpdater.shouldFallbackToText(text)) {
@@ -731,9 +752,8 @@ export class FeishuBot {
     } finally {
       // Only delete handler when all permission prompts are resolved.
       // If a prompt is still awaiting user input, keep the handler so the click can resolve.
-      const handler = this.activePermissionHandlers.get(msg.openId);
-      if (handler && handler.getUnresolvedCount() === 0) {
-        this.activePermissionHandlers.delete(msg.openId);
+      if (currentHandler && currentHandler.getUnresolvedCount() === 0) {
+        this.activePermissionHandlers.delete(currentHandler.getHandlerId());
       }
     }
   }
@@ -742,7 +762,7 @@ export class FeishuBot {
     if (prompt.toolName === 'Bash') {
       return (prompt.toolInput as any).command ?? String(prompt.toolInput);
     }
-    if (prompt.toolName === 'Edit' || prompt.toolName === 'Write') {
+    if (prompt.toolName === 'Edit' || prompt.toolName === 'Write' || prompt.toolName === 'Read') {
       return (prompt.toolInput as any).file_path ?? String(prompt.toolInput);
     }
     if (prompt.toolName === 'WebFetch') {
@@ -902,6 +922,7 @@ export class FeishuBot {
     let cardUpdater: CardUpdater | null = null;
     let cardMessageId: string | null = null;
     let cardInitFailed = false;
+    let currentHandler: PermissionHandler | null = null;
 
     try {
       if (this.feishuClient) {
@@ -931,23 +952,33 @@ export class FeishuBot {
             text, elapsed
           ).catch(e => logger.warn(`SDK Stream: update failed: ${e}`));
         },
-        async (prompt: PermissionPrompt) => {
-          if (!this.feishuClient || cardInitFailed) return;
+        async (prompt: PermissionPrompt, sdkHandler: PermissionHandler) => {
+          if (!this.feishuClient || cardInitFailed) {
+            // Cannot show card — deny immediately rather than hanging until timeout
+            sdkHandler.resolveUserDecision(prompt.index, false);
+            return;
+          }
+          const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
+          const actionText = this.getPermissionActionText(prompt);
+          // Store handler BEFORE await so user clicks during card creation are handled
+          this.activePermissionHandlers.set(sdkHandler.getHandlerId(), sdkHandler);
           try {
-            // Store handler BEFORE await to avoid race condition where user clicks
-            // the card before we've stored the handler reference
-            this.activePermissionHandlers.set(msg.openId, handler);
-            const permCardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
-            const actionText = this.getPermissionActionText(prompt);
             await permCardUpdater.createPermissionCard(
-              msg.openId, prompt.toolName, actionText, prompt.index,
+              msg.openId, prompt.toolName, actionText, prompt.index, sdkHandler.getHandlerId(),
             );
           } catch (err: any) {
             logger.error(`SDK Stream: 权限卡片创建失败: ${err}`);
+            // Auto-deny if card cannot be shown to user
+            sdkHandler.resolveUserDecision(prompt.index, false);
+            // Clean up immediately if no more pending prompts
+            if (sdkHandler.getUnresolvedCount() === 0) {
+              this.activePermissionHandlers.delete(sdkHandler.getHandlerId());
+            }
           }
         },
         true, `new:${msg.openId}`, settingsPath,
       );
+      currentHandler = handler;
 
       if (!result.sessionId) {
         await this.userManager.rollbackClaim(msg.openId, claimMessageId);
@@ -1038,9 +1069,8 @@ export class FeishuBot {
     } finally {
       // Only delete handler when all permission prompts are resolved.
       // If a prompt is still awaiting user input, keep the handler so the click can resolve.
-      const handler = this.activePermissionHandlers.get(msg.openId);
-      if (handler && handler.getUnresolvedCount() === 0) {
-        this.activePermissionHandlers.delete(msg.openId);
+      if (currentHandler && currentHandler.getUnresolvedCount() === 0) {
+        this.activePermissionHandlers.delete(currentHandler.getHandlerId());
       }
     }
   }

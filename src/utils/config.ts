@@ -133,7 +133,7 @@ const DEFAULTS: ConfigData = {
     disallowed_tools: [],
   },
   sdk: {
-    enabled: false,
+    enabled: true,
     permission_mode: 'acceptEdits',
     timeout_ms: 600_000,
     claude_executable: 'claude',

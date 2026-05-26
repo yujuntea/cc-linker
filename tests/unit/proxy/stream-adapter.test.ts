@@ -55,21 +55,6 @@ describe('StreamAdapter', () => {
     expect(chunks[0].session_id).toBe('sid-1');
   });
 
-  test('adapts permission_denied system message to permission_request chunk', () => {
-    const adapter = new StreamAdapter();
-    const chunks: any[] = [];
-    const msg: SDKMessage = {
-      type: 'system',
-      subtype: 'permission_denied',
-      tool_name: 'Bash',
-      tool_use_id: 'test-id',
-    } as any;
-    adapter.adapt(msg, (c) => chunks.push(c));
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0].type).toBe('permission_request');
-    expect(chunks[0].toolName).toBe('Bash');
-  });
-
   test('ignores system messages', () => {
     const adapter = new StreamAdapter();
     const chunks: any[] = [];

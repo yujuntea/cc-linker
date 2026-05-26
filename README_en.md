@@ -27,6 +27,7 @@ Have you ever found yourself in these situations:
 |---------|-------------|
 | Seamless cross-device switching | Chat app sessions resumed on terminal (with context & directory); terminal sessions visible in chat app |
 | Streaming card interaction | See Claude's thinking and replies in real-time in your chat app — no more "spinning wait" |
+| SDK permission control | Optional SDK mode: approve/deny each tool use via interactive cards before Claude executes |
 | Unified session management | Auto-scan, incremental sync, no manual session list maintenance needed |
 | Multi-model switching | One-click model switch in cards, no config changes required |
 | Persistent message queue | File-level message queue survives crashes and restarts |
@@ -209,6 +210,15 @@ throttle_ms = 1500
 show_thinking = true
 max_card_bytes = 25000
 fallback_to_text = true
+
+[sdk]
+enabled = false                          # SDK mode (alternative to stream-json)
+timeout_ms = 600000                      # Permission prompt timeout (default: 10 min)
+permission_mode = "acceptEdits"          # Tool permission mode
+
+[claude]
+allowed_tools = ["Read", "Grep", "Glob"] # Auto-approve these tools
+disallowed_tools = []                    # Always deny these tools
 ```
 
 **Environment Variable Overrides**:
@@ -219,6 +229,7 @@ fallback_to_text = true
 | `CC_LINKER_FEISHU_APP_SECRET` | Feishu App Secret |
 | `CC_LINKER_FEISHU_OWNER_OPEN_ID` | Restrict to specific user only |
 | `CC_LINKER_STREAM_ENABLED` | Streaming response toggle |
+| `CC_LINKER_SDK_ENABLED` | SDK mode with permission control toggle |
 | `CC_LINKER_LOG_LEVEL` | Log level |
 
 ## Architecture Overview
@@ -238,6 +249,8 @@ fallback_to_text = true
 - **Spool Queue**: Persistent message queue, recoverable after crashes
 - **Stream Parser**: Parses Claude `stream-json` output
 - **Card Updater**: Streaming card sending with throttling
+- **Permission Handler** (SDK mode): Interactive tool approval via Feishu cards
+- **SDK Mode** (optional): Uses `@anthropic-ai/claude-agent-sdk` npm package instead of child process spawning, enables permission interaction
 
 ## Developer Guide
 

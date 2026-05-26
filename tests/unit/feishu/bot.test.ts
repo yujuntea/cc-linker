@@ -28,6 +28,7 @@ describe('FeishuBot', () => {
     (config as any).data.security.allowed_roots = [];
     (config as any).data.security.denied_roots = [];
     (config as any).data.stream.enabled = false;
+    (config as any).data.sdk.enabled = false;
     const replyFn: FeishuReplyFn = async (text: string): Promise<string | null> => {
       replies.push(text);
       return `reply-${replies.length}`;
@@ -458,6 +459,7 @@ describe('FeishuBot cards', () => {
     (config as any).data.security.allowed_roots = [];
     (config as any).data.security.denied_roots = [];
     (config as any).data.stream.enabled = false;
+    (config as any).data.sdk.enabled = false;
 
     const replyFn: FeishuReplyFn = async (text: string): Promise<string | null> => {
       textReplies.push(text);

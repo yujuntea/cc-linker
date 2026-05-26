@@ -658,7 +658,7 @@ export class ClaudeSessionManager {
     text: string,
     cwd: string,
     onProgress: (chunk: StreamChunk) => void,
-    onPermissionRequest: (prompt: PermissionPrompt) => void,
+    onPermissionRequest: (prompt: PermissionPrompt, handler: PermissionHandler) => void,
     isNew?: boolean,
     lockKey?: string,
     settingsPath?: string,
@@ -667,151 +667,136 @@ export class ClaudeSessionManager {
     await this.acquireSessionLock(resolvedLockKey);
     await this.acquireSlot();
 
-    const expandedCwd = expandPath(cwd);
-    if (!expandedCwd) {
-      this.releaseSlot();
-      this.releaseSessionLock(resolvedLockKey);
-      const errResult = this._errorResult('cwd is empty', sessionId);
-      return { result: errResult, handler: new PermissionHandler({ allowedTools: [], disallowedTools: [] }) };
-    }
-
-    const startTime = Date.now();
-    const adapter = new StreamAdapter();
-
-    const handler = new PermissionHandler({
-      allowedTools: config.get<string[]>('claude.allowed_tools', []),
-      disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
-      timeoutMs: config.get<number>('sdk.timeout_ms', 600_000),
-    });
-    handler.onPermissionRequest = onPermissionRequest;
-
-    const permissionMode = config.get<string>('sdk.permission_mode', 'acceptEdits');
-    const claudeExecutable = config.get<string>('sdk.claude_executable', 'claude');
-
-    let lastResult: any = null;
-    let hasError = false;
-
-    // Timeout protection: hard timeout + stale timeout (matching CLI spawn behavior)
-    const abortController = new AbortController();
-    const staleTimeout = config.get<number>('runtime.stale_timeout_ms', 5 * 60 * 1000);
-    const hardTimeout = config.get<number>('runtime.hard_timeout_ms', 30 * 60 * 1000);
-    let staleTimer: ReturnType<typeof setTimeout> | null = null;
-    let hardTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const resetStaleTimer = () => {
-      if (staleTimer) clearTimeout(staleTimer);
-      staleTimer = setTimeout(() => {
-        if (!abortController.signal.aborted) {
-          logger.warn(`SDK: stale timeout (${staleTimeout}ms no output), aborting`);
-          abortController.abort();
-        }
-      }, staleTimeout);
-    };
-
-    hardTimer = setTimeout(() => {
-      if (!abortController.signal.aborted) {
-        logger.warn(`SDK: hard timeout (${hardTimeout}ms), aborting`);
-        abortController.abort();
-      }
-    }, hardTimeout);
-
-    resetStaleTimer();
-
     try {
-      for await (const message of query({
-        prompt: text,
-        options: {
-          permissionMode: permissionMode as any,
-          canUseTool: handler.canUseTool.bind(handler),
-          cwd: expandedCwd,
-          allowedTools: config.get<string[]>('claude.allowed_tools', []),
-          disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
-          pathToClaudeCodeExecutable: claudeExecutable,
-          abortController,
-          ...(sessionId && !isNew ? { resume: sessionId } : {}),
-          ...(settingsPath && existsSync(settingsPath) ? { settings: settingsPath } : {}),
-        },
-      })) {
-        resetStaleTimer();
-        adapter.adapt(message as SDKMessage, (chunk: SDKStreamChunk) => {
-          if (chunk.type === 'result') {
-            lastResult = chunk;
-          } else if (chunk.type !== 'permission_request') {
-            onProgress(chunk);
-          }
-        });
+      const expandedCwd = expandPath(cwd);
+      if (!expandedCwd) {
+        const errResult = this._errorResult('cwd is empty', sessionId);
+        return { result: errResult, handler: new PermissionHandler({ allowedTools: [], disallowedTools: [] }) };
+      }
 
-        if (message.type === 'result' && message.subtype !== 'success') {
-          hasError = true;
+      const startTime = Date.now();
+      const adapter = new StreamAdapter();
+
+      const handler = new PermissionHandler({
+        allowedTools: config.get<string[]>('claude.allowed_tools', []),
+        disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
+        timeoutMs: config.get<number>('sdk.timeout_ms', 600_000),
+      });
+      handler.onPermissionRequest = (prompt) => onPermissionRequest(prompt, handler);
+
+      const permissionMode = config.get<string>('sdk.permission_mode', 'acceptEdits');
+      const claudeExecutable = config.get<string>('sdk.claude_executable', 'claude');
+
+      let lastResult: any = null;
+      let hasError = false;
+
+      // Hard timeout only. Stale timeout is not applicable to SDK mode because
+      // canUseTool callback blocking (waiting for user permission) is expected
+      // behavior, not a deadlock. PermissionHandler has its own timeout for
+      // permission prompts.
+      const abortController = new AbortController();
+      const hardTimeout = config.get<number>('runtime.hard_timeout_ms', 30 * 60 * 1000);
+      let hardTimer: ReturnType<typeof setTimeout> | null = null;
+
+      try {
+        hardTimer = setTimeout(() => {
+          if (!abortController.signal.aborted) {
+            logger.warn(`SDK: hard timeout (${hardTimeout}ms), aborting`);
+            abortController.abort();
+          }
+        }, hardTimeout);
+
+        for await (const message of query({
+          prompt: text,
+          options: {
+            permissionMode: permissionMode as any,
+            canUseTool: handler.canUseTool.bind(handler),
+            cwd: expandedCwd,
+            allowedTools: config.get<string[]>('claude.allowed_tools', []),
+            disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
+            pathToClaudeCodeExecutable: claudeExecutable,
+            abortController,
+            ...(sessionId && !isNew ? { resume: sessionId } : {}),
+            ...(settingsPath && existsSync(settingsPath) ? { settings: settingsPath } : {}),
+          },
+        })) {
+          adapter.adapt(message as SDKMessage, (chunk: SDKStreamChunk) => {
+            if (chunk.type === 'result') {
+              lastResult = chunk;
+            } else if (chunk.type !== 'permission_request') {
+              onProgress(chunk);
+            }
+          });
+
+          if (message.type === 'result' && message.subtype !== 'success') {
+            hasError = true;
+          }
+        }
+      } catch (err: any) {
+        logger.error(`SDK: query failed: ${err.message}`);
+        handler.rejectAll();
+        return {
+          result: {
+            response: `Claude SDK 执行失败: ${err.message}`,
+            costUsd: 0,
+            durationMs: Date.now() - startTime,
+            sessionId: sessionId ?? '',
+            jsonlPath: null,
+            sessionStatus: 'degraded',
+            error: err.message,
+          },
+          handler,
+        };
+      } finally {
+        if (hardTimer) clearTimeout(hardTimer);
+      }
+
+      const durationMs = Date.now() - startTime;
+
+      if (!lastResult) {
+        return {
+          result: {
+            response: hasError ? 'Claude 执行失败' : '(空回复)',
+            costUsd: 0,
+            durationMs,
+            sessionId: sessionId ?? '',
+            jsonlPath: null,
+            sessionStatus: hasError ? 'degraded' : 'active',
+            error: hasError ? 'no_result_returned' : undefined,
+          },
+          handler,
+        };
+      }
+
+      const resolvedSessionId = (lastResult.session_id as string) || (sessionId ?? '');
+      let jsonlPath: string | null = null;
+      let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasError ? 'degraded' : 'active';
+
+      if (isNew && resolvedSessionId) {
+        jsonlPath = await resolveJsonlPath(resolvedSessionId);
+        if (!jsonlPath && sessionStatus === 'active') {
+          sessionStatus = 'provisioning';
         }
       }
-    } catch (err: any) {
-      if (staleTimer) clearTimeout(staleTimer);
-      if (hardTimer) clearTimeout(hardTimer);
-      logger.error(`SDK: query failed: ${err.message}`);
+
+      return {
+        result: {
+          response: (lastResult.result as string) ?? (hasError ? 'Claude 执行失败' : '(空回复)'),
+          costUsd: (lastResult.total_cost_usd as number) ?? 0,
+          durationMs: (lastResult.duration_ms as number) ?? durationMs,
+          sessionId: resolvedSessionId,
+          jsonlPath,
+          sessionStatus,
+          error: hasError ? ((lastResult.errors as string[])?.join('; ') ?? 'unknown_error') : undefined,
+          tokensIn: (lastResult.usage as any)?.input_tokens,
+          tokensOut: (lastResult.usage as any)?.output_tokens,
+        },
+        handler,
+      };
+    } finally {
       this.releaseSlot();
       this.releaseSessionLock(resolvedLockKey);
-      return {
-        result: {
-          response: `Claude SDK 执行失败: ${err.message}`,
-          costUsd: 0,
-          durationMs: Date.now() - startTime,
-          sessionId: sessionId ?? '',
-          jsonlPath: null,
-          sessionStatus: 'degraded',
-          error: err.message,
-        },
-        handler,
-      };
     }
-
-    if (staleTimer) clearTimeout(staleTimer);
-    if (hardTimer) clearTimeout(hardTimer);
-
-    const durationMs = Date.now() - startTime;
-    this.releaseSlot();
-    this.releaseSessionLock(resolvedLockKey);
-
-    if (!lastResult) {
-      return {
-        result: {
-          response: hasError ? 'Claude 执行失败' : '(空回复)',
-          costUsd: 0,
-          durationMs,
-          sessionId: sessionId ?? '',
-          jsonlPath: null,
-          sessionStatus: hasError ? 'degraded' : 'active',
-          error: hasError ? 'no_result_returned' : undefined,
-        },
-        handler,
-      };
-    }
-
-    const resolvedSessionId = (lastResult.session_id as string) || (sessionId ?? '');
-    let jsonlPath: string | null = null;
-    let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasError ? 'degraded' : 'active';
-
-    if (isNew && resolvedSessionId) {
-      jsonlPath = await resolveJsonlPath(resolvedSessionId);
-      if (!jsonlPath && sessionStatus === 'active') {
-        sessionStatus = 'provisioning';
-      }
-    }
-
-    return {
-      result: {
-        response: (lastResult.result as string) ?? (hasError ? 'Claude 执行失败' : '(空回复)'),
-        costUsd: (lastResult.total_cost_usd as number) ?? 0,
-        durationMs: (lastResult.duration_ms as number) ?? durationMs,
-        sessionId: resolvedSessionId,
-        jsonlPath,
-        sessionStatus,
-        error: hasError ? ((lastResult.errors as string[])?.join('; ') ?? 'unknown_error') : undefined,
-        tokensIn: (lastResult.usage as any)?.input_tokens,
-        tokensOut: (lastResult.usage as any)?.output_tokens,
-      },
-      handler,
-    };
   }
 
   /** Acquire per-session lock to prevent concurrent messages to same session */

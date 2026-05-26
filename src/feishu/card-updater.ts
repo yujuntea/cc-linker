@@ -107,8 +107,9 @@ export class CardUpdater {
     toolName: string,
     action: string,
     promptIndex: number,
+    handlerId: string,
   ): Promise<string> {
-    const card = this.buildPermissionCard(toolName, action, promptIndex);
+    const card = this.buildPermissionCard(toolName, action, promptIndex, handlerId);
     const resp = await this.client.im.v1.message.create({
       params: { receive_id_type: 'open_id' },
       data: {
@@ -142,6 +143,7 @@ export class CardUpdater {
     toolName: string,
     action: string,
     promptIndex: number,
+    handlerId: string,
   ): Record<string, unknown> {
     const actionLabel = this.getToolActionLabel(toolName);
     return {
@@ -162,13 +164,13 @@ export class CardUpdater {
               tag: 'button',
               text: { tag: 'plain_text', content: '✅ 允许' },
               type: 'primary',
-              value: { type: 'permission_approve', index: promptIndex },
+              value: { type: 'permission_approve', index: promptIndex, handlerId },
             },
             {
               tag: 'button',
               text: { tag: 'plain_text', content: '❌ 拒绝' },
               type: 'default',
-              value: { type: 'permission_deny', index: promptIndex },
+              value: { type: 'permission_deny', index: promptIndex, handlerId },
             },
           ],
         },
