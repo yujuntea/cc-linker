@@ -1,5 +1,5 @@
-import { basename, resolve } from 'path';
-import { existsSync } from 'fs';
+import { basename, dirname, resolve } from 'path';
+import { existsSync, readdirSync } from 'fs';
 import { UserManager } from './mapping';
 import { ListSnapshotManager, ListSnapshotEntry } from './list-snapshot';
 import { SpoolQueue, SpoolMessage, TargetSnapshot } from '../queue/spool';
@@ -250,6 +250,16 @@ export class FeishuBot {
     return entry?.defaultProvider ?? null;
   }
 
+  /** Resolve the user's current working directory for /listDir */
+  private getCwdForUser(openId: string): string {
+    const entry = this.userManager.getEntry(openId);
+    if (entry?.type === 'session' && entry.sessionUuid) {
+      return entry.cwd || this.registry.get(entry.sessionUuid)?.cwd || '';
+    }
+    if (entry?.cwd) return entry.cwd;
+    return config.get<string>('feishu_bot.default_cwd', '');
+  }
+
   /** Handle card action callback from Feishu (card.action.trigger via WSClient) */
   async handleCardAction(payload: FeishuBotCardAction): Promise<string | null> {
     const { open_id: openId, action, message } = payload;
@@ -306,6 +316,8 @@ export class FeishuBot {
         await this.replyFn(reply, { messageId, openId, requestUuid: uniqueUuid() });
         return reply;
       }
+      case 'select_dir':
+        return await this.doSelectDir(openId, sessionId, messageId);
       case 'status': {
         const reply = await this.doStatus(openId);
         await this.replyFn(reply, { messageId, openId, requestUuid: uniqueUuid() });
@@ -407,6 +419,10 @@ export class FeishuBot {
 
       case 'list':
         await this.handleList(msg);
+        return;
+
+      case 'listdir':
+        await this.handleListDir(msg);
         return;
 
       case 'new':
@@ -1079,6 +1095,10 @@ export class FeishuBot {
     await this.doCardList(msg.openId, msg.messageId, msg);
   }
 
+  private async handleListDir(msg: SpoolMessage): Promise<void> {
+    await this.doListDir(msg.openId, msg.messageId, msg);
+  }
+
   private async handleNew(msg: SpoolMessage, rawArgs: string): Promise<void> {
     const { cwd: rawCwd, prompt, providerAlias } = parseNewCommand(rawArgs);
     const defaultCwd = config.get<string>('feishu_bot.default_cwd', '');
@@ -1319,6 +1339,7 @@ export class FeishuBot {
       '可用命令:',
       '  /help                              - 显示此帮助',
       '  /list                              - 列出会话',
+      '  /listDir                            - 浏览目录',
       '  /new [路径] [-- prompt]            - 创建新会话',
       '  /new [路径] --model <别名> [-- p]  - 指定模型创建会话',
       '  /switch <序号|UUID>                - 切换会话',
@@ -1627,6 +1648,101 @@ export class FeishuBot {
     return swapped ? '✅ 已清除默认模型设置' : '⚠️ 清除失败，请重试';
   }
 
+  private async doListDir(openId: string, messageId?: string, msg?: SpoolMessage): Promise<void> {
+    const cwd = this.getCwdForUser(openId);
+    if (!cwd) {
+      const reply = '未配置工作目录，请先在 config.toml 中设置 feishu_bot.default_cwd，或使用 /new <路径>。';
+      if (msg) await this.replyAndFinalize(msg, reply);
+      else await this.replyFn(reply, { messageId, openId, requestUuid: uniqueUuid() });
+      return;
+    }
+
+    const normalized = normalizeCwd(cwd);
+    const validationError = validateCwd(normalized);
+    if (validationError) {
+      if (msg) await this.replyAndFinalize(msg, validationError);
+      else await this.replyFn(validationError, { messageId, openId, requestUuid: uniqueUuid() });
+      return;
+    }
+
+    let entries: string[];
+    try {
+      entries = readdirSync(normalized, { withFileTypes: true })
+        .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+        .map(e => e.name)
+        .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    } catch (err: any) {
+      const reply = `❌ 无法读取目录: ${err.message}`;
+      if (msg) await this.replyAndFinalize(msg, reply);
+      else await this.replyFn(reply, { messageId, openId, requestUuid: uniqueUuid() });
+      return;
+    }
+
+    const hasMore = entries.length > MAX_DIR_LIST_ITEMS;
+    const displayDirs = entries.slice(0, MAX_DIR_LIST_ITEMS);
+
+    const parent = normalized !== dirname(normalized) ? dirname(normalized) : null;
+
+    const card = buildDirListCard(normalized, displayDirs, parent);
+    const replyId = await this.cardReplyFn(card, { messageId, openId });
+
+    if (replyId) {
+      if (msg) {
+        this.spoolQueue.recordDelivery(msg.messageId, 'sent', stableUuid(msg.messageId, 0), 0, replyId, 1);
+        this.spoolQueue.markReplied(msg.messageId, msg.serialKey, replyId);
+        this.spoolQueue.markDone(msg.messageId, msg.serialKey, replyId);
+      } else {
+        this.spoolQueue.recordReceipt(messageId ?? '');
+      }
+    } else {
+      const lines = [`📂 目录浏览: ${normalized}`, ''];
+      if (parent) lines.push(`⬆️ 上级目录: ${parent}`);
+      if (displayDirs.length === 0) {
+        lines.push('📁 当前目录下没有子目录');
+      } else {
+        for (const dir of displayDirs) {
+          lines.push(`📁 ${dir}`);
+        }
+      }
+      if (hasMore) lines.push(`\n... 还有 ${entries.length - MAX_DIR_LIST_ITEMS} 个子目录未显示`);
+      lines.push('\n💡 使用 /new <路径> 切换到指定目录');
+      if (msg) await this.replyAndFinalize(msg, lines.join('\n'));
+      else await this.replyFn(lines.join('\n'), { messageId, openId, requestUuid: uniqueUuid() });
+    }
+  }
+
+  private async doSelectDir(openId: string, path: string, messageId?: string): Promise<string> {
+    if (!path) {
+      return '参数错误：缺少目录路径';
+    }
+
+    const normalized = normalizeCwd(path);
+    const validationError = validateCwd(normalized);
+    if (validationError) return validationError;
+
+    if (!existsSync(normalized)) {
+      return `❌ 目录 ${normalized} 不存在`;
+    }
+
+    const currentEntry = this.userManager.getEntry(openId);
+    const swapped = await this.userManager.compareAndSwap(
+      openId,
+      currentEntry ?? null,
+      {
+        ...currentEntry,
+        type: 'pending_new_session',
+        sessionUuid: null,
+        createdAt: currentEntry?.createdAt ?? new Date().toISOString(),
+        cwd: normalized,
+      },
+    );
+
+    if (!swapped) return '⚠️ 操作冲突，请重试';
+
+    this.spoolQueue.recordReceipt(messageId ?? '');
+    return `✅ 已切换到 ${normalized}\n发送消息即可在该目录创建新会话。`;
+  }
+
   private async doResume(openId: string, uuid: string, messageId?: string): Promise<string> {
     const entry = this.registry.get(uuid);
     if (!entry) return '未找到对应会话，请先执行 /list。';
@@ -1759,6 +1875,58 @@ function buildModelCard(
     config: { wide_screen_mode: true },
     elements,
     header: { title: { tag: 'plain_text', content: '🤖 模型选择' }, template: 'blue' },
+  };
+}
+
+const MAX_DIR_LIST_ITEMS = 15;
+
+/** Build a directory listing card with enter/parent action buttons */
+function buildDirListCard(
+  cwd: string,
+  dirs: string[],
+  parent: string | null,
+): Record<string, unknown> {
+  const elements: Array<Record<string, unknown>> = [];
+
+  elements.push({
+    tag: 'markdown',
+    content: `**当前路径：**\n\`${cwd}\``,
+  });
+
+  if (parent) {
+    elements.push({
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '⬆️ 上级目录' },
+        type: 'default',
+        value: { tag: 'select_dir', sessionId: parent },
+      }],
+    });
+  }
+
+  if (dirs.length === 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({ tag: 'markdown', content: '📁 当前目录下没有子目录' });
+  } else {
+    elements.push({ tag: 'hr' });
+    for (const dir of dirs) {
+      elements.push({
+        tag: 'action',
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: `📁 ${dir}` },
+          type: 'primary',
+          value: { tag: 'select_dir', sessionId: `${cwd}/${dir}` },
+        }],
+      });
+    }
+  }
+
+  return {
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: '📂 目录浏览' }, template: 'blue' },
+    elements,
   };
 }
 

@@ -126,6 +126,19 @@ describe('FeishuBot', () => {
     expect(replies.some(r => r.includes('我的会话'))).toBe(true);
   });
 
+  it('/help includes /listDir', async () => {
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-help-listdir',
+      content: JSON.stringify({ text: '/help' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(replies.some(r => r.includes('listDir'))).toBe(true);
+  });
+
   it('rejects unknown commands', async () => {
     await bot.onMessage({
       open_id: 'ou_user1',
@@ -660,5 +673,271 @@ describe('FeishuBot cards', () => {
     const card = cardReplies[0] as Record<string, unknown>;
     expect(card.config).toEqual({ wide_screen_mode: true });
     expect(card.header).toBeDefined();
+  });
+});
+
+describe('FeishuBot /listDir', () => {
+  let tmpDir: string;
+  let bot: FeishuBot;
+  let textReplies: string[];
+  let cardReplies: Record<string, unknown>[];
+  let userManager: UserManager;
+  let registry: RegistryManager;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'listdir-test-'));
+    mkdirSync(join(tmpDir, 'project-a'), { recursive: true });
+    mkdirSync(join(tmpDir, 'project-b'), { recursive: true });
+    mkdirSync(join(tmpDir, '.hidden-dir'), { recursive: true });
+
+    textReplies = [];
+    cardReplies = [];
+    (config as any).data.feishu_bot.owner_open_id = '';
+    (config as any).data.feishu_bot.default_cwd = tmpDir;
+    (config as any).data.security.allowed_roots = [];
+    (config as any).data.security.denied_roots = [];
+    (config as any).data.stream.enabled = false;
+    (config as any).data.sdk.enabled = false;
+
+    const replyFn: FeishuReplyFn = async (text: string): Promise<string | null> => {
+      textReplies.push(text);
+      return `reply-${textReplies.length}`;
+    };
+    const cardReplyFn = async (card: Record<string, unknown>): Promise<string | null> => {
+      cardReplies.push(card);
+      return `card-${cardReplies.length}`;
+    };
+
+    userManager = new UserManager(join(tmpDir, 'user-mapping.json'));
+    const listSnapshotManager = new ListSnapshotManager(join(tmpDir, 'list-snapshot.json'));
+    const spoolQueue = new SpoolQueue(tmpDir);
+    registry = new RegistryManager(tmpDir);
+
+    bot = new FeishuBot({
+      userManager,
+      listSnapshotManager,
+      spoolQueue,
+      registry,
+      sessionManager: new ClaudeSessionManager(),
+      replyFn,
+      cardReplyFn,
+    });
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('/listDir uses default_cwd when no session exists', async () => {
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-1',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(cardReplies.length).toBe(1);
+    const card = cardReplies[0];
+    expect(card.header).toBeDefined();
+    const elements = card.elements as unknown[];
+    const mdContent = elements
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content)
+      .join('\n');
+    expect(mdContent).toContain(tmpDir);
+    // Check button text for subdirectories
+    const actions = elements.filter((e: any) => e.tag === 'action');
+    const buttonTexts = actions.flatMap((e: any) => e.actions).map((b: any) => b.text?.content ?? '');
+    expect(buttonTexts.some((t: string) => t.includes('project-a'))).toBe(true);
+    expect(buttonTexts.some((t: string) => t.includes('project-b'))).toBe(true);
+  });
+
+  it('/listDir uses active session cwd', async () => {
+    const sessionCwd = join(tmpDir, 'project-a');
+    await userManager.compareAndSwap('ou_user1', null, {
+      type: 'session',
+      sessionUuid: 'sess-1',
+      createdAt: new Date().toISOString(),
+      cwd: sessionCwd,
+    });
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-2',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(cardReplies.length).toBe(1);
+    const elements = cardReplies[0].elements as unknown[];
+    const mdContent = elements
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content)
+      .join('\n');
+    expect(mdContent).toContain(sessionCwd);
+  });
+
+  it('/listDir filters hidden directories', async () => {
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-3',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(cardReplies.length).toBe(1);
+    const elements = cardReplies[0].elements as unknown[];
+    const mdContent = elements
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content)
+      .join('\n');
+    expect(mdContent).not.toContain('.hidden-dir');
+  });
+
+  it('/listDir shows parent directory button when not at root', async () => {
+    await userManager.compareAndSwap('ou_user1', null, {
+      type: 'pending_new_session',
+      sessionUuid: null,
+      createdAt: new Date().toISOString(),
+      cwd: join(tmpDir, 'project-a'),
+    });
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-4',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(cardReplies.length).toBe(1);
+    const elements = cardReplies[0].elements as unknown[];
+    const actions = elements.filter((e: any) => e.tag === 'action');
+    const allButtons = actions.flatMap((e: any) => e.actions);
+    const parentBtn = allButtons.find((b: any) =>
+      b.text?.content?.includes('上级目录')
+    );
+    expect(parentBtn).toBeDefined();
+  });
+
+  it('/listDir shows empty message when no subdirectories', async () => {
+    const emptyDir = join(tmpDir, 'empty-dir');
+    mkdirSync(emptyDir, { recursive: true });
+
+    await userManager.compareAndSwap('ou_user1', null, {
+      type: 'pending_new_session',
+      sessionUuid: null,
+      createdAt: new Date().toISOString(),
+      cwd: emptyDir,
+    });
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-5',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(cardReplies.length).toBe(1);
+    const elements = cardReplies[0].elements as unknown[];
+    const mdContent = elements
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content)
+      .join('\n');
+    expect(mdContent).toContain('没有子目录');
+  });
+
+  it('/listDir rejects non-existent cwd', async () => {
+    await userManager.compareAndSwap('ou_user1', null, {
+      type: 'pending_new_session',
+      sessionUuid: null,
+      createdAt: new Date().toISOString(),
+      cwd: '/nonexistent/path',
+    });
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-6',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(textReplies.some(r => r.includes('不存在'))).toBe(true);
+  });
+
+  it('handleCardAction routes select_dir', async () => {
+    const targetDir = join(tmpDir, 'project-a');
+
+    const result = await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'select_dir', value: targetDir },
+      message: { message_id: 'msg-dir-1' },
+    });
+
+    expect(result).toContain('已切换到');
+    expect(result).toContain(targetDir);
+
+    const entry = userManager.getEntry('ou_user1');
+    expect(entry?.type).toBe('pending_new_session');
+    expect(entry?.cwd).toBe(targetDir);
+    expect(entry?.sessionUuid).toBeNull();
+  });
+
+  it('handleCardAction select_dir rejects non-existent path', async () => {
+    const result = await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'select_dir', value: '/nonexistent/path' },
+      message: { message_id: 'msg-dir-2' },
+    });
+
+    expect(result).toContain('不存在');
+  });
+
+  it('handleCardAction select_dir rejects denied path', async () => {
+    (config as any).data.security.denied_roots = [tmpDir];
+
+    const result = await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'select_dir', value: join(tmpDir, 'project-a') },
+      message: { message_id: 'msg-dir-3' },
+    });
+
+    expect(result).toContain('禁止');
+  });
+
+  it('/listDir card contains enter buttons with correct values', async () => {
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-card',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(cardReplies.length).toBe(1);
+    const elements = cardReplies[0].elements as unknown[];
+    const actions = elements.filter((e: any) => e.tag === 'action');
+    const allButtons = actions.flatMap((e: any) => e.actions);
+
+    const enterBtns = allButtons.filter((b: any) =>
+      b.value?.tag === 'select_dir' && !b.text?.content?.includes('上级')
+    );
+    expect(enterBtns.length).toBeGreaterThanOrEqual(2);
+
+    const paths = enterBtns.map((b: any) => b.value.sessionId);
+    expect(paths.some((p: string) => p.endsWith('/project-a'))).toBe(true);
+    expect(paths.some((p: string) => p.endsWith('/project-b'))).toBe(true);
   });
 });
