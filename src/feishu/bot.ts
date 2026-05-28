@@ -15,13 +15,19 @@ import { logger } from '../utils/logger';
 import { repairJsonlLastPrompt } from '../utils/jsonl-repair';
 import { formatTimeAgo } from '../cli/output';
 import { ProviderManager } from '../utils/providers';
+import {
+  extractImageKey,
+  downloadMessageImage,
+  buildPromptWithImages,
+  cleanupOldImages,
+} from './image';
 
 export type FeishuMessageEvent = {
   open_id: string;
   message_id: string;
   content: string;
   chat_type: 'p2p' | 'group';
-  message_type: 'text';
+  message_type: 'text' | 'image';
 };
 
 export type FeishuReplyFn = (
@@ -79,6 +85,7 @@ export class FeishuBot {
   private stopRequested = false;
   private activeWorkers = new Set<Promise<void>>();
   private activePermissionHandlers = new Map<string, PermissionHandler>();
+  private lastImageCleanup = 0;
 
   constructor(opts: {
     userManager: UserManager;
@@ -108,8 +115,8 @@ export class FeishuBot {
       return;
     }
 
-    if (event.message_type !== 'text') {
-      logger.debug(`忽略非文本消息: ${event.message_id} (message_type=${event.message_type})`);
+    if (!['text', 'image'].includes(event.message_type)) {
+      logger.debug(`忽略不支持的消息类型: ${event.message_id} (message_type=${event.message_type})`);
       return;
     }
 
@@ -128,17 +135,60 @@ export class FeishuBot {
     }
 
     let text = '';
-    try {
-      const content = JSON.parse(event.content);
-      text = content.text ?? '';
-    } catch {
-      text = event.content;
+    let imagePaths: string[] = [];
+
+    if (event.message_type === 'image') {
+      if (!config.get<boolean>('images.enabled', true)) {
+        await this.replyFn('⚠️ 图片处理功能已禁用', {
+          messageId: event.message_id,
+          openId: event.open_id,
+          requestUuid: stableUuid(event.message_id),
+        });
+        return;
+      }
+
+      if (!this.feishuClient) {
+        await this.replyFn('⚠️ 图片处理功能未就绪（缺少飞书客户端配置），请发送文字消息。', {
+          messageId: event.message_id,
+          openId: event.open_id,
+          requestUuid: stableUuid(event.message_id),
+        });
+        return;
+      }
+
+      const imageKey = extractImageKey(event.content);
+      if (!imageKey) {
+        logger.warn(`图片消息解析失败: ${event.message_id}, content=${event.content}`);
+        return;
+      }
+
+      try {
+        const localPath = await downloadMessageImage(
+          this.feishuClient, event.message_id, imageKey,
+        );
+        imagePaths = [localPath];
+        text = '';
+      } catch (err: any) {
+        logger.error(`图片下载失败: ${event.message_id}: ${err.message}`);
+        await this.replyFn(`⚠️ 图片下载失败: ${err.message}`, {
+          messageId: event.message_id,
+          openId: event.open_id,
+          requestUuid: stableUuid(event.message_id),
+        });
+        return;
+      }
+    } else {
+      try {
+        const content = JSON.parse(event.content);
+        text = content.text ?? '';
+      } catch {
+        text = event.content;
+      }
+      text = text.trim();
     }
 
-    text = text.trim();
-    if (!text) return;
+    if (!text && imagePaths.length === 0) return;
 
-    // P0-2: 消息长度限制
     const MAX_MESSAGE_LENGTH = 10000;
     if (text.length > MAX_MESSAGE_LENGTH) {
       await this.replyFn(
@@ -166,6 +216,7 @@ export class FeishuBot {
       status: 'pending',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      imagePaths,
     };
 
     const enqueued = this.spoolQueue.enqueue(spoolMsg);
@@ -185,6 +236,12 @@ export class FeishuBot {
 
     try {
       while (!this.stopRequested) {
+        const now = Date.now();
+        if (now - this.lastImageCleanup > 60 * 60 * 1000) {
+          cleanupOldImages();
+          this.lastImageCleanup = now;
+        }
+
         const maxConcurrency = config.get<number>('queue.worker_concurrency', 5);
 
         while (this.activeWorkers.size < maxConcurrency) {
@@ -261,7 +318,9 @@ export class FeishuBot {
   }
 
   /** Handle card action callback from Feishu (card.action.trigger via WSClient) */
-  async handleCardAction(payload: FeishuBotCardAction): Promise<string | null> {
+  async handleCardAction(
+    payload: FeishuBotCardAction,
+  ): Promise<string | Record<string, unknown> | null> {
     const { open_id: openId, action, message } = payload;
     const { tag, value } = action;
     const messageId = message?.message_id;
@@ -272,7 +331,7 @@ export class FeishuBot {
     }
 
     // Check for permission card interactions first
-    const valueObj = typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
+    const valueObj = typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : null;
     if (valueObj && (valueObj.type === 'permission_approve' || valueObj.type === 'permission_deny')) {
       const index = Number(valueObj.index);
       const handlerId = typeof valueObj.handlerId === 'string' ? valueObj.handlerId : '';
@@ -331,36 +390,69 @@ export class FeishuBot {
     }
   }
 
-  /** Handle permission card button click */
+  /** Handle permission card button click — also returns card for WS response update */
   private async handlePermissionCardAction(
     openId: string,
     approved: boolean,
     index: number,
     handlerId: string,
     messageId?: string,
-  ): Promise<string | null> {
+  ): Promise<string | Record<string, unknown> | null> {
     const handler = this.activePermissionHandlers.get(handlerId);
     if (!handler) {
       logger.warn(`Permission card: no active handler for handlerId=${handlerId}`);
-      return '权限确认已过期，请重试';
+      return {
+        config: { wide_screen_mode: true },
+        header: { title: { tag: 'plain_text', content: '⏱ 已过期' }, template: 'grey' },
+        elements: [{ tag: 'markdown', content: '**权限确认已过期**，请重新触发该操作。' }],
+      };
+    }
+
+    // Delay patch to avoid racing with Feishu's card action processing lock.
+    // Feishu may lock the card during event handling; patching immediately
+    // can be silently ignored. A short delay lets the event finish first.
+    if (this.feishuClient && messageId) {
+      setTimeout(async () => {
+        try {
+          logger.info(`Permission card: delayed patch starting, messageId=${messageId}`);
+          const cardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
+          cardUpdater.setCardMessageId(messageId);
+          if (approved) {
+            await cardUpdater.updatePermissionCardToProcessing();
+          } else {
+            await cardUpdater.updatePermissionCard(false);
+          }
+          logger.info(`Permission card: delayed patch completed, messageId=${messageId}`);
+        } catch (err: any) {
+          logger.warn(`Permission card: delayed patch failed: ${err}`);
+        }
+      }, 1200);
     }
 
     const resolved = handler.resolveUserDecision(index, approved);
     if (!resolved) {
-      return '权限确认已过期，请重试';
+      return {
+        config: { wide_screen_mode: true },
+        header: { title: { tag: 'plain_text', content: '⏱ 已过期' }, template: 'grey' },
+        elements: [{ tag: 'markdown', content: '**权限确认已过期**，请重新触发该操作。' }],
+      };
     }
 
-    if (this.feishuClient && messageId) {
-      try {
-        const cardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
-        cardUpdater.setCardMessageId(messageId);
-        await cardUpdater.updatePermissionCard(approved);
-      } catch (err: any) {
-        logger.warn(`Permission card: update failed: ${err}`);
-      }
+    // Return the new card directly — WSClient will send this back to Feishu
+    // as the response to card.action.trigger, which should update the UI immediately.
+    if (approved) {
+      return {
+        config: { wide_screen_mode: true },
+        header: { title: { tag: 'plain_text', content: '⏳ 处理中...' }, template: 'blue' },
+        elements: [{ tag: 'markdown', content: '**已允许**，Claude 正在执行该操作...' }],
+      };
     }
 
-    return approved ? '✅ 已允许，Claude 将继续执行' : '❌ 已拒绝，Claude 将尝试其他方式';
+    return {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '❌ 已拒绝' }, template: 'red' },
+      elements: [{ tag: 'markdown', content: '操作已被拒绝，Claude 将尝试其他方式。' }],
+    };
   }
 
   /** Claim one message from pending queue */
@@ -462,7 +554,7 @@ export class FeishuBot {
         const currentEntry = this.registry.get(sessionUuid);
         const cwd = msg.target.cwd || currentEntry?.cwd || process.env.HOME || '/';
 
-        const useSDK = config.get<boolean>('sdk.enabled', false);
+        const useSDK = config.get<boolean>('sdk.enabled', true);
         if (useSDK) {
           await this.handleChatSDK(msg, sessionUuid, cwd, currentEntry);
         } else if (config.get<boolean>('stream.enabled', false)) {
@@ -487,7 +579,7 @@ export class FeishuBot {
           return;
         }
 
-        const useSDK = config.get<boolean>('sdk.enabled', false);
+        const useSDK = config.get<boolean>('sdk.enabled', true);
         if (useSDK) {
           await this.createSessionFromPromptSDK(msg, msg.target.cwd ?? claimResult.entry.cwd ?? '', claimMessageId, msg.text);
         } else if (config.get<boolean>('stream.enabled', false)) {
@@ -520,7 +612,8 @@ export class FeishuBot {
     msg: SpoolMessage, sessionUuid: string, cwd: string, currentEntry: any,
   ): Promise<void> {
     const settingsPath = this.getSettingsPathForUser(msg.openId);
-    const result = await this.sessionManager.sendMessage(sessionUuid, msg.text, cwd, false, msg.serialKey, settingsPath);
+    const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
+    const result = await this.sessionManager.sendMessage(sessionUuid, promptText, cwd, false, msg.serialKey, settingsPath);
 
     this.spoolQueue.updateProcessingMessage(msg.messageId, msg.serialKey, {
       responseText: result.response || '(空回复)',
@@ -529,7 +622,7 @@ export class FeishuBot {
     this.registry.upsert(sessionUuid, {
       cwd,
       last_active: new Date().toISOString(),
-      last_message_preview: preview(msg.text),
+      last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
       last_error: result.error ?? null,
       status: result.sessionStatus === 'degraded' ? 'degraded' : 'active',
       jsonl_path: result.jsonlPath ?? undefined,
@@ -577,8 +670,9 @@ export class FeishuBot {
 
     try {
       const settingsPath = this.getSettingsPathForUser(msg.openId);
+      const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
       const result = await this.sessionManager.sendStreamingMessage(
-        sessionUuid, msg.text, cwd,
+        sessionUuid, promptText, cwd,
         (chunk: StreamChunk) => {
           if (cardInitFailed || !cardUpdater) return;
           if (chunk.type === 'thinking') thinking += chunk.content;
@@ -612,7 +706,7 @@ export class FeishuBot {
 
       // Update registry
       this.registry.upsert(sessionUuid, {
-        cwd, last_active: new Date().toISOString(), last_message_preview: preview(msg.text),
+        cwd, last_active: new Date().toISOString(), last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
         last_error: result.error ?? null,
         status: result.sessionStatus === 'degraded' ? 'degraded' : 'active',
         jsonl_path: result.jsonlPath ?? undefined,
@@ -659,6 +753,7 @@ export class FeishuBot {
     let cardMessageId: string | null = null;
     let cardInitFailed = false;
     let currentHandler: PermissionHandler | null = null;
+    let permCardMessageId: string | null = null;
 
     try {
       if (this.feishuClient) {
@@ -676,8 +771,9 @@ export class FeishuBot {
 
     try {
       const settingsPath = this.getSettingsPathForUser(msg.openId);
+      const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
       const { result, handler } = await this.sessionManager.sendSDKMessage(
-        sessionUuid, msg.text, cwd,
+        sessionUuid, promptText, cwd,
         (chunk: StreamChunk) => {
           if (cardInitFailed || !cardUpdater) return;
           if (chunk.type === 'thinking') thinking += chunk.content;
@@ -699,7 +795,7 @@ export class FeishuBot {
           // Store handler BEFORE await so user clicks during card creation are handled
           this.activePermissionHandlers.set(sdkHandler.getHandlerId(), sdkHandler);
           try {
-            await permCardUpdater.createPermissionCard(
+            permCardMessageId = await permCardUpdater.createPermissionCard(
               msg.openId, prompt.toolName, actionText, prompt.index, sdkHandler.getHandlerId(),
             );
           } catch (err: any) {
@@ -716,25 +812,42 @@ export class FeishuBot {
       );
       currentHandler = handler;
 
+      // Defensive: if streaming text is empty but result.response has content,
+      // fall back to result.response (e.g. when SDK partial messages are not emitted).
+      const finalText = text || result.response || '(空回复)';
+
       if (cardUpdater) {
-        if (cardUpdater.shouldFallbackToText(text)) {
-          const truncated = cardUpdater.truncateContent(text);
+        if (cardUpdater.shouldFallbackToText(finalText)) {
+          const truncated = cardUpdater.truncateContent(finalText);
           await cardUpdater.complete(truncated, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
-          const remainder = text.slice(truncated.length);
+          const remainder = finalText.slice(truncated.length);
           if (remainder && config.get<boolean>('stream.fallback_to_text', true)) {
             for (const chunk of splitReplyText(remainder, 3900)) {
               await this.replyFn(chunk, { messageId: msg.messageId, openId: msg.openId });
             }
           }
         } else {
-          await cardUpdater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+          await cardUpdater.complete(finalText, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
         }
         cardMessageId = cardUpdater.getCardMessageId();
         cardUpdater.dispose();
       }
 
+      // Update permission card to completed state after operation finishes
+      if (permCardMessageId && this.feishuClient) {
+        setTimeout(async () => {
+          try {
+            const permCardUpdater = new CardUpdater(this.feishuClient!, { throttle_ms: 0 });
+            permCardUpdater.setCardMessageId(permCardMessageId!);
+            await permCardUpdater.updatePermissionCardToCompleted();
+          } catch (e: any) {
+            logger.warn(`SDK Stream: permission card completion update failed: ${e}`);
+          }
+        }, 1200);
+      }
+
       this.registry.upsert(sessionUuid, {
-        cwd, last_active: new Date().toISOString(), last_message_preview: preview(msg.text),
+        cwd, last_active: new Date().toISOString(), last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
         last_error: result.error ?? null,
         status: result.sessionStatus === 'degraded' ? 'degraded' : 'active',
         jsonl_path: result.jsonlPath ?? undefined,
@@ -817,8 +930,9 @@ export class FeishuBot {
 
     try {
       const settingsPath = this.getSettingsPathForUser(msg.openId);
+      const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
       const result = await this.sessionManager.sendStreamingMessage(
-        null, prompt, cwd,
+        null, promptText, cwd,
         (chunk: StreamChunk) => {
           if (cardInitFailed || !cardUpdater) return;
           if (chunk.type === 'thinking') thinking += chunk.content;
@@ -880,7 +994,7 @@ export class FeishuBot {
         message_count: Math.max(this.registry.get(result.sessionId)?.message_count ?? 0, 1),
         created_at: this.registry.get(result.sessionId)?.created_at ?? now,
         last_active: now,
-        last_message_preview: preview(prompt),
+        last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
         status: result.sessionStatus,
         jsonl_path: result.jsonlPath,
         pending_jsonl_resolve: !result.jsonlPath,
@@ -956,8 +1070,9 @@ export class FeishuBot {
 
     try {
       const settingsPath = this.getSettingsPathForUser(msg.openId);
+      const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
       const { result, handler } = await this.sessionManager.sendSDKMessage(
-        null, prompt, cwd,
+        null, promptText, cwd,
         (chunk: StreamChunk) => {
           if (cardInitFailed || !cardUpdater) return;
           if (chunk.type === 'thinking') thinking += chunk.content;
@@ -1017,18 +1132,22 @@ export class FeishuBot {
         throw new Error('新会话已创建，但映射绑定失败');
       }
 
+      // Defensive: if streaming text is empty but result.response has content,
+      // fall back to result.response (e.g. when SDK partial messages are not emitted).
+      const finalText = text || result.response || '(空回复)';
+
       if (cardUpdater) {
-        if (cardUpdater.shouldFallbackToText(text)) {
-          const truncated = cardUpdater.truncateContent(text);
+        if (cardUpdater.shouldFallbackToText(finalText)) {
+          const truncated = cardUpdater.truncateContent(finalText);
           await cardUpdater.complete(truncated, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
-          const remainder = text.slice(truncated.length);
+          const remainder = finalText.slice(truncated.length);
           if (remainder && config.get<boolean>('stream.fallback_to_text', true)) {
             for (const chunk of splitReplyText(remainder, 3900)) {
               await this.replyFn(chunk, { messageId: msg.messageId, openId: msg.openId });
             }
           }
         } else {
-          await cardUpdater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+          await cardUpdater.complete(finalText, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
         }
         cardMessageId = cardUpdater.getCardMessageId();
         cardUpdater.dispose();
@@ -1042,7 +1161,7 @@ export class FeishuBot {
         message_count: Math.max(this.registry.get(result.sessionId)?.message_count ?? 0, 1),
         created_at: this.registry.get(result.sessionId)?.created_at ?? now,
         last_active: now,
-        last_message_preview: preview(prompt),
+        last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
         status: result.sessionStatus,
         jsonl_path: result.jsonlPath,
         pending_jsonl_resolve: !result.jsonlPath,
@@ -1102,7 +1221,8 @@ export class FeishuBot {
   private async handleNew(msg: SpoolMessage, rawArgs: string): Promise<void> {
     const { cwd: rawCwd, prompt, providerAlias } = parseNewCommand(rawArgs);
     const defaultCwd = config.get<string>('feishu_bot.default_cwd', '');
-    const cwd = normalizeCwd(rawCwd || defaultCwd);
+    const existingCwd = this.userManager.getEntry(msg.openId)?.cwd;
+    const cwd = normalizeCwd(rawCwd || existingCwd || defaultCwd);
 
     // If --model specified, set defaultProvider first
     if (providerAlias) {
@@ -1187,7 +1307,7 @@ export class FeishuBot {
       return;
     }
 
-    const useSDK = config.get<boolean>('sdk.enabled', false);
+    const useSDK = config.get<boolean>('sdk.enabled', true);
     if (useSDK) {
       await this.createSessionFromPromptSDK(msg, cwd, msg.messageId, prompt);
     } else if (config.get<boolean>('stream.enabled', false)) {
@@ -1400,7 +1520,8 @@ export class FeishuBot {
     prompt = msg.text,
   ): Promise<void> {
     const settingsPath = this.getSettingsPathForUser(msg.openId);
-    const result = await this.sessionManager.sendMessage(null, prompt, cwd, true, `new:${msg.openId}`, settingsPath);
+    const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
+    const result = await this.sessionManager.sendMessage(null, promptText, cwd, true, `new:${msg.openId}`, settingsPath);
 
     if (!result.sessionId) {
       await this.userManager.rollbackClaim(msg.openId, claimMessageId);
@@ -1432,7 +1553,7 @@ export class FeishuBot {
       message_count: Math.max(this.registry.get(result.sessionId)?.message_count ?? 0, 1),
       created_at: this.registry.get(result.sessionId)?.created_at ?? now,
       last_active: now,
-      last_message_preview: preview(prompt),
+      last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
       status: result.sessionStatus,
       jsonl_path: result.jsonlPath,
       pending_jsonl_resolve: !result.jsonlPath,
@@ -1550,7 +1671,7 @@ export class FeishuBot {
     }
 
     const defaultCwd = config.get<string>('feishu_bot.default_cwd', '');
-    const cwd = defaultCwd || process.env.HOME || '';
+    const cwd = normalizeCwd(currentEntry?.cwd || defaultCwd || process.env.HOME || '');
     if (!cwd) {
       await this.replyFn('未配置默认工作目录，请先在 config.toml 中设置 feishu_bot.default_cwd。', { messageId, openId, requestUuid: uniqueUuid() });
       this.spoolQueue.recordReceipt(messageId ?? '');
@@ -1683,7 +1804,7 @@ export class FeishuBot {
 
     const parent = normalized !== dirname(normalized) ? dirname(normalized) : null;
 
-    const card = buildDirListCard(normalized, displayDirs, parent);
+    const card = buildDirListCard(normalized, displayDirs, parent, hasMore, entries.length);
     const replyId = await this.cardReplyFn(card, { messageId, openId });
 
     if (replyId) {
@@ -1723,12 +1844,6 @@ export class FeishuBot {
     if (validationError) {
       await this.replyFn(validationError, { messageId, openId, requestUuid: uniqueUuid() });
       return validationError;
-    }
-
-    if (!existsSync(normalized)) {
-      const reply = `❌ 目录 ${normalized} 不存在`;
-      await this.replyFn(reply, { messageId, openId, requestUuid: uniqueUuid() });
-      return reply;
     }
 
     const currentEntry = this.userManager.getEntry(openId);
@@ -1898,6 +2013,8 @@ function buildDirListCard(
   cwd: string,
   dirs: string[],
   parent: string | null,
+  hasMore?: boolean,
+  total?: number,
 ): Record<string, unknown> {
   const elements: Array<Record<string, unknown>> = [];
 
@@ -1934,6 +2051,13 @@ function buildDirListCard(
         }],
       });
     }
+  }
+
+  if (hasMore && total !== undefined) {
+    elements.push({
+      tag: 'markdown',
+      content: `\n... 还有 ${total - dirs.length} 个子目录未显示`,
+    });
   }
 
   return {

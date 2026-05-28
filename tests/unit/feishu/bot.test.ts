@@ -4,11 +4,28 @@ import { UserManager } from '../../../src/feishu/mapping';
 import { ListSnapshotManager } from '../../../src/feishu/list-snapshot';
 import { SpoolQueue } from '../../../src/queue/spool';
 import { ClaudeSessionManager } from '../../../src/proxy/session';
-import { mkdtempSync, rmSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, chmodSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { RegistryManager } from '../../../src/registry';
 import { config } from '../../../src/utils/config';
+
+function createMockFeishuClient() {
+  return {
+    im: {
+      v1: {
+        messageResource: {
+          get: async () => ({
+            writeFile: async (path: string) => {
+              const { writeFileSync } = await import('fs');
+              writeFileSync(path, Buffer.from('fake-image-data'));
+            },
+          }),
+        },
+      },
+    },
+  };
+}
 
 describe('FeishuBot', () => {
   let tmpDir: string;
@@ -96,6 +113,79 @@ describe('FeishuBot', () => {
 
     expect(replies.length).toBeGreaterThanOrEqual(1);
     expect(replies.some(r => r.includes('状态'))).toBe(true);
+  });
+
+  it('ignores unsupported message types like file', async () => {
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-file',
+      content: '{}',
+      chat_type: 'p2p',
+      message_type: 'file' as any,
+    });
+
+    expect(replies).toHaveLength(0);
+  });
+
+  it('replies with error when images.enabled is false', async () => {
+    (config as any).data.images.enabled = false;
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-img1',
+      content: '{"image_key":"img_v3_abc123"}',
+      chat_type: 'p2p',
+      message_type: 'image',
+    });
+
+    expect(replies.length).toBeGreaterThanOrEqual(1);
+    expect(replies.some(r => r.includes('已禁用'))).toBe(true);
+
+    (config as any).data.images.enabled = true;
+  });
+
+  it('replies with error when feishuClient is missing', async () => {
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-img1',
+      content: '{"image_key":"img_v3_abc123"}',
+      chat_type: 'p2p',
+      message_type: 'image',
+    });
+
+    expect(replies.length).toBeGreaterThanOrEqual(1);
+    expect(replies.some(r => r.includes('未就绪'))).toBe(true);
+  });
+
+  it('accepts image message when client is available', async () => {
+    const mockClient = createMockFeishuClient();
+    bot.setFeishuClient(mockClient);
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-img1',
+      content: '{"image_key":"img_v3_abc123"}',
+      chat_type: 'p2p',
+      message_type: 'image',
+    });
+
+    // Should not reply with error
+    expect(replies.some(r => r.includes('下载失败'))).toBe(false);
+    expect(replies.some(r => r.includes('未就绪'))).toBe(false);
+  });
+
+  it('silently ignores invalid image content', async () => {
+    bot.setFeishuClient(createMockFeishuClient());
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-img1',
+      content: 'not-valid-json',
+      chat_type: 'p2p',
+      message_type: 'image',
+    });
+
+    expect(replies).toHaveLength(0);
   });
 
   it('processes /list command', async () => {
@@ -944,5 +1034,93 @@ describe('FeishuBot /listDir', () => {
     const paths = enterBtns.map((b: any) => b.value.sessionId);
     expect(paths.some((p: string) => p.endsWith('/project-a'))).toBe(true);
     expect(paths.some((p: string) => p.endsWith('/project-b'))).toBe(true);
+  });
+
+  it('/listDir shows hasMore hint when more than 15 directories', async () => {
+    for (let i = 0; i < 17; i++) {
+      mkdirSync(join(tmpDir, `dir-${String(i).padStart(2, '0')}`), { recursive: true });
+    }
+
+    await bot.onMessage({
+      open_id: 'ou_user1',
+      message_id: 'msg-listdir-overflow',
+      content: JSON.stringify({ text: '/listDir' }),
+      chat_type: 'p2p',
+      message_type: 'text',
+    });
+    await bot.dispatch();
+
+    expect(cardReplies.length).toBe(1);
+    const elements = cardReplies[0].elements as unknown[];
+    const mdContent = elements
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content)
+      .join('\n');
+    expect(mdContent).toContain('还有');
+    expect(mdContent).toContain('子目录未显示');
+
+    const actions = elements.filter((e: any) => e.tag === 'action');
+    const allButtons = actions.flatMap((e: any) => e.actions);
+    const enterBtns = allButtons.filter((b: any) =>
+      b.value?.tag === 'select_dir' && !b.text?.content?.includes('上级')
+    );
+    expect(enterBtns.length).toBe(15);
+  });
+
+  it('/listDir handles permission error', async () => {
+    const noPermDir = join(tmpDir, 'no-perm');
+    mkdirSync(noPermDir, { recursive: true });
+    mkdirSync(join(noPermDir, 'subdir'), { recursive: true });
+
+    const originalMode = statSync(noPermDir).mode;
+    chmodSync(noPermDir, 0o000);
+
+    try {
+      await userManager.compareAndSwap('ou_user1', null, {
+        type: 'pending_new_session',
+        sessionUuid: null,
+        createdAt: new Date().toISOString(),
+        cwd: noPermDir,
+      });
+
+      await bot.onMessage({
+        open_id: 'ou_user1',
+        message_id: 'msg-listdir-perm',
+        content: JSON.stringify({ text: '/listDir' }),
+        chat_type: 'p2p',
+        message_type: 'text',
+      });
+      await bot.dispatch();
+
+      expect(textReplies.some(r => r.includes('无法读取目录'))).toBe(true);
+    } finally {
+      chmodSync(noPermDir, originalMode);
+    }
+  });
+
+  it('handleCardAction select_dir handles CAS failure', async () => {
+    const targetDir = join(tmpDir, 'project-a');
+
+    await userManager.compareAndSwap('ou_user1', null, {
+      type: 'pending_new_session',
+      sessionUuid: null,
+      createdAt: new Date().toISOString(),
+      cwd: tmpDir,
+    });
+
+    const originalCas = userManager.compareAndSwap.bind(userManager);
+    userManager.compareAndSwap = async () => false;
+
+    try {
+      const result = await bot.handleCardAction({
+        open_id: 'ou_user1',
+        action: { tag: 'select_dir', value: targetDir },
+        message: { message_id: 'msg-dir-cas' },
+      });
+
+      expect(result).toContain('操作冲突');
+    } finally {
+      userManager.compareAndSwap = originalCas;
+    }
   });
 });
