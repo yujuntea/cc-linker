@@ -26,10 +26,52 @@ export async function downloadMessageImage(
 
   const localPath = join(IMAGES_DIR, `${messageId}_${imageKey}${IMAGE_EXTENSION}`);
 
-  const response = await client.im.v1.messageResource.get({
-    params: { type: 'image' },
-    path: { message_id: messageId, file_key: imageKey },
-  });
+  let response: any;
+  try {
+    const apiPromise = client.im.v1.messageResource.get({
+      params: { type: 'image' },
+      path: { message_id: messageId, file_key: imageKey },
+    });
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('API timeout after 15s')), 15000);
+    });
+    response = await Promise.race([apiPromise, timeoutPromise]);
+  } catch (err: any) {
+    const resp = err?.response;
+    const respStatus = resp?.status;
+
+    // SDK uses responseType: "stream", so err.response.data is a ReadableStream.
+    let errorBody = '';
+    try {
+      const stream = resp?.data;
+      if (stream && typeof stream === 'object') {
+        const chunks: Buffer[] = [];
+        stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+        await new Promise<void>((resolve, reject) => {
+          stream.on('end', resolve);
+          stream.on('error', reject);
+        });
+        errorBody = Buffer.concat(chunks).toString('utf-8');
+      }
+    } catch (streamErr: any) {
+      errorBody = `[Failed to read stream: ${streamErr.message}]`;
+    }
+
+    let errorJson = null;
+    try {
+      errorJson = JSON.parse(errorBody);
+    } catch {
+      // Not JSON
+    }
+
+    const errorCode = errorJson?.code ?? 'N/A';
+    const errorMsg = errorJson?.msg ?? (errorBody.slice(0, 500) || 'N/A');
+
+    logger.error(
+      `图片下载 API 失败: ${err.message}, status=${respStatus}, errorCode=${errorCode}, errorMsg=${errorMsg}, message_id=${messageId}, file_key=${imageKey}`,
+    );
+    throw err;
+  }
 
   await response.writeFile(localPath);
   chmodSync(localPath, 0o600);
@@ -38,7 +80,9 @@ export async function downloadMessageImage(
   const stat = statSync(localPath);
   if (stat.size > maxSize) {
     unlinkSync(localPath);
-    throw new Error(`图片大小 ${(stat.size / 1024 / 1024).toFixed(1)}MB 超过限制 ${(maxSize / 1024 / 1024).toFixed(0)}MB`);
+    throw new Error(
+      `图片大小 ${(stat.size / 1024 / 1024).toFixed(1)}MB 超过限制 ${(maxSize / 1024 / 1024).toFixed(0)}MB`,
+    );
   }
 
   logger.info(`图片已下载: ${imageKey} → ${localPath} (${(stat.size / 1024).toFixed(1)}KB)`);
