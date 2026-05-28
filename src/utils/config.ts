@@ -70,6 +70,11 @@ interface ConfigData {
     timeout_ms: number;
     claude_executable: string;
   };
+  images: {
+    enabled: boolean;
+    max_size_bytes: number;
+    cleanup_max_age_hours: number;
+  };
 }
 
 const DEFAULTS: ConfigData = {
@@ -138,6 +143,11 @@ const DEFAULTS: ConfigData = {
     timeout_ms: 600_000,
     claude_executable: 'claude',
   },
+  images: {
+    enabled: true,
+    max_size_bytes: 10 * 1024 * 1024,
+    cleanup_max_age_hours: 24,
+  },
 };
 
 function cloneDefaults(): ConfigData {
@@ -153,6 +163,7 @@ function cloneDefaults(): ConfigData {
     stream: { ...DEFAULTS.stream },
     claude: { ...DEFAULTS.claude },
     sdk: { ...DEFAULTS.sdk },
+    images: { ...DEFAULTS.images },
   };
 }
 

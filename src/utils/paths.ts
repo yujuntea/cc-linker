@@ -10,6 +10,7 @@ export const CC_LINKER_DIR = process.env.CC_LINKER_DIR ?? join(HOME, '.cc-linker
 export const REGISTRY_PATH = process.env.CC_LINKER_REGISTRY_PATH ?? join(CC_LINKER_DIR, 'registry.json');
 export const BACKUP_DIR = join(CC_LINKER_DIR, 'backups');
 export const SCAN_CACHE_PATH = join(CC_LINKER_DIR, 'scan_cache.json');
+export const IMAGES_DIR = join(CC_LINKER_DIR, 'images');
 export const HOOK_LOG_PATH = join(CC_LINKER_DIR, 'hook.log');
 export const CONFIG_PATH = process.env.CC_LINKER_CONFIG_PATH ?? join(CC_LINKER_DIR, 'config.toml');
 

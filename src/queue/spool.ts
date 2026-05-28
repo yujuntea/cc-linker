@@ -40,6 +40,7 @@ export interface SpoolMessage {
   retryCount?: number;
   nextAttemptAt?: string;
   error?: string;
+  imagePaths?: string[];
 }
 
 export interface Receipt {
