@@ -227,8 +227,9 @@ permission_mode = "acceptEdits"
 # disallowed_tools = []
 
 [sdk]
-# 启用 Agent SDK 模式（支持飞书卡片上的交互式权限确认）
-# enabled = false              # 默认关闭，设为 true 启用 SDK 模式
+# Agent SDK 模式（支持飞书卡片上的交互式权限确认）
+# 默认开启。如需关闭，设为 false
+# enabled = true               # 默认 true，支持飞书端交互式权限确认
 # permission_mode = "acceptEdits"  # SDK 基础权限模式
 # timeout_ms = 600000          # 权限确认超时（10分钟）
 # claude_executable = "claude" # Claude 可执行文件路径

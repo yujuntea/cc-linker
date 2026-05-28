@@ -110,6 +110,7 @@ export class CardUpdater {
     handlerId: string,
   ): Promise<string> {
     const card = this.buildPermissionCard(toolName, action, promptIndex, handlerId);
+    logger.info(`CardUpdater: creating permission card for openId=${openId}`);
     const resp = await this.client.im.v1.message.create({
       params: { receive_id_type: 'open_id' },
       data: {
@@ -118,12 +119,19 @@ export class CardUpdater {
         content: JSON.stringify(card),
       },
     });
+    logger.info(`CardUpdater: create response=${JSON.stringify(resp)}`);
     const messageId = resp.data?.message_id ?? null;
     if (!messageId) throw new Error('Failed to create permission card');
     this.cardMessageId = messageId;
     this.state = 'processing';
     this.lastPatchAt = Date.now();
+    logger.info(`CardUpdater: permission card created, message_id=${messageId}`);
     return messageId;
+  }
+
+  /** Update existing permission card to processing state (after user clicked) */
+  async updatePermissionCardToProcessing(): Promise<void> {
+    await this.patchCard(this.buildPermissionProcessingCard());
   }
 
   /** Update existing permission card with result */
@@ -132,6 +140,11 @@ export class CardUpdater {
       ? this.buildPermissionResultCard(true)
       : this.buildPermissionResultCard(false);
     await this.patchCard(card);
+  }
+
+  /** Update existing permission card to completed state (after operation finishes) */
+  async updatePermissionCardToCompleted(): Promise<void> {
+    await this.patchCard(this.buildPermissionCompletedCard());
   }
 
   /** Allow external code to set cardMessageId for permission card patching */
@@ -147,7 +160,7 @@ export class CardUpdater {
   ): Record<string, unknown> {
     const actionLabel = this.getToolActionLabel(toolName);
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: { tag: 'plain_text', content: '🔐 需要权限确认' },
         template: 'orange',
@@ -178,9 +191,25 @@ export class CardUpdater {
     };
   }
 
+  private buildPermissionProcessingCard(): Record<string, unknown> {
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: {
+        title: { tag: 'plain_text', content: '⏳ 处理中...' },
+        template: 'blue',
+      },
+      elements: [
+        {
+          tag: 'markdown',
+          content: '**已允许**，Claude 正在执行该操作...',
+        },
+      ],
+    };
+  }
+
   private buildPermissionResultCard(approved: boolean): Record<string, unknown> {
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: {
         title: {
           tag: 'plain_text',
@@ -194,6 +223,22 @@ export class CardUpdater {
           content: approved
             ? '操作已被允许，Claude 将继续执行。'
             : '操作已被拒绝，Claude 将尝试其他方式。',
+        },
+      ],
+    };
+  }
+
+  private buildPermissionCompletedCard(): Record<string, unknown> {
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: {
+        title: { tag: 'plain_text', content: '✅ 已完成' },
+        template: 'green',
+      },
+      elements: [
+        {
+          tag: 'markdown',
+          content: '操作已执行完毕，Claude 已完成该操作。',
         },
       ],
     };
@@ -218,20 +263,34 @@ export class CardUpdater {
   }
 
   private async patchCard(card: Record<string, unknown>): Promise<void> {
-    if (!this.cardMessageId) return;
+    if (!this.cardMessageId) {
+      logger.warn('CardUpdater: patch skipped, no cardMessageId');
+      return;
+    }
+    const content = JSON.stringify(card);
     try {
-      await this.client.im.v1.message.patch({
+      logger.info(`CardUpdater: patching message_id=${this.cardMessageId}, content=${content}`);
+      const resp = await this.client.im.v1.message.patch({
         path: { message_id: this.cardMessageId },
-        data: { content: JSON.stringify(card) },
+        data: {
+          content,
+        },
       });
+      logger.info(`CardUpdater: patch raw response=${JSON.stringify(resp)}`);
+      const code = resp?.code ?? 'unknown';
+      if (code !== 0 && code !== 'unknown') {
+        throw new Error(`patch returned non-zero code=${code}, msg=${resp?.msg ?? 'unknown'}`);
+      }
+      logger.info(`CardUpdater: patch success, message_id=${this.cardMessageId}`);
     } catch (err: any) {
-      logger.warn(`CardUpdater: patch failed: ${err.message}`);
+      logger.warn(`CardUpdater: patch failed: ${err.message}, message_id=${this.cardMessageId}`);
+      throw err;
     }
   }
 
   private buildProcessingCard(): Record<string, unknown> {
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '⏳ 正在处理...' }, template: 'blue' },
       elements: [{ tag: 'markdown', content: 'Claude 正在处理你的请求，预计 **2-10 秒**...' }],
     };
@@ -251,7 +310,7 @@ export class CardUpdater {
     }
     elements.push({ tag: 'markdown', content: `⏱ 已用时 ${elapsedSec}s` });
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '💭 处理中' }, template: 'blue' },
       elements,
     };
@@ -265,7 +324,7 @@ export class CardUpdater {
     footer.push(`⏱ 耗时: **${Math.floor(durationMs / 1000)}s**`);
     if (numTurns > 0) footer.push(`📊 轮数: **${numTurns}**`);
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '✅ 处理完成' }, template: 'green' },
       elements: [
         { tag: 'markdown', content: esc(display) },
@@ -277,7 +336,7 @@ export class CardUpdater {
 
   private buildErrorCard(message: string): Record<string, unknown> {
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '❌ 处理失败' }, template: 'red' },
       elements: [{ tag: 'markdown', content: `错误原因：**${esc(message)}**\n\n请检查 Claude CLI 是否可用，或稍后重试。` }],
     };

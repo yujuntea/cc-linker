@@ -86,7 +86,10 @@ export function repairJsonlLastPrompt(jsonlPath: string): boolean {
   const cliUsers = userMessages.filter(
     (u) => u.entry.entrypoint === 'cli' || !u.entry.entrypoint
   );
-  const candidateUsers = sdkCliUsers.length > 0 ? sdkCliUsers : cliUsers;
+  let candidateUsers = sdkCliUsers.length > 0 ? sdkCliUsers : cliUsers;
+  if (candidateUsers.length === 0) {
+    candidateUsers = userMessages;
+  }
 
   // Sort by timestamp, find the latest user message
   candidateUsers.sort((a, b) => a.entry.timestamp!.localeCompare(b.entry.timestamp!));

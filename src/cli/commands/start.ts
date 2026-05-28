@@ -343,9 +343,9 @@ async function createBotRuntime(
       },
       'card.action.trigger': async (data: any) => {
         try {
-          const openId = data?.open_id ?? data?.operator?.open_id ?? data?.callback?.open_id ?? '';
-          const messageId = data?.open_message_id ?? data?.context?.open_message_id ?? data?.callback?.message?.message_id ?? '';
-          const actionValue = data?.action?.value ?? data?.callback?.action?.value ?? {};
+          const openId = data?.open_id ?? data?.operator?.open_id ?? data?.event?.operator?.open_id ?? data?.callback?.open_id ?? '';
+          const messageId = data?.open_message_id ?? data?.context?.open_message_id ?? data?.event?.context?.open_message_id ?? data?.callback?.message?.message_id ?? '';
+          const actionValue = data?.action?.value ?? data?.event?.action?.value ?? data?.callback?.action?.value ?? {};
 
           // Detect permission card buttons (use 'type' field instead of 'tag')
           const isPermissionAction = actionValue?.type === 'permission_approve' || actionValue?.type === 'permission_deny';
@@ -362,11 +362,19 @@ async function createBotRuntime(
             message: { message_id: messageId },
           };
 
-          log('INFO', `[card callback] tag=${tag}, sessionId=${sessionId}, openId=${openId}`);
+          log('INFO', `[card callback] tag=${tag}, sessionId=${sessionId}, openId=${openId}, messageId=${messageId || '(empty)'}`);
           const reply = await bot.handleCardAction(action);
-          log('INFO', `[card callback] reply=${reply ? reply.slice(0, 80) : 'null'}`);
+          const replyStr = typeof reply === 'string' ? reply : JSON.stringify(reply).slice(0, 80);
+          log('INFO', `[card callback] reply=${reply ? replyStr : 'null'}`);
 
-          return { type: 'raw' as const, data: { code: 0 } };
+          // If handleCardAction returns a card object, return it directly.
+          // The SDK will base64-encode it and send it back via WebSocket.
+          if (reply && typeof reply === 'object') {
+            return reply;
+          }
+
+          // For non-permission actions, return empty response
+          return { type: 'raw' as const, data: {} };
         } catch (err) {
           log('ERROR', `处理卡片回调失败: ${err}`);
           return { type: 'raw' as const, data: { code: 0 } };

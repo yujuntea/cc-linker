@@ -716,6 +716,7 @@ export class ClaudeSessionManager {
             disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
             pathToClaudeCodeExecutable: claudeExecutable,
             abortController,
+            includePartialMessages: true,
             ...(sessionId && !isNew ? { resume: sessionId } : {}),
             ...(settingsPath && existsSync(settingsPath) ? { settings: settingsPath } : {}),
           },
