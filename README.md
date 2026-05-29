@@ -27,9 +27,12 @@
 |------|------|
 | 🔄 **跨端无缝切换** | 聊天应用发起的对话，终端一键恢复（含上下文和目录）；终端创建的会话，聊天应用随时查看 |
 | 💬 **流式卡片交互** | 聊天应用中实时看到 Claude 的 thinking 和回复，不再是"转圈等待" |
+| 🛡 **交互式权限确认** | SDK 模式下 Claude 需要执行工具时，飞书卡片弹出允许/拒绝按钮 |
+| 🖼 **图片消息支持** | 飞书发送的图片自动下载并传递给 Claude 分析 |
+| 📂 **目录浏览** | `/listDir` 命令交互式浏览和切换工作目录 |
 | 📋 **统一会话管理** | 自动扫描、增量同步，无需手动维护会话列表 |
 | 🎛 **多模型切换** | 在卡片中一键切换模型，无需改配置 |
-| 🛡 **持久化不丢消息** | 文件级消息队列，进程崩溃、重启后消息不丢失 |
+| 💾 **持久化不丢消息** | 文件级消息队列，进程崩溃、重启后消息不丢失 |
 | 🚀 **3 步上手** | `install → setup → start`，5 分钟完成配置 |
 
 ## 📸 效果展示
@@ -137,6 +140,7 @@ cc-linker status                    # 查看桥接状态
 |------|------|
 | `/help` | 显示帮助 |
 | `/list` | 列出会话（带切换/恢复按钮卡片） |
+| `/listDir` | 交互式浏览和切换工作目录 |
 | `/new [路径] [-- 提示词]` | 创建新会话 |
 | `/switch <序号\|UUID>` | 切换会话 |
 | `/resume <序号\|UUID>` | 获取终端恢复命令 |
@@ -233,6 +237,12 @@ permission_mode = "acceptEdits"
 # permission_mode = "acceptEdits"  # SDK 基础权限模式
 # timeout_ms = 600000          # 权限确认超时（10分钟）
 # claude_executable = "claude" # Claude 可执行文件路径
+
+[images]
+# 图片消息处理（默认开启）
+# enabled = true               # 默认 true，自动下载飞书图片并传递给 Claude
+# max_size_bytes = 10485760    # 图片大小限制（默认 10MB）
+# cleanup_max_age_hours = 24   # 过期图片清理周期（默认 24 小时）
 ```
 
 **注意：** SDK 模式需要系统已安装 `claude` 命令行工具（`npm install -g @anthropic-ai/claude-code`）。编译后的二进制文件使用 `pathToClaudeCodeExecutable` 指向系统安装的 claude。
@@ -244,15 +254,20 @@ permission_mode = "acceptEdits"
 | `CC_LINKER_FEISHU_APP_ID` | 飞书 App ID |
 | `CC_LINKER_FEISHU_APP_SECRET` | 飞书 App Secret |
 | `CC_LINKER_FEISHU_OWNER_OPEN_ID` | 限制仅指定用户使用 |
+| `CC_LINKER_FEISHU_DEFAULT_CWD` | 默认工作目录 |
 | `CC_LINKER_STREAM_ENABLED` | 流式响应开关 |
 | `CC_LINKER_LOG_LEVEL` | 日志级别 |
 | `CC_LINKER_CLAUDE_PERMISSION_MODE` | Claude Code 权限模式 |
 | `CC_LINKER_CLAUDE_ALLOWED_TOOLS` | 允许的工具列表（逗号分隔） |
 | `CC_LINKER_CLAUDE_DISALLOWED_TOOLS` | 禁止的工具列表（逗号分隔） |
-| `CC_LINKER_SDK_ENABLED` | 启用 Agent SDK 模式（true/false） |
+| `CC_LINKER_SDK_ENABLED` | 启用 Agent SDK 模式（true/false，默认 true） |
 | `CC_LINKER_SDK_PERMISSION_MODE` | SDK 权限模式 |
 | `CC_LINKER_SDK_TIMEOUT_MS` | 权限确认超时（毫秒） |
 | `CC_LINKER_SDK_CLAUDE_EXECUTABLE` | Claude 可执行文件路径 |
+| `CC_LINKER_MAX_CONCURRENT_SESSIONS` | 最大并发会话数（默认 5） |
+| `CC_LINKER_IMAGES_ENABLED` | 图片处理开关（默认 true） |
+| `CC_LINKER_IMAGES_MAX_SIZE` | 图片大小限制（字节） |
+| `CC_LINKER_IMAGES_CLEANUP_HOURS` | 图片清理周期（小时） |
 
 ## 🏗 架构概览
 
@@ -262,15 +277,26 @@ permission_mode = "acceptEdits"
 │  (session JSONL)    (registry.json)  (当前: 飞书)     │
 │                          ↑                           │
 │                   SessionStart hook                  │
+│                                                      │
+│  内置模块：                                           │
+│  - SDK 模式 (默认): Agent SDK + 交互式权限确认        │
+│  - 流式模式: stream-json + 卡片实时更新               │
+│  - 图片处理: 自动下载 + prompt 注入                   │
+│  - 目录浏览: /listDir 交互式切换 cwd                  │
+│  - 文件队列: 消息持久化 + 崩溃恢复                    │
 └──────────────────────────────────────────────────────┘
 ```
 
 - **Registry** (`~/.cc-linker/registry.json`): 统一会话索引，带文件锁和自动备份
+- **User Mapping** (`~/.cc-linker/user-mapping.json`): 飞书用户 open_id → 当前会话目标的映射（CAS 原子更新）
 - **Scanner**: 增量扫描 Claude Code JSONL 文件，保持注册表最新
 - **Hook**: Claude Code 启动时自动注册新会话
-- **Spool Queue**: 持久化消息队列，崩溃后可恢复
+- **Spool Queue**: 持久化消息队列，崩溃后可恢复（pending → processing → replied → done/failed）
 - **Stream Parser**: 解析 Claude `stream-json` 输出
-- **Card Updater**: 流式卡片发送与节流
+- **Card Updater**: 流式卡片 + 权限卡片的发送与节流
+- **Permission Handler**: SDK 模式下工具权限的交互式确认（允许/拒绝/超时自动拒绝）
+- **Image Processor**: 飞书图片下载、prompt 注入、过期清理
+- **Startup Reconciler**: 进程启动时自动修复不一致状态（恢复卡住的消息、回滚超时 claim、补齐 jsonl_path）
 
 详细架构见 [docs/产品设计文档-自建方案.md](docs/产品设计文档-自建方案.md)。
 
