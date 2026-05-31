@@ -532,8 +532,24 @@ function getExecutablePath(): string {
   // If compiled binary, argv[0] IS the binary
   if (argv0.endsWith('cc-linker')) return argv0;
 
-  // Development (bun run): try dist/cc-linker relative to CWD
-  const distPath = join(process.cwd(), 'dist', 'cc-linker');
+  const scriptPath = process.argv[1] || '';
+
+  // When running from a globally-installed npm package (e.g. inside
+  // node_modules/cc-linker/dist/cli.js), always use the command in PATH.
+  // Bun resolves symlinks, so scriptPath will be the real file path.
+  if (scriptPath.includes('node_modules')) {
+    return 'cc-linker';
+  }
+
+  // When running via global symlink (e.g. /usr/local/bin/cc-linker),
+  // before Bun resolves it.
+  if (scriptPath.endsWith('/cc-linker') || scriptPath === 'cc-linker') {
+    return 'cc-linker';
+  }
+
+  // Development (bun run src/index.ts): try dist/cc-linker relative to script
+  const scriptDir = dirname(scriptPath);
+  const distPath = join(scriptDir, '..', 'dist', 'cc-linker');
   if (existsSync(distPath)) return distPath;
 
   // Fallback: assume 'cc-linker' is in PATH
