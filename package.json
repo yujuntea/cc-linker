@@ -23,7 +23,7 @@
     "cross-platform"
   ],
   "bin": {
-    "cc-linker": "./dist/cli.js"
+    "cc-linker": "dist/cli.js"
   },
   "files": [
     "dist/cli.js",
