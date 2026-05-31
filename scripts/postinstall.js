@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * postinstall hook — runs after `npm install -g cc-linker`.
- * If the cc-linker daemon is running, automatically restart it to apply the update.
+ * If the cc-linker daemon is running, gracefully restart it to apply the update.
  *
  * Set CC_LINKER_POSTINSTALL_RESTART=0 to skip auto-restart (prompt only).
  */
@@ -9,7 +9,6 @@
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { execFileSync } from 'child_process';
 
 const AUTO_RESTART = process.env.CC_LINKER_POSTINSTALL_RESTART !== '0';
 
@@ -36,8 +35,10 @@ try {
   if (AUTO_RESTART) {
     log('cc-linker update detected, restarting daemon (PID ' + pid + ')...');
     log('');
-    // Delegate to cc-linker restart which handles stop → wait → start correctly
-    execFileSync('cc-linker', ['restart'], { stdio: 'inherit' });
+    // Send SIGTERM — launchd (KeepAlive: true) will auto-restart with the new binary.
+    // If not managed by launchd, the daemon will need manual restart via `cc-linker start`.
+    process.kill(pid, 'SIGTERM');
+    log('  Daemon restarting with new version...');
   } else {
     log('cc-linker daemon is running (PID ' + pid + ').');
     log('Restart to apply the update:');
