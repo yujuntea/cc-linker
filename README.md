@@ -109,6 +109,8 @@ bun add -g cc-linker
 ```
 
 > **说明**：当前 npm 包入口基于 Bun 构建；如果希望完全不依赖 Bun，请使用仓库构建出的独立二进制版本。
+>
+> **更新提示**：`npm install -g cc-linker@latest` 时，如果 daemon 正在运行，会自动调用 `cc-linker restart` 升级到新版，无需手动重启。
 
 ### 2. 一键配置
 

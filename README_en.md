@@ -96,6 +96,8 @@ bun add -g cc-linker
 ```
 
 > **Note**: the current npm package entrypoint is built for Bun. If you want a runtime-free distribution, use the standalone binary artifact built from source.
+>
+> **Update tip**: when running `npm install -g cc-linker@latest`, if the daemon is already running, it will automatically call `cc-linker restart` to upgrade to the new version — no manual restart needed.
 
 ### 2. One-Step Setup
 
