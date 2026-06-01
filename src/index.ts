@@ -18,6 +18,7 @@ import { clean } from './cli/commands/clean';
 import { start, stop } from './cli/commands/start';
 import { initFeishu } from './cli/commands/init-feishu';
 import { setup } from './cli/commands/setup';
+import { activityHook } from './cli/commands/activity-hook';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
 import { createRequire } from 'node:module';
 
@@ -195,6 +196,14 @@ program
   .command('init-feishu')
   .description('交互式配置飞书集成（App ID + App Secret + Owner）')
   .action(() => initFeishu());
+
+program
+  .command('activity-hook')
+  .description('Write activity marker (used by Claude Code hooks)')
+  .option('--platform <platform>', 'cli or feishu', 'cli')
+  .option('--action <action>', 'start, end, or heartbeat', 'heartbeat')
+  .option('--session <uuid>', 'session UUID (default: $CLAUDE_SESSION_ID)')
+  .action(activityHook);
 
 // Parse and handle errors
 program.parseAsync(process.argv).catch(handleError);
