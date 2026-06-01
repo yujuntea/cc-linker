@@ -156,6 +156,9 @@ export class ClaudeSessionManager {
     lockKey?: string,
     settingsPath?: string,
   ): Promise<SendMessageResult> {
+    if (sessionId) {
+      this.activityCache?.invalidate(`feishu-detects-cli:${sessionId}`);
+    }
     const resolvedLockKey = lockKey ?? sessionId ?? '__new__';
     await this.acquireSessionLock(resolvedLockKey);
 
@@ -426,6 +429,9 @@ export class ClaudeSessionManager {
     lockKey?: string,
     settingsPath?: string,
   ): Promise<SendMessageResult> {
+    if (sessionId) {
+      this.activityCache?.invalidate(`feishu-detects-cli:${sessionId}`);
+    }
     const resolvedLockKey = lockKey ?? sessionId ?? '__new__';
     await this.acquireSessionLock(resolvedLockKey);
 
