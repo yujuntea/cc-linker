@@ -41,6 +41,8 @@ export interface SpoolMessage {
   nextAttemptAt?: string;
   error?: string;
   imagePaths?: string[];
+  skipActivityCheck?: boolean;    // 强制发送标记
+  awaitingForceSend?: boolean;    // 等待用户决策
 }
 
 export interface Receipt {
