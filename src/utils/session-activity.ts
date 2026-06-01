@@ -264,3 +264,22 @@ export async function hasActiveDescendants(rootPid: number, depth: number = 3): 
   await walk(rootPid, 0);
   return { hasChildren: all.length > 0, children: all };
 }
+
+// === mtime 二次采样（JSONL 写入检测） ===
+
+export async function isJSONLWrittenSince(
+  jsonlPath: string,
+  sinceMs: number,
+  sampleMs: number = 500
+): Promise<{ written: boolean; ageMs: number }> {
+  if (!existsSync(jsonlPath)) return { written: false, ageMs: Infinity };
+
+  const stat1 = await Bun.file(jsonlPath).stat();
+  await sleep(sampleMs);
+  const stat2 = await Bun.file(jsonlPath).stat();
+
+  // 同时检查 size 增长和 mtime 变化（应对 truncate/replace 场景）
+  if (stat2.size > stat1.size) return { written: true, ageMs: 0 };
+  if (stat2.mtimeMs > stat1.mtimeMs) return { written: true, ageMs: 0 };
+  return { written: false, ageMs: Date.now() - stat2.mtimeMs };
+}
