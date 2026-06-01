@@ -182,6 +182,7 @@ function cloneDefaults(): ConfigData {
 export class ConfigManager {
   private data: ConfigData;
   private configPath: string;
+  private runtimeOverrides = new Map<string, any>();
 
   constructor(configPath?: string) {
     this.configPath = configPath ?? CONFIG_PATH;
@@ -286,6 +287,9 @@ export class ConfigManager {
   }
 
   get<T>(path: string, fallback: T): T {
+    if (this.runtimeOverrides.has(path)) {
+      return this.runtimeOverrides.get(path) as T;
+    }
     const parts = path.split('.');
     let current: any = this.data;
     for (const part of parts) {
@@ -293,6 +297,14 @@ export class ConfigManager {
       current = current[part];
     }
     return current ?? fallback;
+  }
+
+  setRuntimeOverride(key: string, value: any): void {
+    this.runtimeOverrides.set(key, value);
+    const [section, k] = key.split('.');
+    if (this.data[section as keyof ConfigData]) {
+      (this.data[section as keyof ConfigData] as any)[k] = value;
+    }
   }
 }
 
