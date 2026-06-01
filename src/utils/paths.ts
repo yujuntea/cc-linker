@@ -24,6 +24,9 @@ export const RUNTIME_SESSION_EVENTS_DIR = join(CC_LINKER_DIR, 'session-events');
 export const RUNTIME_PID_FILE = join(CC_LINKER_DIR, 'cc-linker.pid');
 export const RUNTIME_LOG_FILE = join(CC_LINKER_DIR, 'cc-linker.log');
 
+// Session activity sidecar files (one per session, see session-activity-sync spec)
+export const ACTIVITY_DIR = join(CC_LINKER_DIR, 'activity');
+
 // Spool queue paths
 export const SPOOL_DIR = join(CC_LINKER_DIR, 'spool');
 export const SPOOL_PENDING_DIR = join(SPOOL_DIR, 'pending');
