@@ -680,6 +680,9 @@ export class ClaudeSessionManager {
         return { result: errResult, handler: new PermissionHandler({ allowedTools: [], disallowedTools: [] }) };
       }
 
+      // sessionId may be null for new sessions; alias to sessionUuid so the
+      // activity marker helpers (which require a non-empty key) can guard on it.
+      const sessionUuid = sessionId;
       const startTime = Date.now();
       const adapter = new StreamAdapter();
 
@@ -744,6 +747,11 @@ export class ClaudeSessionManager {
           }
         }, hardTimeout);
 
+        if (sessionUuid) {
+          writeActivityMarker(sessionUuid, 'feishu', 'start', process.pid);
+          this.activityCache?.invalidate(`feishu-detects-cli:${sessionUuid}`);
+        }
+
         for await (const message of query({
           prompt: text,
           options: sdkOptions,
@@ -753,6 +761,10 @@ export class ClaudeSessionManager {
               lastResult = chunk;
             } else if (chunk.type !== 'permission_request') {
               onProgress(chunk);
+            }
+            if ((chunk.type === 'thinking' || chunk.type === 'text') && sessionUuid) {
+              writeActivityMarker(sessionUuid, 'feishu', 'heartbeat', process.pid);
+              this.activityCache?.invalidate(`feishu-detects-cli:${sessionUuid}`);
             }
           });
 
@@ -787,6 +799,10 @@ export class ClaudeSessionManager {
         };
       } finally {
         if (hardTimer) clearTimeout(hardTimer);
+        if (sessionUuid) {
+          writeActivityMarker(sessionUuid, 'feishu', 'end', process.pid);
+          this.activityCache?.invalidate(`feishu-detects-cli:${sessionUuid}`);
+        }
       }
 
       const durationMs = Date.now() - startTime;
