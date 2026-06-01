@@ -1,5 +1,6 @@
 import { logger } from '../utils/logger';
 import { config } from '../utils/config';
+import type { ActivityResult } from '../utils/session-activity';
 
 export type CardState = 'processing' | 'streaming' | 'complete' | 'error';
 
@@ -129,6 +130,32 @@ export class CardUpdater {
     return messageId;
   }
 
+  /** Create a CLI busy notification card with optional force-send action */
+  async createCLIBusyCard(
+    openId: string,
+    sessionTitle: string,
+    status: ActivityResult,
+  ): Promise<string> {
+    const card = this.buildCLIBusyCard(sessionTitle, status);
+    logger.info(`CardUpdater: creating CLI busy card for openId=${openId}, reason=${status.reason}`);
+    const resp = await this.client.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data: {
+        receive_id: openId,
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+    });
+    logger.info(`CardUpdater: create response=${JSON.stringify(resp)}`);
+    const messageId = resp.data?.message_id ?? null;
+    if (!messageId) throw new Error('Failed to create CLI busy card');
+    this.cardMessageId = messageId;
+    this.state = 'processing';
+    this.lastPatchAt = Date.now();
+    logger.info(`CardUpdater: CLI busy card created, message_id=${messageId}`);
+    return messageId;
+  }
+
   /** Update existing permission card to processing state (after user clicked) */
   async updatePermissionCardToProcessing(): Promise<void> {
     await this.patchCard(this.buildPermissionProcessingCard());
@@ -239,6 +266,36 @@ export class CardUpdater {
         {
           tag: 'markdown',
           content: '操作已执行完毕，Claude 已完成该操作。',
+        },
+      ],
+    };
+  }
+
+  private buildCLIBusyCard(
+    sessionTitle: string,
+    status: ActivityResult,
+  ): Record<string, unknown> {
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: {
+        title: { tag: 'plain_text', content: '⚠️ CLI 侧会话处理中' },
+        template: 'yellow',
+      },
+      elements: [
+        {
+          tag: 'markdown',
+          content: `会话 **"${esc(sessionTitle)}"** 正在 **CLI 终端** 处理中。\n\n> 💡 检测依据：${esc(status.reason)}\n> 建议等待 CLI 侧处理完毕后再继续对话。`,
+        },
+        {
+          tag: 'action',
+          actions: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '⚡ 强制发送（会打断 CLI）' },
+              type: 'danger',
+              value: { type: 'cli_force_send' },
+            },
+          ],
         },
       ],
     };
