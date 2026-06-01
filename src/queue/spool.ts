@@ -9,6 +9,7 @@ import {
 } from '../utils/paths';
 import { config } from '../utils/config';
 import { logger } from '../utils/logger';
+import { withLock } from '../utils/lock';
 
 // Message states
 export type SpoolStatus = 'pending' | 'processing' | 'replied' | 'done' | 'failed';
@@ -289,6 +290,28 @@ export class SpoolQueue {
     });
     this.writeAtomic(path, msg);
     return msg;
+  }
+
+  async updateMessageFlags(
+    messageId: string,
+    serialKey: string,
+    flags: { skipActivityCheck?: boolean; awaitingForceSend?: boolean }
+  ): Promise<boolean> {
+    return withLock(this.processingDir, async () => {
+      const path = join(this.processingDir, `${serialKey}:${messageId}.json`);
+      if (!existsSync(path)) return false;
+      try {
+        const raw = readFileSync(path, 'utf8');
+        const msg = JSON.parse(raw) as SpoolMessage;
+        if (flags.skipActivityCheck !== undefined) msg.skipActivityCheck = flags.skipActivityCheck;
+        if (flags.awaitingForceSend !== undefined) msg.awaitingForceSend = flags.awaitingForceSend;
+        writeFileSync(path, JSON.stringify(msg, null, 2), { mode: 0o600 });
+        return true;
+      } catch (err) {
+        logger.warn(`更新 SpoolMessage 标志失败: ${err}`);
+        return false;
+      }
+    });
   }
 
   requeueForRetry(messageId: string, serialKey: string, error: string, delayMs: number): SpoolMessage | null {
