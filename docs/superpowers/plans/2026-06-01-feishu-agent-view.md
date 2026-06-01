@@ -698,6 +698,11 @@ export interface ListCardParams {
   agentViewUrl: string;
 }
 
+// 注:PR 编号来自 ~/.claude/jobs/<id>/state.json(不在 `claude agents --json` 输出里),
+// v1 不读 state.json(spec §2.2 N6),所以列表行不显示 PR。Spec §6.1 mockup 的 `PR #1234` 是
+// 设计示意,非 v1 实际渲染。v2 补 PR 字段时,需要在 buildListCard 内读 state.json 或
+// 让 `claude agents --json` 输出加 PR 字段。
+
 export function buildListCard(params: ListCardParams): Record<string, unknown> {
   const { groups, totalCount, lastRefreshedAt } = params;
   const elements: Array<Record<string, unknown>> = [];
@@ -807,6 +812,7 @@ describe('buildPeekCard', () => {
       name: 'flaky-test-fix', status: 'working', cwd: '/p',
       pid: 12345, startedAt: '2026-06-01T10:00:00Z',
       lastActivity: '2m ago', recentOutput: 'npm test\nPASS\n',
+      shortId: 'abc123', sessionId: 'sess-1',
     });
     const json = JSON.stringify(card);
     expect(json).toContain('flaky-test-fix');
@@ -817,6 +823,7 @@ describe('buildPeekCard', () => {
       name: 'x', status: 'working', cwd: '/p',
       pid: 1, startedAt: '2026-06-01T10:00:00Z',
       lastActivity: 'now', recentOutput: '$ npm test\nFAIL\n',
+      shortId: 'abc', sessionId: 's1',
     });
     const json = JSON.stringify(card);
     expect(json).toContain('$ npm test');
@@ -828,28 +835,33 @@ describe('buildPeekCard', () => {
       name: 'x', status: 'working', cwd: '/p',
       pid: 1, startedAt: '2026-06-01T10:00:00Z',
       lastActivity: 'now', recentOutput: huge,
+      shortId: 'abc', sessionId: 's1',
     });
     const json = JSON.stringify(card);
     expect(json.length).toBeLessThan(30 * 1024);
     expect(json).toContain('...');
   });
-  it('includes Reply/Stop/Back/Refresh action buttons', () => {
+  it('includes Reply/Stop/Back/Refresh action buttons with correct shortId', () => {
     const card = buildPeekCard({
       name: 'x', status: 'blocked', cwd: '/p',
       pid: 1, startedAt: '2026-06-01T10:00:00Z',
       lastActivity: 'now', recentOutput: '...',
+      shortId: 'realShortId', sessionId: 'realSessId',
     });
     const json = JSON.stringify(card);
     expect(json).toContain('agent_view_reply_request');
     expect(json).toContain('agent_view_stop');
     expect(json).toContain('agent_view_back_to_list');
-    expect(json).toContain('agent_view_refresh');
+    expect(json).toContain('agent_view_peek');  // Refresh 按钮:重抓 logs(等同 handlePeek)
+    expect(json).toContain('realShortId');
+    expect(json).toContain('realSessId');
   });
   it('omits Stop button for completed status', () => {
     const card = buildPeekCard({
       name: 'x', status: 'done', cwd: '/p',
       pid: 1, startedAt: '2026-06-01T10:00:00Z',
       lastActivity: 'now', recentOutput: '...',
+      shortId: 'abc', sessionId: 's1',
     });
     const json = JSON.stringify(card);
     expect(json).not.toContain('agent_view_stop');
@@ -875,6 +887,8 @@ export interface PeekCardParams {
   startedAt: string;
   lastActivity: string;
   recentOutput: string;
+  shortId: string;       // 给按钮 value 用
+  sessionId: string;     // 给按钮 value 用
 }
 
 const PEEK_MAX_OUTPUT_BYTES = 2 * 1024;
@@ -889,6 +903,7 @@ function truncateOutput(s: string, maxBytes: number): string {
 
 export function buildPeekCard(p: PeekCardParams): Record<string, unknown> {
   const showStop = p.status === 'working' || p.status === 'blocked' || p.status === 'idle';
+  const showReply = p.status === 'blocked' || p.status === 'stopped' || p.status === 'done';
 
   const elements: Array<Record<string, unknown>> = [
     { tag: 'markdown', content: `**Status:** ${statusLabel(p.status)}` },
@@ -901,18 +916,18 @@ export function buildPeekCard(p: PeekCardParams): Record<string, unknown> {
     {
       tag: 'action',
       actions: [
-        ...(p.status === 'blocked' || p.status === 'stopped' || p.status === 'done'
+        ...(showReply
           ? [{ tag: 'button', text: { tag: 'plain_text', content: 'Reply' }, type: 'primary',
-              value: { tag: 'agent_view_reply_request', shortId: '', sessionId: '', cwd: p.cwd } }]
+              value: { tag: 'agent_view_reply_request', shortId: p.shortId, sessionId: p.sessionId, cwd: p.cwd } }]
           : []),
         ...(showStop
           ? [{ tag: 'button', text: { tag: 'plain_text', content: 'Stop' }, type: 'danger',
-              value: { tag: 'agent_view_stop', shortId: '', sessionId: '' } }]
+              value: { tag: 'agent_view_stop', shortId: p.shortId, sessionId: p.sessionId } }]
           : []),
         { tag: 'button', text: { tag: 'plain_text', content: '← Back to list' }, type: 'default',
           value: { tag: 'agent_view_back_to_list' } },
         { tag: 'button', text: { tag: 'plain_text', content: '🔄 Refresh' }, type: 'default',
-          value: { tag: 'agent_view_peek', shortId: '', sessionId: '', cwd: p.cwd } },
+          value: { tag: 'agent_view_peek', shortId: p.shortId, sessionId: p.sessionId, cwd: p.cwd } },
       ],
     },
   ];
@@ -1110,30 +1125,24 @@ git commit -m "feat(agent-view): 错误/空/等待/超时/取消卡片"
 - Create: `src/agent-view/poller.ts`
 - Test: `tests/unit/agent-view/poller.test.ts`
 
-- [ ] **Step 1: 写失败的测试 — execFile 包装与解析**
+- [ ] **Step 1: 写失败的测试 — execFile 包装与解析(用依赖注入 mock spawn)**
 
 `tests/unit/agent-view/poller.test.ts`:
 
 ```typescript
-import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, mock } from 'bun:test';
 import { AgentViewPoller, ClaudeExecError } from '../../../src/agent-view/poller';
 
-// mock Bun.spawn
 const mockSpawn = mock();
-const origSpawn = Bun.spawn;
 
 describe('AgentViewPoller', () => {
   beforeEach(() => {
     mockSpawn.mockReset();
-    (Bun as any).spawn = mockSpawn;
-  });
-  afterEach(() => {
-    (Bun as any).spawn = origSpawn;
   });
 
   it('getVersion executes `claude --version`', async () => {
     mockSpawn.mockReturnValueOnce(makeProc('2.1.139 (Claude Code)\n', '', 0));
-    const poller = new AgentViewPoller();
+    const poller = new AgentViewPoller({ spawn: mockSpawn as any });
     const v = await poller.getVersion();
     expect(v).toEqual({ major: 2, minor: 1, patch: 139 });
     expect(mockSpawn).toHaveBeenCalledWith(['claude', '--version'], expect.objectContaining({ stdout: 'pipe' }));
@@ -1142,7 +1151,7 @@ describe('AgentViewPoller', () => {
   it('listSessions executes `claude agents --json`', async () => {
     const json = '[{"pid":1,"cwd":"/x","kind":"claude","startedAt":"2026-06-01T00:00:00Z","status":"working"}]';
     mockSpawn.mockReturnValueOnce(makeProc(json, '', 0));
-    const poller = new AgentViewPoller();
+    const poller = new AgentViewPoller({ spawn: mockSpawn as any });
     const sessions = await poller.listSessions();
     expect(sessions).toHaveLength(1);
     expect(mockSpawn).toHaveBeenCalledWith(['claude', 'agents', '--json'], expect.anything());
@@ -1150,19 +1159,19 @@ describe('AgentViewPoller', () => {
 
   it('listSessions returns [] on empty array', async () => {
     mockSpawn.mockReturnValueOnce(makeProc('[]', '', 0));
-    const poller = new AgentViewPoller();
+    const poller = new AgentViewPoller({ spawn: mockSpawn as any });
     expect(await poller.listSessions()).toEqual([]);
   });
 
   it('listSessions throws ClaudeExecError on non-zero exit', async () => {
     mockSpawn.mockReturnValueOnce(makeProc('', 'daemon not running', 1));
-    const poller = new AgentViewPoller();
+    const poller = new AgentViewPoller({ spawn: mockSpawn as any });
     expect(poller.listSessions()).rejects.toThrow(ClaudeExecError);
   });
 
   it('peekLogs executes `claude logs <shortId>`', async () => {
     mockSpawn.mockReturnValueOnce(makeProc('line1\nline2\n', '', 0));
-    const poller = new AgentViewPoller();
+    const poller = new AgentViewPoller({ spawn: mockSpawn as any });
     const out = await poller.peekLogs('abc123');
     expect(out).toContain('line1');
     expect(mockSpawn).toHaveBeenCalledWith(['claude', 'logs', 'abc123'], expect.anything());
@@ -1170,23 +1179,41 @@ describe('AgentViewPoller', () => {
 
   it('stopSession executes `claude stop <shortId>`', async () => {
     mockSpawn.mockReturnValueOnce(makeProc('', '', 0));
-    const poller = new AgentViewPoller();
+    const poller = new AgentViewPoller({ spawn: mockSpawn as any });
     await poller.stopSession('abc123');
     expect(mockSpawn).toHaveBeenCalledWith(['claude', 'stop', 'abc123'], expect.anything());
+  });
+
+  it('kills process on timeout (no zombie)', async () => {
+    const proc = makeLongProc();  // exited 永远不 resolve
+    const killSpy = mock();
+    (proc as any).kill = killSpy;
+    mockSpawn.mockReturnValueOnce(proc);
+    const poller = new AgentViewPoller({ spawn: mockSpawn as any, timeoutMs: 50 });
+    await expect(poller.peekLogs('abc')).rejects.toThrow(/timeout/);
+    expect(killSpy).toHaveBeenCalled();
   });
 });
 
 function makeProc(stdoutText: string, stderrText: string, exitCode: number) {
   const enc = new TextEncoder();
   return {
-    stdout: new ReadableStream({
-      start(c) { c.enqueue(enc.encode(stdoutText)); c.close(); }
-    }),
-    stderr: new ReadableStream({
-      start(c) { c.enqueue(enc.encode(stderrText)); c.close(); }
-    }),
+    stdout: new ReadableStream({ start(c) { c.enqueue(enc.encode(stdoutText)); c.close(); } }),
+    stderr: new ReadableStream({ start(c) { c.enqueue(enc.encode(stderrText)); c.close(); } }),
     exited: Promise.resolve(exitCode),
     pid: 1234,
+    kill: () => {},
+  } as any;
+}
+
+function makeLongProc() {
+  const enc = new TextEncoder();
+  return {
+    stdout: new ReadableStream({ start(c) { c.enqueue(enc.encode('')); } }),  // 不 close
+    stderr: new ReadableStream({ start(c) { c.enqueue(enc.encode('')); } }),
+    exited: new Promise(() => {}),  // 永远 pending
+    pid: 1234,
+    kill: () => {},
   } as any;
 }
 ```
@@ -1210,18 +1237,29 @@ export class ClaudeExecError extends Error {
   }
 }
 
+export type SpawnFn = (cmd: string[], opts: { stdout: 'pipe'; stderr: 'pipe' }) => {
+  stdout: ReadableStream<Uint8Array> | unknown;
+  stderr: ReadableStream<Uint8Array> | unknown;
+  exited: Promise<number>;
+  pid: number;
+  kill: (signal?: string) => void;
+};
+
 export interface AgentViewPollerOptions {
   claudeBin?: string;
   timeoutMs?: number;
+  spawn?: SpawnFn;  // 注入点:测试用 mock,生产用 Bun.spawn
 }
 
 export class AgentViewPoller {
   private readonly claudeBin: string;
   private readonly timeoutMs: number;
+  private readonly spawn: SpawnFn;
 
   constructor(opts: AgentViewPollerOptions = {}) {
     this.claudeBin = opts.claudeBin ?? 'claude';
     this.timeoutMs = opts.timeoutMs ?? 10_000;
+    this.spawn = opts.spawn ?? ((cmd, opts) => Bun.spawn(cmd, opts) as any);
   }
 
   async getVersion(): Promise<ClaudeVersion | null> {
@@ -1252,19 +1290,25 @@ export class AgentViewPoller {
   }
 
   private async exec(cmd: string[]): Promise<string> {
-    const proc = Bun.spawn(cmd, {
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const proc = this.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' });
 
     const stdoutText = await new Response(proc.stdout as any).text();
     const stderrText = await new Response(proc.stderr as any).text();
-    const exitCode = await Promise.race([
-      proc.exited,
-      new Promise<number>((_, reject) =>
-        setTimeout(() => reject(new ClaudeExecError(cmd, -1, 'timeout')), this.timeoutMs)
-      ),
-    ]);
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<number>((_, reject) => {
+      timer = setTimeout(() => {
+        try { proc.kill('SIGTERM'); } catch {}
+        reject(new ClaudeExecError(cmd, -1, 'timeout'));
+      }, this.timeoutMs);
+    });
+
+    let exitCode: number;
+    try {
+      exitCode = await Promise.race([proc.exited, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
 
     if (exitCode !== 0) {
       throw new ClaudeExecError(cmd, exitCode, stderrText);
@@ -1340,11 +1384,26 @@ describe('ExpectedReplyStore', () => {
     // 不在这里 clear 是因为 /cancel 也要 patch 原卡,调用方决定
   });
 
-  it('auto-clears after reply_wait_timeout_ms (5 min)', async () => {
-    const fast = new ExpectedReplyStore({ replyWaitTimeoutMs: 50 });
-    fast.set('ou_xxx', { shortId: 'a', sessionId: 's', cwd: '/p' });
-    await new Promise(r => setTimeout(r, 80));
+  it('auto-clears after reply_wait_timeout_ms and invokes onTimeout callback', async () => {
+    const fast = new ExpectedReplyStore({ replyWaitTimeoutMs: 20 });
+    let called: string | null = null;
+    fast.set('ou_xxx', {
+      shortId: 'a', sessionId: 's', cwd: '/p',
+      onTimeout: (oid) => { called = oid; },
+    });
+    await new Promise(r => setTimeout(r, 100));  // 5x 缓冲,慢机器也稳
     expect(fast.get('ou_xxx')).toBeNull();
+    expect(called).toBe('ou_xxx');
+    fast.dispose();
+  });
+
+  it('clearing a pending entry also clears the timeout', async () => {
+    const fast = new ExpectedReplyStore({ replyWaitTimeoutMs: 50 });
+    let called: string | null = null;
+    fast.set('ou_xxx', { shortId: 'a', sessionId: 's', cwd: '/p', onTimeout: (oid) => { called = oid; } });
+    fast.clear('ou_xxx');
+    await new Promise(r => setTimeout(r, 100));
+    expect(called).toBeNull();  // 提前 clear 后,onTimeout 不应触发
     fast.dispose();
   });
 
@@ -1376,6 +1435,7 @@ export interface ExpectedReplyEntry {
   cwd: string;
   startedAt: number;
   timeoutHandle: ReturnType<typeof setTimeout>;
+  onTimeout?: (openId: string) => void;
 }
 
 export class ExpectedReplyStore {
@@ -1386,7 +1446,10 @@ export class ExpectedReplyStore {
     this.replyWaitTimeoutMs = opts.replyWaitTimeoutMs ?? config.get<number>('agent_view.reply_wait_timeout_ms', 300000);
   }
 
-  set(openId: string, params: { shortId: string; sessionId: string; cwd: string }): void {
+  set(openId: string, params: {
+    shortId: string; sessionId: string; cwd: string;
+    onTimeout?: (openId: string) => void;
+  }): void {
     // 如果已存在,先 clear 旧的 timeout
     this.clear(openId);
 
@@ -1395,7 +1458,8 @@ export class ExpectedReplyStore {
       if (entry && entry.timeoutHandle === timeoutHandle) {
         logger.info(`AgentView: expectedReply timeout for openId=${openId}`);
         this.entries.delete(openId);
-        // 注意:这里不主动 patch 卡,留给调用方定时检查或下次 refresh
+        // 触发回调,让 Manager patch 原卡为超时状态
+        entry.onTimeout?.(openId);
       }
     }, this.replyWaitTimeoutMs);
 
@@ -1405,6 +1469,7 @@ export class ExpectedReplyStore {
       cwd: params.cwd,
       startedAt: Date.now(),
       timeoutHandle,
+      onTimeout: params.onTimeout,
     });
   }
 
@@ -1690,15 +1755,27 @@ describe('AgentViewManager.handlePeek', () => {
     });
   });
 
-  it('calls peekLogs and sends peek card', async () => {
-    await manager.handlePeek('ou_user1', 'a1b2', 'sess-1', '/p', { name: 'foo', status: 'working', pid: 1, startedAt: 'now' });
+  it('calls peekLogs and sends peek card with full meta', async () => {
+    mockPoller.listSessions.mockResolvedValueOnce([
+      { shortId: 'a1b2', sessionId: 'sess-1', name: 'foo', status: 'working', cwd: '/p', kind: 'claude', pid: 1, startedAt: '2026-06-01T10:00:00Z' },
+    ]);
+    await manager.handlePeek('ou_user1', 'a1b2', 'sess-1', '/p', { name: 'foo', status: 'working', pid: 1, startedAt: '2026-06-01T10:00:00Z' });
     expect(mockPoller.peekLogs).toHaveBeenCalledWith('a1b2');
     const sent = mockClient.im.v1.message.create.mock.calls[0][0].data.content;
     expect(sent).toContain('foo');
     expect(sent).toContain('last line of output');
+    expect(sent).toContain('a1b2');  // shortId 在按钮 value 中
+  });
+
+  it('uses shortId as name fallback when listSessions unavailable', async () => {
+    mockPoller.listSessions.mockRejectedValueOnce(new Error('daemon not running'));
+    await manager.handlePeek('ou_user1', 'a1b2', 'sess-1', '/p', { name: '', status: 'working', pid: 0, startedAt: '' });
+    const sent = mockClient.im.v1.message.create.mock.calls[0][0].data.content;
+    expect(sent).toContain('a1b2');  // 至少 shortId 在
   });
 
   it('handles peek failure gracefully', async () => {
+    mockPoller.listSessions.mockResolvedValueOnce([]);
     mockPoller.peekLogs.mockRejectedValueOnce(new Error('session gone'));
     await manager.handlePeek('ou_user1', 'a1b2', 'sess-1', '/p', { name: 'foo', status: 'working', pid: 1, startedAt: 'now' });
     const sent = mockClient.im.v1.message.create.mock.calls[0][0].data.content;
@@ -1752,6 +1829,25 @@ export interface PeekSessionMeta {
   async handlePeek(
     openId: string, shortId: string, sessionId: string, cwd: string, meta: PeekSessionMeta,
   ): Promise<void> {
+    // meta 可能不完整(如 peek 卡上 Refresh 触发时),优先用 listSessions 补全 name/status/pid/startedAt
+    let fullMeta = meta;
+    if (!meta.name || meta.name === shortId) {
+      try {
+        const sessions = await this.poller.listSessions();
+        const session = sessions.find(s => s.shortId === shortId || s.sessionId === sessionId);
+        if (session) {
+          fullMeta = {
+            name: session.name || shortId,
+            status: session.status,
+            pid: session.pid,
+            startedAt: session.startedAt,
+          };
+        }
+      } catch {
+        // 拉不到就走原 meta
+      }
+    }
+
     let recentOutput: string;
     try {
       recentOutput = await this.poller.peekLogs(shortId);
@@ -1763,13 +1859,15 @@ export interface PeekSessionMeta {
       return;
     }
     const card = buildPeekCard({
-      name: meta.name,
-      status: meta.status,
+      name: fullMeta.name,
+      status: fullMeta.status,
       cwd,
-      pid: meta.pid,
-      startedAt: meta.startedAt,
+      pid: fullMeta.pid,
+      startedAt: fullMeta.startedAt,
       lastActivity: 'just now',
       recentOutput,
+      shortId,
+      sessionId,
     });
     await this.sendCard(openId, card);
   }
@@ -1914,10 +2012,19 @@ const REPLYABLE_STATUSES: ReadonlySet<AgentSessionStatus> = new Set(['blocked', 
       return;
     }
 
-    // 2. 标记 expectedReply
-    this.expectedReplyStore.set(openId, { shortId: session.shortId, sessionId: session.sessionId, cwd });
+    // 2. 标记 expectedReply(带 onTimeout 回调,5 分钟无输入 patch 原卡为超时)
+    this.expectedReplyStore.set(openId, {
+      shortId: session.shortId, sessionId: session.sessionId, cwd,
+      onTimeout: (oid: string) => this.handleReplyTimeout(oid),
+    });
 
-    // 3. 发文本提示
+    // 3. patch 原 list/peek 卡为"等待输入"状态
+    const listCardMessageId = this.listCardMessageIds.get(openId);
+    if (listCardMessageId) {
+      await this.sendCard(openId, buildWaitingCard({ name: session.name || 'session' }), listCardMessageId);
+    }
+
+    // 4. 发文本提示
     const name = session.name || 'session';
     const minutes = Math.round(config.get<number>('agent_view.reply_wait_timeout_ms', 300000) / 60000);
     await this.feishuClient.im.v1.message.create({
@@ -1930,6 +2037,22 @@ const REPLYABLE_STATUSES: ReadonlySet<AgentSessionStatus> = new Set(['blocked', 
         }),
       },
     });
+  }
+
+  /**
+   * expectedReply 超时回调:patch 原 list 卡为"等待超时"
+   */
+  private async handleReplyTimeout(openId: string): Promise<void> {
+    const listCardMessageId = this.listCardMessageIds.get(openId);
+    if (listCardMessageId) {
+      await this.sendCard(openId, buildTimeoutCard(), listCardMessageId);
+    } else {
+      // 退化:发文本提示
+      await this.feishuClient.im.v1.message.create({
+        params: { receive_id_type: 'open_id' },
+        data: { receive_id: openId, msg_type: 'text', content: JSON.stringify({ text: '⏱ Agent View 回复等待已超时' }) },
+      });
+    }
   }
 ```
 
@@ -2121,13 +2244,36 @@ describe('buildReplyExecutor', () => {
       im: { v1: { message: { create: mock(async () => ({ data: { message_id: 'm-new' } })),
                               patch: mock(async () => ({})) } } },
     } as any;
-    const executor = buildReplyExecutor({ sessionManager, feishuClient, cardUpdaterFactory: () => cardUpdater });
+    const permissionHandler = mock(async () => {});
+    const executor = buildReplyExecutor({
+      sessionManager, feishuClient, cardUpdaterFactory: () => cardUpdater,
+      permissionHandler,
+    });
     await executor('ou_user1', { shortId: 'a1', sessionId: 'sess-1', cwd: '/p' }, 'do it');
     expect(cardUpdater.startProcessing).toHaveBeenCalledWith('ou_user1');
     expect(sessionManager.sendSDKMessage).toHaveBeenCalledWith(
       'sess-1', 'do it', '/p', expect.any(Function), expect.any(Function), false, 'sess-1', undefined,
     );
     expect(cardUpdater.complete).toHaveBeenCalled();
+  });
+
+  it('forwards permission request to permissionHandler', async () => {
+    const sessionManager = makeMockSessionManager();
+    const cardUpdater = makeMockCardUpdater();
+    const feishuClient = { im: { v1: { message: { create: mock(async () => ({ data: { message_id: 'm-new' } })) } } } } as any;
+    const permissionHandler = mock(async () => {});
+    const executor = buildReplyExecutor({
+      sessionManager, feishuClient, cardUpdaterFactory: () => cardUpdater,
+      permissionHandler,
+    });
+    // 触发 onPermissionRequest 回调
+    const onPermissionRequest = sessionManager.sendSDKMessage.mock.calls[0]
+      ? (sessionManager.sendSDKMessage.mock.calls[0] as any)[4]  // 第 5 个参数
+      : null;
+    if (onPermissionRequest) {
+      await onPermissionRequest({ toolName: 'Bash', toolInput: { cmd: 'rm -rf /' }, suggestions: [] });
+      expect(permissionHandler).toHaveBeenCalled();
+    }
   });
 
   it('renders error card on sendSDKMessage rejection', async () => {
@@ -2138,7 +2284,10 @@ describe('buildReplyExecutor', () => {
     const feishuClient = {
       im: { v1: { message: { create: mock(async () => ({ data: { message_id: 'm-new' } })) } } },
     } as any;
-    const executor = buildReplyExecutor({ sessionManager, feishuClient, cardUpdaterFactory: () => cardUpdater });
+    const executor = buildReplyExecutor({
+      sessionManager, feishuClient, cardUpdaterFactory: () => cardUpdater,
+      permissionHandler: mock(async () => {}),
+    });
     await executor('ou_user1', { shortId: 'a1', sessionId: 'sess-1', cwd: '/p' }, 'do it');
     expect(cardUpdater.error).toHaveBeenCalled();
   });
@@ -2164,10 +2313,20 @@ interface FeishuClientLike {
   im: { v1: { message: { create: (p: any) => Promise<any>; patch: (p: any) => Promise<any> } } };
 }
 
+/**
+ * 权限请求的飞书呈现:由调用方注入(daemon 启动时把 FeishuBot 的逻辑包一下)
+ */
+export type PermissionHandler = (prompt: PermissionPrompt, openId: string) => Promise<void>;
+
 export interface ReplyExecutorDeps {
   sessionManager: ClaudeSessionManager;
   feishuClient: FeishuClientLike;
   cardUpdaterFactory: (client: FeishuClientLike) => CardUpdater;
+  /**
+   * 处理 SDK 权限请求(必填):把 PermissionPrompt 转成飞书权限卡 + 飞书按钮回调
+   * 必须在 daemon 启动时注入(参考 FeishuBot.handlePermissionCardAction 的逻辑)
+   */
+  permissionHandler: PermissionHandler;
 }
 
 export type ReplyExecutor = (
@@ -2180,7 +2339,8 @@ export type ReplyExecutor = (
  * 构造 reply executor:
  * 1. 创建新 CardUpdater → 飞书消息
  * 2. sendSDKMessage(resume) 流式喂给 CardUpdater
- * 3. 完成后 complete,失败时 error
+ * 3. 权限请求转发给 permissionHandler(由 FeishuBot 的实现走飞书权限卡)
+ * 4. 完成后 complete,失败时 error
  */
 export function buildReplyExecutor(deps: ReplyExecutorDeps): ReplyExecutor {
   return async (openId, entry, text) => {
@@ -2188,7 +2348,7 @@ export function buildReplyExecutor(deps: ReplyExecutorDeps): ReplyExecutor {
     await cardUpdater.startProcessing(openId);
 
     try {
-      const { result, handler } = await deps.sessionManager.sendSDKMessage(
+      const { result } = await deps.sessionManager.sendSDKMessage(
         entry.sessionId,
         text,
         entry.cwd,
@@ -2201,10 +2361,9 @@ export function buildReplyExecutor(deps: ReplyExecutorDeps): ReplyExecutor {
             ).catch(() => {});
           }
         },
-        (prompt: PermissionPrompt, h: any) => {
-          // 权限请求通过现有 PermissionHandler 走飞书权限卡
-          // (跟 bot 现有逻辑一致,通过 onPermissionRequest 路径)
-          if (handler && h) h.onPermissionRequest = handler.onPermissionRequest;
+        (prompt: PermissionPrompt) => {
+          // 转发到飞书权限卡(由调用方提供的 handler)
+          void deps.permissionHandler(prompt, openId);
         },
         false,
         entry.sessionId,
@@ -2336,17 +2495,57 @@ describe('FeishuBot AgentView integration', () => {
   });
 
   it('handles agent_view_peek card action', async () => {
+    (agentView as any).poller = { listSessions: mock(async () => [
+      { shortId: 'a1', sessionId: 'sess-1', name: 'foo', status: 'working', cwd: '/p', kind: 'claude', pid: 1, startedAt: '' },
+    ]), peekLogs: mock(async () => '') };
+    (agentView as any).handlePeek = mock(async () => {});
     await bot.handleCardAction({
       open_id: 'ou_user1',
       action: { tag: 'agent_view_peek', value: { shortId: 'a1', sessionId: 'sess-1', cwd: '/p' } },
       message: { message_id: 'msg-x' },
     } as any);
-    expect(mockClient.im.v1.message.create).toHaveBeenCalled();
+    expect((agentView as any).handlePeek).toHaveBeenCalledWith(
+      'ou_user1', 'a1', 'sess-1', '/p', expect.any(Object),
+    );
+  });
+
+  it('handles agent_view_reply_request card action', async () => {
+    (agentView as any).handleReplyRequest = mock(async () => {});
+    await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'agent_view_reply_request', value: { shortId: 'a1', sessionId: 'sess-1', cwd: '/p' } },
+      message: { message_id: 'msg-x' },
+    } as any);
+    expect((agentView as any).handleReplyRequest).toHaveBeenCalledWith(
+      'ou_user1', 'a1', 'sess-1', '/p',
+    );
+  });
+
+  it('handles agent_view_stop card action', async () => {
+    (agentView as any).handleStop = mock(async () => {});
+    await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'agent_view_stop', value: { shortId: 'a1', sessionId: 'sess-1' } },
+      message: { message_id: 'msg-x' },
+    } as any);
+    expect((agentView as any).handleStop).toHaveBeenCalledWith(
+      'ou_user1', 'a1', 'sess-1',
+    );
+  });
+
+  it('handles agent_view_back_to_list card action', async () => {
+    (agentView as any).handleList = mock(async () => {});
+    await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'agent_view_back_to_list', value: {} },
+      message: { message_id: 'msg-x' },
+    } as any);
+    expect((agentView as any).handleList).toHaveBeenCalledWith('ou_user1', 'msg-x');
   });
 
   it('routes reply text via expectedReply when openId has pending entry', async () => {
-    // 设置 expectedReply
-    (bot as any).expectedReplyStore.set('ou_user1', {
+    // 设置 expectedReply 在 agentView 的 store 上(不是 bot 上)
+    (agentView as any).expectedReplyStore.set('ou_user1', {
       shortId: 'a1', sessionId: 'sess-1', cwd: '/p',
     });
     const handleChatSpy = mock(async () => 'reply_handled');
@@ -2397,8 +2596,11 @@ Expected: FAIL — bot not yet integrated
       }
       case 'agent_view_peek': {
         if (this.agentViewManager && valueObj) {
-          // 需要从 list 缓存里查 name/status 等元数据
-          await this.handleAgentViewPeek(openId, valueObj as any, messageId);
+          // peek 卡上的按钮(valueObj 含 shortId/sessionId/cwd),Manager 内部 listSessions 补全 name/status
+          await this.agentViewManager.handlePeek(
+            openId, valueObj.shortId, valueObj.sessionId, valueObj.cwd,
+            { name: '', status: 'working', pid: 0, startedAt: '' },
+          );
         }
         return null;
       }
@@ -2454,24 +2656,7 @@ Expected: FAIL — bot not yet integrated
   }
 ```
 
-3.5 添加 `handleAgentViewPeek` 辅助方法(从卡片 value 中补全 meta):
-
-```typescript
-  private async handleAgentViewPeek(openId: string, value: any, messageId?: string): Promise<void> {
-    if (!this.agentViewManager) return;
-    // 需要 session meta(name/status/pid/startedAt),但 agent_view_peek 按钮的 value 里没带
-    // 简化方案:再 listSessions 一次找到对应 session
-    // (这里 manager 内部封装,bot 不直接调 poller)
-    await this.agentViewManager.handlePeek(openId, value.shortId, value.sessionId, value.cwd, {
-      name: value.shortId || 'session',  // fallback
-      status: 'working' as any,            // fallback,UI 不强依赖
-      pid: 0,
-      startedAt: new Date().toISOString(),
-    });
-  }
-```
-
-(更好的方案是在 list card 按钮 value 里直接带 name/status,留给后续完善)
+3.5 bot 不再需要 `handleAgentViewPeek` 辅助方法 —— `AgentViewManager.handlePeek` 内部已经会 listSessions 补全 meta(见 Task 10 改后的实现)。card action 直接 dispatch 到 `agentViewManager.handlePeek(openId, value.shortId, value.sessionId, value.cwd, { name: '', status: 'working', pid: 0, startedAt: '' })`。
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -2533,8 +2718,24 @@ const agentViewManager = new AgentViewManager({
 
 // 注入 reply executor(连接 sendSDKMessage)
 const sessionManager: ClaudeSessionManager = ...;  // 已存在
+const cardUpdaterFactory = (c: typeof feishuClient) => new CardUpdater(c);
+
+// permissionHandler:把 PermissionPrompt 转成飞书权限卡 + 飞书按钮回调
+// 复用 FeishuBot 的 handlePermissionCardAction 逻辑(在 bot 实例化后通过 bot.exposePermissionHandler 暴露)
+const permissionHandler = async (prompt: PermissionPrompt, openId: string) => {
+  // 这里调用 FeishuBot 的内部方法把 prompt 渲染成飞书权限卡
+  // 详细实现见 src/feishu/bot.ts 的 handlePermissionCardAction
+  // (daemon 启动时由 bot 实例提供具体的实现,这里只是 stub)
+  await bot.handlePermissionCardAction(openId, prompt, /* ... */);
+};
+
 agentViewManager.setReplySender(
-  buildReplyExecutor({ sessionManager, feishuClient, cardUpdaterFactory: (c) => new CardUpdater(c) }),
+  buildReplyExecutor({
+    sessionManager,
+    feishuClient,
+    cardUpdaterFactory,
+    permissionHandler,
+  }),
 );
 ```
 
@@ -2543,6 +2744,8 @@ agentViewManager.setReplySender(
 ```typescript
 const bot = new FeishuBot({ ..., agentViewManager });
 ```
+
+> **实现说明**:permissionHandler 的具体实现由 FeishuBot 暴露,daemon 启动时把 `bot` 的 `handlePermissionCardAction` 方法(或等价函数)注入到 executor。PermissionHandler 的 `resolve()/reject()` 已经在 sendSDKMessage 内部管理,executor 只负责把 prompt 转成飞书卡片通知用户。
 
 - [ ] **Step 3: typecheck + 全量测试**
 
