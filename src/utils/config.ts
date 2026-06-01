@@ -141,7 +141,10 @@ const DEFAULTS: ConfigData = {
     enabled: true,
     permission_mode: 'acceptEdits',
     timeout_ms: 600_000,
-    claude_executable: 'claude',
+    // Empty string means "use SDK-bundled Claude binary" instead of
+    // looking up `claude` in PATH (which may be a globally-installed
+    // version incompatible with this SDK release).
+    claude_executable: '',
   },
   images: {
     enabled: true,

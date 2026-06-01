@@ -685,7 +685,7 @@ export class ClaudeSessionManager {
       handler.onPermissionRequest = (prompt) => onPermissionRequest(prompt, handler);
 
       const permissionMode = config.get<string>('sdk.permission_mode', 'acceptEdits');
-      const claudeExecutable = config.get<string>('sdk.claude_executable', 'claude');
+      const claudeExecutable = config.get<string>('sdk.claude_executable', '');
 
       let lastResult: any = null;
       let hasError = false;
@@ -698,6 +698,38 @@ export class ClaudeSessionManager {
       const hardTimeout = config.get<number>('runtime.hard_timeout_ms', 30 * 60 * 1000);
       let hardTimer: ReturnType<typeof setTimeout> | null = null;
 
+      // Build SDK options.  When claude_executable is empty (the default),
+      // omit pathToClaudeCodeExecutable so the SDK uses its own bundled
+      // binary that is guaranteed to be version-compatible.
+      const sdkOptions: Record<string, any> = {
+        permissionMode: permissionMode as any,
+        canUseTool: handler.canUseTool.bind(handler),
+        cwd: expandedCwd,
+        allowedTools: config.get<string[]>('claude.allowed_tools', []),
+        disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
+        abortController,
+        includePartialMessages: true,
+      };
+      if (claudeExecutable) {
+        sdkOptions.pathToClaudeCodeExecutable = claudeExecutable;
+      }
+      if (sessionId && !isNew) {
+        sdkOptions.resume = sessionId;
+      }
+      if (settingsPath && existsSync(settingsPath)) {
+        sdkOptions.settings = settingsPath;
+      }
+
+      // Diagnostic logging before spawning
+      const binarySource = claudeExecutable
+        ? `external (${claudeExecutable})`
+        : 'SDK-bundled (default)';
+      logger.info(
+        `SDK: spawning Claude — binary=${binarySource}, ` +
+          `session=${sessionId ?? 'new'}, resume=${!isNew && !!sessionId}, ` +
+          `cwd=${expandedCwd}, settings=${settingsPath ?? 'none'}`
+      );
+
       try {
         hardTimer = setTimeout(() => {
           if (!abortController.signal.aborted) {
@@ -708,18 +740,7 @@ export class ClaudeSessionManager {
 
         for await (const message of query({
           prompt: text,
-          options: {
-            permissionMode: permissionMode as any,
-            canUseTool: handler.canUseTool.bind(handler),
-            cwd: expandedCwd,
-            allowedTools: config.get<string[]>('claude.allowed_tools', []),
-            disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
-            pathToClaudeCodeExecutable: claudeExecutable,
-            abortController,
-            includePartialMessages: true,
-            ...(sessionId && !isNew ? { resume: sessionId } : {}),
-            ...(settingsPath && existsSync(settingsPath) ? { settings: settingsPath } : {}),
-          },
+          options: sdkOptions,
         })) {
           adapter.adapt(message as SDKMessage, (chunk: SDKStreamChunk) => {
             if (chunk.type === 'result') {
@@ -734,17 +755,27 @@ export class ClaudeSessionManager {
           }
         }
       } catch (err: any) {
-        logger.error(`SDK: query failed: ${err.message}`);
+        const errMsg = err.message ?? String(err);
+        const errStderr = err.stderr ?? '';
+        const errCode = err.code ?? '';
+        const errStack = err.stack ?? '';
+        const diagCtx =
+          `binary=${binarySource}, session=${sessionId ?? 'new'}, cwd=${expandedCwd}`;
+        logger.error(
+          `SDK: query failed — ${errMsg}${errStderr ? ` | stderr: ${errStderr}` : ''}${errCode ? ` | code: ${errCode}` : ''} | ${diagCtx}`
+        );
+        // Log stack at debug level to avoid noise in production; useful for dev.
+        logger.debug(`SDK: query failed stack: ${errStack}`);
         handler.rejectAll();
         return {
           result: {
-            response: `Claude SDK 执行失败: ${err.message}`,
+            response: `Claude SDK 执行失败: ${errMsg}`,
             costUsd: 0,
             durationMs: Date.now() - startTime,
             sessionId: sessionId ?? '',
             jsonlPath: null,
             sessionStatus: 'degraded',
-            error: err.message,
+            error: errMsg,
           },
           handler,
         };
