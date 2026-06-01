@@ -15,6 +15,8 @@ import { config } from './config';
 import { logger } from './logger';
 import { PKG_VERSION } from '../version';
 
+export { parsePsTimeToSeconds } from './process-info';
+
 // === 类型定义 ===
 
 export type ActivityConfidence = 'high' | 'medium' | 'low';
@@ -169,4 +171,20 @@ export function cleanupOldActivityLogs(maxAgeHours: number = 24): number {
     logger.warn(`清理 activity 日志失败: ${err}`);
   }
   return cleaned;
+}
+
+// === CPU 采样 ===
+
+// 不从 bun 导入 sleep，使用 setTimeout Promise 包装（与 session.ts:50 一致）
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+export async function getInstantCPU(pid: number, durationMs: number = 1000): Promise<number> {
+  const t1 = await getProcessCPUTimeSeconds(pid);
+  await sleep(durationMs);
+  const t2 = await getProcessCPUTimeSeconds(pid);
+
+  const wallClockSec = durationMs / 1000;
+  const cpuSec = t2 - t1;
+  const cores = 1;  // macOS 容器/CI 可能不可靠
+  return Math.max(0, Math.min(100 * cores, (cpuSec / wallClockSec) * 100));
 }
