@@ -265,7 +265,7 @@ AgentViewManager.handleStop(openId, shortId, sessionId)
 - 名称(`name` 字段)
 - 状态(根据 `status` 字段映射)
 - 耗时(从 `startedAt` 计算,人可读格式)
-- 活动描述:v1 留占位 `当前活动: ?`(见 N6)
+- 活动描述:v1 不显示(见 N6)
 - 目录(`cwd`,截断到 `~/projects/my-app`)
 - PR 编号(若有,普通文本)
 
@@ -466,7 +466,7 @@ min_claude_version = "2.1.139"
 ## 12. 文档更新
 
 - `docs/superpowers/specs/2026-06-01-feishu-agent-view-design.md`(本文档)
-- `README.md` / `README_en.md` 新增 "Agent View" 章节,展示命令、卡片截图占位、配置说明
+- `README.md` / `README_en.md` 新增 "Agent View" 章节,展示命令、卡片示例图、配置说明
 - `CLAUDE.md` "Important Files" 表加 `src/agent-view/`
 - `docs/agent-view.md`(可选,放完整用户手册)
 
