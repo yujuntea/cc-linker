@@ -10,6 +10,18 @@ import { config } from '../utils/config';
 const PROJECT_NAME_FILES = ['package.json', 'go.mod', 'Cargo.toml', 'pyproject.toml'];
 const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 
+const NON_MESSAGE_TYPES = new Set([
+  'ai-title',
+  'last-prompt',
+  'queue-operation',
+  'file-history-snapshot',
+  'mode',
+  'permission-mode',
+  'agent-name',
+  // 兼容旧版 cc-linker 写入的 JSONL marker
+  'activity_marker',
+]);
+
 export class JSONLScanner {
   private registry: RegistryManager;
   private fileCache: FileCache;
