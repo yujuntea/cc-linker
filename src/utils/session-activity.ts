@@ -283,3 +283,36 @@ export async function isJSONLWrittenSince(
   if (stat2.mtimeMs > stat1.mtimeMs) return { written: true, ageMs: 0 };
   return { written: false, ageMs: Date.now() - stat2.mtimeMs };
 }
+
+export class SessionActivityCache {
+  private cache = new Map<string, { result: ActivityResult; expiresAt: number }>();
+  private readonly TTL_MS: number;
+
+  constructor(ttlMs?: number) {
+    this.TTL_MS = ttlMs ?? config.get<number>('runtime.activity_cache_ttl_ms', 10_000);
+  }
+
+  get(key: string): ActivityResult | null {
+    const cached = this.cache.get(key);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.result;
+    }
+    this.cache.delete(key);
+    return null;
+  }
+
+  set(key: string, result: ActivityResult): void {
+    this.cache.set(key, { result, expiresAt: Date.now() + this.TTL_MS });
+  }
+
+  /**
+   * 主动失效缓存。SDK 收到新 chunk 时调用，确保下一次检测拿到最新状态。
+   */
+  invalidate(key: string): void {
+    this.cache.delete(key);
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+}
