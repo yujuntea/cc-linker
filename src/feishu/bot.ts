@@ -345,6 +345,10 @@ export class FeishuBot {
       );
     }
 
+    if (valueObj && valueObj.type === 'cli_force_send') {
+      return await this.handleForceSendCardAction(openId, valueObj, message?.message_id);
+    }
+
     const sessionId = value as string;
 
     switch (tag) {
@@ -454,6 +458,43 @@ export class FeishuBot {
       header: { title: { tag: 'plain_text', content: '❌ 已拒绝' }, template: 'red' },
       elements: [{ tag: 'markdown', content: '操作已被拒绝，Claude 将尝试其他方式。' }],
     };
+  }
+
+  /** Handle CLI-busy card's force-send action: mark the pending message to skip activity check. */
+  private async handleForceSendCardAction(
+    openId: string,
+    valueObj: Record<string, unknown>,
+    messageId?: string
+  ): Promise<string | Record<string, unknown> | null> {
+    const entry = this.userManager.getEntry(openId);
+    if (!entry?.sessionUuid) {
+      return {
+        config: { wide_screen_mode: true },
+        header: { title: { tag: 'plain_text', content: '❌ 错误' }, template: 'red' },
+        elements: [{ tag: 'markdown', content: '**会话不存在**' }],
+      };
+    }
+
+    // 在 processing 目录中查找属于该 session 的消息
+    const processingMsgs = this.spoolQueue.listProcessing()
+      .filter(m => m.serialKey === entry.sessionUuid && m.openId === openId);
+
+    if (processingMsgs.length === 0) {
+      return null;
+    }
+
+    const targetMsg = processingMsgs[0];
+    const updated = await this.spoolQueue.updateMessageFlags(
+      targetMsg.messageId,
+      targetMsg.serialKey,
+      { skipActivityCheck: true, awaitingForceSend: false }
+    );
+
+    if (!updated) return null;
+
+    this.sessionManager.activityCache?.invalidate(`feishu-detects-cli:${entry.sessionUuid}`);
+
+    return null;
   }
 
   /** Claim one message from pending queue */
@@ -627,16 +668,17 @@ export class FeishuBot {
     }
   }
 
-  /**
-   * Stub — full implementation added in Task 5.6.
-   * Will use CardUpdater.createCLIBusyCard (Task 5.5) once that method exists.
-   */
   private async sendCLIBusyCard(
-    _msg: SpoolMessage,
-    _entry: any,
+    msg: SpoolMessage,
+    entry: any,
     status: ActivityResult,
   ): Promise<void> {
-    logger.debug(`[stub] sendCLIBusyCard: ${status.reason}`);
+    const cardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: 0 });
+    await cardUpdater.createCLIBusyCard(
+      msg.openId,
+      entry?.title ?? '未命名会话',
+      status
+    );
   }
 
   /** Non-streaming path for existing session messages (extracted from original handleChat session case) */
