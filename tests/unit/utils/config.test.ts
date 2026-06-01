@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
 import { ConfigManager } from '../../../src/utils/config';
 import { writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
@@ -51,5 +51,21 @@ describe('ConfigManager', () => {
 
     const fresh = new ConfigManager(join(tmpDir, 'nonexistent.toml'));
     expect(fresh.get('feishu_bot.app_id', '')).toBe('');
+  });
+});
+
+describe('ConfigManager.setRuntimeOverride', () => {
+  test('覆盖值优先于配置文件', () => {
+    const cm = new ConfigManager();
+    expect(cm.get('runtime.activity_cache_ttl_ms', 999)).toBe(10_000);  // 默认
+    cm.setRuntimeOverride('runtime.activity_cache_ttl_ms', 5_000);
+    expect(cm.get('runtime.activity_cache_ttl_ms', 999)).toBe(5_000);
+  });
+
+  test('boolean 覆盖可被 get 读取', () => {
+    const cm = new ConfigManager();
+    cm.setRuntimeOverride('runtime.cli_process_detection_enabled', false);
+    // 不应抛错，内存覆盖成功
+    expect(cm.get('runtime.cli_process_detection_enabled', true)).toBe(false);
   });
 });
