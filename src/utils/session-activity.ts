@@ -239,6 +239,29 @@ export function cleanupOldActivityLogs(maxAgeHours: number = 24): number {
   } catch (err) {
     logger.warn(`清理 activity 日志失败: ${err}`);
   }
+
+  // Prune stale lastRotationAt entries (>60s old) — the rotate throttle
+  // won't fire for at least 30s after the last rotation, so anything older
+  // than 2x that window is safe to drop. Prevents unbounded growth in
+  // long-running bots that rotate many sessions over their lifetime.
+  const rotationCutoff = Date.now() - MIN_ROTATE_INTERVAL_MS * 2;
+  for (const [sessionUuid, ts] of lastRotationAt) {
+    if (ts < rotationCutoff) {
+      lastRotationAt.delete(sessionUuid);
+    }
+  }
+
+  // Cap warnedSessionUuids to prevent pathological growth. In normal
+  // operation this set is bounded by the number of distinct invalid UUIDs
+  // the process has ever seen (typically tiny), but a misbehaving caller
+  // could spray unique values forever. Keep the most recent 500.
+  if (warnedSessionUuids.size > 1000) {
+    // Map/Set preserve insertion order, so slice(-N) gives the newest N.
+    const toKeep = Array.from(warnedSessionUuids).slice(-500);
+    warnedSessionUuids.clear();
+    for (const id of toKeep) warnedSessionUuids.add(id);
+  }
+
   return cleaned;
 }
 
