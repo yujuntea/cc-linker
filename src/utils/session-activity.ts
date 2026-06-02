@@ -116,8 +116,12 @@ export function writeActivityMarker(
     version: PKG_VERSION,
   };
 
+  // Rotate (best-effort, never throws - has its own try/catch internally)
+  maybeRotateActivityLog(sessionUuid);
+
+  // Write the new marker (separated from rotate so write failure doesn't
+  // happen after file was already truncated by rotate)
   try {
-    maybeRotateActivityLog(sessionUuid);
     appendFileSync(activityLogPath(sessionUuid), JSON.stringify(marker) + '\n', { mode: 0o600 });
   } catch (err) {
     logger.warn(`写入 activity marker 失败: ${sessionUuid}: ${err}`);
