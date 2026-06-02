@@ -60,6 +60,13 @@ export interface ActivityEntry {
 
 const MAX_ACTIVITY_LOG_BYTES = 64 * 1024;
 const ROTATE_KEEP_RATIO = 0.5;
+// Minimum time between rotations per session (30s). Caps IO cost on long
+// streaming sessions while still preventing unbounded log growth. This is
+// a best-effort cap, not a hard limit — the file can still grow past
+// MAX_ACTIVITY_LOG_BYTES between rotations.
+const MIN_ROTATE_INTERVAL_MS = 30_000;
+// Track last rotation timestamp per session
+const lastRotationAt = new Map<string, number>();
 
 // === Sidecar 文件路径 ===
 
@@ -145,6 +152,14 @@ function maybeRotateActivityLog(sessionUuid: string): void {
     const stat = statSync(path);
     if (stat.size <= MAX_ACTIVITY_LOG_BYTES) return;
 
+    // Time-window guard: cap rotation frequency to avoid IO storm on long sessions.
+    // A 30-min session with ~200B heartbeats per streaming chunk = thousands of writes
+    // = hundreds of rotations at 64KB threshold. Without this guard, on slow disks
+    // we'd do hundreds of read+write cycles = significant event-loop blocking.
+    const lastRotation = lastRotationAt.get(sessionUuid) ?? 0;
+    const now = Date.now();
+    if (now - lastRotation < MIN_ROTATE_INTERVAL_MS) return;
+
     const content = readFileSync(path, 'utf8');
     const keepBytes = Math.floor(MAX_ACTIVITY_LOG_BYTES * ROTATE_KEEP_RATIO);
     const tail = content.slice(-keepBytes);
@@ -152,6 +167,7 @@ function maybeRotateActivityLog(sessionUuid: string): void {
     const trimmed = firstNewline >= 0 ? tail.slice(firstNewline + 1) : tail;
 
     writeFileSync(path, trimmed, { mode: 0o600 });
+    lastRotationAt.set(sessionUuid, now);
     logger.debug(`activity log 轮转: ${sessionUuid}, 保留 ${trimmed.length} bytes`);
   } catch (err) {
     logger.debug(`activity log 轮转失败: ${sessionUuid}: ${err}`);
