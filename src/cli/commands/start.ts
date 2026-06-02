@@ -198,6 +198,21 @@ async function createBotRuntime(
   log: (level: string, msg: string) => void,
   wsLogLevel?: number,
 ): Promise<BotRuntime> {
+  // Step 1: 探测 CLI 进程检测可用性（macOS 权限）
+  // 前台和 daemon 模式都需要，确保运行时配置一致
+  const cliDetectionOk = probeCliProcessDetection();
+  if (!cliDetectionOk) {
+    log('WARN', 'CLI 进程检测不可用（macOS 权限），将只使用 marker + mtime 检测');
+    config.setRuntimeOverride('runtime.cli_process_detection_enabled', false);
+  }
+
+  // Step 2: 清理过期 activity 日志
+  // 24 小时未更新的 sidecar 文件可以安全删除
+  const cleaned = cleanupOldActivityLogs(24);
+  if (cleaned > 0) {
+    log('INFO', `清理过期 activity 日志: ${cleaned} 个文件`);
+  }
+
   const spoolQueue = new SpoolQueue();
   const stateCoordinator = new StateCoordinator();
   let replyFn: FeishuReplyFn = async () => null;
@@ -454,21 +469,11 @@ async function createBotRuntime(
 async function startForeground(registry: RegistryManager, opts: StartOptions): Promise<void> {
   console.log(chalk.blue('🚀 启动 cc-linker...'));
 
-  // Step 1: 探测 CLI 进程检测可用性
-  const cliDetectionOk = probeCliProcessDetection();
-  if (!cliDetectionOk) {
-    logger.warn('CLI 进程检测不可用（macOS 权限），将只使用 marker + mtime 检测');
-    config.setRuntimeOverride('runtime.cli_process_detection_enabled', false);
-  }
-
-  // Step 2: 清理过期 activity 日志
-  const cleaned = cleanupOldActivityLogs(24);
-  logger.info(`清理过期 activity 日志: ${cleaned} 个文件`);
-
-  // Step 3-5: 创建 cache + sessionManager + bot 在 createBotRuntime / Task 6.2 中接入
-  // (SessionActivityCache 由 Task 6.2 注入到 sessionManager / FeishuBot)
+  // Step 1 (probe) + Step 2 (cleanup) 已在 createBotRuntime 内执行
+  // Step 3-5 (cache/sessionManager/bot) 也在 createBotRuntime 内执行
 
   // Step 6: Grace period（避免升级期间老 daemon 残留导致误判）
+  // 只在 foreground 模式下执行；daemon 模式不阻塞启动
   logger.info('活跃检测 grace period: 30 秒');
   await new Promise<void>(resolve => setTimeout(resolve, 30_000));
 
