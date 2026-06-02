@@ -4,7 +4,7 @@ import {
   getProcessCPUTimeSeconds,
   type ProcessInfo,
 } from './process-info';
-import { ACTIVITY_DIR, CC_LINKER_DIR } from './paths';
+import { ACTIVITY_DIR } from './paths';
 import {
   appendFileSync, readFileSync, existsSync, statSync, mkdirSync,
   unlinkSync, writeFileSync, readdirSync, openSync, readSync, closeSync,
