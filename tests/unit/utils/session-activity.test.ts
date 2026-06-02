@@ -26,7 +26,10 @@ import {
   isSessionActive,
   SessionActivityCache,
   cleanupOldActivityLogs,
+  isJSONLWrittenSince,
 } from '../../../src/utils/session-activity';
+import { writeFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
 
 describe('Activity Marker (sidecar)', () => {
   let testDir: string;
@@ -125,5 +128,92 @@ describe('SessionActivityCache', () => {
     cache.set('key', { isProcessing: true, confidence: 'high', reason: 'test', source: 'marker' });
     await new Promise(resolve => setTimeout(resolve, 100));
     expect(cache.get('key')).toBeNull();
+  });
+});
+
+describe('isJSONLWrittenSince', () => {
+  let testDir: string;
+
+  beforeEach(() => {
+    testDir = `/tmp/cc-linker-test-${Date.now()}-${Math.random()}`;
+    process.env.CC_LINKER_DIR = testDir;
+    mkdirSync(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    const { rmSync } = await import('fs');
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  test('文件不存在 → written=false, ageMs=Infinity', async () => {
+    const result = await isJSONLWrittenSince('/nonexistent/path.jsonl');
+    expect(result.written).toBe(false);
+    expect(result.ageMs).toBe(Infinity);
+  });
+
+  test('文件未变化 → written=false, ageMs > 0', async () => {
+    const path = join(testDir, 'test.jsonl');
+    writeFileSync(path, '{"type":"user"}\n', 'utf8');
+    const result = await isJSONLWrittenSince(path, 100);
+    expect(result.written).toBe(false);
+    expect(result.ageMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test('文件在采样期间被追加 → written=true, ageMs=0', async () => {
+    const path = join(testDir, 'test.jsonl');
+    writeFileSync(path, '{"type":"user"}\n', 'utf8');
+
+    // 在后台延迟追加文件
+    setTimeout(() => {
+      writeFileSync(path, '{"type":"assistant"}\n', { flag: 'a' });
+    }, 50);
+
+    const result = await isJSONLWrittenSince(path, 200);
+    expect(result.written).toBe(true);
+    expect(result.ageMs).toBe(0);
+  });
+
+});
+
+describe('cleanupOldActivityLogs', () => {
+  let testDir: string;
+
+  beforeEach(() => {
+    testDir = `/tmp/cc-linker-test-${Date.now()}-${Math.random()}`;
+    process.env.CC_LINKER_DIR = testDir;
+  });
+
+  afterEach(async () => {
+    const { rmSync } = await import('fs');
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  test('清理过期文件并返回数量', async () => {
+    const activityDir = join(testDir, 'activity');
+    mkdirSync(activityDir, { recursive: true });
+
+    // 写入一个旧文件（mtime 设为 25 小时前）
+    const oldPath = join(activityDir, 'old-session.log');
+    writeFileSync(oldPath, '{"type":"activity_marker"}\n', 'utf8');
+    const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    const { utimesSync } = await import('fs');
+    utimesSync(oldPath, oldDate, oldDate);
+
+    // 写入一个新文件
+    const newPath = join(activityDir, 'new-session.log');
+    writeFileSync(newPath, '{"type":"activity_marker"}\n', 'utf8');
+
+    // 传入自定义目录进行测试
+    const cleaned = cleanupOldActivityLogs(24, activityDir);
+    expect(cleaned).toBe(1);
+
+    const { existsSync } = await import('fs');
+    expect(existsSync(oldPath)).toBe(false);
+    expect(existsSync(newPath)).toBe(true);
+  });
+
+  test('activity 目录不存在 → 返回 0', () => {
+    const cleaned = cleanupOldActivityLogs(24, '/nonexistent/activity/dir');
+    expect(cleaned).toBe(0);
   });
 });

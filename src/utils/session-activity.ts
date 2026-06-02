@@ -221,13 +221,14 @@ function maybeRotateActivityLog(sessionUuid: string): void {
   }
 }
 
-export function cleanupOldActivityLogs(maxAgeHours: number = 24): number {
-  if (!existsSync(ACTIVITY_DIR)) return 0;
+export function cleanupOldActivityLogs(maxAgeHours: number = 24, targetDir?: string): number {
+  const dir = targetDir ?? ACTIVITY_DIR;
+  if (!existsSync(dir)) return 0;
   const cutoff = Date.now() - maxAgeHours * 60 * 60 * 1000;
   let cleaned = 0;
   try {
-    for (const file of readdirSync(ACTIVITY_DIR)) {
-      const path = join(ACTIVITY_DIR, file);
+    for (const file of readdirSync(dir)) {
+      const path = join(dir, file);
       try {
         const stat = statSync(path);
         if (stat.mtimeMs < cutoff) {
@@ -361,7 +362,6 @@ export async function hasActiveDescendants(rootPid: number, depth: number = 3): 
 
 export async function isJSONLWrittenSince(
   jsonlPath: string,
-  sinceMs: number,
   sampleMs: number = 500
 ): Promise<{ written: boolean; ageMs: number }> {
   if (!existsSync(jsonlPath)) return { written: false, ageMs: Infinity };
@@ -499,7 +499,7 @@ async function detectCliActivity(entry: ActivityEntry): Promise<ActivityResult> 
   }
 
   if (entry.jsonl_path) {
-    const mtimeResult = await isJSONLWrittenSince(entry.jsonl_path, 0);
+    const mtimeResult = await isJSONLWrittenSince(entry.jsonl_path);
     if (mtimeResult.written) {
       return {
         isProcessing: true,

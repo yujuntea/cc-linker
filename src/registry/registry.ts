@@ -7,6 +7,7 @@ import { logger } from '../utils/logger';
 import { CCLinkerError } from '../utils/errors';
 import { CC_LINKER_DIR } from '../utils/paths';
 import { config } from '../utils/config';
+import { activityLogPath } from '../utils/session-activity';
 
 const MAX_BACKUPS = 3;
 
@@ -242,6 +243,14 @@ export class RegistryManager {
 
   /** 从 registry 中移除指定会话并保存。 */
   async remove(uuid: string): Promise<void> {
+    // 同步删除 activity sidecar 文件，防止磁盘泄漏
+    try {
+      const path = activityLogPath(uuid);
+      if (existsSync(path)) unlinkSync(path);
+    } catch {
+      // 文件不存在或路径无效，忽略
+    }
+
     delete this.data.sessions[uuid];
     this.dirtySessions.delete(uuid);
     this.removedSessions.add(uuid);
@@ -251,6 +260,14 @@ export class RegistryManager {
   /** 批量移除多个会话并保存（只获取一次锁）。 */
   async removeBatch(uuids: string[]): Promise<void> {
     for (const uuid of uuids) {
+      // 同步删除 activity sidecar 文件
+      try {
+        const path = activityLogPath(uuid);
+        if (existsSync(path)) unlinkSync(path);
+      } catch {
+        // 忽略
+      }
+
       delete this.data.sessions[uuid];
       this.dirtySessions.delete(uuid);
       this.removedSessions.add(uuid);

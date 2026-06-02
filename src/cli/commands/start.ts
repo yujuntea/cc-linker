@@ -186,8 +186,19 @@ interface BotRuntime {
 function probeCliProcessDetection(): boolean {
   if (process.platform !== 'darwin') return true;
   try {
-    const procs = getClaudeProcessesByCwd(process.cwd());
-    return procs.length > 0; // 能列出说明 lsof 没权限错
+    // Probe whether lsof can read our own process's cwd.
+    // Using our own PID avoids the false negative that occurs when no
+    // claude process is currently running (the common case on startup).
+    // If lsof lacks Full Disk Access it will exit non-zero or return
+    // empty output, and we fall back to marker + mtime detection.
+    const result = Bun.spawnSync([
+      'lsof', '-p', String(process.pid), '-a', '-d', 'cwd', '-Fn',
+    ]);
+    if (result.exitCode !== 0) return false;
+    const output = new TextDecoder().decode(result.stdout);
+    // Verify the output contains an 'n' line with a path, confirming
+    // lsof actually returned usable data (not just an error header).
+    return output.includes('\nn') || output.startsWith('n');
   } catch {
     return false;
   }

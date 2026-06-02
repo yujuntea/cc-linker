@@ -164,10 +164,17 @@ export class ClaudeSessionManager {
 
     try {
       await this.acquireSlot();
+      if (sessionId) {
+        writeActivityMarker(sessionId, 'feishu', 'start', process.pid);
+      }
 
       try {
         return await this._doSendMessage(sessionId, text, cwd, isNew ?? false, settingsPath);
       } finally {
+        if (sessionId) {
+          writeActivityMarker(sessionId, 'feishu', 'end', process.pid);
+          this.activityCache?.invalidate(`feishu-detects-cli:${sessionId}`);
+        }
         this.releaseSlot();
       }
     } finally {
@@ -437,10 +444,17 @@ export class ClaudeSessionManager {
 
     try {
       await this.acquireSlot();
+      if (sessionId) {
+        writeActivityMarker(sessionId, 'feishu', 'start', process.pid);
+      }
 
       try {
         return await this._doStreamingMessage(sessionId, text, cwd, onProgress, isNew ?? false, settingsPath);
       } finally {
+        if (sessionId) {
+          writeActivityMarker(sessionId, 'feishu', 'end', process.pid);
+          this.activityCache?.invalidate(`feishu-detects-cli:${sessionId}`);
+        }
         this.releaseSlot();
       }
     } finally {
