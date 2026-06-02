@@ -59,8 +59,16 @@ export interface ActivityEntry {
 // === Rotate 阈值 ===
 
 // Validate sessionUuid to prevent path traversal in activityLogPath.
-// sessionUuid comes from Claude CLI's session_id (always a UUID v4).
-const SESSION_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Loosened from strict UUID v4 to allow any non-empty string that doesn't contain
+// path separators. This still prevents path traversal (slashes/dots blocked at
+// join-time) but accepts real Claude CLI session IDs (UUIDs), test fixtures
+// ('test-session-1234'), and any future non-UUID format.
+// The real security against `../etc/passwd` is the join() resolution, not this regex.
+const SESSION_UUID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+
+// Track sessionUuids we've already warned about (to avoid log spam from
+// per-chunk heartbeat calls)
+const warnedSessionUuids = new Set<string>();
 
 const MAX_ACTIVITY_LOG_BYTES = 64 * 1024;
 const ROTATE_KEEP_RATIO = 0.5;
@@ -96,7 +104,13 @@ export function writeActivityMarker(
 
   // Validate sessionUuid format to prevent path traversal
   if (!SESSION_UUID_REGEX.test(sessionUuid)) {
-    logger.warn(`writeActivityMarker: invalid sessionUuid ${JSON.stringify(sessionUuid)}`);
+    if (!warnedSessionUuids.has(sessionUuid)) {
+      warnedSessionUuids.add(sessionUuid);
+      logger.warn(
+        `writeActivityMarker: invalid sessionUuid ${JSON.stringify(sessionUuid)} ` +
+        `(this is logged once per sessionUuid; subsequent calls will be silent)`
+      );
+    }
     return;
   }
 
@@ -135,7 +149,13 @@ export function readLastActivityMarker(sessionUuid: string): ActivityMarker | nu
 
   // Validate sessionUuid format to prevent path traversal
   if (!SESSION_UUID_REGEX.test(sessionUuid)) {
-    logger.warn(`readLastActivityMarker: invalid sessionUuid ${JSON.stringify(sessionUuid)}`);
+    if (!warnedSessionUuids.has(sessionUuid)) {
+      warnedSessionUuids.add(sessionUuid);
+      logger.warn(
+        `readLastActivityMarker: invalid sessionUuid ${JSON.stringify(sessionUuid)} ` +
+        `(this is logged once per sessionUuid; subsequent calls will be silent)`
+      );
+    }
     return null;
   }
 
