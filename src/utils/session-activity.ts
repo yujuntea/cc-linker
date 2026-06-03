@@ -1,6 +1,8 @@
 import { withTimeout } from './async';
 import {
   getClaudeProcessesByCwd,
+  getDarwinClaudeProcesses,
+  getLinuxClaudeProcesses,
   getProcessCPUTimeSeconds,
   type ProcessInfo,
 } from './process-info';
@@ -291,14 +293,23 @@ export function findClaudeProcessByCwd(targetCwd: string): { pid: number; cwd: s
     realTarget = targetCwd;
   }
 
-  // getClaudeProcessesByCwd 已按 cwd 过滤，直接取第一个
   const candidates = getClaudeProcessesByCwd(realTarget);
   if (candidates.length === 0) {
-    // 退一步：尝试原路径（realpath 可能因为权限失败但路径确实存在）
     const fallback = getClaudeProcessesByCwd(targetCwd);
     if (fallback.length === 0) return null;
     return { pid: fallback[0].pid, cwd: fallback[0].cwd };
   }
+
+  // 优先选择"纯交互式"进程（command 是 claude 或 claude --resume）
+  // 避免选择 claude agents / background 进程（这些已在 process-info 中过滤，但双重保险）
+  const interactive = candidates.find(c => {
+    const cmd = c.command.trim();
+    return cmd === 'claude' || cmd.startsWith('claude --resume');
+  });
+  if (interactive) {
+    return { pid: interactive.pid, cwd: interactive.cwd };
+  }
+
   return { pid: candidates[0].pid, cwd: candidates[0].cwd };
 }
 
@@ -319,6 +330,11 @@ export async function hasActiveChildProcesses(pid: number): Promise<ChildResult>
       .filter(child =>
         !child.command.includes('shell-snapshot') &&
         !child.command.includes('zsh -c source') &&
+        // 排除 MCP servers（长期运行，不是用户任务）
+        !child.command.includes('/mcp/') &&
+        !child.command.includes('minimax-coding-plan-mcp') &&
+        // 排除 macOS caffeinate（系统唤醒工具）
+        !child.command.startsWith('caffeinate') &&
         child.command.trim() !== ''
       );
 
@@ -465,12 +481,14 @@ async function detectCliActivity(entry: ActivityEntry): Promise<ActivityResult> 
   if (config.get<boolean>('runtime.cli_process_detection_enabled', true)) {
     const proc = findClaudeProcessByCwd(entry.cwd);
     if (proc) {
+      logger.info(`[activity] Found claude process pid=${proc.pid} in ${entry.cwd}`);
       const childCheck = await hasActiveDescendants(proc.pid);
       if (childCheck.hasChildren) {
         const childNames = childCheck.children
           .map(c => c.command.split(' ')[0])
           .slice(0, 3)
           .join(', ');
+        logger.info(`[activity] pid=${proc.pid} has children: ${childNames}`);
         return {
           isProcessing: true,
           confidence: 'high',
@@ -480,6 +498,7 @@ async function detectCliActivity(entry: ActivityEntry): Promise<ActivityResult> 
       }
 
       const cpuResult = await sampleCPU(entry.cwd);
+      logger.info(`[activity] pid=${proc.pid} CPU=${cpuResult.cpuPercent.toFixed(1)}%`);
       if (cpuResult.isProcessing) {
         return {
           isProcessing: true,
@@ -495,6 +514,37 @@ async function detectCliActivity(entry: ActivityEntry): Promise<ActivityResult> 
         reason: 'cli_process_idle',
         source: 'cpu',
       };
+    }
+
+    // Fallback: 精确 cwd 匹配找不到进程时，全局搜索所有未被排除的 claude 进程的后代，
+    // 查找用户任务子进程（bash/sleep/sh/zsh 等）。这覆盖 Claude Code CLI 的 background/daemon
+    // 场景：用户任务子进程可能在 --bg-pty-host（cwd 在 /private/tmp）下运行。
+    logger.info(`[activity] No claude process in ${entry.cwd}, scanning all claude processes for user tasks`);
+    const uid = process.getuid?.() ?? 0;
+    const allProcs = process.platform === 'linux'
+      ? getLinuxClaudeProcesses(uid)
+      : process.platform === 'darwin'
+        ? getDarwinClaudeProcesses(uid)
+        : [];
+    for (const p of allProcs) {
+      const childCheck = await hasActiveDescendants(p.pid);
+      const userTasks = childCheck.children.filter(c => {
+        const cmd = c.command.toLowerCase();
+        return cmd.includes('bash') || cmd.includes('sh ') || cmd.includes('zsh') || cmd.includes('sleep');
+      });
+      if (userTasks.length > 0) {
+        const taskNames = userTasks
+          .map(c => c.command.split(' ')[0])
+          .slice(0, 3)
+          .join(', ');
+        logger.info(`[activity] Found user tasks under pid=${p.pid}: ${taskNames}`);
+        return {
+          isProcessing: true,
+          confidence: 'medium',
+          reason: `executing: ${taskNames}`,
+          source: 'child',
+        };
+      }
     }
   }
 

@@ -24,9 +24,12 @@ export function getLinuxClaudeProcesses(uid: number): ProcessInfo[] {
         .replace(/\0/g, ' ').trim();
       const cwd = readlinkSync(`/proc/${pid}/cwd`);
 
-      // 过滤
+      // 过滤：排除 cc-linker / SDK 启动的非交互式进程
       if (command.includes(' -p ') || command.includes('--output-format')) continue;
       if (command.includes('/sdk/') || command.includes('claude-agent-sdk')) continue;
+      // 过滤：排除 Claude Code CLI 的 background/daemon 进程（这些不是用户交互式进程）
+      // 注意：保留 --bg-pty-host，因为它是实际处理用户输入的进程，用户任务子进程在它下面运行
+      if (command.includes('--bg-spare') || command.includes('daemon run')) continue;
 
       const stat = statSync(`/proc/${pid}`);
       if (stat.uid !== uid) continue;
@@ -75,6 +78,9 @@ export function getDarwinClaudeProcesses(uid: number): ProcessInfo[] {
       const command = pidToCommand.get(pid) ?? '';
       if (command.includes(' -p ') || command.includes('--output-format')) continue;
       if (command.includes('/sdk/') || command.includes('claude-agent-sdk')) continue;
+      // 过滤：排除 Claude Code CLI 的 background/daemon 进程（这些不是用户交互式进程）
+      // 注意：保留 --bg-pty-host，因为它是实际处理用户输入的进程，用户任务子进程在它下面运行
+      if (command.includes('--bg-spare') || command.includes('daemon run')) continue;
       out.push({ pid, cwd, command });
     }
     return out;
