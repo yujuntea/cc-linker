@@ -212,7 +212,17 @@ export class SpoolQueue {
     msg.updatedAt = msg.updatedAt || msg.createdAt;
 
     const path = join(this.pendingDir, `${msg.serialKey}:${msg.messageId}.json`);
-    this.writeAtomic(path, msg);
+    try {
+      this.writeAtomic(path, msg);
+    } catch (err) {
+      // writeAtomic 可能因 ENAMETOOLONG / EACCES / ENOSPC 失败。
+      // 必须 revert 之前写过的 receipt，否则后续同 messageId 消息会被 hasReceipt 误判为已接收。
+      logger.warn(
+        `enqueue 写入 pending 失败: ${msg.messageId} (key=${msg.serialKey}): ${err}`,
+      );
+      try { unlinkSync(receiptPath); } catch {}
+      return false;
+    }
 
     logger.debug(`消息入队: ${msg.messageId} (key=${msg.serialKey}, target=${msg.target.type})`);
     return true;

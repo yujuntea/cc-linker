@@ -101,4 +101,34 @@ describe('SpoolQueue concurrency with cmd: serialKey (PR 2 pain point A core gua
     expect(claimed).not.toBeNull();
     expect(claimed?.text).toBe('hello');
   });
+
+  // CR2 #4: enqueue 失败时 receipt 必须被 revert，否则后续同 messageId 消息被 hasReceipt 误判
+  it('enqueue failure reverts receipt so retry can succeed (CR2 #4)', async () => {
+    // 构造一个会触发 ENAMETOOLONG 的 serialKey——直接构造 100 字符字段（绕开 SAFE_ID_REGEX 80 上限，
+    // 因为 SpoolQueue 不做格式校验，本测试验证 error path）
+    const hugeMsg: SpoolMessage = {
+      messageId: 'a'.repeat(100),
+      openId: 'ou_user1',
+      text: '/list',
+      target: { type: 'no_target' as const, openId: 'ou_user1' },
+      // filename: cmd: + 100 + : + 100 + : + 100 + .json = 4+100+1+100+1+100+5 = 311 字符 → ENAMETOOLONG
+      serialKey: `cmd:${'o'.repeat(100)}:${'a'.repeat(100)}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // enqueue 失败时必须 return false + revert receipt（不残留）
+    const result = spoolQueue.enqueue(hugeMsg);
+    expect(result).toBe(false);
+
+    // 关键断言：receipt 必须被 revert
+    const receiptsDir = join(tmpDir, 'receipts');
+    const receiptFile = join(receiptsDir, `${hugeMsg.messageId}.json`);
+    expect(existsSync(receiptFile)).toBe(false);
+
+    // 后续合法 enqueue 必须成功（无残留状态污染）
+    const okResult = spoolQueue.enqueue(makeMsg('om_retry_001', 'cmd:ou_user1:om_retry_001', '/list'));
+    expect(okResult).toBe(true);
+  });
 });
