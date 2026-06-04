@@ -110,6 +110,20 @@ export class JSONLScanner {
     }
   }
 
+  /**
+   * Extract text content from a JSONL message content field.
+   * Handles both `string` content and `Array<{type, text}>` content forms.
+   * Returns null if the content is neither (e.g., image-only, tool_result, etc.)
+   */
+  private static extractTextContent(content: unknown): string | null {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      const block = content.find((b: any) => b?.type === 'text');
+      return block?.text ?? null;
+    }
+    return null;
+  }
+
   private parseFull(filePath: string, sessionId: string): Partial<SessionEntry> {
     const content = readFileSync(filePath, 'utf8');
     const lines = content.split('\n').filter(Boolean);
@@ -128,13 +142,8 @@ export class JSONLScanner {
         if (entry.type === 'last-prompt' && !lastPrompt) lastPrompt = entry.lastPrompt;
         // 从第一个用户消息中提取标题（作为 ai-title 和 last-prompt 的备选）
         if (!firstUserMessage && entry.type === 'user') {
-          const content = entry.message?.content;
-          if (typeof content === 'string' && content.length > 0) {
-            firstUserMessage = content;
-          } else if (Array.isArray(content)) {
-            const textBlock = content.find((b: any) => b.type === 'text');
-            if (textBlock?.text) firstUserMessage = textBlock.text;
-          }
+          const text = JSONLScanner.extractTextContent(entry.message?.content);
+          if (text && text.length > 0) firstUserMessage = text;
         }
         // 提取创建时间：取最早的时间戳（首条有 timestamp 的记录）
         if (!createdAt && entry.timestamp) createdAt = entry.timestamp;
@@ -160,13 +169,8 @@ export class JSONLScanner {
           if (textBlock) preview = textBlock.text.slice(0, 100);
         }
         if (entry.type === 'user' && !lastUserPreview) {
-          const content = entry.message?.content;
-          if (typeof content === 'string') {
-            lastUserPreview = content.slice(0, 100);
-          } else if (Array.isArray(content)) {
-            const textBlock = content.find((b: any) => b.type === 'text');
-            if (textBlock?.text) lastUserPreview = textBlock.text.slice(0, 100);
-          }
+          const text = JSONLScanner.extractTextContent(entry.message?.content);
+          if (text) lastUserPreview = text.slice(0, 100);
         }
         // 三个字段都拿到就 break 提升性能
         if (lastActive && preview && lastUserPreview) break;
@@ -247,13 +251,8 @@ export class JSONLScanner {
               if (textBlock) preview = textBlock.text.slice(0, 100);
             }
             if (entry.type === 'user' && !lastUserPreview) {
-              const content = entry.message?.content;
-              if (typeof content === 'string') {
-                lastUserPreview = content.slice(0, 100);
-              } else if (Array.isArray(content)) {
-                const textBlock = content.find((b: any) => b.type === 'text');
-                if (textBlock?.text) lastUserPreview = textBlock.text.slice(0, 100);
-              }
+              const text = JSONLScanner.extractTextContent(entry.message?.content);
+              if (text) lastUserPreview = text.slice(0, 100);
             }
           } catch {}
         }
@@ -267,16 +266,10 @@ export class JSONLScanner {
               try {
                 const entry = JSON.parse(allLines[i]);
                 if (entry.type === 'user') {
-                  const content = entry.message?.content;
-                  if (typeof content === 'string') {
-                    lastUserPreview = content.slice(0, 100);
+                  const text = JSONLScanner.extractTextContent(entry.message?.content);
+                  if (text) {
+                    lastUserPreview = text.slice(0, 100);
                     break;
-                  } else if (Array.isArray(content)) {
-                    const textBlock = content.find((b: any) => b.type === 'text');
-                    if (textBlock?.text) {
-                      lastUserPreview = textBlock.text.slice(0, 100);
-                      break;
-                    }
                   }
                 }
               } catch {}
@@ -295,7 +288,7 @@ export class JSONLScanner {
         const lines = content.split('\n').filter(Boolean);
         lineCount = lines.length;
 
-        for (let i = lines.length - 1; i >= Math.max(0, lines.length - 10); i--) {
+        for (let i = lines.length - 1; i >= 0; i--) {
           try {
             const entry = JSON.parse(lines[i]);
             if (NON_MESSAGE_TYPES.has(entry.type)) continue;
@@ -307,14 +300,11 @@ export class JSONLScanner {
               if (textBlock) preview = textBlock.text.slice(0, 100);
             }
             if (entry.type === 'user' && !lastUserPreview) {
-              const content = entry.message?.content;
-              if (typeof content === 'string') {
-                lastUserPreview = content.slice(0, 100);
-              } else if (Array.isArray(content)) {
-                const textBlock = content.find((b: any) => b.type === 'text');
-                if (textBlock?.text) lastUserPreview = textBlock.text.slice(0, 100);
-              }
+              const text = JSONLScanner.extractTextContent(entry.message?.content);
+              if (text) lastUserPreview = text.slice(0, 100);
             }
+            // 三个字段都拿到就 break（小文件无 4KB fallback 但仍可早退）
+            if (lastActive && preview && lastUserPreview) break;
           } catch {}
         }
       }

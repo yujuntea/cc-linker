@@ -178,7 +178,7 @@ describe('JSONLScanner parseTail user/assistant preview', () => {
     expect(entry?.last_user_preview).toBe('PROMPT_AT_LINE_31');
   });
 
-  it('parseTail 4KB fallback finds user prompt beyond tail (existing session, large file)', () => {
+  it('parseTail 4KB fallback finds user prompt beyond tail (existing session, large file)', async () => {
     const sessionId = 'test-parsetail-4kb-fallback';
     // parseTail 用于已注册 session 的增量更新（registry.has(sessionId) === true）
     // 大文件分支只读 4KB，如果 4KB 内没有 user prompt，fallback 全量重读
@@ -220,7 +220,7 @@ describe('JSONLScanner parseTail user/assistant preview', () => {
       message_count: 0,
       last_message_preview: '',
     });
-    registry.flush();  // 显式 flush 写盘
+    await registry.flush();  // 显式 flush 写盘
 
     const cache: FileCache = new Map();
     cache.set(join(projectDir, `${sessionId}.jsonl`), 0);  // 强制 scanner 重扫

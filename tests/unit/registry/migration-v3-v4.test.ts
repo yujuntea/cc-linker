@@ -209,4 +209,49 @@ describe('migrateV3toV4', () => {
     // A backup of the original v3 file must have been rotated
     expect(require('fs').existsSync(join(tmpDir, 'backups'))).toBe(true);
   });
+
+  it('reload() persists v3→v4 migration to disk', async () => {
+    // Initial v3 file
+    writeRegistry(3, {
+      's1': {
+        origin: 'cli',
+        cwd: '/tmp/reload-test',
+        project_name: null,
+        jsonl_path: null,
+        project_dir: null,
+        created_at: '2026-01-01T00:00:00Z',
+        last_active: '2026-01-02T00:00:00Z',
+        title: 'Reload Test',
+        message_count: 3,
+        last_message_preview: 'old',
+      },
+    });
+
+    // First load: migrates and persists v4
+    const m1 = new RegistryManager(tmpDir);
+    expect(m1.sessions['s1'].title).toBe('Reload Test');
+
+    // Manually re-write v3 to simulate a stale on-disk file
+    writeRegistry(3, {
+      's1': {
+        origin: 'cli',
+        cwd: '/tmp/reload-test',
+        project_name: null,
+        jsonl_path: null,
+        project_dir: null,
+        created_at: '2026-01-01T00:00:00Z',
+        last_active: '2026-01-02T00:00:00Z',
+        title: 'Reload Test',
+        message_count: 3,
+        last_message_preview: 'old',
+      },
+    });
+
+    // Reload from a second manager — should re-migrate and re-persist
+    const m2 = new RegistryManager(tmpDir);
+    await m2.reload();
+    const raw = JSON.parse(readFileSync(join(tmpDir, 'registry.json'), 'utf8'));
+    expect(raw.version).toBe(4);
+    expect(raw.sessions['s1'].title).toBe('Reload Test');
+  });
 });

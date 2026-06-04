@@ -105,6 +105,9 @@ export class RegistryManager {
         logger.info(
           `Registry schema 已从 v${originalVersion} 迁移到 v${parsed.version}，持久化到磁盘`
         );
+        // 迁移时持久化到磁盘。StateCoordinator（src/runtime/state-coordinator.ts）
+        // 保证单 bot 进程运行，所以这里不需要 withLock 保护（CLI 命令读时通过
+        // proper-lockfile 串行化）。如果未来允许多进程并发，需要改为 withLock。
         this.rotateBackup();
         this.saveSync(validated);
         return validated;
@@ -141,6 +144,9 @@ export class RegistryManager {
       const validated = RegistrySchema.parse(parsed);
       // Migration happened — re-acquire write lock to persist the new version
       if (originalVersion !== parsed.version) {
+        // 迁移时持久化到磁盘。StateCoordinator（src/runtime/state-coordinator.ts）
+        // 保证单 bot 进程运行，所以这里不需要 withLock 保护（CLI 命令读时通过
+        // proper-lockfile 串行化）。如果未来允许多进程并发，需要改为 withLock。
         await withLock(this.registryPath, async () => {
           this.rotateBackup();
           this.saveSync(validated);
