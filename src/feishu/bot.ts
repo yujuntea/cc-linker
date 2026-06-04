@@ -366,6 +366,16 @@ export class FeishuBot {
       return null;
     }
 
+    // SAFE_ID_REGEX 校验：与 onMessage 一致，覆盖 11 处 recordReceipt 调用。
+    // 不在白名单的 messageId 会让 recordReceipt 写 receipts/${messageId}.json
+    // 时撞 ENAMETOOLONG 或 path-traversal；openId 同理。
+    if (!isSafeId(openId) || !isSafeId(messageId ?? '')) {
+      logger.warn(
+        `卡片回调 ID 格式异常，拒绝: openId=${openId}, messageId=${messageId ?? '(none)'}`,
+      );
+      return null;
+    }
+
     // Check for permission card interactions first
     const valueObj = typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : null;
     if (valueObj && (valueObj.type === 'permission_approve' || valueObj.type === 'permission_deny')) {

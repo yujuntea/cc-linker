@@ -296,4 +296,46 @@ describe('FeishuBot serialKey and messageId validation', () => {
     expect(fileA).toMatch(/^cmd:ou_user1:om_cmd_a:/);
     expect(fileB).toMatch(/^cmd:ou_user1:om_cmd_b:/);
   });
+
+  // ====== handleCardAction SAFE_ID_REGEX 校验（CR2 #2）======
+
+  it('handleCardAction rejects card with invalid openId (no recordReceipt, returns null)', async () => {
+    const result = await bot.handleCardAction({
+      open_id: 'ou_user1:bad',  // 含 : 字符
+      action: { tag: 'button', value: { tag: 'list' } },
+      message: { message_id: 'om_valid_card' },
+    });
+
+    // 拒绝：返回 null，receipts 目录不应该写
+    expect(result).toBeNull();
+    const receiptsDir = join(tmpDir, 'receipts');
+    const receiptsFiles = existsSync(receiptsDir) ? readdirSync(receiptsDir) : [];
+    expect(receiptsFiles).toHaveLength(0);
+  });
+
+  it('handleCardAction rejects card with invalid messageId (no recordReceipt, returns null)', async () => {
+    const result = await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'button', value: { tag: 'list' } },
+      message: { message_id: 'om:bad:id' },  // 含 : 字符
+    });
+
+    expect(result).toBeNull();
+    const receiptsDir = join(tmpDir, 'receipts');
+    const receiptsFiles = existsSync(receiptsDir) ? readdirSync(receiptsDir) : [];
+    expect(receiptsFiles).toHaveLength(0);
+  });
+
+  it('handleCardAction rejects card with messageId longer than 80 chars', async () => {
+    const result = await bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'button', value: { tag: 'list' } },
+      message: { message_id: 'a'.repeat(81) },
+    });
+
+    expect(result).toBeNull();
+    const receiptsDir = join(tmpDir, 'receipts');
+    const receiptsFiles = existsSync(receiptsDir) ? readdirSync(receiptsDir) : [];
+    expect(receiptsFiles).toHaveLength(0);
+  });
 });
