@@ -167,6 +167,65 @@ describe('FeishuBot doSwitch overview card', () => {
     expect(allContent).not.toContain('<script>');
   });
 
+  // ===== fix #1: overview card metadata line 必须包含 origin/status =====
+  // 之前 buildSessionOverviewCard 的元信息行只有 message_count + formatTimeAgo，
+  // 与 list 卡片不一致——用户切到某个 CLI 会话后看不到来源/状态。
+
+  it('overview card includes origin label (CLI/feishu) in metadata line', async () => {
+    env.registry.upsert('origin-cli-uuid', {
+      origin: 'cli',
+      cwd: '/tmp/o',
+      project_name: 'o',
+      jsonl_path: null,
+      project_dir: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_active: '2026-01-02T00:00:00Z',
+      title: 'CLI session',
+      message_count: 1,
+      last_message_preview: 'p',
+    });
+
+    await env.bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'switch', value: 'origin-cli-uuid' },
+      message: { message_id: 'msg-origin-cli' },
+    });
+
+    expect(env.cardReplies.length).toBe(1);
+    const allContent = JSON.stringify(env.cardReplies[0].card.elements);
+    // formatOrigin('cli') = '终端'
+    expect(allContent).toContain('终端');
+  });
+
+  it('overview card includes origin label (feishu) in metadata line', async () => {
+    env.registry.upsert('origin-feishu-uuid', {
+      origin: 'feishu',
+      cwd: '/tmp/f',
+      project_name: 'f',
+      jsonl_path: null,
+      project_dir: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_active: '2026-01-02T00:00:00Z',
+      title: 'Feishu session',
+      message_count: 1,
+      last_message_preview: 'p',
+    });
+
+    await env.bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'switch', value: 'origin-feishu-uuid' },
+      message: { message_id: 'msg-origin-feishu' },
+    });
+
+    expect(env.cardReplies.length).toBe(1);
+    const allContent = JSON.stringify(env.cardReplies[0].card.elements);
+    // formatOrigin('feishu') = '飞书'
+    expect(allContent).toContain('飞书');
+  });
+
+  // 注：原 'overview card shows non-active status' 已被下方 BUG-2 'refuses to bind' 完全覆盖
+  // （同 status='corrupted' setup + 严格更强的断言：text + mapping 不变）。删除避免重复。
+
   // ===== 【review 必加】补充测试覆盖盲区 =====
 
   it('doSwitch sends failure text when CAS swap fails (swapped=false)', async () => {
@@ -203,6 +262,110 @@ describe('FeishuBot doSwitch overview card', () => {
     // 验证：发"切换失败"消息（绝不卡片，避免误导用户以为切换成功）
     expect(env.textReplies.length).toBe(1);
     expect(env.cardReplies.length).toBe(0);
-    expect(env.textReplies[0].text).toBe('⚠️ 切换失败，会话可能已被修改');
+    expect(env.textReplies[0].text).toBe('⚠️ 切换失败：会话状态已被其他操作变更，请稍后重试');
+  });
+
+  // ===== 第二轮 review fix D: CAS 失败路径加 logger.warn + 用户消息更明确 =====
+
+  it('doSwitch CAS failure path logs a warn (for operator diagnostics)', async () => {
+    env.registry.upsert('swaplog-uuid', {
+      origin: 'cli',
+      cwd: '/tmp/swaplog',
+      project_name: 'sl',
+      jsonl_path: null,
+      project_dir: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_active: '2026-01-02T00:00:00Z',
+      title: 'Swap Log',
+      message_count: 1,
+      last_message_preview: 'p',
+    });
+
+    const originalCompareAndSwap = env.userManager.compareAndSwap.bind(env.userManager);
+    (env.userManager as any).compareAndSwap = async () => false;
+
+    // 捕获 console.warn
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(' '));
+
+    try {
+      await env.bot.handleCardAction({
+        open_id: 'ou_user1',
+        action: { tag: 'switch', value: 'swaplog-uuid' },
+        message: { message_id: 'msg-swaplog' },
+      });
+    } finally {
+      (env.userManager as any).compareAndSwap = originalCompareAndSwap;
+      console.warn = originalWarn;
+    }
+
+    // 验证：logger.warn 被调用，包含 openId + uuid 便于运维定位
+    const relevantWarn = warnings.find(w => w.includes('swaplog-uuid') && w.includes('ou_user1'));
+    expect(relevantWarn).toBeDefined();
+  });
+
+  // ===== BUG-2: doSwitch 必须拒绝 status ≠ 'active' 的 session（与 doResume 一致）=====
+  // 之前 doSwitch 接受任何状态的 session，导致用户切到 corrupted/provisioning/degraded/archived
+  // 后发消息会失败（与 doResume 的拒绝行为不一致）。
+  // 修复后：doSwitch 在 CAS 之前检查 status，非 active 返回明确错误。
+
+  it('doSwitch refuses to bind to corrupted session (consistent with doResume)', async () => {
+    env.registry.upsert('corrupted-uuid', {
+      origin: 'cli',
+      cwd: '/tmp/c',
+      project_name: 'c',
+      jsonl_path: null,
+      project_dir: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_active: '2026-01-02T00:00:00Z',
+      title: 'Corrupted',
+      message_count: 1,
+      last_message_preview: 'p',
+      status: 'corrupted',
+    });
+
+    await env.bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'switch', value: 'corrupted-uuid' },
+      message: { message_id: 'msg-corrupt' },
+    });
+
+    // 关键验证：发 text 错误消息，不发 overview 卡片
+    expect(env.cardReplies.length).toBe(0);
+    expect(env.textReplies.length).toBe(1);
+    expect(env.textReplies[0].text).toContain('已损坏');
+    expect(env.textReplies[0].text).toContain('不能直接切换');
+
+    // 验证：mapping 没有变成 'session'（用户没有被绑定到坏会话）
+    const entry = env.userManager.getEntry('ou_user1');
+    expect(entry?.type).not.toBe('session');
+  });
+
+  it('doSwitch refuses to bind to provisioning session with friendly message', async () => {
+    env.registry.upsert('prov-uuid', {
+      origin: 'cli',
+      cwd: '/tmp/p',
+      project_name: 'p',
+      jsonl_path: null,
+      project_dir: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_active: '2026-01-02T00:00:00Z',
+      title: 'Provisioning',
+      message_count: 1,
+      last_message_preview: 'p',
+      status: 'provisioning',
+    });
+
+    await env.bot.handleCardAction({
+      open_id: 'ou_user1',
+      action: { tag: 'switch', value: 'prov-uuid' },
+      message: { message_id: 'msg-prov' },
+    });
+
+    expect(env.cardReplies.length).toBe(0);
+    expect(env.textReplies.length).toBe(1);
+    // 应该提到状态和建议（与 doResume 风格一致）
+    expect(env.textReplies[0].text).toContain('自动修复');
   });
 });

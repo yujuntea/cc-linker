@@ -1,7 +1,10 @@
 import { describe, it, expect, afterEach, beforeEach } from 'bun:test';
-import { readdirSync } from 'fs';
+import { readdirSync, mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { tmpdir } from 'os';
 import { createTestBot, type TestBot } from '../helpers/feishu-bot';
+import { syncBeforeCommand } from '../../src/scanner';
+import { RegistryManager } from '../../src/registry/registry';
 
 /**
  * 集成测试：模拟真实并发场景。
@@ -49,6 +52,102 @@ describe('Feishu concurrent commands integration', () => {
     expect(newFile).not.toBe(listFile);
   });
 
+  // ===== Spec §集成测试 5 个 MUST 场景 =====
+  // 5 个场景: A (streaming + /list) / B (/new + /list) / C (双 /new 互斥) / D (/new 无 prompt + /list) / E (3x /list)
+  // 原始 commit 漏了 A/C/D，本轮补全。
+
+  it('scenario A (true streaming + /list): /list returns card with 🔴 marker for streaming session', async () => {
+    // 准备：注册一个 session A，模拟其正在被 Claude 处理
+    env.registry.upsert('streaming-session-A', {
+      origin: 'cli', cwd: '/tmp/proj', project_name: 'proj', jsonl_path: null, project_dir: null,
+      created_at: '2026-01-01T00:00:00Z', last_active: new Date().toISOString(),
+      title: 'Streaming Session', message_count: 1, last_message_preview: 'p',
+    });
+
+    // Mock sessionManager.listSessions() —— 模拟 A 正在被 Claude 处理
+    const originalListSessions = env.sessionManager.listSessions.bind(env.sessionManager);
+    (env.sessionManager as any).listSessions = () => [
+      { sessionId: 'streaming-session-A', pid: 12345, cwd: '/tmp/proj', createdAt: Date.now(), lastOutputAt: Date.now(), isNew: false },
+    ];
+
+    try {
+      // /list 入队
+      await env.bot.onMessage({
+        open_id: 'ou_user1', message_id: 'om_list_while_streaming',
+        content: JSON.stringify({ text: '/list' }),
+        chat_type: 'p2p', message_type: 'text',
+      });
+
+      // Drain queue: 让 worker pool 真正处理这条消息
+      await env.bot.dispatch();
+
+      // 验证：/list 已处理完（cardReplies 收到 1 张卡片，包含 🔴 标记）
+      expect(env.cardReplies.length).toBe(1);
+      const allContent = JSON.stringify(env.cardReplies[0].card.elements);
+      // 关键断言：streaming session A 在 /list 卡片里有 🔴 标记
+      // （证明 /list 没有被 streaming session 阻塞——这是 spec 痛点 A 的核心）
+      expect(allContent).toContain('🔴');
+    } finally {
+      (env.sessionManager as any).listSessions = originalListSessions;
+    }
+  });
+
+  it('scenario D: /new (no prompt) + /list run independently (no serialization)', async () => {
+    // 准备一个 session 让 /list 有内容
+    env.registry.upsert('existing-session-D', {
+      origin: 'cli', cwd: '/tmp/proj', project_name: 'proj', jsonl_path: null, project_dir: null,
+      created_at: '2026-01-01T00:00:00Z', last_active: new Date().toISOString(),
+      title: 'Existing', message_count: 1, last_message_preview: 'p',
+    });
+
+    // /new 无 prompt：只设 mapping 为 pending_new_session，不创建 session
+    await env.bot.onMessage({
+      open_id: 'ou_user1', message_id: 'om_new_noprompt',
+      content: JSON.stringify({ text: '/new' }),
+      chat_type: 'p2p', message_type: 'text',
+    });
+
+    // /list：独立命令
+    await env.bot.onMessage({
+      open_id: 'ou_user1', message_id: 'om_list_d',
+      content: JSON.stringify({ text: '/list' }),
+      chat_type: 'p2p', message_type: 'text',
+    });
+
+    // 验证：两条消息都用独立的 cmd: serialKey，互不阻塞
+    const pending = readdirSync(join(env.tmpDir, 'pending'));
+    const newFile = pending.find(f => f.includes('om_new_noprompt'));
+    const listFile = pending.find(f => f.includes('om_list_d'));
+    expect(newFile).toMatch(/^cmd:ou_user1:om_new_noprompt:/);
+    expect(listFile).toMatch(/^cmd:ou_user1:om_list_d:/);
+  });
+
+  it('scenario C: two /new -- prompt get independent cmd: serialKeys (queue-level parallelism)', async () => {
+    // Queue-level 并行：两条消息用独立 cmd: serialKey，SpoolQueue 不阻塞它们。
+    // Claude-level 互斥（new:openId lock）由 ClaudeSessionManager.acquireSessionLock 实现，
+    // 见 src/proxy/session.ts 的现有锁测试。
+
+    await env.bot.onMessage({
+      open_id: 'ou_user1', message_id: 'om_new_p1',
+      content: JSON.stringify({ text: '/new -- prompt1' }),
+      chat_type: 'p2p', message_type: 'text',
+    });
+
+    await env.bot.onMessage({
+      open_id: 'ou_user1', message_id: 'om_new_p2',
+      content: JSON.stringify({ text: '/new -- prompt2' }),
+      chat_type: 'p2p', message_type: 'text',
+    });
+
+    const pending = readdirSync(join(env.tmpDir, 'pending'));
+    const p1File = pending.find(f => f.includes('om_new_p1'));
+    const p2File = pending.find(f => f.includes('om_new_p2'));
+
+    expect(p1File).toMatch(/^cmd:ou_user1:om_new_p1:/);
+    expect(p2File).toMatch(/^cmd:ou_user1:om_new_p2:/);
+    expect(p1File).not.toBe(p2File);
+  });
+
   it('scenario E: three /list commands queued independently', async () => {
     for (let i = 1; i <= 3; i++) {
       await env.bot.onMessage({
@@ -64,5 +163,81 @@ describe('Feishu concurrent commands integration', () => {
     expect(pending.filter(f => f.startsWith('cmd:ou_user1:om_list_1:')).length).toBe(1);
     expect(pending.filter(f => f.startsWith('cmd:ou_user1:om_list_2:')).length).toBe(1);
     expect(pending.filter(f => f.startsWith('cmd:ou_user1:om_list_3:')).length).toBe(1);
+  });
+});
+
+// ===== Spec §2.1 端到端 v3→v4 迁移测试 =====
+// Spec §2.1 明确：升 v4 第一次启动后，老 session 的 last_user_preview 不为空。
+// 这需要 cache + scanner + migration 三者协同工作，必须端到端测试。
+
+describe('v3→v4 end-to-end migration', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'e2e-migration-test-'));
+  });
+
+  afterEach(() => {
+    if (existsSync(tmpDir)) {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('v3 cache + v3 registry: after sync, new preview fields are populated', async () => {
+    // 1. 写入 v3 格式的 cache（无 meta.schemaVersion 字段）
+    const claudeDir = join(tmpDir, '.claude', 'projects', '-Users-test-e2e');
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(join(tmpDir, '.claude', 'projects', '-Users-test-e2e', 'e2e-session.jsonl'), [
+      JSON.stringify({
+        cwd: '/tmp/e2e',
+        type: 'user',
+        message: { role: 'user', content: 'E2E_TEST_USER_PROMPT_LINE_1' },
+        timestamp: '2026-01-01T00:00:00Z',
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'E2E assistant reply' }] },
+        timestamp: '2026-01-01T00:01:00Z',
+      }),
+    ].join('\n'));
+
+    // 2. 写入 v3 格式的 registry（包含一个 session，但没新字段）
+    const v3Registry = {
+      version: 3,
+      updated_at: '2026-01-01T00:00:00Z',
+      sessions: {
+        'e2e-session': {
+          origin: 'cli',
+          cwd: '/tmp/e2e',
+          project_name: 'e2e',
+          jsonl_path: null,
+          project_dir: 'e2e',
+          created_at: '2026-01-01T00:00:00Z',
+          last_active: '2026-01-01T00:01:00Z',
+          title: 'E2E',
+          message_count: 2,
+          last_message_preview: 'E2E assistant reply',
+          // 注意：没有 last_user_preview / last_assistant_preview
+        },
+      },
+    };
+    writeFileSync(join(tmpDir, 'registry.json'), JSON.stringify(v3Registry, null, 2));
+
+    // 3. 写入 v3 格式的 scan_cache（无 meta.schemaVersion）
+    writeFileSync(join(tmpDir, 'scan_cache.json'), JSON.stringify({
+      // 没有 meta 字段——v3 格式
+      cache: { 'whatever': 0 },
+    }));
+
+    // 4. 触发 sync：模拟 bot 启动
+    const registry = new RegistryManager(tmpDir);
+    await syncBeforeCommand(registry, join(tmpDir, 'scan_cache.json'), join(tmpDir, '.claude'));
+
+    // 5. 验证：registry 升到 v4 + 新字段被填入
+    const entry = registry.get('e2e-session');
+    expect(entry).toBeDefined();
+    // 关键断言：老 session 升级后 last_user_preview 不为空（spec §2.1 核心要求）
+    expect(entry?.last_user_preview).toBe('E2E_TEST_USER_PROMPT_LINE_1');
+    expect(entry?.last_assistant_preview).toBe('E2E assistant reply');  // < 80 chars, 完整保留
   });
 });
