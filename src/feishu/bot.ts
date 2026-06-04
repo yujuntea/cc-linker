@@ -2096,6 +2096,11 @@ export class FeishuBot {
     return reply;
   }
 
+  /** Check if a session is currently being processed by Claude (in active processes). */
+  private isSessionRunning(uuid: string): boolean {
+    return this.sessionManager.listSessions().some(s => s.sessionId === uuid);
+  }
+
   private async doResume(openId: string, uuid: string, messageId?: string): Promise<string> {
     const entry = this.registry.get(uuid);
     if (!entry) return '未找到对应会话，请先执行 /list。';
@@ -2167,6 +2172,32 @@ function buildListCard(sessions: Array<[string, { title?: string; origin: string
     config: { wide_screen_mode: true },
     elements,
     header: { title: { tag: 'plain_text', content: `📋 我的会话（${sessions.length}/${total}）` }, template: 'blue' },
+  };
+}
+
+/** Build an overview card for the user to see session progress after switch. */
+function buildSessionOverviewCard(
+  uuid: string,
+  entry: { title?: string | null; cwd?: string; message_count: number; last_active: string; last_user_preview?: string; last_assistant_preview?: string },
+  isRunning: boolean,
+): Record<string, unknown> {
+  const runningTag = isRunning ? '🔴 处理中 · ' : '';
+  const titlePrefix = `${runningTag}${entry.title ?? 'Untitled'}`;
+
+  return {
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: '🔄 已切换会话' }, template: 'blue' },
+    elements: [
+      { tag: 'markdown', content: `**${titlePrefix}**\nID: \`${uuid.slice(0, 8)}\`\n📁 \`${entry.cwd ?? '-'}\`` },
+      ...(entry.last_user_preview ? [{ tag: 'markdown', content: `**💬 最后提问：**\n> ${esc(entry.last_user_preview)}` }] : []),
+      ...(entry.last_assistant_preview ? [{ tag: 'markdown', content: `**🤖 最后回复：**\n> ${esc(entry.last_assistant_preview)}` }] : []),
+      { tag: 'hr' },
+      { tag: 'markdown', content: `📊 ${entry.message_count} 条消息${entry.last_active ? ' · ' + formatTimeAgo(entry.last_active) : ''}\n\n💡 直接发送消息即可继续此会话` },
+      { tag: 'hr' },
+      { tag: 'action', actions: [
+        { tag: 'button', text: { tag: 'plain_text', content: '📖 恢复指引' }, type: 'default', value: { tag: 'resume', sessionId: uuid } },
+      ]},
+    ],
   };
 }
 
@@ -2295,6 +2326,14 @@ function buildDirListCard(
 function preview(text: string, maxLength = 80): string {
   const normalized = text.replace(/\s+/g, ' ').trim();
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 3)}...` : normalized;
+}
+
+/** Escape < and > in markdown content to prevent injection.
+ *  Local copy — card-updater.ts:448 也有同名私有实现。
+ *  后续如出现第三处调用，应考虑抽到 src/feishu/markdown-escape.ts 共享（PR 2 评审意见）。
+ */
+function esc(text: string): string {
+  return text.replace(/[<>]/g, c => c === '<' ? '&lt;' : '&gt;');
 }
 
 function buildSessionTitle(text: string): string {
