@@ -1,18 +1,32 @@
 /**
  * Escape `<` and `>` for use inside Feishu interactive card markdown content.
  *
- * Why only these two characters:
- * - `<` and `>` are the only chars Feishu treats as HTML-like in card markdown
- *   (they can leak raw tags or break code spans that use angle brackets).
- * - We intentionally do NOT escape markdown metacharacters like `*` `_` `` ` ``
- *   `~` — session titles and previews legitimately contain them, and stripping
- *   them would corrupt the displayed text. The card layout is robust to those.
- * - `&` is also left alone: replacing it with `&amp;` would force callers who
- *   re-escape to track the order (`&` first, then `<`/`>`), and there is no
- *   Feishu rendering hazard from leaving raw `&` in card text.
+ * **Scope of this helper (deliberately narrow):**
  *
- * Callers that put user-controlled strings into card content MUST pass them
- * through `esc()` (or `preview(text) → esc()` for truncated previews).
+ * - **What it prevents:** Feishu card markdown renders `<` and `>` as
+ *   HTML-like delimiters, so a raw `<` in user input can leak what looks like
+ *   a tag into the card, and a `>` can prematurely close a code span.
+ *   `esc()` blocks both.
+ *
+ * - **What it does NOT prevent (out of scope):** Feishu card markdown ALSO
+ *   renders `*` `_` `**` `~~` `` ` `` as formatting (bold/italic/strike/code).
+ *   A session title like `**URGENT**` will display as bold in the card, and
+ *   `` `cmd` `` will display as inline code. `esc()` does nothing about
+ *   this — if you need to neutralize markdown-style injection, you need a
+ *   different helper (backslash-escape, sentinel-replace, or sanitize before
+ *   the title lands in registry). This is a known and accepted gap.
+ *
+ * - **Why we don't escape `&`:** adding `&` → `&amp;` would force callers who
+ *   re-escape to track order (`&` first, then `<`/`>`), and Feishu's renderer
+ *   does not produce output where a raw `&` is unsafe in card text. Leaving
+ *   it alone keeps the rule simple.
+ *
+ * **Caller contract:** any field that comes from a user-controlled source
+ * (session title, preview, provider name from config.toml, directory path,
+ * etc.) and is interpolated into a `tag: 'markdown'` content string MUST
+ * pass through `esc()`. For previews that are also length-truncated, apply
+ * `preview()` first and `esc()` after — see `buildListCard` for the
+ * reference pattern.
  */
 export function esc(text: string): string {
   return text.replace(/[<>]/g, c => (c === '<' ? '&lt;' : '&gt;'));
