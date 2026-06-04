@@ -2195,7 +2195,8 @@ function buildListCard(
   if (sessions.length === 0) {
     elements.push({ tag: 'markdown', content: '当前没有可用会话。\n可使用 **✨ 新建会话** 创建新会话。' });
   } else {
-    for (const [index, [uuid, entry]] of sessions.entries()) {
+    for (const [i, [uuid, entry]] of sessions.entries()) {
+      const index = i + 1;  // 1-based,与 text fallback (line 1888) 和 snapshot (line 1852) 一致
       const runningMark = runningUuids.has(uuid) ? '🔴 ' : '';
       // esc() 必须在 preview() 之后调用,避免 preview 截断把 &lt; 切到一半
       // (例如 '<' + 截断会变成 '<' 单独一个被误读)
@@ -2213,7 +2214,8 @@ function buildListCard(
           { tag: 'button', text: { tag: 'plain_text', content: '📖 恢复' }, type: 'default', value: { tag: 'resume', sessionId: uuid } },
         ],
       });
-      if (index < sessions.length) {
+      // <hr> 只在 session 之间插入(不是最后一条之后)
+      if (i < sessions.length - 1) {
         elements.push({ tag: 'hr' });
       }
     }

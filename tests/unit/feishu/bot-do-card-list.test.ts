@@ -55,6 +55,9 @@ describe('FeishuBot doCardList running marker', () => {
     expect(allContent).toContain('Idle Session');
     // Idle session 不应有 🔴
     expect(allContent).not.toContain('🔴 Idle Session');
+    // numbering 是 1-based(防 off-by-one 回归)
+    expect(allContent).toMatch(/\*\*1\./);
+    expect(allContent).toMatch(/\*\*2\./);
   });
 
   it('list card text fallback shows [运行中] for running sessions', async () => {
