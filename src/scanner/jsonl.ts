@@ -361,7 +361,8 @@ export class JSONLScanner {
               if (!lastActive) lastActive = entry.timestamp;
             }
             if (entry.type === 'assistant') {
-              assistantMessages.unshift(entry);
+              // 用 push + 后面统一 reverse：避免每条 unshift 的 O(n) 移动，整体 O(n)
+              assistantMessages.push(entry);
             }
             if (entry.type === 'user' && !lastUserPreview) {
               const text = JSONLScanner.extractTextContent(entry.message?.content);
@@ -371,7 +372,9 @@ export class JSONLScanner {
         }
 
         if (!preview) {
-          preview = JSONLScanner.cleanAssistantText(assistantMessages, 240) ?? '';
+          // assistantMessages 是倒序收集的（最新在前），cleanAssistantText 期望正序
+          // （从尾部迭代找最新），调用前 reverse 一次即可
+          preview = JSONLScanner.cleanAssistantText(assistantMessages.reverse(), 240) ?? '';
         }
 
         // 4KB 内找不到 user preview 或 assistant preview 时全量重读
@@ -390,7 +393,8 @@ export class JSONLScanner {
                   }
                 }
                 if (!preview && entry.type === 'assistant') {
-                  fullAssistantMessages.unshift(entry);
+                  // 用 push + 后面统一 reverse：避免每条 unshift 的 O(n) 移动，整体 O(n)
+                  fullAssistantMessages.push(entry);
                 }
                 // 全量 fallback 时也顺便收集 lastPrompt（如果 4KB 内没拿到）
                 if (entry.type === 'last-prompt' && !lastPrompt && entry.lastPrompt) {
@@ -399,7 +403,8 @@ export class JSONLScanner {
               } catch {}
             }
             if (!preview && fullAssistantMessages.length > 0) {
-              const cleanedFromFull = JSONLScanner.cleanAssistantText(fullAssistantMessages, 240);
+              // 同上：倒序收集，cleanAssistantText 期望正序，调用前 reverse
+              const cleanedFromFull = JSONLScanner.cleanAssistantText(fullAssistantMessages.reverse(), 240);
               if (cleanedFromFull) preview = cleanedFromFull;
             }
           } catch (err) {
