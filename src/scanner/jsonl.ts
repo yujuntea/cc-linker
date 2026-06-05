@@ -146,6 +146,29 @@ export class JSONLScanner {
       .replace(/`/g, '');
   }
 
+  /**
+   * 截断到 maxLength，按行边界回退
+   *
+   * 规则：
+   * - 如果原文长度 ≤ maxLength，直接返回
+   * - 否则按 \n 分割，找累积长度 ≤ maxLength 的最后一个行边界
+   * - 截断后追加 '...'
+   *
+   * 例：
+   * - maxLength=240，文本 250 字符无 \n → slice(0, 240) + '...'
+   * - maxLength=240，文本 300 字符（10 行，每行 30）在第 9 行结束 → 截到第 9 行 + '...'
+   * - 截断后保留 < 50% maxLength → 仍按字符截（不强行按行）
+   */
+  private static truncateByLine(text: string, maxLength: number): string {
+    if (text.length <= maxLength) return text;
+    const truncated = text.slice(0, maxLength);
+    const lastNewline = truncated.lastIndexOf('\n');
+    if (lastNewline > maxLength * 0.5) {
+      return truncated.slice(0, lastNewline) + '...';
+    }
+    return truncated + '...';
+  }
+
   private parseFull(filePath: string, sessionId: string): Partial<SessionEntry> {
     const content = readFileSync(filePath, 'utf8');
     const lines = content.split('\n').filter(Boolean);
