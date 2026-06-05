@@ -250,6 +250,7 @@ export class JSONLScanner {
     let lastActive: string | null = null;
     let preview = '';
     let lastUserPreview = '';
+    const assistantMessages: Array<{ type: string; message?: { content?: unknown } }> = [];
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
         const entry = JSON.parse(lines[i]);
@@ -264,9 +265,8 @@ export class JSONLScanner {
         if ((entry.type === 'assistant' || entry.type === 'user') && !lastActive) {
           lastActive = entry.timestamp;
         }
-        if (entry.type === 'assistant' && !preview) {
-          const textBlock = entry.message?.content?.find((b: any) => b.type === 'text');
-          if (textBlock) preview = textBlock.text.slice(0, 100);
+        if (entry.type === 'assistant') {
+          assistantMessages.push(entry);
         }
         if (entry.type === 'user' && !lastUserPreview) {
           const text = JSONLScanner.extractTextContent(entry.message?.content);
@@ -277,6 +277,13 @@ export class JSONLScanner {
       } catch {
         // Silently skip malformed JSON lines
       }
+    }
+
+    // 调 cleanAssistantText 拿到 cleaned assistant text（如果有）
+    if (!preview) {
+      // assistantMessages 是倒序收集（最新在前），cleanAssistantText 期望正序
+      // （从尾部迭代找最新），所以调用前 reverse
+      preview = JSONLScanner.cleanAssistantText(assistantMessages.reverse(), 240) ?? '';
     }
 
     // 自建方案下，JSONLScanner 扫描的均为 CLI 会话
@@ -319,9 +326,9 @@ export class JSONLScanner {
       created_at: createdAt ?? new Date().toISOString(),
       last_active: lastActive ?? new Date().toISOString(),
       // 三字段并存：last_message_preview 保留 100 字符（向后兼容 CLI/bot 多处复用）
-      last_message_preview: preview || lastPrompt?.slice(0, 100) || '[无内容]',
+      last_message_preview: preview ? preview.slice(0, 100) : (lastPrompt?.slice(0, 100) || '[无内容]'),
       // 新增 80 字符版（bot overview 卡片用）
-      last_assistant_preview: preview ? preview.slice(0, 80) : undefined,
+      last_assistant_preview: preview ? preview : undefined,
       last_user_preview: lastUserPreview ? lastUserPreview.slice(0, 80) : undefined,
       // 注意：parseFull 不再硬编码 status: 'active'。由调用方根据 existing.status 决定
       // 保留（degraded/provisioning）或重置（corrupted → active）。详见 review finding #6。

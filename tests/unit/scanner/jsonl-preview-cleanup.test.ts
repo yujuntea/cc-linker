@@ -258,3 +258,58 @@ describe('JSONLScanner.parseTail integration with cleanAssistantText', () => {
     expect(result.last_assistant_preview).toBe('真正回复');
   });
 });
+
+describe('JSONLScanner.parseFull integration with cleanAssistantText', () => {
+  let tmpDir: string;
+  let projectDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'jsonl-cleanup-parsefull-'));
+    projectDir = join(tmpDir, '.claude', 'projects', '-Users-test-project');
+    mkdirSync(projectDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function makeScanner(): JSONLScanner {
+    const registry = {
+      has: () => false,
+      get: () => undefined,
+      upsert: () => {},
+    };
+    const cache: FileCache = new Map();
+    return new (JSONLScanner as any)(registry, cache, tmpDir);
+  }
+
+  function writeJsonl(lines: string[]): string {
+    const path = join(projectDir, 'session-parsefull.jsonl');
+    writeFileSync(path, lines.join('\n') + '\n');
+    return path;
+  }
+
+  it('returns cleaned final answer in parseFull result', () => {
+    const lines = [
+      '{"type":"user","message":{"content":"问题"}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"## 决策版"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Bash","input":{}}]}}',
+    ];
+    const path = writeJsonl(lines);
+    const scanner = makeScanner();
+    const result = (scanner as any).parseFull(path, 'session-parsefull');
+    expect(result.last_assistant_preview).toBe('决策版');
+    expect(result.last_assistant_preview).not.toContain('##');
+  });
+
+  it('parseFull result has last_assistant_preview up to 240 chars', () => {
+    const longText = 'b'.repeat(300);
+    const lines = [
+      `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"${longText}"}]}}`,
+    ];
+    const path = writeJsonl(lines);
+    const scanner = makeScanner();
+    const result = (scanner as any).parseFull(path, 'session-parsefull');
+    expect(result.last_assistant_preview).toBe('b'.repeat(240) + '...');
+  });
+});
