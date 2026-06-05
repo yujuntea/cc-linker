@@ -365,9 +365,19 @@ provider = "claude-sonnet-4"
 [review]
 mode = "parallel"              # parallel | single
 providers = ["kimi-2.6", "qwen3.6-plus"]
+# parallel 模式语义：
+# - 所有 providers 同时启动会话
+# - 收集齐所有 review opinions 后才推进到下一状态（任一失败则该轮外审视为失败）
+# - 任一 provider 返回 0 issues 仍正常推进（其他 provider 的 issues 仍然计入）
+# single 模式语义：只取 providers[0]
 
 [arbiter]
 provider = "claude-opus-4"
+# 触发条件：Work Model 的 verdict 满足以下任一即调用 Arbiter
+# - "reject": Work Model 拒绝全部 review 意见
+# - "disagree_significantly": Work Model 拒绝 >50% 的 review 意见
+# - "low_acceptance": Work Model 接受 <30% 的 review 意见
+# 默认 "disagree_significantly"
 trigger_on = "disagree_significantly"
 
 [guards]
@@ -423,6 +433,11 @@ system = """
 """
 
 # --- per-phase 覆盖 ---
+# 合并规则（深度 merge，未指定的字段继承 top-level）：
+# - 标量字段（string/number/bool）：phase 值完全覆盖 top-level
+# - 数组字段（providers）：phase 值完全替换 top-level 数组（不追加）
+# - table 字段（prompts）：phase 的子表与 top-level 子表深度 merge
+# 例：phase=code 时 review.providers = ["kimi-2.6", "qwen3.6-plus", "mimo-2.5-pro"]，完全替换默认的 ["kimi-2.6", "qwen3.6-plus"]
 [phase_overrides.spec]
 review.mode = "single"
 review.providers = ["claude-opus-4"]
@@ -456,8 +471,11 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
   if (text.match(/(architecture|task breakdown|milestone|dependencies?)/)) return 'plan';
   if (text.match(/(implement|fix|debug|optimize|refactor)/)) return 'code';
   
-  // 启发式 4: LLM 分类（兜底）
-  return await llmClassify(input.rawInput);
+  // 启发式 4: LLM 分类（兜底，Phase 3 才实现，Phase 1 抛 "phase_unknown" 由用户手动选择）
+  if (config.review.phaseDetect.llmFallback) {
+    return await llmClassify(input.rawInput);
+  }
+  throw new PhaseUnknownError(rawInput);
 }
 ```
 
@@ -546,7 +564,7 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
   - `GET /api/pipelines/<id>/report` — 下载报告
   - `GET /api/profiles` — 列出可用 profile
   - `GET /api/providers` — 列出可用 model（复用 ProviderManager）
-  - `GET /events` — SSE 流
+  - `GET /events?pipelineId=<id>` — SSE 流，订阅指定 pipeline 的 state 变更
 
 ### 5.4 IDE 与状态机的协作
 
