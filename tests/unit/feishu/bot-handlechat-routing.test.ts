@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, mock } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll, mock } from 'bun:test';
 import { FeishuBot } from '../../../src/feishu/bot';
 import { AgentViewManager } from '../../../src/agent-view/manager';
 import { UserManager } from '../../../src/feishu/mapping';
@@ -49,6 +49,12 @@ let textReplies: string[];
 let handleCommandCalls: SpoolMessage[] = [];
 let handleReplyCalls: Array<{ openId: string; text: string }> = [];
 let handleCancelReplyCalls: string[] = [];
+
+// Snapshot of the original AgentSnapshotFetcher.fetch — tests below overwrite
+// it via `(AgentSnapshotFetcher as any).fetch = mock(...)`. Restore in afterAll
+// so the override does not leak into later test files in the same `bun test`
+// run (e.g. snapshot-fetcher.test.ts) which depend on the real implementation.
+const origFetcherFetch = AgentSnapshotFetcher.fetch;
 
 function makeSpoolMessage(over: Partial<SpoolMessage> = {}): SpoolMessage {
   return {
@@ -267,4 +273,8 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
     expect(handleReplyCalls).toHaveLength(0);
     expect(textReplies.some((t) => t.includes('请先执行'))).toBe(true);
   });
+});
+
+afterAll(() => {
+  (AgentSnapshotFetcher as any).fetch = origFetcherFetch;
 });

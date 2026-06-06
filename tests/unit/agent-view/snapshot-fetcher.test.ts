@@ -33,14 +33,23 @@ const fixtureDir = join(import.meta.dir, '..', '..', 'fixtures', 'agents-json');
 // after the fact for its bindings inside snapshot-fetcher).
 const origProbeCheck = DaemonProbe.check;
 
+// Snapshot the original AgentSnapshotFetcher.fetch so we can restore it before
+// each test — earlier test files (e.g. bot-handlechat-routing.test.ts) overwrite
+// `AgentSnapshotFetcher.fetch` without restoring it, and that override leaks
+// into this file when both run in the same `bun test` invocation.
+const origFetch = AgentSnapshotFetcher.fetch;
+
 beforeEach(() => {
   (DaemonProbe as any).check = origProbeCheck;
+  (AgentSnapshotFetcher as any).fetch = origFetch;
   execFileSyncMock.mockReset();
   execFileMock.mockReset();
 });
 
 afterAll(() => {
   (DaemonProbe as any).check = origProbeCheck;
+  (AgentSnapshotFetcher as any).fetch = origFetch;
+  mock.restore(); // Restore all mock.module() replacements
 });
 
 describe('AgentSnapshotFetcher.fetch', () => {
