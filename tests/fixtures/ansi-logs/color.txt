@@ -1,0 +1,2 @@
+[31mError: [0mtest failed
+[32mOK: [0m3 tests passed

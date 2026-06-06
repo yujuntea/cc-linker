@@ -1,0 +1,3 @@
+$ npm test
+PASS tests/checkout.test.ts
+FAIL tests/cart.test.ts
