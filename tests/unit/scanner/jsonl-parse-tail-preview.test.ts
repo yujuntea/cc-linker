@@ -55,8 +55,8 @@ describe('parseTailForPreview', () => {
     // File > 4KB; the last user/assistant lines are inside the tail
     const path = join(tmpDir, 'large.jsonl');
     const padding = JSON.stringify({ type: 'progress', data: 'x'.repeat(200) });
-    // ~3.5KB of padding (about 18 lines of 200 bytes each)
-    const paddingLines = Array(15).fill(padding).join('\n');
+    // 18 lines of padding ≈ 4.1KB, just over 4KB boundary
+    const paddingLines = Array(18).fill(padding).join('\n');
     const tail = [
       JSON.stringify({ type: 'user', message: { content: '最近的问题' } }),
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '最近的回复' }] } }),
