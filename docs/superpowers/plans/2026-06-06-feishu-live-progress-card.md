@@ -655,7 +655,7 @@ function buildSessionOverviewCard(
     elements: [
       { tag: 'markdown', content: `**${titlePrefix}${liveHint}**\nID: \`${uuid.slice(0, 8)}\`\n📁 \`${esc(entry.cwd ?? '-')}\`` },
       ...(lastUser ? [{ tag: 'markdown', content: `**💬 最后提问：**\n> ${esc(lastUser)}` }] : []),
-      ...(lastAssistant ? [{ tag: 'markdown', content: `**🤖 最后回复：**\n> ${esc(lastAssistant)}${liveHint}` }] : []),
+      ...(lastAssistant ? [{ tag: 'markdown', content: `**🤖 最后回复：**\n> ${esc(lastAssistant)}` }] : []),
       { tag: 'hr' },
       { tag: 'markdown', content: `📊 ${formatMetaStats(entry)}\n\n💡 直接发送消息即可继续此会话` },
       { tag: 'hr' },
@@ -1231,7 +1231,7 @@ Expected: "✅ cc-linker 正在运行 (PID: ...)"
 1. 在飞书发 `sleep 50`（或类似长任务）
 2. 在飞书 `/list` 找该 session
 3. 切到该 session（`/switch <id>` 或卡片按钮）
-4. 观察 15s 内卡片自动刷新，看到 "🤖 最后回复 _(实时)_"
+4. 观察 15s 内卡片自动刷新，标题行带 _(实时)_ 标记（橙色 "🔄 处理中会话" 模板）
 5. 等任务完成，卡片应转为蓝色"已切换会话"模板
 6. 再次切到该 session（已闲），不应有 live watcher
 
