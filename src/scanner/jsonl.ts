@@ -596,15 +596,18 @@ function processTailForPreview(tail: string): { lastUser?: string; lastAssistant
   const lines = tail.split('\n').filter(Boolean);
 
   let lastUser: string | undefined;
-  let lastAssistant: string | undefined;
-  let lastToolResult: string | undefined;
+  // Track both candidates WITH their line index (higher = more recent in file).
+  // We pick whichever is more recent chronologically, not whichever happens to
+  // be at the highest line of the same type. This is critical for bash-loop
+  // tasks where the most recent message is a tool_result stdout (the date
+  // output) but there is an older assistant text block ("I'll start the loop").
+  let assistantCandidate: { text: string; line: number } | undefined;
+  let toolResultCandidate: { text: string; line: number } | undefined;
+
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const entry = JSON.parse(lines[i]);
       if (entry.type === 'user') {
-        // 【user 内容】两条独立路径, 不能互斥:
-        //  1) lastUser: 纯 text 块 → "请你..."
-        //  2) lastToolResult: tool_result 块 → bash 输出 / 文件内容
         if (!lastUser) {
           const content = entry.message?.content;
           if (typeof content === 'string') {
@@ -614,39 +617,51 @@ function processTailForPreview(tail: string): { lastUser?: string; lastAssistant
             if (textBlock?.text) lastUser = textBlock.text.slice(0, 100);
           }
         }
-        if (!lastToolResult) {
+        if (!toolResultCandidate) {
           const blocks = entry.message?.content;
           if (Array.isArray(blocks)) {
             for (const block of blocks) {
               if (block.type === 'tool_result') {
                 const c = block.content;
+                let txt: string | undefined;
                 if (typeof c === 'string' && c.trim()) {
-                  lastToolResult = c.trim().slice(0, 100);
-                  break;
+                  txt = c.trim();
                 } else if (Array.isArray(c)) {
                   const tb = c.find((b: any) => b.type === 'text');
-                  if (tb?.text) {
-                    lastToolResult = tb.text.trim().slice(0, 100);
-                    break;
-                  }
+                  if (tb?.text) txt = tb.text.trim();
                 }
+                if (txt) {
+                  toolResultCandidate = { text: txt.slice(0, 100), line: i };
+                }
+                break;
               }
             }
           }
         }
-      } else if (entry.type === 'assistant' && !lastAssistant) {
+      } else if (entry.type === 'assistant' && !assistantCandidate) {
         const textBlock = entry.message?.content?.find((b: any) => b.type === 'text');
-        if (textBlock?.text) lastAssistant = textBlock.text.slice(0, 100);
+        if (textBlock?.text) {
+          assistantCandidate = { text: textBlock.text.slice(0, 100), line: i };
+        }
       }
-      if (lastUser && lastAssistant) break;
+      if (lastUser && assistantCandidate && toolResultCandidate) break;
     } catch {
       // 跳过损坏行
     }
   }
-  // 优先用 assistant text, 没拿到就 fallback 到最近 tool_result stdout
-  // (bash 循环 / shell 命令型任务的"进度"都在 tool_result 里)
-  if (!lastAssistant && lastToolResult) {
-    lastAssistant = lastToolResult;
+
+  // Pick the more recent (higher line index) of the two candidates.
+  // This makes the live card show "what Claude is doing RIGHT NOW" — for
+  // bash loops, the tool_result stdout wins (last date output); for chat
+  // responses, the latest assistant text wins.
+  let lastAssistant: string | undefined;
+  if (assistantCandidate && toolResultCandidate) {
+    lastAssistant = assistantCandidate.line >= toolResultCandidate.line
+      ? assistantCandidate.text
+      : toolResultCandidate.text;
+  } else {
+    lastAssistant = assistantCandidate?.text ?? toolResultCandidate?.text;
   }
+
   return { lastUser, lastAssistant };
 }

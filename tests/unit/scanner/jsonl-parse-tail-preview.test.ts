@@ -136,17 +136,32 @@ describe('parseTailForPreview', () => {
     expect(result.lastAssistant).toBe('Sat Jun 6 16:32:41 HKT 2026');
   });
 
-  it('prefers assistant text over tool_result when both exist', () => {
+  it('picks the more recent (chronologically later) candidate', () => {
+    // 当 old planning text + fresh tool_result 都存在时, tool_result 更新, 应选 tool_result.
+    // 这样 live card 显示"Claude 此刻在做什么"而不是"loop 开始时它说的".
     const path = join(tmpDir, 'session.jsonl');
     const lines = [
       JSON.stringify({ type: 'user', message: { content: 'q' } }),
-      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'reply' }] } }),
-      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'stdout1' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'old planning' }] } }),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'newest stdout' }] } }),
     ];
     writeFileSync(path, lines.join('\n'));
 
     const result = parseTailForPreview(path);
-    // assistant text 'reply' 比 tool_result 'stdout1' 优先
-    expect(result.lastAssistant).toBe('reply');
+    expect(result.lastAssistant).toBe('newest stdout');
+  });
+
+  it('picks the more recent assistant text when it comes after tool_result', () => {
+    // 当 assistant text 比 tool_result 更新 (e.g. 循环结束后的总结), 用 text
+    const path = join(tmpDir, 'session.jsonl');
+    const lines = [
+      JSON.stringify({ type: 'user', message: { content: 'q' } }),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'old stdout' }] } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'final summary' }] } }),
+    ];
+    writeFileSync(path, lines.join('\n'));
+
+    const result = parseTailForPreview(path);
+    expect(result.lastAssistant).toBe('final summary');
   });
 });
