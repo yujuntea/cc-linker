@@ -8,6 +8,7 @@
  */
 import { logger } from '../utils/logger';
 import { isSessionActive, SessionActivityCache } from '../utils/session-activity';
+import { withTimeout } from '../utils/async';
 import { parseTailForPreview } from '../scanner/jsonl';
 import { CardUpdater } from './card-updater';
 import type { FeishuBot } from './bot';
@@ -72,7 +73,14 @@ export interface WatcherDeps {
   feishuClient: any;
   bot: FeishuBot;
   config: LiveProgressConfig;
-  onStop: (openId: string, reason: string) => void;
+  /**
+   * Called once when the watcher stops. `watcher` is the watcher instance
+   * that just stopped — the implementation should compare identity with
+   * the current map entry (e.g. `liveWatchers.get(oid) === watcher`) before
+   * deleting, otherwise a slow in-flight tick that finishes after `/switch B`
+   * can clobber B from the map.
+   */
+  onStop: (openId: string, reason: string, watcher: LiveProgressWatcher) => void;
 }
 
 export interface LivePreview {
@@ -188,22 +196,20 @@ export class LiveProgressWatcher {
       clearInterval(this.intervalHandle);
       this.intervalHandle = null;
     }
-    // 等待 in-flight tick 完成（最多 5s），避免 SIGTERM/process.exit 截断 patchCard
-    if (this.inFlightTick) {
-      try {
-        await Promise.race([
-          this.inFlightTick,
-          new Promise<void>(resolve => setTimeout(resolve, 5000)),
-        ]);
-      } catch {
-        // tick 内部已经 catch + log, 不会再抛; 这里只是防御
-      }
-    }
+    // 立即 log + 触发 onStop（不 await inFlightTick），避免 tick 内部调 stop() 时
+    // self-deadlock (inFlightTick === 自身 promise). 让 caller 5s race 等真正完成
+    // 发生在 log/onStop 之后, 但 5s 等待对调用方透明
     const elapsedSec = Math.floor((Date.now() - this.startedAt) / 1000);
     logger.info(
       `LiveProgressWatcher stop: openId=${this.deps.openId}, uuid=${this.deps.uuid}, ` +
       `reason=${reason}, ticks=${this.tickCount}, elapsed=${elapsedSec}s`,
     );
-    this.deps.onStop(this.deps.openId, reason);
+    this.deps.onStop(this.deps.openId, reason, this);
+
+    // 等待 in-flight tick 完成 (最多 5s, 避免 SIGTERM 截断 patchCard)
+    if (this.inFlightTick) {
+      // withTimeout 内部 timer 会清理, 不会泄漏; 不 reject
+      await withTimeout(this.inFlightTick, 5000, undefined as void | undefined);
+    }
   }
 }

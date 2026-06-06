@@ -660,7 +660,11 @@ export class FeishuBot {
     // 【live progress】用户发新消息（非 command）→ 停止该用户的 live watcher
     // 命令（/list / /status 等）不打断 watcher，因为用户可能切到 session 后想查进展
     if (!isCommandMessage(msg.text)) {
-      this.stopLiveWatcher(msg.openId, 'user_new_message');
+      // .catch 防 unhandled rejection: stopLiveWatcher 现在 async, 未来若
+      // onStop 内部加 throwable 步骤 (logging, metrics) 没 catch 会进程崩
+      this.stopLiveWatcher(msg.openId, 'user_new_message').catch(err =>
+        logger.error(`stopLiveWatcher(user_new_message) failed: ${err}`),
+      );
     }
 
     if (this.spoolQueue.hasSentDelivery(msg.messageId)) {
@@ -2104,7 +2108,9 @@ export class FeishuBot {
       }
 
       // 【live progress】总是先停止旧 watcher (防止 /switch A→B 后 A 的 watcher 残留)
-      this.stopLiveWatcher(openId, 'new_switch');
+      this.stopLiveWatcher(openId, 'new_switch').catch(err =>
+        logger.error(`stopLiveWatcher(new_switch) failed: ${err}`),
+      );
 
       // 启动新 watcher（仅 isRunning=true 时）
       if (isRunning) {
@@ -2115,7 +2121,14 @@ export class FeishuBot {
           feishuClient: this.feishuClient,
           bot: this,
           config: this.liveConfig,
-          onStop: (oid, _reason) => this.liveWatchers.delete(oid),
+          onStop: (oid, _reason, w) => {
+            // Identity check: 旧 watcher A 可能在 in-flight (5s race), 期间
+            // /switch B 已 set 进 map. A 的 onStop 触发时, 如果 map 里的 oid
+            // 已不是 A 而是 B, 删 oid 会误删 B. 必须 identity 比较.
+            if (this.liveWatchers.get(oid) === w) {
+              this.liveWatchers.delete(oid);
+            }
+          },
         });
         this.liveWatchers.set(openId, watcher);
         watcher.start();
