@@ -521,6 +521,7 @@ async function startForeground(registry: RegistryManager, opts: StartOptions): P
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(chalk.yellow(`\n收到 ${signal}，优雅停机中...`));
+    try { bot.shutdown(); } catch {}
     await shutdown(signal);
     logger.info('cc-linker 已停止');
     process.exit(0);
@@ -579,6 +580,7 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
     if (shuttingDown) return;
     shuttingDown = true;
     log('INFO', `收到 ${signal}，优雅停机中...`);
+    try { bot.shutdown(); } catch {}
     await shutdown(signal);
     try { if (existsSync(RUNTIME_PID_FILE)) unlinkSync(RUNTIME_PID_FILE); } catch {}
     log('INFO', 'cc-linker 已停止');
