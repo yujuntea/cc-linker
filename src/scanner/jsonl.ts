@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync, statSync, existsSync, openSync, readSync, closeSync } from 'fs';
+import type { Stats } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
 import { parse as parseToml } from '@iarna/toml';
@@ -557,7 +558,7 @@ export function parseTailForPreview(jsonlPath: string): {
   lastUser?: string;
   lastAssistant?: string;
 } {
-  let stat: import('fs').Stats;
+  let stat: Stats;
   try {
     stat = statSync(jsonlPath);
   } catch {
@@ -567,15 +568,25 @@ export function parseTailForPreview(jsonlPath: string): {
 
   const readSize = Math.min(4096, stat.size);
   const fd = openSync(jsonlPath, 'r');
-  const buf = Buffer.alloc(readSize);
   try {
+    const buf = Buffer.alloc(readSize);
     readSync(fd, buf, 0, readSize, stat.size - readSize);
+    return processTailForPreview(buf.toString('utf8'));
   } catch {
-    closeSync(fd);
+    // 任何错误（Buffer OOM、readSync 失败等）→ 返回空对象，保持函数容错语义。
+    // finally 仍会执行，确保 fd 不泄漏。
     return {};
+  } finally {
+    closeSync(fd);
   }
-  closeSync(fd);
-  const tail = buf.toString('utf8');
+}
+
+/**
+ * Pure helper: given a raw 4KB tail string, extract the most recent user prompt
+ * and assistant text. Extracted from parseTailForPreview so the file-handling
+ * try/finally block stays clean and readable.
+ */
+function processTailForPreview(tail: string): { lastUser?: string; lastAssistant?: string } {
   const lines = tail.split('\n').filter(Boolean);
 
   let lastUser: string | undefined;

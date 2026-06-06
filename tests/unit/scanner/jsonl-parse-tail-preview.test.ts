@@ -46,6 +46,47 @@ describe('parseTailForPreview', () => {
     expect(result).toEqual({});
   });
 
+  it('returns empty object for missing file', () => {
+    const result = parseTailForPreview(join(tmpDir, 'nonexistent.jsonl'));
+    expect(result).toEqual({});
+  });
+
+  it('finds content inside last 4KB of large file', () => {
+    // File > 4KB; the last user/assistant lines are inside the tail
+    const path = join(tmpDir, 'large.jsonl');
+    const padding = JSON.stringify({ type: 'progress', data: 'x'.repeat(200) });
+    // ~3.5KB of padding (about 18 lines of 200 bytes each)
+    const paddingLines = Array(15).fill(padding).join('\n');
+    const tail = [
+      JSON.stringify({ type: 'user', message: { content: '最近的问题' } }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '最近的回复' }] } }),
+    ].join('\n');
+    writeFileSync(path, paddingLines + '\n' + tail);
+
+    const result = parseTailForPreview(path);
+    expect(result.lastUser).toBe('最近的问题');
+    expect(result.lastAssistant).toBe('最近的回复');
+  });
+
+  it('returns lastAssistant even when last user is outside 4KB tail', () => {
+    // File > 4KB; the last user prompt is BEFORE the last 4KB
+    // (drowned by tool_result blocks). The function should still return
+    // what it can find inside the 4KB tail.
+    const path = join(tmpDir, 'huge.jsonl');
+    const padding = JSON.stringify({ type: 'progress', data: 'x'.repeat(200) });
+    // ~5KB of padding (about 25 lines)
+    const paddingLines = Array(25).fill(padding).join('\n');
+    const head = JSON.stringify({ type: 'user', message: { content: '很久以前的问题' } });
+    const tail = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '当前回复' }] } });
+    writeFileSync(path, head + '\n' + paddingLines + '\n' + tail);
+
+    const result = parseTailForPreview(path);
+    // lastAssistant found (inside tail)
+    expect(result.lastAssistant).toBe('当前回复');
+    // lastUser NOT found (before tail) — this documents the intentional limitation
+    expect(result.lastUser).toBeUndefined();
+  });
+
   it('returns empty object for malformed JSONL lines', () => {
     const path = join(tmpDir, 'session.jsonl');
     writeFileSync(path, 'not json\n{broken: json\n');
