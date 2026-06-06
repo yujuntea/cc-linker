@@ -22,7 +22,7 @@ export interface LiveProgressConfig {
 
 export const DEFAULT_LIVE_PROGRESS_CONFIG: LiveProgressConfig = {
   intervalMs: 10_000,
-  maxTicks: 400,
+  maxTicks: 800,
   maxPatchFailures: 3,
 };
 

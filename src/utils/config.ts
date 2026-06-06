@@ -101,8 +101,8 @@ const DEFAULTS: ConfigData = {
     default_cwd: '',
   },
   runtime: {
-    stale_timeout_ms: 5 * 60 * 1000,
-    hard_timeout_ms: 30 * 60 * 1000,
+    stale_timeout_ms: 10 * 60 * 1000,
+    hard_timeout_ms: 3 * 60 * 60 * 1000,
     max_concurrent_sessions: 5,
     idle_timeout_ms: 30 * 60 * 1000,
     session_lock_timeout_ms: 10 * 60 * 1000,
