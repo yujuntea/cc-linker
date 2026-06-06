@@ -114,6 +114,48 @@ describe('isSessionActive (combined)', () => {
     const r2 = await isSessionActive(entry, cache, 'cli-detects-feishu');
     expect(r2.isProcessing).toBe(true);
   });
+
+  // 回归测试：修复前 feishu-detects-cli 方向不查 marker，SDK 启动的 session
+  // 总是被判为 inactive (因为 SDK 不 spawn 子 claude 进程).
+  // 修复后 marker 是最权威信号，应返回 isProcessing=true.
+  test('feishu-detects-cli + SDK marker (heartbeat) → isProcessing=true', async () => {
+    const cache = new SessionActivityCache();
+    const entry = {
+      sessionUuid: '55555555-5555-5555-5555-555555555555',
+      cwd: '/Users/wuyujun/Git/testLinker',
+      jsonl_path: null,
+    };
+    // SDK 在 sendSDKMessage 调 writeActivityMarker(... 'feishu' 'heartbeat' ...)
+    writeActivityMarker('55555555-5555-5555-5555-555555555555', 'feishu', 'heartbeat');
+    const r = await isSessionActive(entry, cache, 'feishu-detects-cli');
+    expect(r.isProcessing).toBe(true);
+    expect(r.source).toBe('marker');
+  });
+
+  test('feishu-detects-cli + SDK marker (end) → isProcessing=false', async () => {
+    const cache = new SessionActivityCache();
+    const entry = {
+      sessionUuid: '66666666-6666-6666-6666-666666666666',
+      cwd: '/Users/wuyujun/Git/testLinker',
+      jsonl_path: null,
+    };
+    writeActivityMarker('66666666-6666-6666-6666-666666666666', 'feishu', 'end');
+    const r = await isSessionActive(entry, cache, 'feishu-detects-cli');
+    expect(r.isProcessing).toBe(false);
+    expect(r.source).toBe('marker');
+  });
+
+  test('feishu-detects-cli + 无 marker + 无进程 → isProcessing=false', async () => {
+    // 模拟 CLI session 已结束 (无 marker, JSONL mtime 在 setup 时未写)
+    const cache = new SessionActivityCache();
+    const entry = {
+      sessionUuid: '77777777-7777-7777-7777-777777777777',
+      cwd: '/Users/wuyujun/Git/testLinker',
+      jsonl_path: null,
+    };
+    const r = await isSessionActive(entry, cache, 'feishu-detects-cli');
+    expect(r.isProcessing).toBe(false);
+  });
 });
 
 describe('SessionActivityCache', () => {

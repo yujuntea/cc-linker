@@ -78,7 +78,7 @@ describe('LiveProgressWatcher', () => {
       feishuClient: { im: { v1: { message: { patch: async () => ({ code: 0 }) } } } },
       bot: {} as any,
       config: DEFAULT_LIVE_PROGRESS_CONFIG,
-      onStop: (_oid, reason) => { stopped = true; stopReason = reason; },
+      onStop: (_oid, reason, _watcher) => { stopped = true; stopReason = reason; },
     });
     w.stop('test_reason');
     expect(stopped).toBe(true);

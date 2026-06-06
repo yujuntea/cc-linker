@@ -476,6 +476,31 @@ async function sampleCPUImpl(cwd: string): Promise<CpuResult> {
 // === 方向性检测 ===
 
 async function detectCliActivity(entry: ActivityEntry): Promise<ActivityResult> {
+  // Activity marker is the most authoritative signal (no lsof/ps required).
+  // Critically, SDK-bundled claude (@anthropic-ai/claude-agent-sdk) does NOT spawn a
+  // separate claude subprocess — it runs in-process — so process-based detection
+  // can't see it. The marker is written by sendSDKMessage on every thinking/text
+  // chunk and on start/end, providing reliable "the bot is actively working on this
+  // session" signal regardless of process topology.
+  if (entry.sessionUuid) {
+    const marker = readLastActivityMarker(entry.sessionUuid);
+    if (marker) {
+      if (marker.action === 'end') {
+        return { isProcessing: false, confidence: 'high', reason: 'marker_end', source: 'marker' };
+      }
+      const ageMs = Date.now() - new Date(marker.timestamp).getTime();
+      const judgment = judgeMarkerAge(ageMs);
+      if (judgment.active) {
+        return {
+          isProcessing: true,
+          confidence: judgment.confidence,
+          reason: `marker_${marker.action}_${Math.floor(ageMs / 1000)}s_ago`,
+          source: 'marker',
+        };
+      }
+    }
+  }
+
   if (config.get<boolean>('runtime.cli_process_detection_enabled', true)) {
     const proc = findClaudeProcessByCwd(entry.cwd);
     if (proc) {
