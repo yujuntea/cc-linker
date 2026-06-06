@@ -5,7 +5,12 @@ import { config } from '../utils/config';
 import { withLock } from '../utils/lock';
 import { logger } from '../utils/logger';
 
-export type MappingEntryType = 'session' | 'pending_new_session' | 'pending_new_session_claimed';
+export type MappingEntryType =
+  | 'session'
+  | 'pending_new_session'
+  | 'pending_new_session_claimed'
+  | 'pending_agent_reply'         // 新增 — Agent View reply 等待输入
+  | 'last_agent_list_card';       // 新增 — Agent View 最新列表卡
 
 export interface MappingEntry {
   type: MappingEntryType;
@@ -17,6 +22,12 @@ export interface MappingEntry {
   claimedByMessageId?: string;
   claimedAt?: string;
   defaultProvider?: string; // User's default model alias (user-level config)
+  // ===== Agent View 新增字段 =====
+  shortId?: string;          // pending_agent_reply: background session short hash
+  startedAt?: string;        // pending_agent_reply: ISO 启动时间
+  timeoutMs?: number;        // pending_agent_reply: 超时毫秒
+  cardMessageId?: string;    // last_agent_list_card: 飞书卡片 message_id
+  updatedAt?: string;        // last_agent_list_card: ISO 更新时间
 }
 
 export interface UserMapping {
