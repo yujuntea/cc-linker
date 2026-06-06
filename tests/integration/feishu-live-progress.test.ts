@@ -197,4 +197,55 @@ describe('Feishu live progress integration', () => {
     const result = await isSessionProcessing('mixed-uuid', { cwd: '/tmp' }, bot);
     expect(result).toBe(true);
   });
+
+  // 回归测试：修复 C7 (doSwitch 必须总是 stopLiveWatcher, 不仅仅是新 target running 时)
+  it('regression C7: /switch A running → /switch B idle MUST stop A watcher', async () => {
+    env.registry.upsert('uuid-a', {
+      origin: 'feishu', cwd: '/tmp/a', project_name: 'proj', jsonl_path: null, project_dir: null,
+      created_at: '2026-01-01T00:00:00Z', last_active: new Date().toISOString(),
+      title: 'A', message_count: 1, last_message_preview: 'p',
+    });
+    env.registry.upsert('uuid-b', {
+      origin: 'feishu', cwd: '/tmp/b', project_name: 'proj', jsonl_path: null, project_dir: null,
+      created_at: '2026-01-01T00:00:00Z', last_active: new Date().toISOString(),
+      title: 'B', message_count: 1, last_message_preview: 'p',
+    });
+
+    // 只有 A 在跑, B 是 idle
+    const origList = env.sessionManager.listSessions.bind(env.sessionManager);
+    (env.sessionManager as any).listSessions = () => [
+      { sessionId: 'uuid-a', pid: 1, cwd: '/tmp/a', createdAt: Date.now(), lastOutputAt: Date.now(), isNew: false },
+    ];
+
+    try {
+      (env.bot as any).cardReplyFn = async () => 'fake-card-msg-id';
+
+      // Switch to A (running) → watcher A starts
+      await env.bot.onMessage({
+        open_id: 'ou_user1', message_id: 'om_switch_a',
+        content: JSON.stringify({ text: '/switch uuid-a' }),
+        chat_type: 'p2p', message_type: 'text',
+      });
+      await env.bot.dispatch();
+
+      let watchers = (env.bot as any).liveWatchers as Map<string, any>;
+      expect(watchers.has('ou_user1')).toBe(true);
+      const watcherA = watchers.get('ou_user1');
+      expect(watcherA.deps.uuid).toBe('uuid-a');
+
+      // Switch to B (idle) → A 的 watcher 必须停 (B idle 时不启新 watcher, 但旧 watcher 不能残留)
+      await env.bot.onMessage({
+        open_id: 'ou_user1', message_id: 'om_switch_b',
+        content: JSON.stringify({ text: '/switch uuid-b' }),
+        chat_type: 'p2p', message_type: 'text',
+      });
+      await env.bot.dispatch();
+
+      expect(watcherA.stopped).toBe(true);  // A watcher 已被 stop
+      watchers = (env.bot as any).liveWatchers as Map<string, any>;
+      expect(watchers.has('ou_user1')).toBe(false);  // map 中已无 watcher
+    } finally {
+      (env.sessionManager as any).listSessions = origList;
+    }
+  });
 });
