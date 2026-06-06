@@ -539,3 +539,66 @@ export class JSONLScanner {
     return null;
   }
 }
+
+/**
+ * Lightweight JSONL tail reader for live progress cards.
+ *
+ * Reads only the last 4KB of the file and extracts the most recent
+ * user prompt and assistant text. Different from parseTail in that
+ * it returns ONLY the preview fields (lastUser, lastAssistant)
+ * without scanning the full file or doing 4KB fallback.
+ *
+ * Used by LiveProgressWatcher.tick() to refresh the overview card
+ * every 15s with the latest text content.
+ *
+ * Returns empty object on error (file missing, corrupt, etc).
+ */
+export function parseTailForPreview(jsonlPath: string): {
+  lastUser?: string;
+  lastAssistant?: string;
+} {
+  let stat: import('fs').Stats;
+  try {
+    stat = statSync(jsonlPath);
+  } catch {
+    return {};
+  }
+  if (stat.size === 0) return {};
+
+  const readSize = Math.min(4096, stat.size);
+  const fd = openSync(jsonlPath, 'r');
+  const buf = Buffer.alloc(readSize);
+  try {
+    readSync(fd, buf, 0, readSize, stat.size - readSize);
+  } catch {
+    closeSync(fd);
+    return {};
+  }
+  closeSync(fd);
+  const tail = buf.toString('utf8');
+  const lines = tail.split('\n').filter(Boolean);
+
+  let lastUser: string | undefined;
+  let lastAssistant: string | undefined;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (entry.type === 'user' && !lastUser) {
+        const content = entry.message?.content;
+        if (typeof content === 'string') {
+          lastUser = content.slice(0, 100);
+        } else if (Array.isArray(content)) {
+          const textBlock = content.find((b: any) => b.type === 'text');
+          if (textBlock?.text) lastUser = textBlock.text.slice(0, 100);
+        }
+      } else if (entry.type === 'assistant' && !lastAssistant) {
+        const textBlock = entry.message?.content?.find((b: any) => b.type === 'text');
+        if (textBlock?.text) lastAssistant = textBlock.text.slice(0, 100);
+      }
+      if (lastUser && lastAssistant) break;
+    } catch {
+      // 跳过损坏行
+    }
+  }
+  return { lastUser, lastAssistant };
+}
