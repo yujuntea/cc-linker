@@ -2281,21 +2281,34 @@ function buildListCard(
 }
 
 /** Build an overview card for the user to see session progress after switch. */
+interface OverviewCardOverrides {
+  lastUserPreview?: string;
+  lastAssistantPreview?: string;
+}
+
 function buildSessionOverviewCard(
   uuid: string,
   entry: Pick<SessionEntry, 'title' | 'cwd' | 'message_count' | 'last_active' | 'origin' | 'status' | 'last_user_preview' | 'last_assistant_preview'>,
   isRunning: boolean,
+  overrides: OverviewCardOverrides = {},
 ): Record<string, unknown> {
+  const lastUser = overrides.lastUserPreview ?? entry.last_user_preview;
+  const lastAssistant = overrides.lastAssistantPreview ?? entry.last_assistant_preview;
+  const liveHint = isRunning ? ' _(实时)_' : '';
+
   const runningTag = isRunning ? '🔴 处理中 · ' : '';
   const titlePrefix = `${runningTag}${esc(truncateTitleForCard(entry.title))}`;
 
   return {
     config: { wide_screen_mode: true },
-    header: { title: { tag: 'plain_text', content: '🔄 已切换会话' }, template: 'blue' },
+    header: {
+      title: { tag: 'plain_text', content: isRunning ? '🔄 处理中会话' : '🔄 已切换会话' },
+      template: isRunning ? 'orange' : 'blue',
+    },
     elements: [
-      { tag: 'markdown', content: `**${titlePrefix}**\nID: \`${uuid.slice(0, 8)}\`\n📁 \`${esc(entry.cwd ?? '-')}\`` },
-      ...(entry.last_user_preview ? [{ tag: 'markdown', content: `**💬 最后提问：**\n> ${esc(entry.last_user_preview)}` }] : []),
-      ...(entry.last_assistant_preview ? [{ tag: 'markdown', content: `**🤖 最后回复：**\n> ${esc(entry.last_assistant_preview)}` }] : []),
+      { tag: 'markdown', content: `**${titlePrefix}${liveHint}**\nID: \`${uuid.slice(0, 8)}\`\n📁 \`${esc(entry.cwd ?? '-')}\`` },
+      ...(lastUser ? [{ tag: 'markdown', content: `**💬 最后提问：**\n> ${esc(lastUser)}` }] : []),
+      ...(lastAssistant ? [{ tag: 'markdown', content: `**🤖 最后回复：**\n> ${esc(lastAssistant)}${liveHint}` }] : []),
       { tag: 'hr' },
       // 元信息行：消息数 + 时间 + 来源/状态（与 list 卡片保持一致）
       // 非 active status 显示中文标签（如 '已损坏'）—— ITEM-6 修复
