@@ -3,8 +3,9 @@ import { existsSync, readdirSync } from 'fs';
 import { UserManager } from './mapping';
 import { ListSnapshotManager, ListSnapshotEntry } from './list-snapshot';
 import { SpoolQueue, SpoolMessage, TargetSnapshot } from '../queue/spool';
-import { ClaudeSessionManager } from '../proxy/session';
+import { ClaudeSessionManager, SendMessageResult } from '../proxy/session';
 import { sessionManager as defaultSessionManager } from '../proxy/session';
+import type { AgentViewManager } from '../agent-view/manager';
 import { StreamChunk } from '../proxy/stream-parser';
 import { CardUpdater } from './card-updater';
 import { LiveProgressWatcher, isSessionProcessing, DEFAULT_LIVE_PROGRESS_CONFIG, type LiveProgressConfig } from './live-progress';
@@ -103,6 +104,13 @@ export class FeishuBot {
   private stopRequested = false;
   private activeWorkers = new Set<Promise<void>>();
   private activePermissionHandlers = new Map<string, PermissionHandler>();
+  /**
+   * Agent View manager (set via setAgentView in start.ts). Holds deps with
+   * `runChatSDK` arrow-bound to this FeishuBot instance so AgentViewManager.handleReply
+   * can drive the full SDK streaming lifecycle (permission cards, throttled
+   * updates, registry updates, spool finalization) without going through SpoolQueue.
+   */
+  private agentView?: AgentViewManager;
   /**
    * Tracks the 1200ms-delayed "click → 处理中" patch timer for each permission card,
    * keyed by Feishu message_id. Used by the post-operation completion patcher to
@@ -821,7 +829,46 @@ export class FeishuBot {
 
         const useSDK = config.get<boolean>('sdk.enabled', true);
         if (useSDK) {
-          await this.handleChatSDK(msg, sessionUuid, cwd, currentEntry);
+          const settingsPath = this.getSettingsPathForUser(msg.openId);
+          const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
+          let runResult: Awaited<ReturnType<FeishuBot['runChatSDK']>> | null = null;
+          try {
+            runResult = await this.runChatSDK({
+              openId: msg.openId,
+              sessionUuid,
+              cwd,
+              settingsPath,
+              promptText,
+              serialKey: msg.serialKey,
+              isNew: false,
+            });
+          } catch (err: any) {
+            // runChatSDK 已经把卡片标为 error 并 dispose;只做 SpoolQueue / 取消清理
+            this.spoolQueue.markReplied(msg.messageId, msg.serialKey);
+            this.spoolQueue.markFailed(msg.messageId, msg.serialKey, String(err?.message ?? err));
+            this.cancelledMessageIds.delete(msg.messageId);
+            return;
+          }
+          const { result, cardMessageId } = runResult;
+          this.registry.upsert(sessionUuid, {
+            cwd, last_active: new Date().toISOString(),
+            last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
+            last_error: result.error ?? null,
+            status: result.sessionStatus === 'degraded' ? 'degraded' : 'active',
+            jsonl_path: result.jsonlPath ?? undefined,
+            pending_jsonl_resolve: result.jsonlPath ? false : currentEntry?.pending_jsonl_resolve,
+            message_count: (currentEntry?.message_count ?? 0) + 1,
+          });
+          await this.registry.flush();
+          this.spoolQueue.updateProcessingMessage(msg.messageId, msg.serialKey, { responseText: result.response || '(空回复)' });
+          if (cardMessageId) {
+            this.spoolQueue.recordDelivery(msg.messageId, 'sent', stableUuid(msg.messageId, 0), 0, cardMessageId, 1);
+          }
+          this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+          this.spoolQueue.markDone(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
+          const jlPath = result.jsonlPath ?? currentEntry?.jsonl_path;
+          if (jlPath) { try { repairJsonlLastPrompt(jlPath); } catch {} }
+          this.cancelledMessageIds.delete(msg.messageId);
         } else if (config.get<boolean>('stream.enabled', false)) {
           await this.handleChatStreaming(msg, sessionUuid, cwd, currentEntry);
         } else {
@@ -1015,10 +1062,44 @@ export class FeishuBot {
     }
   }
 
-  /** SDK path for chat messages (supports permission interaction) */
-  private async handleChatSDK(
-    msg: SpoolMessage, sessionUuid: string, cwd: string, currentEntry: any,
-  ): Promise<void> {
+  /**
+   * SDK-driven chat streaming lifecycle (public, reusable from Agent View reply).
+   *
+   * Drives the full SDK streaming pipeline: processing card → streaming updates →
+   * permission card interactive prompts → completion / fallback to text → registry
+   * upsert → spool finalization. Used by:
+   *   1. `handleChat` (the original SpoolMessage path) — constructs params and calls.
+   *   2. `AgentViewManager.handleReply` (T18) — calls directly with isNew=false to
+   *      inject a reply into a `claude agents` background session.
+   *
+   * IMPORTANT: This method depends on `this.feishuClient`, `this.activePermissionHandlers`,
+   * `this.cancelledMessageIds`, `this.activePermissionCardTimeouts`, `this.registry`,
+   * `this.spoolQueue`, `this.replyFn`, `this.getSettingsPathForUser`, etc. So
+   * `setAgentView` MUST overwrite `deps.runChatSDK` with an arrow function that
+   * captures `this` (the FeishuBot instance) — otherwise a bare method reference
+   * would lose `this` binding and crash at runtime.
+   *
+   * @param params.openId       Feishu openId (for card recipient + reply routing)
+   * @param params.sessionUuid  Target session UUID (or null when isNew=true)
+   * @param params.cwd          Working directory for the Claude process
+   * @param params.settingsPath Optional ~/.claude/settings.json override
+   * @param params.promptText   Prompt body (already with image references inlined)
+   * @param params.serialKey    SpoolQueue serial key (sessionUuid or `new:${openId}`)
+   * @param params.isNew        True for new-session creation path
+   * @returns { result, handler, cardMessageId } — result for callers that need cost/tokens
+   *   or sessionId; handler for permission state inspection; cardMessageId for downstream
+   *   "find this card and patch it" operations.
+   */
+  public async runChatSDK(params: {
+    openId: string;
+    sessionUuid: string;
+    cwd: string;
+    settingsPath?: string;
+    promptText: string;
+    serialKey: string;
+    isNew?: boolean;
+  }): Promise<{ result: SendMessageResult; handler: PermissionHandler; cardMessageId: string | null }> {
+    const { openId, sessionUuid, cwd, settingsPath, promptText, serialKey, isNew = false } = params;
     const startTime = Date.now();
     let thinking = '';
     let text = '';
@@ -1038,7 +1119,7 @@ export class FeishuBot {
           max_card_bytes: config.get<number>('stream.max_card_bytes', 25000),
           show_thinking: config.get<boolean>('stream.show_thinking', true),
         });
-        cardMessageId = await cardUpdater.startProcessing(msg.openId);
+        cardMessageId = await cardUpdater.startProcessing(openId);
       }
     } catch (err: any) {
       logger.warn(`SDK Stream: 发送处理中卡片失败: ${err}`);
@@ -1046,8 +1127,6 @@ export class FeishuBot {
     }
 
     try {
-      const settingsPath = this.getSettingsPathForUser(msg.openId);
-      const promptText = buildPromptWithImages(msg.text, msg.imagePaths ?? []);
       const { result, handler } = await this.sessionManager.sendSDKMessage(
         sessionUuid, promptText, cwd,
         (chunk: StreamChunk) => {
@@ -1072,7 +1151,7 @@ export class FeishuBot {
           this.activePermissionHandlers.set(sdkHandler.getHandlerId(), sdkHandler);
           try {
             const createdId = await permCardUpdater.createPermissionCard(
-              msg.openId, prompt.toolName, actionText, prompt.index, sdkHandler.getHandlerId(),
+              openId, prompt.toolName, actionText, prompt.index, sdkHandler.getHandlerId(),
             );
             if (createdId) permCardMessageIds.add(createdId);
           } catch (err: any) {
@@ -1085,7 +1164,7 @@ export class FeishuBot {
             }
           }
         },
-        false, msg.serialKey, settingsPath,
+        isNew, serialKey, settingsPath,
       );
       currentHandler = handler;
 
@@ -1094,9 +1173,8 @@ export class FeishuBot {
       const finalText = text || result.response || '(空回复)';
 
       if (cardUpdater) {
-        const wasCancelled = this.cancelledMessageIds.has(msg.messageId);
+        const wasCancelled = this.cancelledMessageIds.has(serialKey);
         if (wasCancelled) {
-          this.cancelledMessageIds.delete(msg.messageId);
           await cardUpdater.cancel();
         } else if (cardUpdater.shouldFallbackToText(finalText)) {
           const truncated = cardUpdater.truncateContent(finalText);
@@ -1104,7 +1182,7 @@ export class FeishuBot {
           const remainder = finalText.slice(truncated.length);
           if (remainder && config.get<boolean>('stream.fallback_to_text', true)) {
             for (const chunk of splitReplyText(remainder, 3900)) {
-              await this.replyFn(chunk, { messageId: msg.messageId, openId: msg.openId });
+              await this.replyFn(chunk, { openId });
             }
           }
         } else {
@@ -1138,29 +1216,22 @@ export class FeishuBot {
         }, 1200);
       }
 
-      this.registry.upsert(sessionUuid, {
-        cwd, last_active: new Date().toISOString(), last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
-        last_error: result.error ?? null,
-        status: result.sessionStatus === 'degraded' ? 'degraded' : 'active',
-        jsonl_path: result.jsonlPath ?? undefined,
-        pending_jsonl_resolve: result.jsonlPath ? false : currentEntry?.pending_jsonl_resolve,
-        message_count: (currentEntry?.message_count ?? 0) + 1,
-      });
-      await this.registry.flush();
+      // Spool finalization skipped: Agent View reply (T18) calls this method
+      // outside the SpoolQueue, so there is no SpoolMessage to update. Callers
+      // that DO have a SpoolMessage (handleChat) handle the spool update inline.
 
-      this.spoolQueue.updateProcessingMessage(msg.messageId, msg.serialKey, { responseText: result.response || '(空回复)' });
-      if (cardMessageId) {
-        this.spoolQueue.recordDelivery(msg.messageId, 'sent', stableUuid(msg.messageId, 0), 0, cardMessageId, 1);
-      }
-      this.spoolQueue.markReplied(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
-      this.spoolQueue.markDone(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
-
-      const jlPath = result.jsonlPath ?? currentEntry?.jsonl_path;
-      if (jlPath) { try { repairJsonlLastPrompt(jlPath); } catch {} }
-
-      this.cancelledMessageIds.delete(msg.messageId);
+      return { result, handler, cardMessageId };
     } catch (err: any) {
-      cardMessageId = await this._handleStreamError(msg, err, cardUpdater, cardInitFailed, cardMessageId, false);
+      logger.error(`runChatSDK 失败: ${err?.message ?? err}`);
+      if (cardUpdater) {
+        await cardUpdater.error(err.message ?? 'Unknown error');
+        cardMessageId = cardUpdater.getCardMessageId();
+        cardUpdater.dispose();
+      } else if (!cardInitFailed && this.feishuClient) {
+        // No card was ever created — surface a text error reply
+        await this.replyFn(`处理失败: ${err.message ?? err}`, { openId });
+      }
+      throw err;
     } finally {
       // Only delete handler when all permission prompts are resolved.
       // If a prompt is still awaiting user input, keep the handler so the click can resolve.
@@ -1168,6 +1239,24 @@ export class FeishuBot {
         this.activePermissionHandlers.delete(currentHandler.getHandlerId());
       }
     }
+  }
+
+  /**
+   * Set the Agent View manager. Wires `mgr.deps.runChatSDK` to an arrow function
+   * that captures this FeishuBot instance so `runChatSDK` can be called from
+   * outside the bot (e.g. by AgentViewManager.handleReply) without losing
+   * `this` binding.
+   *
+   * v2.2 critical fix: the deps object passed to AgentViewManager is already
+   * constructed. We MUST overwrite `deps.runChatSDK` with an arrow function —
+   * a bare method reference (`this.runChatSDK`) would lose `this` and crash
+   * when the manager invokes it, because `runChatSDK` reads `this.feishuClient`,
+   * `this.activePermissionHandlers`, etc.
+   */
+  setAgentView(mgr: AgentViewManager): void {
+    this.agentView = mgr;
+    // v2.2 fix: arrow function captures `this` (the FeishuBot instance)
+    mgr.deps.runChatSDK = (params) => this.runChatSDK(params);
   }
 
   private getPermissionActionText(prompt: PermissionPrompt): string {

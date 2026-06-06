@@ -15,7 +15,7 @@ export interface AgentViewDeps {
     openId: string; sessionUuid: string; cwd: string;
     promptText: string; serialKey: string; isNew?: boolean;
     settingsPath?: string;
-  }) => Promise<{ result: any; handler: any; cardMessageId: string }>;
+  }) => Promise<{ result: any; handler: any; cardMessageId: string | null }>;
   expectedReplyTimeoutMs?: number;
 }
 
