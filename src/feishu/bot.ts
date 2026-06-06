@@ -7,7 +7,7 @@ import { ClaudeSessionManager } from '../proxy/session';
 import { sessionManager as defaultSessionManager } from '../proxy/session';
 import { StreamChunk } from '../proxy/stream-parser';
 import { CardUpdater } from './card-updater';
-import { LiveProgressWatcher, DEFAULT_LIVE_PROGRESS_CONFIG, type LiveProgressConfig } from './live-progress';
+import { LiveProgressWatcher, isSessionProcessing, DEFAULT_LIVE_PROGRESS_CONFIG, type LiveProgressConfig } from './live-progress';
 import { PermissionHandler, type PermissionPrompt } from '../proxy/permission-handler';
 import { esc } from './markdown-escape';
 import { RegistryManager } from '../registry';
@@ -2066,8 +2066,8 @@ export class FeishuBot {
       return 'failed';
     }
 
-    // swapped=true：判断目标 session 是否正在跑 Claude
-    const isRunning = this.isSessionRunning(uuid);
+    // swapped=true：判断目标 session 是否正在处理（飞书 in-memory + CLI marker 统一）
+    const isRunning = await isSessionProcessing(uuid, session, this);
 
     // 发概览卡片
     const card = buildSessionOverviewCard(uuid, session, isRunning);
@@ -2080,6 +2080,22 @@ export class FeishuBot {
         this.spoolQueue.markDone(msg.messageId, msg.serialKey, replyId);
       } else {
         this.spoolQueue.recordReceipt(messageId ?? '');
+      }
+
+      // 启动 live watcher（仅 isRunning=true 时）
+      if (isRunning) {
+        this.stopLiveWatcher(openId, 'new_switch');
+        const watcher = new LiveProgressWatcher({
+          uuid,
+          openId,
+          cardMessageId: replyId,
+          feishuClient: this.feishuClient,
+          bot: this,
+          config: this.liveConfig,
+          onStop: (oid, _reason) => this.liveWatchers.delete(oid),
+        });
+        this.liveWatchers.set(openId, watcher);
+        watcher.start();
       }
     } else {
       // 降级到 text
