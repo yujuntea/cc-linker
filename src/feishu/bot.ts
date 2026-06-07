@@ -566,7 +566,9 @@ export class FeishuBot {
         // v2.2.11: bg-conflict 拒绝卡上的三个按钮
         case 'agent_view_stop_and_send':
           return await this.agentView.handleStopAndSend(
-            openId, valueObj.shortId, valueObj.sessionId, valueObj.cwd, valueObj.text, messageId,
+            openId, valueObj.shortId, valueObj.sessionId, valueObj.cwd, valueObj.text,
+            valueObj.parentUuid ?? '', valueObj.hasParent === true,
+            messageId,
           );
         case 'agent_view_new_and_send':
           return await this.agentView.handleNewAndSend(
@@ -1299,8 +1301,26 @@ export class FeishuBot {
         if (worker) {
           const workerPid = (worker as any).pid;
           const workerName = (worker as any).dispatch?.seed?.name || short;
+          // v2.2.13: 在拒绝时 pre-compute parent UUID(从 roster.launch.sessionId 提取
+          // basename),stash 到 conflict card 的 stop_and_send button value 上。
+          // 这样 handleStopAndSend 不需要再读 roster —— 因为 `claude stop` 一执行
+          // worker 就会被从 roster 移除,二次查必然查不到 parent。
+          // 没 parent 的 raw-slash bg(罕见)就让 handler 直接 resume bg 自身。
+          let parentUuid: string | null = null;
+          try {
+            const parentPath = _bgConflictHooks.lookupResumeFromPath(roster, short);
+            if (parentPath) {
+              const id = parentPath.split('/').pop()?.replace(/\.jsonl$/, '') ?? '';
+              if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+                parentUuid = id;
+              }
+            }
+          } catch {
+            // ignore
+          }
           logger.info(
-            `runChatSDK: 拒绝向 live bg worker ${short} 发消息(pid=${workerPid}),弹冲突卡让用户选择`,
+            `runChatSDK: 拒绝向 live bg worker ${short} 发消息(pid=${workerPid}),` +
+              `弹冲突卡(parent=${parentUuid?.slice(0, 8) ?? 'none'})`,
           );
           if (cardUpdater) {
             // 之前已经发了"💭 处理中"卡,把它 patch 成冲突卡(text 同上,占位防卡片悬挂)
@@ -1318,6 +1338,7 @@ export class FeishuBot {
               cwd,
               text: promptText,
               workerPid,
+              parentUuid,
             });
             try {
               await this.cardReplyFn(JSON.parse(conflictCard), { openId });

@@ -26,12 +26,17 @@ export type AgentViewValue =
   | { tag: 'agent_view_stop_confirm'; shortId: string; sessionId: string }
   | { tag: 'agent_view_back_to_chat' }
   // v2.2.11: bg-conflict 拒绝卡上的三个按钮(stashed text 跟着 value 走)
+  // v2.2.13 新增 parentUuid / hasParent —— runChatSDK 拒绝分支读 roster 后
+  // 把 parent 路径 pre-compute 好 stashed 到 button value,这样后续 handleStopAndSend
+  // 在 claude stop 把 worker 从 roster 移除后,不需要再二次查(避免 race)。
   | {
       tag: 'agent_view_stop_and_send';
       shortId: string;
       sessionId: string;
       cwd: string;
       text: string;
+      parentUuid: string;
+      hasParent: boolean;
     }
   | { tag: 'agent_view_new_and_send'; cwd: string; text: string }
   | { tag: 'agent_view_bg_conflict_cancel' };

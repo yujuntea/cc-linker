@@ -407,9 +407,61 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
     restore();
     restoreCard();
 
-    // still refuses (v2.2.11 doesn't touch parent lookup at all)
+    // v2.2.13: 仍然拒绝发 SDK,但 v2.2.13 会尝试调用 lookupResumeFromPath
+    // 来 pre-compute parentUuid,这里路径 basename 不是合法 UUID,所以
+    // stashed parentUuid=空,hasParent=false(handler 退化用 bg sessionId)。
     expect(calls.length).toBe(0);
     expect(cards.length).toBe(1);
-    expect(lookupResumeFromPathMock).not.toHaveBeenCalled();
+    expect(lookupResumeFromPathMock).toHaveBeenCalled();
+    // 🛑 button: parentUuid=空, hasParent=false
+    const card = cards[0];
+    const stopBtn = card.elements
+      ?.find((e: any) => e.tag === 'action')
+      ?.actions?.find((a: any) => a.value?.tag === 'agent_view_stop_and_send');
+    expect(stopBtn).toBeDefined();
+    expect(stopBtn.value.parentUuid).toBe('');
+    expect(stopBtn.value.hasParent).toBe(false);
+  });
+
+  it('v2.2.13: refuses and stashes valid parentUuid in stop_and_send button', async () => {
+    // v2.2.13 happy path: lookup 返回合法 UUID,stashed 到 button value,handler 会用它
+    const bgShort = '92664deb';
+    const bgUuid = '92664deb-f4b6-48d3-9cdd-85cf8eea6dfc';
+    const parentUuid = '57872373-61d8-483b-ae2d-306351e2d86e';
+    const parentPath = `/Users/wuyujun/.claude/projects/-Users-wuyujun-Git-cc-linker/${parentUuid}.jsonl`;
+
+    readRosterMock.mockImplementation(() => ({
+      proto: 1, updatedAt: 0,
+      workers: {
+        [bgShort]: { pid: 33341, sessionId: bgUuid, cwd: '/x', startedAt: 0, dispatch: { source: 'slash' } },
+      },
+    }));
+    lookupResumeFromPathMock.mockImplementation((_r: any, short: string) =>
+      short === bgShort ? parentPath : null,
+    );
+
+    const { calls, restore } = stubSdkAndCapture();
+    const { cards, restore: restoreCard } = captureCardReplyFn();
+    try {
+      await bot.runChatSDK({
+        openId: 'ou_user_withparent',
+        sessionUuid: bgUuid,
+        cwd: '/Users/wuyujun/Git/cc-linker',
+        promptText: '继续处理',
+        serialKey: bgUuid,
+        isNew: false,
+      });
+    } catch (_e) {}
+    restore();
+    restoreCard();
+
+    expect(calls.length).toBe(0);
+    expect(cards.length).toBe(1);
+    const stopBtn = cards[0].elements
+      ?.find((e: any) => e.tag === 'action')
+      ?.actions?.find((a: any) => a.value?.tag === 'agent_view_stop_and_send');
+    expect(stopBtn).toBeDefined();
+    expect(stopBtn.value.parentUuid).toBe(parentUuid);
+    expect(stopBtn.value.hasParent).toBe(true);
   });
 });

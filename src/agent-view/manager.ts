@@ -438,18 +438,25 @@ export class AgentViewManager {
   }
 
   /**
-   * v2.2.11 + v2.2.12: bg-conflict 拒绝卡 → [🛑 停 bg 后继续发送] 按钮。
+   * v2.2.11 + v2.2.13: bg-conflict 拒绝卡 → [🛑 停 bg 后继续发送] 按钮。
    *
-   * 1) 跑 `claude stop <shortId>` 释放 bg worker
-   * 2) 等 supervisor 收尾(~1s)
-   * 3) **v2.2.12 修复**: 探测 bg sessionId 的 JSONL 有没有 user/assistant 对话条目。
-   *    bg worker 在跑时**通常不写自己的 JSONL**(只写 ai-title / agent-name 两条
-   *    metadata),真实对话 state 在 worker 内存里,killed 之后对话就丢了。
-   *    `claude -p --resume <bg>` 会报 "No conversation found with session ID"。
-   *    解决:发现 bg JSONL 没有对话就 fallback 到 parent (从 roster 拿 launch.sessionId),
-   *    parent 才有真实历史。UserManager 同步切到 parent,后续消息也走 parent 不再触发探测。
-   * 4) 通过 runChatSDK 用解析出来的 sessionId resume(bg 自身有对话时,bg 优先级 > parent,
-   *    但实测几乎所有 bg session 都是空 JSONL,所以这条路径基本不命中)。
+   * v2.2.13 关键修正:**总是 fallback 到 parent**(除非没 parent)。
+   *
+   *   1) 跑 `claude stop <shortId>` 释放 bg worker
+   *   2) 等 supervisor 收尾(~1s)
+   *   3) 用 button value 里 stashed 的 parent UUID resume(不再二次查 roster,
+   *      因为 stop 后 worker 已被移除)。UserManager 同步切到 parent,后续消息
+   *      走 parent,不再触发 bg-conflict 探测。
+   *
+   * v2.2.12 的"探测 bg JSONL 有无对话"思路错误:实测 92664deb (有真实 user/
+   * assistant 对话条目) stop 后 resume 仍然报 "No conversation found"。claude
+   * 在 stop 后对 bg sessionId 状态判定不可靠。parent 永远可靠 —— bot 路径走
+   * parent,牺牲"继承 bg 内存里跑出来的 worker 增量"(已经因为 stop 丢了),
+   * 换取"消息能正常发出"。
+   *
+   * v2.2.13 进一步:stashed parent UUID 写在 button value 里,本函数不再读 roster
+   * (worker 已被 stop 移走,二次查必然查不到 parent)。parent 不可用(hasParent=false)
+   * 时退化为用 bg sessionId 直接 resume(raw-slash bg 场景,几乎不存在)。
    */
   async handleStopAndSend(
     openId: string,
@@ -457,6 +464,8 @@ export class AgentViewManager {
     sessionId: string,
     cwd: string,
     text: string,
+    parentUuid: string,
+    hasParent: boolean,
     messageId?: string,
   ): Promise<string | null> {
     // Step 1: stop bg worker
@@ -491,51 +500,29 @@ export class AgentViewManager {
       }
     }
 
-    // Step 3 (v2.2.12): 决定用哪个 sessionId resume。
-    //   - bg sessionId 的 JSONL 有 user/assistant 对话 → 用 bg(继承 worker 进度)
-    //   - bg sessionId 的 JSONL 只有 metadata → fallback 到 parent(从 roster 拿
-    //     dispatch.launch.sessionId 的 basename)。worker 内存里的对话在 killed
-    //     后丢失,parent 是唯一还有历史的入口。
-    let effectiveSessionUuid = sessionId;
-    let effectiveSerialKey = sessionId;
-    let fallbackNote = '';
-    try {
-      const { bgJsonlHasConversation } = await import('./bg-jsonl-check');
-      if (!bgJsonlHasConversation(sessionId)) {
-        // empty → fallback to parent
-        const { readRoster, lookupResumeFromPath } = await import('./roster-source');
-        const roster = readRoster();
-        const parentPath = lookupResumeFromPath(roster, shortId);
-        if (parentPath) {
-          const parentId = parentPath.split('/').pop()?.replace(/\.jsonl$/, '') ?? '';
-          if (parentId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parentId)) {
-            effectiveSessionUuid = parentId;
-            effectiveSerialKey = parentId;
-            fallbackNote = ` (bg ${shortId} 已无对话,改 resume parent ${parentId.slice(0, 8)}...)`;
-            // 同步把 UserManager 的 session entry CAS 切到 parent
-            const oldEntry = this.deps.userManager.getEntry(openId);
-            if (oldEntry?.type === 'session' && oldEntry.sessionUuid === sessionId) {
-              const newEntry: MappingEntry = { ...oldEntry, sessionUuid: parentId };
-              const ok = await this.deps.userManager.compareAndSwap(openId, oldEntry, newEntry);
-              if (ok) {
-                this.deps.replyFn(
-                  `🛑 bg worker ${shortId} 已停止。\n` +
-                    `⚠️ bg session 自身 JSONL 没有对话(worker 内存里丢了),已自动 fallback 到 parent session。`,
-                  { openId },
-                );
-              } else {
-                this.deps.replyFn(
-                  `🛑 bg worker ${shortId} 已停止。\n` +
-                    `⚠️ bg session JSONL 无对话,fallback 到 parent(下一条消息 session 已是 parent)。`,
-                  { openId },
-                );
-              }
-            }
-          }
+    // Step 3 (v2.2.13): 总是 fallback 到 parent(除非没 parent)。
+    //   hasParent=true:用 button value stashed 的 parent UUID resume。parent 永远可靠。
+    //   hasParent=false:bg 是 raw slash 派发(无 parent),直接 resume bg sessionId —— 这种情况
+    //     极少见,且 v2.2.12 的"探测空 JSONL"策略也救不了它(失败的话直接报错给用户看)。
+    const effectiveSessionUuid = hasParent && parentUuid ? parentUuid : sessionId;
+    const effectiveSerialKey = effectiveSessionUuid;
+    const fallbackNote = hasParent && parentUuid
+      ? `已自动 fallback 到 parent session (${parentUuid.slice(0, 8)}...) —— bg worker 内存里的增量对话会丢失,parent 有 fork 之前的历史。`
+      : '';
+
+    // 把 UserManager 的 session entry CAS 切到 effective sessionId(后续消息不再触发探测)
+    if (effectiveSessionUuid !== sessionId) {
+      const oldEntry = this.deps.userManager.getEntry(openId);
+      if (oldEntry?.type === 'session' && oldEntry.sessionUuid === sessionId) {
+        const newEntry: MappingEntry = { ...oldEntry, sessionUuid: effectiveSessionUuid };
+        const ok = await this.deps.userManager.compareAndSwap(openId, oldEntry, newEntry);
+        if (ok && fallbackNote) {
+          this.deps.replyFn(
+            `🛑 bg worker ${shortId} 已停止。${fallbackNote}`,
+            { openId },
+          );
         }
       }
-    } catch (err: any) {
-      // graceful:探测失败时不 fallback,继续用 bg sessionId
     }
 
     // Step 4: 调 runChatSDK 真正发消息。worker 已不在 roster,探测不会再拒绝。

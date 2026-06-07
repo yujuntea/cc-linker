@@ -387,19 +387,24 @@ export function buildStopConfirmCard(name: string, shortId: string, sessionId: s
 }
 
 /**
- * v2.2.11: bg-worker 并发冲突卡。
+ * v2.2.11 + v2.2.13: bg-worker 并发冲突卡。
  *
  * 触发场景:用户在飞书侧 Attach 到一个仍被 daemon bg worker 持有的 session,
  * 然后试图发消息。直接发会让 worker 跟飞书 SDK 同时操作 cwd 文件,可能造成
  * 改动互相覆盖。bot 默认拒绝并给两条出路:
- *   1) [🛑 停 bg 后继续发送] — 跑 `claude stop <short>` 释放 worker,然后用同一
- *      sessionId resume(继承 worker 写到 JSONL 的所有进度),把 stashed text 作
- *      为新 turn 发出
+ *   1) [🛑 停 bg 后继续发送] — 跑 `claude stop <short>` 释放 worker,然后**总是
+ *      fallback 到 parent session** resume(不再尝试 resume bg 自身 —— v2.2.12
+ *      实测 post-stop resume 即使 JSONL 有内容也可能报"No conversation found",
+ *      状态不稳),把 stashed text 作为新 turn 发出。parent 从 roster 拿
+ *      `dispatch.launch.sessionId`,在拒绝分支已 pre-compute 好 stashed 到
+ *      button value,handler 不需要二次查(避免 worker 被 stop 后从 roster 移除
+ *      导致查不到 parent)。
  *   2) [🌿 开新会话发送] — runChatSDK(isNew=true),独立新 session,不影响 bg
  *   3) [❌ 取消] — 丢弃,不发不存
  *
- * stashed text 通过 button.value.text 传到下次 card action callback,handler
- * 自取自用,不依赖任何持久化。
+ * `parentUuid` + `hasParent` 字段:正常 bg 是 fork 出来的,有 parent;极少数
+ * 是 raw slash 派发,没 parent。这种 raw-slash case handler 会直接 resume bg
+ * 自身 sessionId。`hasParent=false` 时,handler 知道这情况。
  */
 export function buildBgConflictCard(opts: {
   name: string;
@@ -408,7 +413,9 @@ export function buildBgConflictCard(opts: {
   cwd: string;
   text: string;
   workerPid?: number;
+  parentUuid?: string | null;
 }): string {
+  const hasParent = !!(opts.parentUuid && /^[0-9a-f]{8}-/.test(opts.parentUuid));
   const elements: any[] = [
     {
       tag: 'markdown',
@@ -435,6 +442,8 @@ export function buildBgConflictCard(opts: {
             sessionId: opts.sessionId,
             cwd: opts.cwd,
             text: opts.text,
+            parentUuid: opts.parentUuid ?? '',
+            hasParent,
           },
           type: 'primary',
         },
