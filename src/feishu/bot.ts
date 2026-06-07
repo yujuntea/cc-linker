@@ -9,6 +9,7 @@ import { ClaudeSessionManager, SendMessageResult } from '../proxy/session';
 import { sessionManager as defaultSessionManager } from '../proxy/session';
 import type { AgentViewManager } from '../agent-view/manager';
 import { isAgentViewValue } from '../agent-view/action';
+import { buildBgConflictCard } from '../agent-view/card';
 import { StreamChunk } from '../proxy/stream-parser';
 import { CardUpdater } from './card-updater';
 import { LiveProgressWatcher, isSessionProcessing, DEFAULT_LIVE_PROGRESS_CONFIG, type LiveProgressConfig } from './live-progress';
@@ -562,6 +563,17 @@ export class FeishuBot {
         case 'agent_view_back_to_chat':
           await this.agentView.handleBackToChat(openId);
           return null;
+        // v2.2.11: bg-conflict 拒绝卡上的三个按钮
+        case 'agent_view_stop_and_send':
+          return await this.agentView.handleStopAndSend(
+            openId, valueObj.shortId, valueObj.sessionId, valueObj.cwd, valueObj.text, messageId,
+          );
+        case 'agent_view_new_and_send':
+          return await this.agentView.handleNewAndSend(
+            openId, valueObj.cwd, valueObj.text, messageId,
+          );
+        case 'agent_view_bg_conflict_cancel':
+          return await this.agentView.handleBgConflictCancel(openId, messageId);
         default:
           return null;
       }
@@ -1269,55 +1281,70 @@ export class FeishuBot {
     }
 
     try {
-      // v2.2.10: bg-conflict 自动改走 parent session resume。
+      // v2.2.11: bg-worker 并发 **拒绝**(取代 v2.2.10 silent swap-to-parent)。
       //
-      // 用户从 Agent View Attach 到一个 daemon 仍持有的 bg session(典型:
-      // `/background` 派出去的 worker 还在跑),普通 `claude -p --resume <bg>`
-      // 会被 claude 拒绝。bg session 自己的 JSONL 通常只有 2 行 metadata
-      // (ai-title / agent-name),真实对话 state 全在 daemon worker 内存里
-      // —— 即便加 --fork-session 也报"No conversation found with session ID"。
+      // 旧行为(v2.2.10):探测到 sessionUuid 仍被 bg worker 持有时,silently swap
+      // 到 parent JSONL 让消息能发出去。问题:JSONL 是隔离了,但**两个 claude 进程
+      // 共享同一个 cwd**,如果 bg worker 正在改代码 + 飞书 SDK 也开始改代码,
+      // filesystem 副作用(Edit/Write/Bash 改文件、git commit 等)互相覆盖,真实
+      // 风险是丢失改动,不是 JSONL 错乱。
       //
-      // 解决:roster.workers[short].dispatch.launch.sessionId 指向 bg 的
-      // **parent JSONL**(bg session 就是从这个 parent fork 出来的),那个 JSONL
-      // 有真实对话历史(实测 29K tokens),resume 它就拿到完整 context。
-      // 用户后续消息 chain 在 parent 上,bg worker 继续独立跑。
-      //
-      // 这只是给 Attach 后第一条消息的 bg-conflict 兜底。一旦 UserManager 切到
-      // parent sessionId,后续消息 sessionUuid 已经是 parent,不再触发该分支。
-      let effectiveSessionUuid: string | null = sessionUuid ?? null;
-      let parentSessionUuid: string | null = null;
+      // 新行为(v2.2.11):探测到冲突 → 不调 SDK,直接发拒绝卡(buildBgConflictCard)
+      // 让用户选 [🛑 停 bg 后继续发送] / [🌿 开新会话发送] / [❌ 取消]。
+      // 把决定权交给用户,默认 safe。
       if (sessionUuid && !isNew) {
-        try {
-          const roster = _bgConflictHooks.readRoster();
-          const short = sessionUuid.slice(0, 8);
-          if (roster?.workers?.[short]) {
-            const parentJsonl = _bgConflictHooks.lookupResumeFromPath(roster, short);
-            if (parentJsonl) {
-              const parentBasename = parentJsonl.split('/').pop() ?? '';
-              const parentId = parentBasename.replace(/\.jsonl$/, '');
-              if (parentId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parentId)) {
-                parentSessionUuid = parentId;
-                effectiveSessionUuid = parentId;
-                logger.info(
-                  `runChatSDK: sessionId=${sessionUuid} 被 live bg worker 持有,` +
-                    `改 resume parent sessionId=${parentId} (来自 roster.dispatch.launch.sessionId)`,
-                );
-              }
-            }
-            if (!parentSessionUuid) {
-              logger.warn(
-                `runChatSDK: sessionId=${sessionUuid} 被 live bg worker 持有,` +
-                  `但 roster 里没有可用的 parent JSONL —— 后续 SDK 调用可能失败`,
-              );
+        const roster = _bgConflictHooks.readRoster();
+        const short = sessionUuid.slice(0, 8);
+        const worker = roster?.workers?.[short];
+        if (worker) {
+          const workerPid = (worker as any).pid;
+          const workerName = (worker as any).dispatch?.seed?.name || short;
+          logger.info(
+            `runChatSDK: 拒绝向 live bg worker ${short} 发消息(pid=${workerPid}),弹冲突卡让用户选择`,
+          );
+          if (cardUpdater) {
+            // 之前已经发了"💭 处理中"卡,把它 patch 成冲突卡(text 同上,占位防卡片悬挂)
+            await cardUpdater
+              .complete(`⚠️ 该 session 仍有 bg worker 在跑(pid=${workerPid}),已弹卡询问下一步`, 0, 0, 0, 0)
+              .catch(() => {});
+            cardUpdater.dispose();
+            cardUpdater = null;
+          }
+          if (this.cardReplyFn) {
+            const conflictCard = buildBgConflictCard({
+              name: workerName,
+              shortId: short,
+              sessionId: sessionUuid,
+              cwd,
+              text: promptText,
+              workerPid,
+            });
+            try {
+              await this.cardReplyFn(JSON.parse(conflictCard), { openId });
+            } catch (err: any) {
+              logger.warn(`runChatSDK: 冲突卡发送失败 (graceful): ${err?.message ?? err}`);
             }
           }
-        } catch (err: any) {
-          logger.debug(`runChatSDK: bg-conflict 探测失败 (graceful): ${err?.message ?? err}`);
+          // 同时把 spool / cancelled state 清理一下(没有 SDK 调用要 abort)
+          this.cancelledMessageIds.delete(serialKey);
+          return {
+            result: {
+              response: '(bg worker 冲突,已弹卡询问下一步)',
+              costUsd: 0,
+              durationMs: 0,
+              sessionId: sessionUuid,
+              jsonlPath: null,
+              sessionStatus: 'degraded' as const,
+              error: 'bg_worker_conflict',
+            },
+            handler: new PermissionHandler({ allowedTools: [], disallowedTools: [] }),
+            cardMessageId,
+          };
         }
       }
 
       const { result, handler } = await this.sessionManager.sendSDKMessage(
-        effectiveSessionUuid, promptText, cwd,
+        sessionUuid, promptText, cwd,
         (chunk: StreamChunk) => {
           if (cardInitFailed || !cardUpdater) return;
           if (chunk.type === 'thinking') thinking += chunk.content;
@@ -1356,26 +1383,6 @@ export class FeishuBot {
         isNew, serialKey, settingsPath,
       );
       currentHandler = handler;
-
-      // v2.2.10: 如果走了 bg-conflict 兜底切到 parent sessionId,把 UserManager
-      // 的 session entry CAS 更新到 parent —— 后续消息 sessionUuid 已经是 parent,
-      // 不会再触发探测,与 bg worker 完全解耦。
-      if (parentSessionUuid && parentSessionUuid !== sessionUuid) {
-        const oldEntry = this.userManager.getEntry(openId);
-        if (oldEntry?.type === 'session' && oldEntry.sessionUuid === sessionUuid) {
-          const newEntry: MappingEntry = { ...oldEntry, sessionUuid: parentSessionUuid };
-          const ok = await this.userManager.compareAndSwap(openId, oldEntry, newEntry);
-          if (ok) {
-            logger.info(
-              `runChatSDK: UserManager(${openId}) 从 bg fork ${sessionUuid} 切到 parent ${parentSessionUuid}`,
-            );
-          } else {
-            logger.warn(
-              `runChatSDK: parent 切换 CAS 失败(entry 并发改了),下条消息可能再次探测`,
-            );
-          }
-        }
-      }
 
       // Defensive: if streaming text is empty but result.response has content,
       // fall back to result.response (e.g. when SDK partial messages are not emitted).

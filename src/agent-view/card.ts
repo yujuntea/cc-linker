@@ -385,3 +385,81 @@ export function buildStopConfirmCard(name: string, shortId: string, sessionId: s
     ],
   });
 }
+
+/**
+ * v2.2.11: bg-worker 并发冲突卡。
+ *
+ * 触发场景:用户在飞书侧 Attach 到一个仍被 daemon bg worker 持有的 session,
+ * 然后试图发消息。直接发会让 worker 跟飞书 SDK 同时操作 cwd 文件,可能造成
+ * 改动互相覆盖。bot 默认拒绝并给两条出路:
+ *   1) [🛑 停 bg 后继续发送] — 跑 `claude stop <short>` 释放 worker,然后用同一
+ *      sessionId resume(继承 worker 写到 JSONL 的所有进度),把 stashed text 作
+ *      为新 turn 发出
+ *   2) [🌿 开新会话发送] — runChatSDK(isNew=true),独立新 session,不影响 bg
+ *   3) [❌ 取消] — 丢弃,不发不存
+ *
+ * stashed text 通过 button.value.text 传到下次 card action callback,handler
+ * 自取自用,不依赖任何持久化。
+ */
+export function buildBgConflictCard(opts: {
+  name: string;
+  shortId: string;
+  sessionId: string;
+  cwd: string;
+  text: string;
+  workerPid?: number;
+}): string {
+  const elements: any[] = [
+    {
+      tag: 'markdown',
+      content:
+        `**\`${opts.name}\`** 仍在后台运行` +
+        (opts.workerPid ? `(bg worker pid=${opts.workerPid})` : '') +
+        `。\n\n` +
+        `从飞书发新消息会让 worker 和飞书侧的 claude **同时**在 \`${truncateCwd(opts.cwd)}\` ` +
+        `操作文件,可能造成改动互相覆盖。bot 默认拒绝,请选择:`,
+    },
+    {
+      tag: 'markdown',
+      content: `**你的消息:** ${opts.text.length > 100 ? opts.text.slice(0, 100) + '…' : opts.text}`,
+    },
+    {
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🛑 停 bg 后继续发送' },
+          value: {
+            tag: 'agent_view_stop_and_send',
+            shortId: opts.shortId,
+            sessionId: opts.sessionId,
+            cwd: opts.cwd,
+            text: opts.text,
+          },
+          type: 'primary',
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🌿 开新会话发送' },
+          value: { tag: 'agent_view_new_and_send', cwd: opts.cwd, text: opts.text },
+          type: 'default',
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '❌ 取消' },
+          value: { tag: 'agent_view_bg_conflict_cancel' },
+          type: 'default',
+        },
+      ],
+    },
+  ];
+  return JSON.stringify({
+    ...TEMPLATE_HEADER,
+    header: {
+      title: { tag: 'plain_text', content: `⚠️ bg worker 仍在运行 · \`${opts.name}\`` },
+      template: 'yellow',
+    },
+    elements,
+  });
+}
+

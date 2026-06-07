@@ -412,12 +412,160 @@ export class AgentViewManager {
       session.status === 'waiting' && session.waitingFor
         ? `\n等待原因: ${session.waitingFor}`
         : '';
+    // v2.2.11: 探测到 live bg worker 时,预警 attach 后发消息会被拒绝卡阻拦,
+    // 避免用户后面莫名其妙看到冲突卡才反应过来。settled session 不显示该提示。
+    let bgWorkerNotice = '';
+    try {
+      const { readRoster } = await import('./roster-source');
+      const roster = readRoster();
+      const short = sessionId.slice(0, 8);
+      if (roster?.workers?.[short]) {
+        bgWorkerNotice =
+          `\n\n⚠️ 该 session 仍有 bg worker 在跑。直接发消息会被阻拦(避免与 worker ` +
+          `并发改 cwd 文件),弹卡询问 [🛑 停 bg 后继续发送] / [🌿 开新会话发送] / ` +
+          `[❌ 取消]。`;
+      }
+    } catch {
+      // graceful: roster 读不到就不显示警示
+    }
     await this.deps.replyFn(
       `📎 已 Attach 到 \`${session.name}\`${warning}${waitingInfo}\n` +
         `Status: ${session.status} · CWD: ${cwd}\n` +
-        `💡 提示:发 /new 创建新会话,或 /agents 返回列表。`,
+        `💡 提示:发 /new 创建新会话,或 /agents 返回列表。${bgWorkerNotice}`,
       { openId },
     );
+    return null;
+  }
+
+  /**
+   * v2.2.11: bg-conflict 拒绝卡 → [🛑 停 bg 后继续发送] 按钮。
+   *
+   * 1) 跑 `claude stop <shortId>` 释放 bg worker
+   * 2) 等 supervisor 收尾(~1s)
+   * 3) 通过 runChatSDK 用同一 sessionId resume —— 此时 worker 已不在 roster,
+   *    bot.runChatSDK 的探测不会再触发拒绝,SDK 真正下发消息
+   * 4) sessionId 保持不变 = 继承 worker 写到 JSONL 的所有进度
+   */
+  async handleStopAndSend(
+    openId: string,
+    shortId: string,
+    sessionId: string,
+    cwd: string,
+    text: string,
+    messageId?: string,
+  ): Promise<string | null> {
+    // Step 1: stop bg worker
+    try {
+      const cp = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execFileP = promisify(cp.execFile);
+      await execFileP('claude', ['stop', shortId], { timeout: 5000 });
+    } catch (err: any) {
+      // "No job matching"(已自然 settle)算成功;其他错才报
+      const msg = err?.stderr || err?.message || String(err);
+      if (!/No job matching/i.test(msg)) {
+        await this.deps.replyFn(`❌ Stop 失败:${msg}`, { openId });
+        return null;
+      }
+    }
+    // Step 2: 等 supervisor 释放(同 handleStopConfirm)
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 把拒绝卡 patch 成"已处理"提示,避免用户重复点
+    if (messageId) {
+      try {
+        await this.deps.patchFn(
+          messageId,
+          buildErrorCard({
+            title: '🛑 bg worker 已停止',
+            body: '正在发送你的消息...',
+          }),
+        );
+      } catch {
+        // patch 失败不影响主流程
+      }
+    }
+
+    // Step 3: 用 sessionId resume 发原消息。runChatSDK 内部:
+    //   - 重新探测 roster,worker 已不在,不会再触发拒绝
+    //   - SDK 正常 resume 同一 sessionId,继承全部历史
+    try {
+      await this.deps.runChatSDK({
+        openId,
+        sessionUuid: sessionId,
+        cwd,
+        promptText: text,
+        serialKey: sessionId,
+        isNew: false,
+      });
+    } catch (err: any) {
+      await this.deps.replyFn(`❌ 发送失败:${err?.message ?? err}`, { openId });
+    }
+    return null;
+  }
+
+  /**
+   * v2.2.11: bg-conflict 拒绝卡 → [🌿 开新会话发送] 按钮。
+   *
+   * 完全独立于原 bg session:isNew=true 让 runChatSDK 不带 resume,
+   * SDK 创建全新 sessionId。bg worker 继续独立跑,飞书侧拿到一个全新
+   * 上下文(cwd 沿用原 session 的,方便继续在同项目下干活)。
+   */
+  async handleNewAndSend(
+    openId: string,
+    cwd: string,
+    text: string,
+    messageId?: string,
+  ): Promise<string | null> {
+    if (messageId) {
+      try {
+        await this.deps.patchFn(
+          messageId,
+          buildErrorCard({
+            title: '🌿 开新会话中',
+            body: '正在创建独立 session 处理你的消息...',
+          }),
+        );
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      await this.deps.runChatSDK({
+        openId,
+        sessionUuid: '', // empty + isNew=true → 新建
+        cwd,
+        promptText: text,
+        serialKey: `new:${openId}:${Date.now()}`,
+        isNew: true,
+      });
+    } catch (err: any) {
+      await this.deps.replyFn(`❌ 新会话创建失败:${err?.message ?? err}`, { openId });
+    }
+    return null;
+  }
+
+  /**
+   * v2.2.11: bg-conflict 拒绝卡 → [❌ 取消] 按钮。
+   * 把拒绝卡 patch 成"已取消"提示,不调 SDK,不动 UserManager。
+   */
+  async handleBgConflictCancel(
+    _openId: string,
+    messageId?: string,
+  ): Promise<string | null> {
+    if (messageId) {
+      try {
+        await this.deps.patchFn(
+          messageId,
+          buildErrorCard({
+            title: '❌ 已取消',
+            body: '消息未发送,bg worker 不受影响。',
+          }),
+        );
+      } catch {
+        // ignore
+      }
+    }
     return null;
   }
 

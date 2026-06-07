@@ -24,7 +24,17 @@ export type AgentViewValue =
   | { tag: 'agent_view_cancel_reply' }
   | { tag: 'agent_view_stop'; shortId: string; sessionId: string; name: string }
   | { tag: 'agent_view_stop_confirm'; shortId: string; sessionId: string }
-  | { tag: 'agent_view_back_to_chat' };
+  | { tag: 'agent_view_back_to_chat' }
+  // v2.2.11: bg-conflict 拒绝卡上的三个按钮(stashed text 跟着 value 走)
+  | {
+      tag: 'agent_view_stop_and_send';
+      shortId: string;
+      sessionId: string;
+      cwd: string;
+      text: string;
+    }
+  | { tag: 'agent_view_new_and_send'; cwd: string; text: string }
+  | { tag: 'agent_view_bg_conflict_cancel' };
 
 export function isAgentViewValue(v: any): v is AgentViewValue {
   return Boolean(

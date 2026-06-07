@@ -193,7 +193,7 @@ describe('FeishuBot.runChatSDK (T11 public surface)', () => {
   });
 });
 
-describe('FeishuBot.runChatSDK — v2.2.10 bg-conflict parent-fallback', () => {
+describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
   let env: TestBot;
   let bot: FeishuBot;
 
@@ -236,7 +236,7 @@ describe('FeishuBot.runChatSDK — v2.2.10 bg-conflict parent-fallback', () => {
             sessionStatus: 'active' as const,
             error: null,
             jsonlPath: null,
-            sessionId: sessionId, // echo back so result.sessionId matches
+            sessionId: sessionId,
           },
           handler: { getUnresolvedCount: () => 0, getHandlerId: () => 'stub' },
         };
@@ -250,67 +250,89 @@ describe('FeishuBot.runChatSDK — v2.2.10 bg-conflict parent-fallback', () => {
     };
   }
 
-  it('swaps bg sessionId for parent UUID when roster shows a live worker', async () => {
-    // Seed a session entry pointing at the bg short
+  // 截获 conflict cardReplyFn 发送的内容(普通 replyFn 走另一条路,这里只关心 card)
+  function captureCardReplyFn(): { cards: any[]; restore: () => void } {
+    const cards: any[] = [];
+    const orig = (bot as any).cardReplyFn;
+    (bot as any).cardReplyFn = async (card: any, _opts: any) => {
+      cards.push(card);
+      return 'om_conflict_card';
+    };
+    return { cards, restore: () => { (bot as any).cardReplyFn = orig; } };
+  }
+
+  it('REFUSES send (no SDK call) and emits conflict card when live bg worker holds session', async () => {
     const bgShort = 'd78c8339';
     const bgUuid = 'd78c8339-18b0-4f53-8452-d4228d30f51f';
-    const parentUuid = 'ab027020-95f6-4cd4-96a4-63d04fa5ebf8';
-    const parentPath = `/Users/wuyujun/.claude/projects/-Users-wuyujun/${parentUuid}.jsonl`;
-
-    await env.userManager.compareAndSwap('ou_user_attach', null, {
-      type: 'session',
-      sessionUuid: bgUuid,
-      cwd: '/Users/wuyujun',
-      createdAt: new Date().toISOString(),
-    });
+    const workerName = 'Print date every five seconds';
 
     readRosterMock.mockImplementation(() => ({
-      proto: 1,
-      updatedAt: 0,
-      workers: { [bgShort]: { pid: 1, sessionId: bgUuid, cwd: '/Users/wuyujun', startedAt: 0, dispatch: { source: 'slash' } } },
+      proto: 1, updatedAt: 0,
+      workers: {
+        [bgShort]: {
+          pid: 38207,
+          sessionId: bgUuid,
+          cwd: '/Users/wuyujun',
+          startedAt: 0,
+          dispatch: { source: 'slash', seed: { name: workerName } },
+        },
+      },
     }));
-    lookupResumeFromPathMock.mockImplementation((_r: any, short: string) =>
-      short === bgShort ? parentPath : null,
-    );
+    // lookupResumeFromPath is irrelevant to v2.2.11 (we refuse, don't swap)
 
-    const { calls, restore } = stubSdkAndCapture();
+    const { calls, restore: restoreSdk } = stubSdkAndCapture();
+    const { cards, restore: restoreCard } = captureCardReplyFn();
+
+    let result: any = null;
     try {
-      await bot.runChatSDK({
+      result = await bot.runChatSDK({
         openId: 'ou_user_attach',
         sessionUuid: bgUuid,
         cwd: '/Users/wuyujun',
-        promptText: 'hi',
+        promptText: '继续处理',
         serialKey: bgUuid,
         isNew: false,
       });
     } catch (_e) {
-      // post-SDK card/spool path may throw (no feishuClient in test) — irrelevant
+      // post-SDK card/spool path may throw (no feishuClient in test)
     } finally {
-      restore();
+      restoreSdk();
+      restoreCard();
     }
 
-    // Critical: sendSDKMessage MUST have been called with parent UUID, not the bg one
-    expect(calls.length).toBe(1);
-    expect(calls[0].sessionId).toBe(parentUuid);
+    // CRITICAL: SDK was NOT called (v2.2.10 silently called with parent; v2.2.11 refuses)
+    expect(calls.length).toBe(0);
 
-    // UserManager entry CAS-swapped to parent
-    const entry = env.userManager.getEntry('ou_user_attach');
-    expect(entry?.type).toBe('session');
-    expect((entry as any).sessionUuid).toBe(parentUuid);
+    // Conflict card was sent with all 3 buttons + the stashed text
+    expect(cards.length).toBe(1);
+    const card = cards[0];
+    expect(JSON.stringify(card)).toContain('Print date every five seconds');
+    expect(JSON.stringify(card)).toContain('继续处理');
+    const actions = card.elements?.find((e: any) => e.tag === 'action')?.actions ?? [];
+    const tags = actions.map((a: any) => a.value?.tag);
+    expect(tags).toContain('agent_view_stop_and_send');
+    expect(tags).toContain('agent_view_new_and_send');
+    expect(tags).toContain('agent_view_bg_conflict_cancel');
+    // 🛑 button carries stashed text + sessionId for the recovery handler
+    const stopBtn = actions.find((a: any) => a.value?.tag === 'agent_view_stop_and_send');
+    expect(stopBtn.value.text).toBe('继续处理');
+    expect(stopBtn.value.sessionId).toBe(bgUuid);
+    expect(stopBtn.value.cwd).toBe('/Users/wuyujun');
+    const newBtn = actions.find((a: any) => a.value?.tag === 'agent_view_new_and_send');
+    expect(newBtn.value.text).toBe('继续处理');
+
+    // Result returned to spool layer is degraded with bg_worker_conflict error
+    expect(result).not.toBeNull();
+    expect(result.result.error).toBe('bg_worker_conflict');
+    expect(result.result.sessionStatus).toBe('degraded');
   });
 
-  it('does NOT touch sessionUuid when roster has no matching worker', async () => {
+  it('does NOT refuse when roster has no matching worker (normal SDK call proceeds)', async () => {
     const plainUuid = '00000000-0000-0000-0000-000000000000';
-    await env.userManager.compareAndSwap('ou_user_plain', null, {
-      type: 'session',
-      sessionUuid: plainUuid,
-      cwd: '/Users/wuyujun',
-      createdAt: new Date().toISOString(),
-    });
-    // empty roster → no bg conflict
     readRosterMock.mockImplementation(() => ({ proto: 1, updatedAt: 0, workers: {} }));
 
     const { calls, restore } = stubSdkAndCapture();
+    const { cards, restore: restoreCard } = captureCardReplyFn();
     try {
       await bot.runChatSDK({
         openId: 'ou_user_plain',
@@ -322,19 +344,23 @@ describe('FeishuBot.runChatSDK — v2.2.10 bg-conflict parent-fallback', () => {
       });
     } catch (_e) {}
     restore();
+    restoreCard();
 
+    expect(calls.length).toBe(1);
     expect(calls[0].sessionId).toBe(plainUuid);
-    const entry = env.userManager.getEntry('ou_user_plain');
-    expect((entry as any).sessionUuid).toBe(plainUuid);
+    expect(cards.length).toBe(0); // no conflict card
   });
 
-  it('does NOT swap when isNew=true (new sessions never resume)', async () => {
+  it('does NOT refuse when isNew=true (new sessions never collide)', async () => {
     readRosterMock.mockImplementation(() => ({
-      proto: 1,
-      updatedAt: 0,
-      workers: { aaaaaaaa: { pid: 1, sessionId: 'aaaaaaaa-...', cwd: '/x', startedAt: 0, dispatch: { source: 'slash' } } },
+      proto: 1, updatedAt: 0,
+      workers: {
+        aaaaaaaa: {
+          pid: 1, sessionId: 'aaaaaaaa-...', cwd: '/x', startedAt: 0,
+          dispatch: { source: 'slash' },
+        },
+      },
     }));
-    lookupResumeFromPathMock.mockImplementation(() => '/some/parent.jsonl');
 
     const { calls, restore } = stubSdkAndCapture();
     try {
@@ -344,27 +370,30 @@ describe('FeishuBot.runChatSDK — v2.2.10 bg-conflict parent-fallback', () => {
         cwd: '/tmp',
         promptText: 'hi',
         serialKey: 'aaaaaaaa-new',
-        isNew: true, // ← new session, skip detection
+        isNew: true,
       });
     } catch (_e) {}
     restore();
 
-    // sessionId passed to SDK is unchanged (and detection never ran)
+    // Detection skipped (isNew=true), SDK called normally
+    expect(calls.length).toBe(1);
     expect(calls[0].sessionId).toBe('aaaaaaaa-0000-0000-0000-000000000000');
-    expect(lookupResumeFromPathMock).not.toHaveBeenCalled();
   });
 
-  it('skips swap when parent path is missing or not a valid UUID basename', async () => {
+  it('refuses regardless of lookupResumeFromPath result (v2.2.11 no longer uses it)', async () => {
+    // Path returns garbage; v2.2.11 doesn't care — it refuses either way.
     const bgShort = 'd78c8339';
     const bgUuid = 'd78c8339-18b0-4f53-8452-d4228d30f51f';
     readRosterMock.mockImplementation(() => ({
       proto: 1, updatedAt: 0,
-      workers: { [bgShort]: { pid: 1, sessionId: bgUuid, cwd: '/x', startedAt: 0, dispatch: { source: 'slash' } } },
+      workers: {
+        [bgShort]: { pid: 1, sessionId: bgUuid, cwd: '/x', startedAt: 0, dispatch: { source: 'slash' } },
+      },
     }));
-    // returns a path whose basename isn't a UUID
-    lookupResumeFromPathMock.mockImplementation(() => '/some/not-a-uuid.jsonl');
+    lookupResumeFromPathMock.mockImplementation(() => '/some/garbage.jsonl');
 
     const { calls, restore } = stubSdkAndCapture();
+    const { cards, restore: restoreCard } = captureCardReplyFn();
     try {
       await bot.runChatSDK({
         openId: 'ou_user_baddash',
@@ -376,8 +405,11 @@ describe('FeishuBot.runChatSDK — v2.2.10 bg-conflict parent-fallback', () => {
       });
     } catch (_e) {}
     restore();
+    restoreCard();
 
-    // No parent → no swap → SDK still gets bg sessionId
-    expect(calls[0].sessionId).toBe(bgUuid);
+    // still refuses (v2.2.11 doesn't touch parent lookup at all)
+    expect(calls.length).toBe(0);
+    expect(cards.length).toBe(1);
+    expect(lookupResumeFromPathMock).not.toHaveBeenCalled();
   });
 });
