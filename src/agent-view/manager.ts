@@ -438,13 +438,18 @@ export class AgentViewManager {
   }
 
   /**
-   * v2.2.11: bg-conflict 拒绝卡 → [🛑 停 bg 后继续发送] 按钮。
+   * v2.2.11 + v2.2.12: bg-conflict 拒绝卡 → [🛑 停 bg 后继续发送] 按钮。
    *
    * 1) 跑 `claude stop <shortId>` 释放 bg worker
    * 2) 等 supervisor 收尾(~1s)
-   * 3) 通过 runChatSDK 用同一 sessionId resume —— 此时 worker 已不在 roster,
-   *    bot.runChatSDK 的探测不会再触发拒绝,SDK 真正下发消息
-   * 4) sessionId 保持不变 = 继承 worker 写到 JSONL 的所有进度
+   * 3) **v2.2.12 修复**: 探测 bg sessionId 的 JSONL 有没有 user/assistant 对话条目。
+   *    bg worker 在跑时**通常不写自己的 JSONL**(只写 ai-title / agent-name 两条
+   *    metadata),真实对话 state 在 worker 内存里,killed 之后对话就丢了。
+   *    `claude -p --resume <bg>` 会报 "No conversation found with session ID"。
+   *    解决:发现 bg JSONL 没有对话就 fallback 到 parent (从 roster 拿 launch.sessionId),
+   *    parent 才有真实历史。UserManager 同步切到 parent,后续消息也走 parent 不再触发探测。
+   * 4) 通过 runChatSDK 用解析出来的 sessionId resume(bg 自身有对话时,bg 优先级 > parent,
+   *    但实测几乎所有 bg session 都是空 JSONL,所以这条路径基本不命中)。
    */
   async handleStopAndSend(
     openId: string,
@@ -486,16 +491,61 @@ export class AgentViewManager {
       }
     }
 
-    // Step 3: 用 sessionId resume 发原消息。runChatSDK 内部:
-    //   - 重新探测 roster,worker 已不在,不会再触发拒绝
-    //   - SDK 正常 resume 同一 sessionId,继承全部历史
+    // Step 3 (v2.2.12): 决定用哪个 sessionId resume。
+    //   - bg sessionId 的 JSONL 有 user/assistant 对话 → 用 bg(继承 worker 进度)
+    //   - bg sessionId 的 JSONL 只有 metadata → fallback 到 parent(从 roster 拿
+    //     dispatch.launch.sessionId 的 basename)。worker 内存里的对话在 killed
+    //     后丢失,parent 是唯一还有历史的入口。
+    let effectiveSessionUuid = sessionId;
+    let effectiveSerialKey = sessionId;
+    let fallbackNote = '';
+    try {
+      const { bgJsonlHasConversation } = await import('./bg-jsonl-check');
+      if (!bgJsonlHasConversation(sessionId)) {
+        // empty → fallback to parent
+        const { readRoster, lookupResumeFromPath } = await import('./roster-source');
+        const roster = readRoster();
+        const parentPath = lookupResumeFromPath(roster, shortId);
+        if (parentPath) {
+          const parentId = parentPath.split('/').pop()?.replace(/\.jsonl$/, '') ?? '';
+          if (parentId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parentId)) {
+            effectiveSessionUuid = parentId;
+            effectiveSerialKey = parentId;
+            fallbackNote = ` (bg ${shortId} 已无对话,改 resume parent ${parentId.slice(0, 8)}...)`;
+            // 同步把 UserManager 的 session entry CAS 切到 parent
+            const oldEntry = this.deps.userManager.getEntry(openId);
+            if (oldEntry?.type === 'session' && oldEntry.sessionUuid === sessionId) {
+              const newEntry: MappingEntry = { ...oldEntry, sessionUuid: parentId };
+              const ok = await this.deps.userManager.compareAndSwap(openId, oldEntry, newEntry);
+              if (ok) {
+                this.deps.replyFn(
+                  `🛑 bg worker ${shortId} 已停止。\n` +
+                    `⚠️ bg session 自身 JSONL 没有对话(worker 内存里丢了),已自动 fallback 到 parent session。`,
+                  { openId },
+                );
+              } else {
+                this.deps.replyFn(
+                  `🛑 bg worker ${shortId} 已停止。\n` +
+                    `⚠️ bg session JSONL 无对话,fallback 到 parent(下一条消息 session 已是 parent)。`,
+                  { openId },
+                );
+              }
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      // graceful:探测失败时不 fallback,继续用 bg sessionId
+    }
+
+    // Step 4: 调 runChatSDK 真正发消息。worker 已不在 roster,探测不会再拒绝。
     try {
       await this.deps.runChatSDK({
         openId,
-        sessionUuid: sessionId,
+        sessionUuid: effectiveSessionUuid,
         cwd,
         promptText: text,
-        serialKey: sessionId,
+        serialKey: effectiveSerialKey,
         isNew: false,
       });
     } catch (err: any) {
