@@ -1,6 +1,8 @@
 import { basename, dirname, join, resolve } from 'path';
 import { existsSync, readdirSync } from 'fs';
 import { UserManager } from './mapping';
+import type { MappingEntry } from './mapping';
+import { readRoster, lookupResumeFromPath } from '../agent-view/roster-source';
 import { ListSnapshotManager, ListSnapshotEntry } from './list-snapshot';
 import { SpoolQueue, SpoolMessage, TargetSnapshot } from '../queue/spool';
 import { ClaudeSessionManager, SendMessageResult } from '../proxy/session';
@@ -90,6 +92,16 @@ function stableUuid(messageId: string, chunkIndex = 0): string {
 function uniqueUuid(): string {
   return `card-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
+
+/**
+ * v2.2.10 测试 hook —— runChatSDK 内部走 _bgConflictHooks 调用 roster 探测,
+ * tests swap 字段即可模拟 live bg worker 场景,不用 mock.module(后者跨文件
+ * 不可撤销,污染 roster-source.test.ts)。
+ */
+export const _bgConflictHooks = {
+  readRoster,
+  lookupResumeFromPath,
+};
 
 export class FeishuBot {
   private userManager: UserManager;
@@ -1257,8 +1269,55 @@ export class FeishuBot {
     }
 
     try {
+      // v2.2.10: bg-conflict 自动改走 parent session resume。
+      //
+      // 用户从 Agent View Attach 到一个 daemon 仍持有的 bg session(典型:
+      // `/background` 派出去的 worker 还在跑),普通 `claude -p --resume <bg>`
+      // 会被 claude 拒绝。bg session 自己的 JSONL 通常只有 2 行 metadata
+      // (ai-title / agent-name),真实对话 state 全在 daemon worker 内存里
+      // —— 即便加 --fork-session 也报"No conversation found with session ID"。
+      //
+      // 解决:roster.workers[short].dispatch.launch.sessionId 指向 bg 的
+      // **parent JSONL**(bg session 就是从这个 parent fork 出来的),那个 JSONL
+      // 有真实对话历史(实测 29K tokens),resume 它就拿到完整 context。
+      // 用户后续消息 chain 在 parent 上,bg worker 继续独立跑。
+      //
+      // 这只是给 Attach 后第一条消息的 bg-conflict 兜底。一旦 UserManager 切到
+      // parent sessionId,后续消息 sessionUuid 已经是 parent,不再触发该分支。
+      let effectiveSessionUuid: string | null = sessionUuid ?? null;
+      let parentSessionUuid: string | null = null;
+      if (sessionUuid && !isNew) {
+        try {
+          const roster = _bgConflictHooks.readRoster();
+          const short = sessionUuid.slice(0, 8);
+          if (roster?.workers?.[short]) {
+            const parentJsonl = _bgConflictHooks.lookupResumeFromPath(roster, short);
+            if (parentJsonl) {
+              const parentBasename = parentJsonl.split('/').pop() ?? '';
+              const parentId = parentBasename.replace(/\.jsonl$/, '');
+              if (parentId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parentId)) {
+                parentSessionUuid = parentId;
+                effectiveSessionUuid = parentId;
+                logger.info(
+                  `runChatSDK: sessionId=${sessionUuid} 被 live bg worker 持有,` +
+                    `改 resume parent sessionId=${parentId} (来自 roster.dispatch.launch.sessionId)`,
+                );
+              }
+            }
+            if (!parentSessionUuid) {
+              logger.warn(
+                `runChatSDK: sessionId=${sessionUuid} 被 live bg worker 持有,` +
+                  `但 roster 里没有可用的 parent JSONL —— 后续 SDK 调用可能失败`,
+              );
+            }
+          }
+        } catch (err: any) {
+          logger.debug(`runChatSDK: bg-conflict 探测失败 (graceful): ${err?.message ?? err}`);
+        }
+      }
+
       const { result, handler } = await this.sessionManager.sendSDKMessage(
-        sessionUuid, promptText, cwd,
+        effectiveSessionUuid, promptText, cwd,
         (chunk: StreamChunk) => {
           if (cardInitFailed || !cardUpdater) return;
           if (chunk.type === 'thinking') thinking += chunk.content;
@@ -1297,6 +1356,26 @@ export class FeishuBot {
         isNew, serialKey, settingsPath,
       );
       currentHandler = handler;
+
+      // v2.2.10: 如果走了 bg-conflict 兜底切到 parent sessionId,把 UserManager
+      // 的 session entry CAS 更新到 parent —— 后续消息 sessionUuid 已经是 parent,
+      // 不会再触发探测,与 bg worker 完全解耦。
+      if (parentSessionUuid && parentSessionUuid !== sessionUuid) {
+        const oldEntry = this.userManager.getEntry(openId);
+        if (oldEntry?.type === 'session' && oldEntry.sessionUuid === sessionUuid) {
+          const newEntry: MappingEntry = { ...oldEntry, sessionUuid: parentSessionUuid };
+          const ok = await this.userManager.compareAndSwap(openId, oldEntry, newEntry);
+          if (ok) {
+            logger.info(
+              `runChatSDK: UserManager(${openId}) 从 bg fork ${sessionUuid} 切到 parent ${parentSessionUuid}`,
+            );
+          } else {
+            logger.warn(
+              `runChatSDK: parent 切换 CAS 失败(entry 并发改了),下条消息可能再次探测`,
+            );
+          }
+        }
+      }
 
       // Defensive: if streaming text is empty but result.response has content,
       // fall back to result.response (e.g. when SDK partial messages are not emitted).
