@@ -5,25 +5,36 @@ import { DaemonProbe } from './daemon-probe';
 import { parseAgentsJson, attachRosterSources, filterUserDispatched } from './snapshot';
 import { readRoster, buildRosterSourceMap } from './roster-source';
 import { readCompletedSessions, readClaimedSources } from './daemon-log-reader';
+import { captureNames, lookupName } from './name-cache';
 import type { AgentSession, AgentSessionSource } from './types';
 
 export type FetchResult =
   | { ok: true; sessions: AgentSession[] }
   | { ok: false; reason: string };
 
+// v2.2.6: 内部测试 hook —— 不直接 import { captureNames, lookupName } 调用,
+// 走这个 mutable 对象,测试 swap 它的字段就能拦截。绕开 bun 的 mock.module
+// 跨文件不可撤销限制,避免污染 name-cache.test.ts。
+export const _nameCacheHooks = {
+  captureNames,
+  lookupName,
+};
+
 /**
- * v2.2.4 新增 / v2.2.5 修正:为已 settled (status='done') 的 session 拼装 AgentSession。
+ * v2.2.4 新增 / v2.2.5 修正 / v2.2.6 接入 name-cache:
+ * 为已 settled (status='done') 的 session 拼装 AgentSession。
  *
  * - 跳过仍然在 active(--json)列表中的,避免和 active session 重复
  * - 跳过 'killed'(TUI 也不展示,只展示 'done')
  * - source 优先级:roster(仍在飞)> daemon.log claimed 事件 > 'unknown'
  *   这样能在 settled 之后还原最初的 dispatch.source,用于在 filterUserDispatched
- *   把 'spare' 完成项正确过滤掉(v2.2.4 的遗留:完成的 spare 因为 source='unknown'
- *   而被错误保留)。
- * - name 用 `claude logs <short>` 拿用户 prompt 首行(3s 超时)。
- *   settled session 通常 daemon 已清理 worker,`claude logs` 会报
- *   "No job matching '<short>'",此时退化为 `<short> (logs unavailable)`,
- *   保留 short hash 提供 debug 可见性,同时给出"为什么没有 name"的信号。
+ *   把 'spare' 完成项正确过滤掉。
+ * - name 优先级(v2.2.6):
+ *     1) name-cache(snapshot-fetcher 之前 fetch active 时存的)
+ *     2) `claude logs <short>` 首行 (3s 超时)
+ *     3) short hash (无后缀,保持显示干净)
+ *   v2.2.5 给找不到 name 的退化加了 `(logs unavailable)` 后缀,实际几乎所有 settled
+ *   都会命中,反而成了噪音 —— 移除该后缀,保持 short hash 干净。
  */
 async function enrichCompletedSessions(
   completed: Map<string, { short: string; settledAt: number; status: 'done' | 'killed' }>,
@@ -40,24 +51,24 @@ async function enrichCompletedSessions(
     const source: AgentSessionSource =
       rosterSourceMap.get(short) ?? daemonLogSourceMap.get(short) ?? 'unknown';
 
-    // Name: claude logs often fails for settled sessions (daemon already cleaned the worker).
-    // Fall back to "<short> (logs unavailable)" so users still see something debug-able
-    // and know why the human-readable name is missing.
-    let name: string;
-    try {
-      const cp = await import('node:child_process');
-      const { promisify } = await import('node:util');
-      const execFileP = promisify(cp.execFile);
-      const r = await execFileP('claude', ['logs', short], { timeout: 3000 });
-      const firstLine = r.stdout
-        .split('\n')
-        .map(l => l.trim())
-        .find(l => l && !l.startsWith('<'));
-      name = firstLine ? firstLine.slice(0, 60) : short;
-    } catch {
-      // claude logs failed (typical for settled sessions) — show short hash with a hint
-      name = `${short} (logs unavailable)`;
+    // Name: cache hit → `claude logs` → short hash
+    let name = _nameCacheHooks.lookupName(short);
+    if (!name) {
+      try {
+        const cp = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        const execFileP = promisify(cp.execFile);
+        const r = await execFileP('claude', ['logs', short], { timeout: 3000 });
+        const firstLine = r.stdout
+          .split('\n')
+          .map(l => l.trim())
+          .find(l => l && !l.startsWith('<'));
+        if (firstLine) name = firstLine.slice(0, 60);
+      } catch {
+        // claude logs failed (typical for settled sessions) — fall through to short
+      }
     }
+    if (!name) name = short;
 
     result.push({
       pid: 0,
@@ -117,6 +128,13 @@ export const AgentSnapshotFetcher = {
       // 注意:v2.2.5 起,filterUserDispatched 推迟到 merge completed 之后执行,
       // 这样从 daemon.log 推断出 source='spare' 的 completed session 也会被正确过滤。
       let sessions = attachRosterSources(parseAgentsJson(stdout), sourceMap);
+
+      // v2.2.6: 把当前 active session 的 {short → name} 写进 name-cache。
+      // 之后这些 session settled 时,enrichCompletedSessions 能从 cache 拿回真名,
+      // 不必再让 Feishu 显示一排 `273a5566` 这样的 short hash。
+      // 走 _nameCacheHooks 间接调用是为了让 tests 能 swap 这俩函数 ——
+      // bun 的 mock.module 在跨文件场景下不可撤销,会污染 name-cache.test.ts。
+      _nameCacheHooks.captureNames(sessions);
 
       // v2.2.4 / v2.2.5: 叠加 daemon.log 中的 completed (done) sessions。
       // 跳过仍在 --json 中的 short(race condition:daemon 刚把同一 session 又派出来)。

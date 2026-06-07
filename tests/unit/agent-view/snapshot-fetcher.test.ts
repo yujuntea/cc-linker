@@ -42,6 +42,17 @@ mock.module('../../../src/agent-view/daemon-log-reader', () => ({
   readClaimedSources: readClaimedSourcesMock,
 }));
 
+// v2.2.6: name-cache 的真实实现会写 ~/.cc-linker/agent-names-cache.json。
+// 不用 mock.module(bun 已知限制:跨文件不可撤销,会污染 name-cache.test.ts),
+// 改成 swap snapshot-fetcher 暴露的 _nameCacheHooks(普通 object,可写)。
+import { _nameCacheHooks } from '../../../src/agent-view/snapshot-fetcher';
+const origCaptureNames = _nameCacheHooks.captureNames;
+const origLookupName = _nameCacheHooks.lookupName;
+const captureNamesMock = mock(
+  (_sessions: Array<{ sessionId: string; name: string }>, _now?: number, _path?: string) => {},
+);
+const lookupNameMock = mock((_short: string, _path?: string): string | undefined => undefined);
+
 const fixtureDir = join(import.meta.dir, '..', '..', 'fixtures', 'agents-json');
 
 // Monkey-patch DaemonProbe.check (already-loaded module — can't use mock.module
@@ -68,11 +79,19 @@ beforeEach(() => {
   readCompletedSessionsMock.mockImplementation(() => new Map());
   readClaimedSourcesMock.mockReset();
   readClaimedSourcesMock.mockImplementation(() => new Map());
+  captureNamesMock.mockReset();
+  lookupNameMock.mockReset();
+  lookupNameMock.mockImplementation(() => undefined);
+  // swap the mutable hooks (works across test files where mock.module wouldn't)
+  _nameCacheHooks.captureNames = captureNamesMock;
+  _nameCacheHooks.lookupName = lookupNameMock;
 });
 
 afterAll(() => {
   (DaemonProbe as any).check = origProbeCheck;
   (AgentSnapshotFetcher as any).fetch = origFetch;
+  _nameCacheHooks.captureNames = origCaptureNames;
+  _nameCacheHooks.lookupName = origLookupName;
   mock.restore(); // Restore all mock.module() replacements
 });
 
@@ -225,7 +244,7 @@ describe('AgentSnapshotFetcher.fetch', () => {
     }
   });
 
-  test('v2.2.5: name falls back to "<short> (logs unavailable)" when claude logs fails', async () => {
+  test('v2.2.6: name falls back to short hash (no suffix) when both cache miss and claude logs fail', async () => {
     execFileSyncMock.mockImplementation(() => '2.1.163\n');
     (DaemonProbe as any).check = () => true;
     const raw = readFileSync(join(fixtureDir, 'busy.json'), 'utf8');
@@ -241,6 +260,8 @@ describe('AgentSnapshotFetcher.fetch', () => {
       () => new Map([['d54a475a', { short: 'd54a475a', settledAt: 1000, status: 'done' }]]),
     );
     readClaimedSourcesMock.mockImplementation(() => new Map([['d54a475a', 'slash']]));
+    // cache miss → falls all the way through to short hash (no "(logs unavailable)" suffix)
+    lookupNameMock.mockImplementation(() => undefined);
 
     const result = await AgentSnapshotFetcher.fetch();
 
@@ -248,8 +269,59 @@ describe('AgentSnapshotFetcher.fetch', () => {
     if (result.ok) {
       const completed = result.sessions.find(s => s.sessionId === 'd54a475a');
       expect(completed).toBeDefined();
-      expect(completed?.name).toBe('✅ d54a475a (logs unavailable)');
+      expect(completed?.name).toBe('✅ d54a475a');
       expect(completed?.completed).toBe(true);
+    }
+  });
+
+  test('v2.2.6: name-cache hit short-circuits the `claude logs` exec', async () => {
+    execFileSyncMock.mockImplementation(() => '2.1.163\n');
+    (DaemonProbe as any).check = () => true;
+    const raw = readFileSync(join(fixtureDir, 'busy.json'), 'utf8');
+    execFileMock.mockImplementation((cmd, args, cb) => {
+      if (cmd === 'claude' && args[0] === 'logs') {
+        // If the implementation ever falls through to claude logs, this would replace the
+        // name — making the assertion below fail. The cache hit must short-circuit it.
+        cb(null, 'wrong name from logs\n', '');
+        return;
+      }
+      cb(null, raw, '');
+    });
+    readCompletedSessionsMock.mockImplementation(
+      () => new Map([['timer001', { short: 'timer001', settledAt: 1000, status: 'done' }]]),
+    );
+    readClaimedSourcesMock.mockImplementation(() => new Map([['timer001', 'fleet']]));
+    lookupNameMock.mockImplementation(short =>
+      short === 'timer001' ? 'timer command response' : undefined,
+    );
+
+    const result = await AgentSnapshotFetcher.fetch();
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const completed = result.sessions.find(s => s.sessionId === 'timer001');
+      expect(completed?.name).toBe('✅ timer command response');
+    }
+  });
+
+  test('v2.2.6: captureNames is invoked with the parsed active session list', async () => {
+    execFileSyncMock.mockImplementation(() => '2.1.163\n');
+    (DaemonProbe as any).check = () => true;
+    const raw = readFileSync(join(fixtureDir, 'busy.json'), 'utf8');
+    execFileMock.mockImplementation((_cmd, _args, cb) => {
+      cb(null, raw, '');
+    });
+
+    await AgentSnapshotFetcher.fetch();
+
+    expect(captureNamesMock).toHaveBeenCalled();
+    const passed = captureNamesMock.mock.calls[0][0];
+    expect(Array.isArray(passed)).toBe(true);
+    // busy.json fixture has 2 active sessions; both must reach the cache.
+    expect(passed.length).toBe(2);
+    for (const s of passed) {
+      expect(typeof s.sessionId).toBe('string');
+      expect(typeof s.name).toBe('string');
     }
   });
 

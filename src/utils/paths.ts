@@ -18,6 +18,10 @@ export const CONFIG_PATH = process.env.CC_LINKER_CONFIG_PATH ?? join(CC_LINKER_D
 export const USER_MAPPING_PATH = join(CC_LINKER_DIR, 'user-mapping.json');
 export const LIST_SNAPSHOT_PATH = join(CC_LINKER_DIR, 'list-snapshot.json');
 
+// Agent View: shortId → display name cache (populated from active `claude agents --json`,
+// used to recover name for settled sessions after daemon clears its roster entry).
+export const AGENT_NAMES_CACHE_PATH = join(CC_LINKER_DIR, 'agent-names-cache.json');
+
 // Runtime paths
 export const RUNTIME_OWNER_LOCK_PATH = join(CC_LINKER_DIR, 'owner.lock');
 export const RUNTIME_SESSION_EVENTS_DIR = join(CC_LINKER_DIR, 'session-events');
