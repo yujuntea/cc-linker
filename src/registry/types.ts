@@ -30,6 +30,10 @@ export const SessionEntrySchema = z.object({
   last_assistant_preview: z.string().max(240).optional(),// 240 字符 cleaned（去 ##/**/`/``` 后，bot 概览卡片专用）
   status: StatusSchema.optional(),
   lastKnownProvider: z.string().nullable().optional(), // Display-only: what model was used when session was created
+  // v0.4.1: scanner 检测到 JSONL 含 `isSidechain: true` 条目时标 true —— 这些是
+  // Task tool 派生的 subagent sessions。/list 按此过滤(复用 Agent View 的
+  // filterUserDispatched 模式)。老 entry 没这个字段 = 视作 false(下次扫描会补)。
+  is_subagent: z.boolean().optional(),
 });
 export type SessionEntry = z.infer<typeof SessionEntrySchema>;
 

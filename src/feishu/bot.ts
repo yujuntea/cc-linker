@@ -2377,7 +2377,12 @@ export class FeishuBot {
   private async doCardList(openId: string, messageId?: string, msg?: SpoolMessage): Promise<void> {
     await syncBeforeCommand(this.registry);
 
+    // v0.4.1: 过滤掉 Task tool 派生的 subagent sessions(和 Agent View 的
+    // filterUserDispatched 思路一致 —— Agent View 滤 source='spare',
+    // /list 滤 is_subagent=true)。老 entry 没 is_subagent 字段 = 当 false 处理
+    // (不激进清空,下次扫描会补)。
     const allSessions = Object.entries(this.registry.sessions)
+      .filter(([_, entry]) => entry.is_subagent !== true)
       .sort((a, b) => b[1].last_active.localeCompare(a[1].last_active));
 
     const MAX_LIST_ITEMS = 10;

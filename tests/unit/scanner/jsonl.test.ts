@@ -145,4 +145,80 @@ describe('JSONLScanner', () => {
     expect(entry?.last_active).toBe('2026-05-03T10:05:00Z');
     expect(entry?.last_message_preview).toBe('latest assistant tail preview');
   });
+
+  // v0.4.1: parseFull 检测到 JSONL 含 isSidechain:true 条目时设 is_subagent,
+  // /list 据此过滤掉 Task tool 派生的 subagent sessions。
+  it('marks session as is_subagent when JSONL has isSidechain:true entries', async () => {
+    const sessionId = 'subagent-session-aaaa-bbbb-cccc-dddddddddddd';
+    const projectDir = join(tmpDir, '.claude', 'projects', '-Users-test-subagent');
+    mkdirSync(projectDir, { recursive: true });
+    const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
+    // 模拟 Task tool 派生的 subagent:user/assistant 条目 isSidechain:true,
+    // 顶级 hook/permission entries isSidechain:false。
+    const lines: string[] = [];
+    lines.push(JSON.stringify({ type: 'attachment', sessionId, isSidechain: false, timestamp: '2026-05-01T09:00:00Z' }));
+    lines.push(JSON.stringify({ type: 'permission-mode', sessionId, isSidechain: false, timestamp: '2026-05-01T09:00:01Z' }));
+    lines.push(JSON.stringify({
+      type: 'user',
+      isSidechain: true,
+      parentUuid: 'parent-uuid',
+      message: { role: 'user', content: 'do task X' },
+      sessionId,
+      timestamp: '2026-05-01T09:01:00Z',
+    }));
+    lines.push(JSON.stringify({
+      type: 'assistant',
+      isSidechain: true,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+      sessionId,
+      timestamp: '2026-05-01T09:02:00Z',
+    }));
+    writeFileSync(jsonlPath, lines.join('\n'));
+
+    const scanner = new JSONLScanner(
+      registry,
+      new Map(),
+      join(tmpDir, '.claude')
+    );
+    await scanner.scan();
+
+    const entry = registry.get(sessionId);
+    expect(entry?.is_subagent).toBe(true);
+  });
+
+  it('does NOT mark session as subagent when JSONL has no isSidechain:true entries', async () => {
+    const sessionId = 'top-level-session-aaaa-bbbb-cccc-dddddddddddd';
+    const projectDir = join(tmpDir, '.claude', 'projects', '-Users-test-toplevel');
+    mkdirSync(projectDir, { recursive: true });
+    const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
+    // 模拟用户在终端跑的真实 session —— 没有 isSidechain:true 条目
+    const lines: string[] = [];
+    lines.push(JSON.stringify({ type: 'attachment', sessionId, isSidechain: false, timestamp: '2026-05-01T09:00:00Z' }));
+    lines.push(JSON.stringify({
+      type: 'user',
+      isSidechain: false,
+      message: { role: 'user', content: 'help me with this code' },
+      sessionId,
+      timestamp: '2026-05-01T09:01:00Z',
+    }));
+    lines.push(JSON.stringify({
+      type: 'assistant',
+      isSidechain: false,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'sure' }] },
+      sessionId,
+      timestamp: '2026-05-01T09:02:00Z',
+    }));
+    writeFileSync(jsonlPath, lines.join('\n'));
+
+    const scanner = new JSONLScanner(
+      registry,
+      new Map(),
+      join(tmpDir, '.claude')
+    );
+    await scanner.scan();
+
+    const entry = registry.get(sessionId);
+    // 字段不存在 = 老 entry 的语义,等同于 false(/list filter 用 !== true 比较)
+    expect(entry?.is_subagent).toBeUndefined();
+  });
 });

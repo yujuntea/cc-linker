@@ -230,6 +230,12 @@ export class JSONLScanner {
     let lastPrompt: string | null = null;
     let firstUserMessage: string | null = null;
     let createdAt: string | null = null;
+    // v0.4.1: 检测 Task tool 派生的 subagent sessions —— 任何条目有 isSidechain: true
+    // 即可判定为 subagent。/list 据此过滤(复用 Agent View 的 filterUserDispatched
+    // 模式)。反向扫了两次,但只要 isSidechain 出现在尾部 4KB 内 parseTail 就能拿到,
+    // 所以这里只在 parseFull 设上,parseTail 在文件变化但 full 还没跑时不更新
+    // is_subagent 字段(下次 sync 就会修好)。老 entry 没这个字段 → /list 当 false 处理。
+    let isSubagent = false;
 
     for (let i = 0; i < lines.length; i++) {
       try {
@@ -244,10 +250,12 @@ export class JSONLScanner {
         }
         // 提取创建时间：取最早的时间戳（首条有 timestamp 的记录）
         if (!createdAt && entry.timestamp) createdAt = entry.timestamp;
+        // v0.4.1: 任何 isSidechain 条目 = Task tool subagent
+        if (entry.isSidechain === true) isSubagent = true;
         // Early exit: once we have core metadata, no need to keep scanning.
         // lastPrompt 故意不在 break 条件内——有些 JSONL 没有 last-prompt marker，
         // 没有它会强制遍历全部行（性能 bug，详见 review finding #2）。
-        if (cwd && aiTitle && firstUserMessage && createdAt) break;
+        if (cwd && aiTitle && firstUserMessage && createdAt && isSubagent) break;
       } catch {
         // Silently skip malformed JSON lines
       }
@@ -336,6 +344,8 @@ export class JSONLScanner {
       // 新增 80 字符版（bot overview 卡片用）
       last_assistant_preview: preview ? preview : undefined,
       last_user_preview: lastUserPreview ? lastUserPreview.slice(0, 80) : undefined,
+      // v0.4.1: subagent 标记
+      is_subagent: isSubagent || undefined,
       // 注意：parseFull 不再硬编码 status: 'active'。由调用方根据 existing.status 决定
       // 保留（degraded/provisioning）或重置（corrupted → active）。详见 review finding #6。
     };
