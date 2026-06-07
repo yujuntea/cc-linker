@@ -28,13 +28,18 @@ mock.module('node:child_process', () => {
 });
 
 // v2.2.4: snapshot-fetcher 内部还会调 readCompletedSessions() 读 ~/.claude/daemon.log。
-// 这会让 tests 拉进真实机器上的 completed 列表,污染 fixture 断言。
+// v2.2.5: 同时也调 readClaimedSources() 推断 completed session 的 dispatch.source。
+// 这会让 tests 拉进真实机器上的 completed 列表 / claimed 事件,污染 fixture 断言。
 // 显式 mock 掉,默认返回空 Map。子测试需要时可以覆盖。
 const readCompletedSessionsMock = mock(
   (_withinHours: number): Map<string, any> => new Map(),
 );
+const readClaimedSourcesMock = mock(
+  (_withinHours: number): Map<string, any> => new Map(),
+);
 mock.module('../../../src/agent-view/daemon-log-reader', () => ({
   readCompletedSessions: readCompletedSessionsMock,
+  readClaimedSources: readClaimedSourcesMock,
 }));
 
 const fixtureDir = join(import.meta.dir, '..', '..', 'fixtures', 'agents-json');
@@ -61,6 +66,8 @@ beforeEach(() => {
   execFileMock.mockReset();
   readCompletedSessionsMock.mockReset();
   readCompletedSessionsMock.mockImplementation(() => new Map());
+  readClaimedSourcesMock.mockReset();
+  readClaimedSourcesMock.mockImplementation(() => new Map());
 });
 
 afterAll(() => {
@@ -173,6 +180,103 @@ describe('AgentSnapshotFetcher.fetch', () => {
       // Only the 2 from busy.json
       expect(result.sessions).toHaveLength(2);
       expect(result.sessions.some(s => s.sessionId === 'deadbeef')).toBe(false);
+    }
+  });
+
+  test('v2.2.5: completed spare sessions are filtered out via daemon.log claimed events', async () => {
+    execFileSyncMock.mockImplementation(() => '2.1.163\n');
+    (DaemonProbe as any).check = () => true;
+    const raw = readFileSync(join(fixtureDir, 'busy.json'), 'utf8');
+    execFileMock.mockImplementation((cmd, _args, cb) => {
+      // Route the `claude logs <short>` calls execFileP makes for completed sessions
+      if (cmd === 'claude' && _args[0] === 'logs') {
+        cb(new Error("No job matching"), '', '');
+        return;
+      }
+      cb(null, raw, '');
+    });
+    // 3 completed sessions, all `done`: spare (must drop), slash (keep), fleet (keep)
+    readCompletedSessionsMock.mockImplementation(
+      () =>
+        new Map([
+          ['spare001', { short: 'spare001', settledAt: 1000, status: 'done' }],
+          ['slash002', { short: 'slash002', settledAt: 2000, status: 'done' }],
+          ['fleet003', { short: 'fleet003', settledAt: 3000, status: 'done' }],
+        ]),
+    );
+    readClaimedSourcesMock.mockImplementation(
+      () =>
+        new Map([
+          ['spare001', 'spare'],
+          ['slash002', 'slash'],
+          ['fleet003', 'fleet'],
+        ]),
+    );
+
+    const result = await AgentSnapshotFetcher.fetch();
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // 2 from busy.json + 2 surviving completed (slash + fleet); spare dropped
+      expect(result.sessions).toHaveLength(4);
+      expect(result.sessions.some(s => s.sessionId === 'spare001')).toBe(false);
+      expect(result.sessions.some(s => s.sessionId === 'slash002')).toBe(true);
+      expect(result.sessions.some(s => s.sessionId === 'fleet003')).toBe(true);
+    }
+  });
+
+  test('v2.2.5: name falls back to "<short> (logs unavailable)" when claude logs fails', async () => {
+    execFileSyncMock.mockImplementation(() => '2.1.163\n');
+    (DaemonProbe as any).check = () => true;
+    const raw = readFileSync(join(fixtureDir, 'busy.json'), 'utf8');
+    execFileMock.mockImplementation((cmd, args, cb) => {
+      if (cmd === 'claude' && args[0] === 'logs') {
+        // Simulate `claude logs <short>` failing — typical for settled sessions
+        cb(new Error("No job matching 'd54a475a'"), '', '');
+        return;
+      }
+      cb(null, raw, '');
+    });
+    readCompletedSessionsMock.mockImplementation(
+      () => new Map([['d54a475a', { short: 'd54a475a', settledAt: 1000, status: 'done' }]]),
+    );
+    readClaimedSourcesMock.mockImplementation(() => new Map([['d54a475a', 'slash']]));
+
+    const result = await AgentSnapshotFetcher.fetch();
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const completed = result.sessions.find(s => s.sessionId === 'd54a475a');
+      expect(completed).toBeDefined();
+      expect(completed?.name).toBe('✅ d54a475a (logs unavailable)');
+      expect(completed?.completed).toBe(true);
+    }
+  });
+
+  test('v2.2.5: source inferred from daemon.log when not in roster', async () => {
+    execFileSyncMock.mockImplementation(() => '2.1.163\n');
+    (DaemonProbe as any).check = () => true;
+    const raw = readFileSync(join(fixtureDir, 'busy.json'), 'utf8');
+    execFileMock.mockImplementation((cmd, args, cb) => {
+      if (cmd === 'claude' && args[0] === 'logs') {
+        cb(new Error('No job matching'), '', '');
+        return;
+      }
+      cb(null, raw, '');
+    });
+    // roster has no entry for 'fleet088' (typical for completed) — but daemon.log does.
+    readCompletedSessionsMock.mockImplementation(
+      () => new Map([['fleet088', { short: 'fleet088', settledAt: 1000, status: 'done' }]]),
+    );
+    readClaimedSourcesMock.mockImplementation(() => new Map([['fleet088', 'fleet']]));
+
+    const result = await AgentSnapshotFetcher.fetch();
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const completed = result.sessions.find(s => s.sessionId === 'fleet088');
+      expect(completed).toBeDefined();
+      expect(completed?.source).toBe('fleet');
     }
   });
 });
