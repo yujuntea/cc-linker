@@ -497,6 +497,27 @@ describe('handleBackToChat', () => {
     expect(cardReplyFn).not.toHaveBeenCalled();
     expect(patchFn).not.toHaveBeenCalled();
   });
+
+  test('clears any pending expectedReply before replying', async () => {
+    const { mgr, userManager, replyFn } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    // Seed a pending_agent_reply so the user was mid-reply
+    await mgr.expectedReply.set('ou_back_pending', {
+      shortId: waiting.sessionId.slice(0, 8),
+      sessionId: waiting.sessionId,
+      cwd: waiting.cwd,
+    });
+    expect(userManager.getEntry('ou_back_pending')?.type).toBe('pending_agent_reply');
+
+    await mgr.handleBackToChat('ou_back_pending');
+
+    // expectedReply 已被清掉(无论是否之前有 pending,都安全 clear)
+    expect(mgr.expectedReply.get('ou_back_pending')).toBeUndefined();
+    expect(userManager.getEntry('ou_back_pending')).toBeUndefined();
+    // replyFn 仍然发了退出文本
+    expect(replyFn).toHaveBeenCalledTimes(1);
+    expect(replyFn.mock.calls[0][0]).toContain('已退出 Agent View');
+  });
 });
 
 describe('handleReplyRequest (Step A)', () => {

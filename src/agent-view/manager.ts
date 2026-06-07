@@ -512,8 +512,12 @@ export class AgentViewManager {
     await this.deps.replyFn('✅ 已取消等待回复', { openId });
   }
 
-  /** Drop the user out of Agent View — pure text reply, no state mutation. */
+  /** Drop the user out of Agent View — pure text reply, no state mutation.
+   *  v2.2: clear any pending expectedReply so the next chat message doesn't
+   *  get re-routed as a reply (the user wants to chat, not reply to a
+   *  background session). */
   async handleBackToChat(openId: string): Promise<void> {
+    await this.expectedReply.clear(openId, 'overwrite');
     await this.deps.replyFn(
       '已退出 Agent View,继续发送消息或 / 命令即可。下次进 /agents 视图重新打 /agents。',
       { openId },
