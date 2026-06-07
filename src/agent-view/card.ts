@@ -111,7 +111,15 @@ export function buildListCard(
       },
       template: 'blue',
     },
-    elements: [{ tag: 'markdown', content: `Last refreshed ${refreshedAt}` }, ...elements],
+    elements: [
+      // v2.2.1: 状态来源提示(claude agents --json 有秒级延迟,与 TUI 不完全一致)
+      {
+        tag: 'markdown',
+        content: 'ℹ️ 状态由 `claude agents --json` 提供,可能与终端 TUI 有数秒延迟',
+      },
+      { tag: 'markdown', content: `Last refreshed ${refreshedAt}` },
+      ...elements,
+    ],
   });
 }
 
