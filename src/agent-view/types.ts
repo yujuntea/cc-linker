@@ -38,6 +38,9 @@ export function groupByStatus(sessions: AgentSession[]): AgentSessionGroup {
     busy: sessions.filter(s => s.status === 'busy'),
     waiting: sessions.filter(s => s.status === 'waiting'),
     idle: sessions.filter(s => s.status === 'idle' && !s.completed),
-    completed: sessions.filter(s => s.completed === true),
+    // completed 仅匹配 (status === 'idle' && completed === true)——
+    // snapshot-fetcher 只会把 settled (idle+completed) session 放进这个组,
+    // 防止 active busy 错进 completed section
+    completed: sessions.filter(s => s.status === 'idle' && s.completed === true),
   };
 }

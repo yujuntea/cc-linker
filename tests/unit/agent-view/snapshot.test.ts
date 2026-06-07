@@ -177,3 +177,50 @@ describe('filterUserDispatched (v2.2.2)', () => {
     expect(filterUserDispatched(sessions)).toHaveLength(2);
   });
 });
+
+describe('groupByStatus (v2.2.4: completed section)', () => {
+  function mk(over: Partial<AgentSession>): AgentSession {
+    return {
+      pid: 0,
+      cwd: '',
+      kind: 'background',
+      startedAt: 0,
+      sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      name: 't',
+      status: 'idle',
+      source: 'unknown',
+      ...over,
+    };
+  }
+
+  test('completed:true session goes to completed group, not idle', () => {
+    const sessions = [
+      mk({ sessionId: 'idle0000-1111-2222-3333-444444444444', status: 'idle' }),
+      mk({
+        sessionId: 'compl000-1111-2222-3333-444444444444',
+        status: 'idle',
+        completed: true,
+      }),
+    ];
+    const groups = groupByStatus(sessions);
+    expect(groups.idle).toHaveLength(1);
+    expect(groups.completed).toHaveLength(1);
+    expect(groups.completed[0].sessionId.startsWith('compl000')).toBe(true);
+  });
+
+  test('session without completed flag goes to idle (not completed) even if status=idle', () => {
+    const sessions = [mk({ status: 'idle' })];
+    const groups = groupByStatus(sessions);
+    expect(groups.idle).toHaveLength(1);
+    expect(groups.completed).toHaveLength(0);
+  });
+
+  test('completed flag on busy session still goes to busy (not completed)', () => {
+    // Defensive:completed should only apply to idle (settled) sessions.
+    // Active busy sessions should never be marked completed by snapshot-fetcher.
+    const sessions = [mk({ status: 'busy', completed: true })];
+    const groups = groupByStatus(sessions);
+    expect(groups.busy).toHaveLength(1);
+    expect(groups.completed).toHaveLength(0);
+  });
+});

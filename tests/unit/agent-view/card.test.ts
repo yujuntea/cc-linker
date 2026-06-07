@@ -8,7 +8,7 @@ import {
   buildWaitingCard,
   buildStopConfirmCard,
 } from '../../../src/agent-view/card';
-import { groupByStatus } from '../../../src/agent-view/types';
+import { groupByStatus, type AgentSession } from '../../../src/agent-view/types';
 import { parseAgentsJson } from '../../../src/agent-view/snapshot';
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -115,6 +115,70 @@ describe('buildListCard', () => {
         e.content.startsWith('Last refreshed'),
     );
     expect(refreshLine).toBeDefined();
+  });
+
+  test('v2.2.4: renders a separate "已完成" section for completed sessions', () => {
+    const groups = {
+      busy: [],
+      waiting: [],
+      idle: [],
+      completed: [
+        {
+          pid: 0,
+          cwd: '',
+          kind: 'background' as const,
+          startedAt: Date.now() - 5 * 60_000,
+          sessionId: '3a41fe73',
+          name: '✅ fix-flaky-test',
+          status: 'idle' as const,
+          source: 'slash' as const,
+          completed: true,
+        },
+      ],
+    };
+    const card = JSON.parse(buildListCard(groups, '12:34:56'));
+    // 标题用 "已完成" 区分于 idle 的 "空闲"
+    const completedHeader = card.elements.find(
+      (e: any) =>
+        e.tag === 'markdown' &&
+        typeof e.content === 'string' &&
+        e.content.includes('已完成') &&
+        e.content.includes('(1)'),
+    );
+    expect(completedHeader).toBeDefined();
+    // 总数应包含 completed
+    expect(card.header.title.content).toContain('1 sessions');
+  });
+
+  test('v2.2.4: completed sessions do NOT appear in idle group', () => {
+    const sessions: AgentSession[] = [
+      {
+        pid: 1,
+        cwd: '/a',
+        kind: 'background',
+        startedAt: 0,
+        sessionId: 'idle0000-1111-2222-3333-444444444444',
+        name: 'active-idle',
+        status: 'idle',
+        source: 'slash',
+      },
+      {
+        pid: 0,
+        cwd: '',
+        kind: 'background',
+        startedAt: 0,
+        sessionId: 'compl000-1111-2222-3333-444444444444',
+        name: '✅ done',
+        status: 'idle',
+        source: 'slash',
+        completed: true,
+      },
+    ];
+    const groups = groupByStatus(sessions);
+    expect(groups.idle).toHaveLength(1);
+    expect(groups.idle[0].sessionId.startsWith('idle0000')).toBe(true);
+    expect(groups.completed).toHaveLength(1);
+    expect(groups.completed[0].sessionId.startsWith('compl000')).toBe(true);
   });
 });
 
