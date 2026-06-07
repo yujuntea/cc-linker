@@ -41,4 +41,29 @@ describe('start.ts — Agent View wiring regression', () => {
     expect(src).toMatch(/client\.im\.v1\.message\.patch\s*\(/);
     expect(src).toMatch(/message_id/);
   });
+
+  // v2.2.9 regression — start.ts:232 declares replyFn / cardReplyFn / patchFn as
+  // `async () => null` stubs, then later (inside the `if (appId && appSecret)`
+  // block) reassigns them to real Feishu client wrappers. agentView is
+  // constructed BEFORE the reassignment, so it captures the stub by reference
+  // — `agentView.deps.replyFn` stays the stub unless we explicitly re-sync.
+  //
+  // patchFn was already re-synced (`agentView.deps.patchFn = patchFn`),
+  // cardReplyFn works via a closure wrapper (agentViewCardReplyFn reads the
+  // outer `cardReplyFn` variable by name), but replyFn was missed → all
+  // Attach/Stop/Reply text messages silently dropped to /dev/null.
+  // This test pins the fix in place.
+  test('syncs the real replyFn back to agentView.deps after Feishu client is set up', () => {
+    expect(src).toMatch(/agentView\.deps\.replyFn\s*=\s*replyFn/);
+  });
+
+  test('syncs the real patchFn back to agentView.deps after Feishu client is set up', () => {
+    expect(src).toMatch(/agentView\.deps\.patchFn\s*=\s*patchFn/);
+  });
+
+  test('cardReplyFn is wrapped in a closure so reassignment propagates without explicit sync', () => {
+    // The closure reads `cardReplyFn` by name → reassignment to local var is observed.
+    expect(src).toMatch(/agentViewCardReplyFn[^=]*=\s*async[^{]*\{\s*return\s+cardReplyFn\(/);
+  });
 });
+

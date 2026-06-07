@@ -362,6 +362,12 @@ async function createBotRuntime(
       }
     };
     bot.setReplyFn(replyFn);
+    // v2.2.9 fix: 把真 replyFn 同步到 agentView.deps —— 否则 agentView 一直
+    // 拿着 line 232 的 stub `async () => null`,Attach/Stop/Reply 等所有走
+    // this.deps.replyFn(...) 发文本的路径全部静默无效。
+    // cardReplyFn 通过 agentViewCardReplyFn 闭包按名读变量已 work,
+    // patchFn 在 line 431 显式同步过,但 replyFn 漏了 —— 这里补齐。
+    agentView.deps.replyFn = replyFn;
 
     cardReplyFn = async (
       card: Record<string, unknown>,
