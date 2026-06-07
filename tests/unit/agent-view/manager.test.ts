@@ -200,6 +200,54 @@ describe('handleList', () => {
     expect(sentCard.header.template).toBe('red');
     expect(sentCard.elements[0].content).toContain('daemon not running');
   });
+
+  test('caps sessions to 10 in list card (spec §6.1)', async () => {
+    const { mgr, cardReplyFn } = makeMgrWithSpies();
+    const manySessions = Array.from({ length: 25 }, (_, i) =>
+      makeBusySession({
+        sessionId: `aaaaaaaa-bbbb-cccc-dddd-${String(i).padStart(12, '0')}`,
+        name: `task-${i}`,
+      }),
+    );
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: manySessions,
+    }));
+
+    await mgr.handleList('ou_test_cap');
+
+    // 列表卡只显示前 10 个 — 计数每个 session 行的 markdown 数
+    const sentCard = JSON.parse(cardReplyFn.mock.calls[0][0] as string);
+    // session 行 markdown 数(emoji + name 标识)
+    const sessionRows = sentCard.elements.filter(
+      (e: any) => e.tag === 'markdown' && /✽|✋|⏹/.test(e.content || ''),
+    );
+    expect(sessionRows).toHaveLength(10);
+  });
+
+  test('exceeds 25KB triggers text fallback (no card sent)', async () => {
+    const { mgr, cardReplyFn, replyFn } = makeMgrWithSpies();
+    // 构造大量超长 session 让 buildListCard 超过 25KB
+    const huge = Array.from({ length: 10 }, (_, i) =>
+      makeBusySession({
+        sessionId: `aaaaaaaa-bbbb-cccc-dddd-${String(i).padStart(12, '0')}`,
+        name: 'x'.repeat(3000) + `-${i}`, // 每个 3KB+,10 个 > 30KB
+        cwd: '/very/very/very/long/path/' + 'y'.repeat(200) + '/' + i,
+      }),
+    );
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: huge,
+    }));
+
+    await mgr.handleList('ou_test_big');
+
+    expect(cardReplyFn).not.toHaveBeenCalled();
+    expect(replyFn).toHaveBeenCalledTimes(1);
+    const fallback = replyFn.mock.calls[0][0] as string;
+    expect(fallback).toContain('Agent View');
+    expect(fallback).toContain('10 sessions');
+  });
 });
 
 describe('handleRefreshList', () => {
@@ -339,6 +387,47 @@ describe('handlePeek', () => {
     expect(replyFn).toHaveBeenCalledTimes(1);
     expect(replyFn.mock.calls[0][0]).toContain('会话已不存在');
     expect(cardReplyFn).not.toHaveBeenCalled();
+  });
+
+  test('honors CC_LINKER_AGENT_VIEW_PEEK_LINES / PEEK_MAX_BYTES env vars', async () => {
+    // Save and override config
+    const origPeekLines = (config as any).data.agent_view.peek_lines;
+    const origPeekMaxBytes = (config as any).data.agent_view.peek_max_bytes;
+    (config as any).data.agent_view.peek_lines = 3;
+    (config as any).data.agent_view.peek_max_bytes = 100;
+
+    try {
+      const { mgr, cardReplyFn } = makeMgrWithSpies();
+      const waiting = makeWaitingSession();
+      (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+        ok: true,
+        sessions: [waiting],
+      }));
+      // 50 行,每行 50 字符
+      const rawLog = Array.from({ length: 50 }, (_, i) =>
+        `line-${String(i).padStart(2, '0')}-${'a'.repeat(50)}`,
+      ).join('\n');
+      execFileMock.mockImplementation((_cmd, _args, cb) => {
+        cb(null, rawLog, '');
+      });
+
+      const shortId = waiting.sessionId.slice(0, 8);
+      await mgr.handlePeek('ou_peek_cfg', shortId, waiting.sessionId, waiting.cwd);
+
+      const sentCard = JSON.parse(cardReplyFn.mock.calls[0][0] as string);
+      const codeBlock = sentCard.elements.find((e: any) => /Recent output/.test(e.content || ''));
+      const codeText = (codeBlock.content.match(/```\n([\s\S]*?)\n```/) || ['', ''])[1];
+      // 行数 <= 3(取后 3 行)
+      const lines = codeText.split('\n').filter(Boolean);
+      expect(lines.length).toBeLessThanOrEqual(3);
+      // 总字节 <= 100(truncateBytes)
+      const bytes = new TextEncoder().encode(codeText).length;
+      expect(bytes).toBeLessThanOrEqual(100);
+    } finally {
+      // Restore
+      (config as any).data.agent_view.peek_lines = origPeekLines;
+      (config as any).data.agent_view.peek_max_bytes = origPeekMaxBytes;
+    }
   });
 });
 

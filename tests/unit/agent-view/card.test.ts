@@ -39,23 +39,23 @@ describe('buildListCard', () => {
   });
 
   test('exceeds 25KB: caller should fallback to text', () => {
-    // 构造 200 个 session
-    const big = Array.from({ length: 200 }, (_, i) => ({
+    // 构造会超过 25KB 的 session:每个 name 3KB,10 个就 > 30KB
+    // (但 manager 层会在 >= 10 个时 cap,所以需要超大 name 才能超 25KB)
+    const big = Array.from({ length: 10 }, (_, i) => ({
       pid: i,
-      cwd: '/very/long/path/to/some/directory/' + i,
+      cwd: '/very/long/path/' + 'x'.repeat(200) + '/' + i,
       kind: 'background',
       startedAt: 1000 + i,
-      sessionId: 'uuid-' + i,
-      name: 'session-' + i + '-name-very-long',
+      sessionId: 'uuid-' + i + '-aaaa-bbbb-cccc-dddd',
+      name: 'session-' + 'y'.repeat(3000) + '-' + i,
       status: 'busy',
     }));
     const sessions = parseAgentsJson(JSON.stringify(big));
     const groups = groupByStatus(sessions);
     const cardStr = buildListCard(groups, '12:34:56');
     const size = new TextEncoder().encode(cardStr).length;
-    // 列表上限 10 个,所以正常情况不会超 25KB
-    // 这个测试只确认 size 是 number
-    expect(typeof size).toBe('number');
+    // 卡大小 > 25KB,应由 manager 走 text fallback(此测试仅断言 size)
+    expect(size).toBeGreaterThan(25_000);
   });
 });
 

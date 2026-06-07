@@ -4,6 +4,14 @@ import { ExpectedReplyState } from './expected-reply-state';
 import { buildListCard, buildPeekCard, buildErrorCard, buildEmptyCard, buildWaitingCard, buildStopConfirmCard } from './card';
 import type { AgentSession, AgentSessionGroup, AgentSessionStatus } from './types';
 import { groupByStatus } from './types';
+import { config } from '../utils/config';
+
+/** Maximum list-card byte size. 飞书 card 25KB 上限;超过走 text fallback。 */
+const MAX_CARD_BYTES = 25_000;
+/** 列表卡显示上限:spec §6.1 "列表上限 10 个会话 + 折行"。 */
+const MAX_LIST_ITEMS = 10;
+/** 列表 fallback 文本:卡超 25KB 时降级。 */
+const LIST_FALLBACK_TEXT = (n: number) => `📋 Agent View · ${n} sessions · /agents to refresh`;
 
 export interface AgentViewDeps {
   userManager: UserManager;
@@ -39,14 +47,22 @@ export class AgentViewManager {
       await this.deps.cardReplyFn(card, { openId });
       return;
     }
-    const groups = groupByStatus(result.sessions);
-    if (groups.busy.length + groups.waiting.length + groups.idle.length === 0) {
+    const totalSessions = result.sessions.length;
+    if (totalSessions === 0) {
       const card = buildEmptyCard();
       await this.deps.cardReplyFn(card, { openId });
       return;
     }
+    // 列表上限 10(spec §6.1)
+    const cappedSessions = result.sessions.slice(0, MAX_LIST_ITEMS);
+    const groups = groupByStatus(cappedSessions);
     const card = buildListCard(groups, new Date().toLocaleTimeString());
-    const cardMessageId = await this.deps.cardReplyFn(card, { openId });
+    const cardMessageId = await this.sendOrFallback(
+      card,
+      { openId },
+      LIST_FALLBACK_TEXT(totalSessions),
+      openId,
+    );
     if (cardMessageId) {
       // 保存 cardMessageId 到 user-mapping(last_agent_list_card)
       // 供 handleRefreshList 校验 messageId 时使用
@@ -91,13 +107,21 @@ export class AgentViewManager {
       await this.deps.patchFn(messageId, card);
       return null;
     }
-    const groups = groupByStatus(result.sessions);
-    if (groups.busy.length + groups.waiting.length + groups.idle.length === 0) {
+    const totalSessions = result.sessions.length;
+    if (totalSessions === 0) {
       const card = buildEmptyCard();
       await this.deps.patchFn(messageId, card);
       return null;
     }
+    const cappedSessions = result.sessions.slice(0, MAX_LIST_ITEMS);
+    const groups = groupByStatus(cappedSessions);
     const card = buildListCard(groups, new Date().toLocaleTimeString());
+    // G11:超 25KB 走 text fallback;用 replyFn 代替 patchFn(无法 patch 一个新消息)
+    const size = new TextEncoder().encode(card).length;
+    if (size > MAX_CARD_BYTES) {
+      await this.deps.replyFn(LIST_FALLBACK_TEXT(totalSessions), { openId });
+      return null;
+    }
     await this.deps.patchFn(messageId, card);
     return null;
   }
@@ -136,12 +160,14 @@ export class AgentViewManager {
       await this.deps.replyFn(`❌ claude logs 失败:${err.message}`, { openId });
       return null;
     }
-    // strip ANSI + 取后 30 行 + 截到 2048 bytes
+    // strip ANSI + 取后 N 行 + 截到 M bytes(N, M 来自 config)
     const { stripAnsi } = await import('./ansi-strip');
     const stripped = stripAnsi(raw);
-    const lines = stripped.split('\n').slice(-30).join('\n');
+    const peekLines = config.get<number>('agent_view.peek_lines', 30);
+    const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
+    const lines = stripped.split('\n').slice(-peekLines).join('\n');
     // agent-view 自己实现 truncateBytes(简单,避免跨模块依赖 card-updater private)
-    const truncated = truncateBytes(lines, 2048);
+    const truncated = truncateBytes(lines, peekMaxBytes);
     const buttons = {
       peek: true,
       attach: true,
@@ -161,7 +187,12 @@ export class AgentViewManager {
       recentOutput: truncated,
       buttons,
     });
-    return await this.deps.cardReplyFn(card, { openId });
+    return await this.sendOrFallback(
+      card,
+      { openId },
+      `🔍 Peek · \`${session.name}\` · /agents 刷新列表`,
+      openId,
+    );
   }
 
   /**
@@ -205,8 +236,10 @@ export class AgentViewManager {
     }
     const { stripAnsi } = await import('./ansi-strip');
     const stripped = stripAnsi(raw);
-    const lines = stripped.split('\n').slice(-30).join('\n');
-    const truncated = truncateBytes(lines, 2048);
+    const peekLines = config.get<number>('agent_view.peek_lines', 30);
+    const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
+    const lines = stripped.split('\n').slice(-peekLines).join('\n');
+    const truncated = truncateBytes(lines, peekMaxBytes);
     const buttons = {
       peek: true,
       attach: true,
@@ -226,6 +259,15 @@ export class AgentViewManager {
       recentOutput: truncated,
       buttons,
     });
+    // G11:超 25KB 走 text fallback(无法 patch 时发新文本)
+    const size = new TextEncoder().encode(card).length;
+    if (size > MAX_CARD_BYTES) {
+      await this.deps.replyFn(
+        `🔍 Peek · \`${session.name}\` · /agents 刷新列表`,
+        { openId },
+      );
+      return null;
+    }
     await this.deps.patchFn(messageId, card);
     return null;
   }
@@ -489,6 +531,24 @@ export class AgentViewManager {
     if (now - this.lastRefreshAt < this.minRefreshIntervalMs) return false;
     this.lastRefreshAt = now;
     return true;
+  }
+
+  /**
+   * G11 卡片尺寸保护:卡 ≤ 25KB 发 cardReplyFn;超 25KB 降级为 replyFn text。
+   * 返回 cardMessageId(若走 fallback 则返回 null)。
+   */
+  private async sendOrFallback(
+    card: string,
+    cardOpts: { openId: string; messageId?: string },
+    fallbackText: string,
+    openId: string,
+  ): Promise<string | null> {
+    const size = new TextEncoder().encode(card).length;
+    if (size > MAX_CARD_BYTES) {
+      await this.deps.replyFn(fallbackText, { openId });
+      return null;
+    }
+    return await this.deps.cardReplyFn(card, cardOpts);
   }
 }
 
