@@ -10,6 +10,8 @@ import { ProviderManager } from '../../utils/providers';
 import { ClaudeSessionManager, cleanupOrphanProcesses } from '../../proxy/session';
 import { SessionActivityCache, cleanupOldActivityLogs } from '../../utils/session-activity';
 import { getClaudeProcessesByCwd } from '../../utils/process-info';
+import { AgentViewManager } from '../../agent-view/manager';
+import type { AgentViewDeps } from '../../agent-view/manager';
 import { RUNTIME_PID_FILE, RUNTIME_LOG_FILE } from '../../utils/paths';
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
@@ -228,6 +230,7 @@ async function createBotRuntime(
   const stateCoordinator = new StateCoordinator();
   let replyFn: FeishuReplyFn = async () => null;
   let cardReplyFn: FeishuBotCardReplyFn = async () => null;
+  let patchFn: (messageId: string, card: string) => Promise<any> = async () => null;
 
   const providerManager = new ProviderManager();
 
@@ -290,6 +293,29 @@ async function createBotRuntime(
     cardReplyFn,
     feishuClient: client,
   });
+
+  // Construct AgentViewManager. runChatSDK is a placeholder — bot.setAgentView
+  // rewrites it to an arrow-bound call to this bot's runChatSDK.
+  // AgentViewDeps expects cardReplyFn(card: string, ...) but the bot's
+  // FeishuBotCardReplyFn takes (card: Record<string, unknown>, ...); wrap
+  // once so both interfaces stay satisfied without an extra JSON.parse round.
+  const agentViewCardReplyFn: AgentViewDeps['cardReplyFn'] = async (card, opts) => {
+    return cardReplyFn(JSON.parse(card), opts);
+  };
+  const agentView = new AgentViewManager({
+    userManager,
+    feishuClient: client,
+    replyFn,
+    cardReplyFn: agentViewCardReplyFn,
+    patchFn,
+    runChatSDK: async () => {
+      throw new Error('runChatSDK should be replaced by setAgentView before first use');
+    },
+  });
+  bot.setAgentView(agentView);
+  // R8 启动恢复:从 user-mapping.json 恢复 pending_agent_reply slots
+  // (清掉超时的,重建未超时的 in-memory + setTimeout)
+  await agentView.restoreExpectedReplyStates();
 
   if (!appId || !appSecret) {
     log('WARN', '飞书 App ID/Secret 未配置，跳过 WSClient 连接');
@@ -371,6 +397,29 @@ async function createBotRuntime(
       }
     };
     bot.setCardReplyFn(cardReplyFn);
+
+    // patchFn 实际调用飞书 message.update API 来更新已发送的卡片
+    // 这是 Agent View 刷新/等待状态更新所必需的
+    patchFn = async (
+      messageId: string,
+      card: string,
+    ): Promise<any> => {
+      try {
+        const response = await client.im.v1.message.patch({
+          path: { message_id: messageId },
+          data: {
+            content: card,
+          },
+        });
+        log('DEBUG', `[patchFn] 卡片更新成功: message_id=${messageId}`);
+        return response;
+      } catch (err: any) {
+        log('ERROR', `[patchFn] 卡片更新失败: ${err?.message ?? err}, messageId=${messageId}`);
+        return null;
+      }
+    };
+    // 把新的 patchFn 同步到 agentView.deps(注意:setAgentView 时已绑定 deps 对象)
+    agentView.deps.patchFn = patchFn;
 
     bot.setFeishuClient(client);
 
