@@ -1,7 +1,12 @@
 // src/agent-view/card.ts
 import type { AgentSessionGroup, AgentSession, AgentSessionStatus } from './types';
 
-const TEMPLATE_HEADER = { config: { wide_screen_mode: true } };
+// v2.2.20 fix: Agent View 卡(Peek/List/Error/Empty/Waiting/StopConfirm/BgConflict)
+// 全部需要 `update_multi: true`,否则飞书侧会把对它们的 patch 当成 "merge" 而
+// 非 "replace" 处理,出现"内容先刷新后被旧内容覆盖"的 revert 现象。
+// 参见 CardUpdater(card-updater.ts:204, 235, 287 等) 的 streaming/permission/
+// CLI busy 卡也都设了这个字段。
+const TEMPLATE_HEADER = { config: { wide_screen_mode: true, update_multi: true } };
 
 /** 列表卡:按 busy / waiting / idle / completed 四组渲染
  * v2.2 修正:hasMore > 0 时,追加 "… N more(用 `claude agents --cwd <path>` 缩小范围)" 提示
@@ -254,6 +259,38 @@ export function buildPeekCard(opts: {
       template: 'blue',
     },
     elements,
+  });
+}
+
+/**
+ * v2.2.20: Peek 卡 loading 占位符。
+ *
+ * 为什么需要:handleRefreshPeek 必须**同步**返回一个非 null 的 card 对象,
+ * 不能返回 null。如果返回 null,start.ts:508 会回 `return { type: 'raw', data: {} }`
+ * 给飞书,实测(2026-06-08 23:09)这种空响应会让飞书把卡片 revert 到最初
+ * 创建时的内容 → 用户报告"新内容先看到,然后被旧内容覆盖"。
+ *
+ * 修复模式(同 handlePermissionCardAction bot.ts:692-700):
+ *   1) sync 立即返回 loading 卡,飞书立即渲染
+ *   2) 1.2s 后 async patch 替换为真数据
+ */
+export function buildLoadingPeekCard(opts: {
+  name: string;
+  shortId: string;
+  sessionId: string;
+}): string {
+  return JSON.stringify({
+    ...TEMPLATE_HEADER,
+    header: {
+      title: { tag: 'plain_text', content: `⏳ 刷新中 · \`${opts.name}\`` },
+      template: 'blue',
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: '⏳ 正在加载最新日志...\n\n(异步 fetch JSONL 尾部 assistant 内容,约 1.2s)',
+      },
+    ],
   });
 }
 

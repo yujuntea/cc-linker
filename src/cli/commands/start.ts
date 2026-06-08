@@ -12,6 +12,7 @@ import { SessionActivityCache, cleanupOldActivityLogs } from '../../utils/sessio
 import { getClaudeProcessesByCwd } from '../../utils/process-info';
 import { AgentViewManager } from '../../agent-view/manager';
 import type { AgentViewDeps } from '../../agent-view/manager';
+import { createPatchFn } from '../../feishu/patch';
 import { RUNTIME_PID_FILE, RUNTIME_LOG_FILE } from '../../utils/paths';
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
@@ -404,35 +405,16 @@ async function createBotRuntime(
     };
     bot.setCardReplyFn(cardReplyFn);
 
-    // patchFn 实际调用飞书 message.update API 来更新已发送的卡片
-    // 这是 Agent View 刷新/等待状态更新所必需的
-    // v2.2 修正:1200ms delay 避免 Feishu card action event lock(bot.ts:608-625 同款 pattern)
-    // 测试模式:CC_LINKER_DISABLE_PATCH_DELAY=1 跳过延迟,加速测试
-    patchFn = async (
-      messageId: string,
-      card: string,
-    ): Promise<any> => {
-      if (process.env.CC_LINKER_DISABLE_PATCH_DELAY !== '1') {
-        await new Promise(r => setTimeout(r, 1200));
-      }
-      try {
-        const response = await client.im.v1.message.patch({
-          path: { message_id: messageId },
-          data: {
-            content: card,
-          },
-        });
-        if (response?.code !== 0) {
-          log('WARN', `[patchFn] 飞书返回非 0 code: ${response?.code}, message_id=${messageId}`);
-          return null;
-        }
-        log('DEBUG', `[patchFn] 卡片更新成功: message_id=${messageId}`);
-        return response;
-      } catch (err: any) {
-        log('WARN', `[patchFn] 卡片更新失败: ${err?.message ?? err}, messageId=${messageId}`);
-        return null;
-      }
-    };
+    // v2.2.20:把 patchFn 实现搬到 src/feishu/patch.ts,延迟参数化(默认 0)。
+    // 历史(commit 之前):这里写死 1200ms 延迟 + env var bypass,来自 permission
+    // card 路径的"避免 Feishu card action event lock"思路。但 agent-view 的
+    // patchFn 也会被 6 处 handler(handleRefreshList/Peek/StopAndSend/
+    // NewAndSend/BgConflictCancel/ReplyRequest)复用,1.2s 延迟让用户点 Refresh
+    // 后飞书客户端 1.2s 都看不到新内容,叠加 Peek 卡缺 update_multi: true
+    // (card.ts:4 已修)出现 revert 现象。Permission card 路径(在 bot.ts:663-679
+    // 用自己的 setTimeout)不走这个 patchFn,保留 1200ms 路径不必要。
+    // 同步把 CC_LINKER_DISABLE_PATCH_DELAY env var 移除(已无 1200ms 路径需要绕开)。
+    patchFn = createPatchFn(client, log);
     // 把新的 patchFn 同步到 agentView.deps(注意:setAgentView 时已绑定 deps 对象)
     agentView.deps.patchFn = patchFn;
 

@@ -7,6 +7,7 @@ import {
   buildEmptyCard,
   buildWaitingCard,
   buildStopConfirmCard,
+  buildBgConflictCard,
 } from '../../../src/agent-view/card';
 import { groupByStatus, type AgentSession } from '../../../src/agent-view/types';
 import { parseAgentsJson } from '../../../src/agent-view/snapshot';
@@ -249,5 +250,65 @@ describe('buildStopConfirmCard', () => {
     const actions = card.elements.find((e: any) => e.tag === 'action');
     const tags = actions?.actions?.map((a: any) => a.value?.tag) || [];
     expect(tags).toContain('agent_view_stop_confirm');
+  });
+});
+
+/**
+ * v2.2.20: Agent View 卡的 patch 在飞书侧被回滚/覆盖的根本原因之一是
+ * 缺 update_multi: true。CardUpdater 的所有动态卡(streaming/permission/
+ * CLI busy)都设了 update_multi:true,飞书把这当 "streaming-friendly" 处理,
+ * 每次 patch 都替换显示;Peek/List 等 agent-view 卡没有这个标记,飞书某些
+ * 情况下把首次 patch 当作 "merge" 而非 "replace" 处理,导致回滚到旧内容。
+ * 修复:TEMPLATE_HEADER 统一加 update_multi: true。
+ */
+describe('Agent View cards: update_multi: true (v2.2.20 fix for Peek revert bug)', () => {
+  test('buildPeekCard has update_multi: true', () => {
+    const card = JSON.parse(
+      buildPeekCard({
+        name: 'x', status: 'busy', cwd: '/', pid: 1, startedAt: 0,
+        recentOutput: 'r', shortId: 's', sessionId: 'u',
+        buttons: { peek: true, attach: true, reply: false, stop: true, refresh: true },
+      }),
+    );
+    expect(card.config).toBeDefined();
+    expect(card.config?.update_multi).toBe(true);
+  });
+
+  test('buildListCard has update_multi: true', () => {
+    const card = JSON.parse(
+      buildListCard({ busy: [], waiting: [], idle: [], completed: [] }, '12:34:56'),
+    );
+    expect(card.config?.update_multi).toBe(true);
+  });
+
+  test('buildErrorCard has update_multi: true', () => {
+    const card = JSON.parse(buildErrorCard({ title: 'X', body: 'Y' }));
+    expect(card.config?.update_multi).toBe(true);
+  });
+
+  test('buildEmptyCard has update_multi: true', () => {
+    const card = JSON.parse(buildEmptyCard());
+    expect(card.config?.update_multi).toBe(true);
+  });
+
+  test('buildWaitingCard has update_multi: true', () => {
+    const card = JSON.parse(
+      buildWaitingCard({ name: 'x', status: 'waiting', cwd: '/' }),
+    );
+    expect(card.config?.update_multi).toBe(true);
+  });
+
+  test('buildStopConfirmCard has update_multi: true', () => {
+    const card = JSON.parse(buildStopConfirmCard('x', 's', 'u'));
+    expect(card.config?.update_multi).toBe(true);
+  });
+
+  test('buildBgConflictCard has update_multi: true', () => {
+    const card = JSON.parse(
+      buildBgConflictCard({
+        name: 'x', shortId: 's', sessionId: 'u', cwd: '/', text: 't',
+      }),
+    );
+    expect(card.config?.update_multi).toBe(true);
   });
 });

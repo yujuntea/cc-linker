@@ -34,12 +34,16 @@ describe('start.ts — Agent View wiring regression', () => {
     expect(src).toMatch(/agentView\.restoreExpectedReplyStates\s*\(\s*\)/);
   });
 
-  test('declares a patchFn (Feishu message.update wiring)', () => {
-    // patchFn is the function that calls client.im.v1.message.patch
+  test('declares a patchFn and wires it through createPatchFn (v2.2.20 refactor)', () => {
+    // v2.2.20: patchFn 实现搬到 src/feishu/patch.ts 的 createPatchFn。
+    // start.ts 不再直接调 client.im.v1.message.patch(在 patch.ts 里)。
+    // 验证两点:
+    //   1) start.ts 仍然声明 patchFn 变量(后续赋值给 agentView.deps.patchFn)
+    //   2) start.ts 引用 createPatchFn 来构造它
     expect(src).toMatch(/let\s+patchFn/);
-    // Real implementation should call message.patch with message_id + content
-    expect(src).toMatch(/client\.im\.v1\.message\.patch\s*\(/);
-    expect(src).toMatch(/message_id/);
+    expect(src).toMatch(/createPatchFn\s*\(/);
+    // start.ts 应该 import 这个 helper
+    expect(src).toMatch(/from\s+['"]\.\.\/\.\.\/feishu\/patch['"]/);
   });
 
   // v2.2.9 regression — start.ts:232 declares replyFn / cardReplyFn / patchFn as

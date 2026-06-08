@@ -1,7 +1,7 @@
 import type { UserManager, MappingEntry } from '../feishu/mapping';
 import { AgentSnapshotFetcher } from './snapshot-fetcher';
 import { ExpectedReplyState } from './expected-reply-state';
-import { buildListCard, buildPeekCard, buildErrorCard, buildEmptyCard, buildWaitingCard, buildStopConfirmCard } from './card';
+import { buildListCard, buildPeekCard, buildErrorCard, buildEmptyCard, buildWaitingCard, buildStopConfirmCard, buildLoadingPeekCard } from './card';
 import type { AgentSession, AgentSessionGroup, AgentSessionStatus } from './types';
 import { groupByStatus } from './types';
 import { config } from '../utils/config';
@@ -254,67 +254,110 @@ export class AgentViewManager {
   }
 
   /**
-   * Peek 卡 → [Refresh] 按钮入口。校验 messageId 后,跟 handlePeek 类似流程
-   * 但用 patchFn patch 现有 peek 卡。session 不存在时 patch 错误卡提示"已自动刷新列表"。
+   * Peek 卡 → [Refresh] 按钮入口。
+   *
+   * v2.2.20 关键修复:**必须 sync 返回 loading card object,不能 null**。
+   *
+   * 原因:start.ts:508 在 reply 为 null/string 时回 `return { type: 'raw', data: {} }`
+   * 给飞书。实测(2026-06-08 23:09)这种空响应会让飞书把卡片 revert 到最初
+   * 创建时的内容 → 用户报告"新内容先看到,然后被旧内容覆盖"。
+   *
+   * 修复:返回 sync loading card(飞书立即渲染),1.2s 后 async patch 替换为
+   * 真数据(避开飞书 card action event lock + update_multi:true 保证替换
+   * 生效)。
    */
   async handleRefreshPeek(
     openId: string,
     shortId: string,
     sessionId: string,
     messageId?: string,
-  ): Promise<string | null> {
+  ): Promise<string | Record<string, unknown> | null> {
     if (!messageId) return null;
     // 2s debounce:防止用户对同一 Peek 卡快速连点 Refresh
     // (实测日志 11:25-11:27 期间 10 次),避免多次 patch 排队叠加 1200ms 延迟
     // 导致 patch 顺序不可控,Feishu 客户端把早到(synthetic 内容)的 patch
     // 渲染为终态——表现为 "原卡片内容覆盖" 现象。
     if (!this.shouldRefresh()) return null;
-    const session = await this.findSession(openId, sessionId);
-    if (!session) {
-      await this.deps.patchFn(
-        messageId,
-        buildErrorCard({
-          title: '⚠️ 会话已不存在',
-          body: '已自动刷新列表',
-        }),
-      );
-      return null;
+
+    // 同步做基础 session 校验(用于给 sync loading card 一个名字)
+    // 用 try/catch 包裹:如果 snapshot fetch 失败,fallback 通用 loading card
+    let sessionName = shortId;
+    try {
+      const session = await this.findSession(openId, sessionId);
+      if (!session) {
+        // session 已不存在:直接 sync 返回错误卡,无需 async patch
+        return JSON.parse(
+          buildErrorCard({
+            title: '⚠️ 会话已不存在',
+            body: '已自动刷新列表',
+          }),
+        );
+      }
+      sessionName = session.name;
+    } catch {
+      // snapshot 拉取失败也走 loading card 路径(用户至少能看到个反馈)
     }
-    const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
-    const peek = await this.resolvePeekContent(shortId, peekMaxBytes);
-    const truncated = peek.text ?? '(无可用输出)';
-    const buttons = {
-      peek: true,
-      attach: true,
-      reply: session.status === 'waiting',
-      stop: session.status === 'busy',
-      refresh: true,
-    };
-    const card = buildPeekCard({
-      name: session.name,
-      status: session.status,
-      completed: session.completed,
-      waitingFor: session.waitingFor,
-      shortId,
-      sessionId,
-      cwd: session.cwd,
-      pid: session.pid,
-      startedAt: session.startedAt,
-      recentOutput: truncated,
-      outputFormat: peek.format,
-      buttons,
-    });
-    // G11:超 25KB 走 text fallback(无法 patch 时发新文本)
-    const size = new TextEncoder().encode(card).length;
-    if (size > MAX_CARD_BYTES) {
-      await this.deps.replyFn(
-        `🔍 Peek · \`${session.name}\` · /agents 刷新列表`,
-        { openId },
-      );
-      return null;
+
+    // Fire-and-forget:在 background 跑真正的数据拉取 + patch
+    // 不 await —— bot 会把 sync 返回的 loading card 立即发给飞书
+    void this._doRefreshPeek(openId, shortId, sessionId, messageId, sessionName);
+
+    // Sync 返回 loading card(飞书立即渲染,1.2s 后被真数据 patch 替换)
+    return JSON.parse(buildLoadingPeekCard({ name: sessionName, shortId, sessionId }));
+  }
+
+  /**
+   * v2.2.20: handleRefreshPeek 的 background work。
+   * 1.2s 后用真数据 patch Peek 卡,叠加 update_multi:true 让飞书正常替换内容。
+   */
+  private async _doRefreshPeek(
+    openId: string,
+    shortId: string,
+    sessionId: string,
+    messageId: string,
+    sessionName: string,
+  ): Promise<void> {
+    try {
+      const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
+      const peek = await this.resolvePeekContent(shortId, peekMaxBytes);
+      const truncated = peek.text ?? '(无可用输出)';
+      // 这里 findSession 之前已经跑过一次(在 sync 路径),但为保险起见再拉一次
+      const session = await this.findSession(openId, sessionId);
+      if (!session) return;
+      const buttons = {
+        peek: true,
+        attach: true,
+        reply: session.status === 'waiting',
+        stop: session.status === 'busy',
+        refresh: true,
+      };
+      const card = buildPeekCard({
+        name: session.name,
+        status: session.status,
+        completed: session.completed,
+        waitingFor: session.waitingFor,
+        shortId,
+        sessionId,
+        cwd: session.cwd,
+        pid: session.pid,
+        startedAt: session.startedAt,
+        recentOutput: truncated,
+        outputFormat: peek.format,
+        buttons,
+      });
+      // G11:超 25KB 走 text fallback(无法 patch 时发新文本)
+      const size = new TextEncoder().encode(card).length;
+      if (size > MAX_CARD_BYTES) {
+        await this.deps.replyFn(
+          `🔍 Peek · \`${sessionName}\` · /agents 刷新列表`,
+          { openId },
+        );
+        return;
+      }
+      await this.deps.patchFn(messageId, card);
+    } catch (err: any) {
+      logger.warn(`_doRefreshPeek failed: shortId=${shortId}, err=${err?.message ?? err}`);
     }
-    await this.deps.patchFn(messageId, card);
-    return null;
   }
 
   /**

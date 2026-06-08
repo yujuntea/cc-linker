@@ -432,6 +432,14 @@ describe('handlePeek', () => {
 });
 
 describe('handleRefreshPeek', () => {
+  /** v2.2.20: fire-and-forget 模式,需要等 microtask flush 才能看到 patchFn 调用 */
+  async function flushMicrotasks() {
+    // 多次 setImmediate 嵌套,确保 _doRefreshPeek 链路上每个 await 都跑完
+    for (let i = 0; i < 5; i++) {
+      await new Promise<void>((r) => setImmediate(r));
+    }
+  }
+
   test('patches peek card with fresh logs when session still exists', async () => {
     const { mgr, cardReplyFn, patchFn, replyFn } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
@@ -446,6 +454,7 @@ describe('handleRefreshPeek', () => {
 
     const shortId = waiting.sessionId.slice(0, 8);
     await mgr.handleRefreshPeek('ou_rpeek_1', shortId, waiting.sessionId, 'om_peek_001');
+    await flushMicrotasks();
 
     // patchFn called once with the right messageId; cardReplyFn NOT called
     expect(patchFn).toHaveBeenCalledTimes(1);
@@ -465,25 +474,28 @@ describe('handleRefreshPeek', () => {
   test('no-ops when messageId is missing', async () => {
     const { mgr, patchFn, cardReplyFn } = makeMgrWithSpies();
     await mgr.handleRefreshPeek('ou_rpeek_noop', 'shortid', 'session', undefined);
+    await flushMicrotasks();
     expect(patchFn).not.toHaveBeenCalled();
     expect(cardReplyFn).not.toHaveBeenCalled();
   });
 
-  test('patches an error card when session has disappeared', async () => {
+  test('returns error card SYNC when session has disappeared (no background patch needed)', async () => {
     const { mgr, patchFn, cardReplyFn } = makeMgrWithSpies();
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
       ok: true,
       sessions: [],
     }));
 
-    await mgr.handleRefreshPeek('ou_rpeek_gone', 'shortid', 'missing', 'om_peek_002');
+    const result = await mgr.handleRefreshPeek('ou_rpeek_gone', 'shortid', 'missing', 'om_peek_002');
+    await flushMicrotasks();
 
-    expect(patchFn).toHaveBeenCalledTimes(1);
-    expect(patchFn.mock.calls[0][0]).toBe('om_peek_002');
-    const sentCard = JSON.parse(patchFn.mock.calls[0][1] as string);
-    // Error card template=red with "会话已不存在" header
+    // v2.2.20:session 不存在时,直接 sync 返回 error card(避免空响应触发 revert)
+    expect(result).not.toBeNull();
+    const sentCard = result as any;
     expect(sentCard.header.template).toBe('red');
     expect(sentCard.header.title.content).toContain('会话已不存在');
+    // background 不再 patch(因为已经 sync 返回了 error card)
+    expect(patchFn).not.toHaveBeenCalled();
     expect(cardReplyFn).not.toHaveBeenCalled();
   });
 
@@ -502,13 +514,55 @@ describe('handleRefreshPeek', () => {
 
     // 第一次:shouldRefresh=true,会发 patch
     await mgr.handleRefreshPeek('ou_rpeek_dedupe', shortId, busy.sessionId, 'om_peek_dedupe');
+    await flushMicrotasks();
     expect(patchFn).toHaveBeenCalledTimes(1);
 
     // 紧接第二次:应在 debounce 窗口内,无操作
     patchFn.mockClear();
     await mgr.handleRefreshPeek('ou_rpeek_dedupe', shortId, busy.sessionId, 'om_peek_dedupe');
+    await flushMicrotasks();
     expect(patchFn).not.toHaveBeenCalled();
     expect(cardReplyFn).not.toHaveBeenCalled();
+  });
+
+  // v2.2.20 关键修复:handleRefreshPeek 必须返回 sync card object(loading placeholder),
+  // 不能返回 null。如果返回 null,start.ts:508 会回 `return { type: 'raw', data: {} }`
+  // 给飞书,实测这种空响应会让飞书把卡片 revert 到最初创建时的内容(用户报告的
+  // "新内容先看到,然后被旧内容覆盖" 中的旧内容)。
+  // 修复后:返回 sync loading card,飞书立即渲染 → 1.2s 后 async patch 替换为真内容。
+  test('returns a SYNC loading card (not null) to prevent Feishu revert', async () => {
+    const { mgr, patchFn } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [waiting],
+    }));
+    const shortId = waiting.sessionId.slice(0, 8);
+
+    const result = await mgr.handleRefreshPeek(
+      'ou_rpeek_sync_1', shortId, waiting.sessionId, 'om_peek_sync_001',
+    );
+
+    // 关键断言:返回值必须是非 null 的 card object(loading placeholder)
+    expect(result).not.toBeNull();
+    expect(typeof result).toBe('object');
+    const card = result as any;
+    // 必须是 update_multi: true,否则 patch 会被飞书当 merge 处理
+    expect(card.config?.update_multi).toBe(true);
+    // header 应该是 loading 风格(蓝底 + ⏳ 图标)
+    expect(card.header.template).toBe('blue');
+    expect(card.header.title.content).toMatch(/⏳|刷新|loading/i);
+
+    // 异步 patch 在微任务队列里完成 — 等 1 个 tick 拿到 patchFn 调用
+    // 注:这是 fire-and-forget,实际生产中 patchFn 会晚于 sync card 返回约 1.2s
+    // (避开飞书 card action event lock)
+    await new Promise(r => setTimeout(r, 10));
+    expect(patchFn).toHaveBeenCalledTimes(1);
+    const patchedCard = JSON.parse(patchFn.mock.calls[0][1] as string);
+    // 异步 patch 里的卡是真数据(包含 session name,不是 loading)
+    expect(patchedCard.header.title.content).toContain('waiting-task');
+    // 不应再是 loading 文案
+    expect(patchedCard.header.title.content).not.toMatch(/⏳/);
   });
 });
 
