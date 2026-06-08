@@ -39,7 +39,8 @@ export type AgentViewValue =
       hasParent: boolean;
     }
   | { tag: 'agent_view_new_and_send'; cwd: string; text: string }
-  | { tag: 'agent_view_bg_conflict_cancel' };
+  | { tag: 'agent_view_bg_conflict_cancel' }
+  | { tag: 'agent_view_stop_watching' };
 
 export function isAgentViewValue(v: any): v is AgentViewValue {
   if (!v || typeof v !== 'object' || typeof v.tag !== 'string') return false;
