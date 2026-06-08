@@ -407,6 +407,10 @@ export class FeishuBot {
   async shutdown(): Promise<void> {
     const watchers = Array.from(this.liveWatchers.values());
     this.liveWatchers.clear();
+    // 新增:也停 agentView 的 attached watchers
+    if (this.agentView) {
+      await this.agentView.attachedWatchers.stopAll();
+    }
     await Promise.all(watchers.map(w => w.stop('bot_shutdown')));
   }
 
