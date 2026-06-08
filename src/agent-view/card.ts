@@ -544,7 +544,7 @@ function truncateRecentForCard(
 }
 
 /**
- * 内部渲染器:无截断,纯字符串拼接。Task 3 会在此基础上加截断 wrapper。
+ * 内部渲染器:无截断,纯字符串拼接。被 buildAttachedCard(经 truncateRecentForCard)和 truncateRecentForCard 自身共用。
  * @internal
  */
 function renderAttachedCardJson(opts: {
