@@ -929,6 +929,10 @@ export class FeishuBot {
     //              写命令 清 expectedReply + 提示"已自动取消",再走 handleCommand
     // - 普通文本 → expectedReply 激活时 → handleReply,否则走原 switch
     if (this.agentView && config.get<boolean>('agent_view.enabled', true)) {
+      // 新增:任何进入 handleChat 的消息都停掉当前 attached watch
+      if (this.agentView.attachedWatchers.has(msg.openId)) {
+        void this.agentView.attachedWatchers.stop(msg.openId, 'user_chat', { patchFinal: true });
+      }
       if (msg.text === '/cancel') {
         await this.agentView.handleCancelReply(msg.openId, msg.messageId);
         return;
