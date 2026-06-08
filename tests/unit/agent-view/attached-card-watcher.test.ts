@@ -275,3 +275,114 @@ describe('AttachedCardWatcher.tick()', () => {
     expect(onStop).toHaveBeenCalledWith('ou_test', 'max_ticks', watcher);
   });
 });
+
+describe('AttachedWatchers manager', () => {
+ let patchFn: ReturnType<typeof mock>;
+ let resolveContent: ReturnType<typeof mock>;
+
+ beforeEach(() => {
+ patchFn = mock(async () => ({}));
+ resolveContent = mock(async () => ({ text: 'output', format: 'markdown' as const }));
+ });
+
+ test('start adds watcher to map; has() returns true', async () => {
+ const mgr = new AttachedWatchers(patchFn, resolveContent, {
+ ...DEFAULT_ATTACHED_WATCH_CONFIG, intervalMs:50,
+ });
+ expect(mgr.has('ou_a')).toBe(false);
+ await mgr.start('ou_a', {
+ sessionId: 's1', shortId: 's1short', name: 'n', cwd: '/tmp', cardMessageId: 'om1',
+ });
+ expect(mgr.has('ou_a')).toBe(true);
+ await mgr.stopAll();
+ });
+
+ test('start supersedes old watcher (old stop, new starts)', async () => {
+ const mgr = new AttachedWatchers(patchFn, resolveContent, {
+ ...DEFAULT_ATTACHED_WATCH_CONFIG, intervalMs:50,
+ });
+ await mgr.start('ou_a', {
+ sessionId: 's1', shortId: 's1short', name: 'n1', cwd: '/tmp', cardMessageId: 'om1',
+ });
+ const oldWatcher = (mgr as any).watchers.get('ou_a');
+ await mgr.start('ou_a', {
+ sessionId: 's2', shortId: 's2short', name: 'n2', cwd: '/tmp', cardMessageId: 'om2',
+ });
+ const newWatcher = (mgr as any).watchers.get('ou_a');
+ expect(newWatcher).not.toBe(oldWatcher);
+ expect((oldWatcher as any).stopped).toBe(true);
+ expect((newWatcher as any).stopped).toBe(false);
+ await mgr.stopAll();
+ });
+
+ test('stop: removes from map', async () => {
+ const mgr = new AttachedWatchers(patchFn, resolveContent, {
+ ...DEFAULT_ATTACHED_WATCH_CONFIG, intervalMs:50,
+ });
+ await mgr.start('ou_a', {
+ sessionId: 's1', shortId: 's1short', name: 'n', cwd: '/tmp', cardMessageId: 'om1',
+ });
+ await mgr.stop('ou_a', 'user_stop');
+ expect(mgr.has('ou_a')).toBe(false);
+ });
+
+ test('stop on missing openId: no-op', async () => {
+ const mgr = new AttachedWatchers(patchFn, resolveContent);
+ await mgr.stop('nonexistent', 'test'); // should not throw
+ });
+
+ test('identity check: old watcher onStop does not delete new watcher', async () => {
+ const mgr = new AttachedWatchers(patchFn, resolveContent, {
+ ...DEFAULT_ATTACHED_WATCH_CONFIG, intervalMs:50,
+ });
+ await mgr.start('ou_a', {
+ sessionId: 's1', shortId: 's1short', name: 'n1', cwd: '/tmp', cardMessageId: 'om1',
+ });
+ const oldWatcher = (mgr as any).watchers.get('ou_a');
+ // supersede-style start
+ await mgr.start('ou_a', {
+ sessionId: 's2', shortId: 's2short', name: 'n2', cwd: '/tmp', cardMessageId: 'om2',
+ });
+ // manually invoke oldWatcher.onStop (simulating slow in-flight tick completing)
+ oldWatcher.deps.onStop('ou_a', 'superseded', oldWatcher);
+ // verify new watcher in map was not deleted
+ expect(mgr.has('ou_a')).toBe(true);
+ const current = (mgr as any).watchers.get('ou_a');
+ expect(current).not.toBe(oldWatcher);
+ await mgr.stopAll();
+ });
+
+ test('inFlightTick mutex: setInterval skips if previous still running', async () => {
+ // construct a slow patchFn that simulates tick blocking
+ let resolvePatch: () => void = () => {};
+ const slowPatch = mock(async () => {
+ return new Promise<void>(r => { resolvePatch = r; });
+ });
+ const mgr = new AttachedWatchers(slowPatch as any, resolveContent, {
+ ...DEFAULT_ATTACHED_WATCH_CONFIG, intervalMs:10, maxTicks:1000,
+ });
+ // stub AgentSnapshotFetcher (project pattern, not spyOn, to avoid spy leakage)
+ const origFetch = AgentSnapshotFetcher.fetch;
+ (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+ ok: true,
+ sessions: [{
+ pid:1, cwd: '/tmp', kind: 'background', startedAt: Date.now(),
+ sessionId: 's1', name: 'n', status: 'busy', source: 'slash',
+ }],
+ }));
+ try {
+ await mgr.start('ou_a', {
+ sessionId: 's1', shortId: 's1short', name: 'n', cwd: '/tmp', cardMessageId: 'om1',
+ });
+ // wait ~30ms so multiple intervals fire
+ await new Promise(r => setTimeout(r,30));
+ // patch should only be called once (inFlightTick mutex skips subsequent)
+ expect(slowPatch).toHaveBeenCalledTimes(1);
+ // resolve in-flight patch
+ resolvePatch();
+ } finally {
+ (AgentSnapshotFetcher as any).fetch = origFetch;
+ await mgr.stopAll();
+ }
+ });
+});
