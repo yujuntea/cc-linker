@@ -60,16 +60,15 @@ handleAttach(openId, sessionId, shortId, name, cwd)
   │
   ├─ [0] 实时守卫 + [1] CAS 1 清旧 + [2] CAS 2 写新（不变）
   │
-  ├─ [3] replyFn('📎 已 Attach 到 `name` ...')        ← 原文本确认保留
+  ├─ [3] replyFn('📎 已 Attach 到 `name` ...')           ← 原文本确认保留
   │
-  └─ [4] this.attachedWatchers.start(openId, {        ← 新增
-         sessionId, shortId, name, cwd, cardReplyFn, patchFn, ...
-       })
+  └─ [4] 发首张 attached 卡 + 启动 watch (AttachedWatchers.start) ← 新增
        │
        ├─ 构造 buildAttachedCard (status + cwd + waitingFor + recentOutput)
        ├─ 调 cardReplyFn 发卡 → 拿到 cardMessageId
        ├─ if (size > 25KB) 走智能截断重试（§3.3）
-       └─ 启动 setInterval(10s) → tick() (AttachedCardWatcher 内部)
+       └─ 调 attachedWatchers.start(openId, { sessionId, shortId, name, cwd, cardMessageId })
+              → 构造 watcher + setInterval(10s) → tick()
 ```
 
 ```
@@ -414,7 +413,7 @@ tick() 触发 (setInterval 10s)
   ├─ card = buildAttachedCard({ ... content.text, outputFormat: content.format, lastWatchedAt: now.toLocaleTimeString() })
   │     └─ 内含 §3.3 智能截断
   │
-  └─ await this.deps.patchFn(this.cardMessageId, card)
+  └─ await this.deps.patchFn(this.deps.cardMessageId, card)
         ├─ 成功 → patchFailureCount = 0
         └─ 失败 → patchFailureCount++;≥ 3 → stop('patch_failed')
 ```
