@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, mock, afterAll } from 'bun:test';
+import { beforeEach, afterEach, describe, expect, test, mock } from 'bun:test';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -66,7 +66,7 @@ beforeEach(() => {
   (AgentSnapshotFetcher as any).fetch = mock(async () => ({ ok: true, sessions: [] }));
 });
 
-afterAll(() => {
+afterEach(() => {
   (AgentSnapshotFetcher as any).fetch = origFetcherFetch;
 });
 

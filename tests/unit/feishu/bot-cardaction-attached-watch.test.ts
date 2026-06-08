@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, mock } from 'bun:test';
+import { beforeEach, afterEach, describe, expect, test, mock } from 'bun:test';
 import { FeishuBot } from '../../../src/feishu/bot';
 import { AgentViewManager } from '../../../src/agent-view/manager';
 import { UserManager } from '../../../src/feishu/mapping';
@@ -28,6 +28,10 @@ beforeEach(() => {
   };
   bot.setAgentView(agentView);
   (AgentSnapshotFetcher as any).fetch = mock(async () => ({ ok: true, sessions: [] }));
+});
+
+afterEach(() => {
+  (AgentSnapshotFetcher as any).fetch = origFetcherFetch;
 });
 
 describe('FeishuBot.handleCardAction agent_view_stop_watching', () => {

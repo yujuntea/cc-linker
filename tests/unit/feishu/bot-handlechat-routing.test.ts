@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterAll, mock } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { FeishuBot } from '../../../src/feishu/bot';
 import { AgentViewManager } from '../../../src/agent-view/manager';
 import { UserManager } from '../../../src/feishu/mapping';
@@ -294,6 +294,6 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
   });
 });
 
-afterAll(() => {
+afterEach(() => {
   (AgentSnapshotFetcher as any).fetch = origFetcherFetch;
 });

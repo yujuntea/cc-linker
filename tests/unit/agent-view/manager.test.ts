@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, mock, afterAll } from 'bun:test';
+import { beforeEach, afterEach, describe, expect, test, mock } from 'bun:test';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -54,7 +54,7 @@ mock.module('node:child_process', () => {
 
 let tmpDir: string;
 
-// Snapshot of the original fetch — restored in afterAll so other test files
+// Snapshot of the original fetch — restored in afterEach so other test files
 // don't see our mocks bleed over (Bun shares the module registry).
 const origFetch = AgentSnapshotFetcher.fetch;
 
@@ -65,9 +65,12 @@ beforeEach(() => {
   execFileMock.mockImplementation((_cmd, _args, cb) => {
     cb(null, '', '');
   });
+  // 每个 test 入口先重置到原版 fetch,防止上个 test 的 (AgentSnapshotFetcher as any).fetch
+  // = mock(...) 漏到本次 test(afterEach 兜底,beforeEach 双保险)。
+  (AgentSnapshotFetcher as any).fetch = origFetch;
 });
 
-afterAll(() => {
+afterEach(() => {
   (AgentSnapshotFetcher as any).fetch = origFetch;
 });
 

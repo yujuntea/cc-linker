@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, mock, afterAll } from 'bun:test';
+import { beforeEach, describe, expect, test, mock, afterEach } from 'bun:test';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -67,7 +67,7 @@ beforeEach(() => {
   }));
 });
 
-afterAll(() => {
+afterEach(() => {
   (AgentSnapshotFetcher as any).fetch = origFetcherFetch;
 });
 

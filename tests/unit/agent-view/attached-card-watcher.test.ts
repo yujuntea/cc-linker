@@ -96,6 +96,10 @@ describe('AttachedCardWatcher.tick()', () => {
     fetchSpy = spyOn(AgentSnapshotFetcher, 'fetch');
   });
 
+  afterEach(() => {
+    fetchSpy?.mockRestore?.();
+  });
+
   test('happy path: snapshot busy + content -> patchFn called once', async () => {
     fetchSpy.mockResolvedValue({ ok: true, sessions: [makeSession('busy')] });
     const watcher = new AttachedCardWatcher({
