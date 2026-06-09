@@ -1,0 +1,36 @@
+{
+  "state": "done",
+  "detail": "",
+  "tempo": "idle",
+  "output": null,
+  "children": null,
+  "linkScanOffset": 113583,
+  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/4d9df1d2-3319-4535-a175-f8011b0db673.jsonl",
+  "template": "bg",
+  "respawnFlags": [
+    "--settings",
+    "/Users/wuyujun/.claude/providers/xiaomi-mimo.json",
+    "--model",
+    "mimo-v2.5-pro[1m]"
+  ],
+  "providerEnv": {
+    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+  },
+  "intent": "test 1: sleep 30 && echo done",
+  "name": "shell command execution",
+  "nameSource": "auto",
+  "sessionId": "4d9df1d2-3319-4535-a175-f8011b0db673",
+  "resumeSessionId": "4d9df1d2-3319-4535-a175-f8011b0db673",
+  "daemonShort": "4d9df1d2",
+  "cliVersion": "2.1.163",
+  "cwd": "/Users/wuyujun",
+  "createdAt": "2026-06-09T02:56:32.639Z",
+  "updatedAt": "2026-06-09T11:22:32.069Z",
+  "firstTerminalAt": "2026-06-09T02:57:16.658Z",
+  "backend": "daemon",
+  "inFlight": {
+    "tasks": 0,
+    "queued": 0,
+    "kinds": []
+  }
+}

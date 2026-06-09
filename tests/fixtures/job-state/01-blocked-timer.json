@@ -1,0 +1,39 @@
+{
+  "state": "blocked",
+  "detail": "是否继续？",
+  "tempo": "blocked",
+  "inFlight": {
+    "tasks": 0,
+    "queued": 0,
+    "kinds": []
+  },
+  "needs": "是否继续？",
+  "output": null,
+  "children": null,
+  "linkScanOffset": 95389,
+  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/3a41fe73-0951-470a-bd2f-fb5a9f0fbe6b.jsonl",
+  "template": "bg",
+  "respawnFlags": [
+    "--reply-on-resume",
+    "--permission-mode",
+    "acceptEdits",
+    "--model",
+    "MiniMax-M3[1m]"
+  ],
+  "intent": "sleep 30 && echo done",
+  "name": "timer command response",
+  "nameSource": "auto",
+  "sessionId": "3a41fe73-0951-470a-bd2f-fb5a9f0fbe6b",
+  "resumeSessionId": "3a41fe73-0951-470a-bd2f-fb5a9f0fbe6b",
+  "daemonShort": "3a41fe73",
+  "cliVersion": "2.1.163",
+  "cwd": "/Users/wuyujun",
+  "bgIsolation": "none",
+  "providerEnv": {
+    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+  },
+  "backend": "daemon",
+  "createdAt": "2026-06-06T11:19:51.691Z",
+  "updatedAt": "2026-06-09T16:42:02.148Z",
+  "firstTerminalAt": "2026-06-06T11:21:34.802Z"
+}

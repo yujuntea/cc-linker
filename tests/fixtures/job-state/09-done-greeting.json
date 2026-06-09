@@ -1,0 +1,34 @@
+{
+  "state": "done",
+  "detail": "",
+  "tempo": "idle",
+  "output": null,
+  "children": null,
+  "linkScanOffset": 49285,
+  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/e36ed632-4774-4c36-86b2-359431f453b3.jsonl",
+  "template": "bg",
+  "respawnFlags": [
+    "--settings",
+    "/Users/wuyujun/.claude/providers/bailian-qwen3.6.json",
+    "--permission-mode",
+    "acceptEdits",
+    "--model",
+    "qwen3.6-plus[1m]"
+  ],
+  "bgIsolation": "none",
+  "providerEnv": {
+    "ANTHROPIC_MODEL": "qwen3.6-plus[1m]"
+  },
+  "intent": "hi",
+  "name": "greeting handler",
+  "nameSource": "auto",
+  "sessionId": "e36ed632-4774-4c36-86b2-359431f453b3",
+  "resumeSessionId": "e36ed632-4774-4c36-86b2-359431f453b3",
+  "daemonShort": "e36ed632",
+  "cliVersion": "2.1.163",
+  "cwd": "/Users/wuyujun",
+  "createdAt": "2026-06-07T14:25:59.491Z",
+  "updatedAt": "2026-06-08T14:55:37.892Z",
+  "firstTerminalAt": "2026-06-07T17:15:26.303Z",
+  "backend": "daemon"
+}

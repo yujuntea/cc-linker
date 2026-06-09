@@ -1,0 +1,18 @@
+{
+  "state": "hypothetical_future_state",
+  "tempo": "idle",
+  "detail": null,
+  "needs": null,
+  "inFlight": null,
+  "linkScanPath": null,
+  "linkScanOffset": 0,
+  "name": "future state test",
+  "nameSource": "auto",
+  "intent": "test forward compat",
+  "resumeSessionId": "00000000-0000-0000-0000-000000000000",
+  "daemonShort": "00000000",
+  "template": "bg",
+  "respawnFlags": [],
+  "cliVersion": "9.9.9",
+  "cwd": "/tmp"
+}

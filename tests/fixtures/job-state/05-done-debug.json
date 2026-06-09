@@ -1,0 +1,40 @@
+{
+  "state": "done",
+  "detail": "shipped cc-linker@0.4.2: commit 2733855, npm published, GitHub Release + tags pushed",
+  "tempo": "idle",
+  "inFlight": {
+    "tasks": 0,
+    "queued": 0,
+    "kinds": []
+  },
+  "output": {
+    "result": "cc-linker@0.4.2 shipped (npm + GitHub Release + tags)"
+  },
+  "children": null,
+  "linkScanOffset": 3876293,
+  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun-Git-cc-linker/5bb2a103-eee2-41bd-8e9d-00af400ac813.jsonl",
+  "template": "bg",
+  "respawnFlags": [
+    "--reply-on-resume",
+    "--permission-mode",
+    "acceptEdits",
+    "--model",
+    "MiniMax-M3[1m]"
+  ],
+  "bgIsolation": "none",
+  "providerEnv": {
+    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+  },
+  "intent": "Git 上也创建下新 Tag 呀，同时放上npm包",
+  "name": "Debug peek card refresh state override",
+  "nameSource": "auto",
+  "sessionId": "5bb2a103-eee2-41bd-8e9d-00af400ac813",
+  "resumeSessionId": "5bb2a103-eee2-41bd-8e9d-00af400ac813",
+  "daemonShort": "5bb2a103",
+  "cliVersion": "2.1.163",
+  "cwd": "/Users/wuyujun/Git/cc-linker",
+  "createdAt": "2026-06-08T16:02:36.860Z",
+  "updatedAt": "2026-06-09T10:47:56.088Z",
+  "firstTerminalAt": "2026-06-08T16:07:52.563Z",
+  "backend": "daemon"
+}

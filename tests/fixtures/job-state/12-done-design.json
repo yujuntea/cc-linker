@@ -1,0 +1,37 @@
+{
+  "state": "done",
+  "detail": "no task given — agent standing by, waiting for instructions",
+  "tempo": "idle",
+  "inFlight": {
+    "tasks": 0,
+    "queued": 0,
+    "kinds": []
+  },
+  "output": null,
+  "children": null,
+  "linkScanOffset": 52252,
+  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun-Git-cc-linker/92664deb-f4b6-48d3-9cdd-85cf8eea6dfc.jsonl",
+  "template": "bg",
+  "respawnFlags": [
+    "--permission-mode",
+    "acceptEdits",
+    "--model",
+    "MiniMax-M3[1m]"
+  ],
+  "intent": "OK",
+  "name": "Design cross-model AI review tool",
+  "nameSource": "auto",
+  "sessionId": "92664deb-f4b6-48d3-9cdd-85cf8eea6dfc",
+  "resumeSessionId": "92664deb-f4b6-48d3-9cdd-85cf8eea6dfc",
+  "daemonShort": "92664deb",
+  "cliVersion": "2.1.163",
+  "cwd": "/Users/wuyujun/Git/cc-linker",
+  "bgIsolation": "none",
+  "providerEnv": {
+    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+  },
+  "backend": "daemon",
+  "createdAt": "2026-06-06T06:47:00.129Z",
+  "updatedAt": "2026-06-07T14:25:22.910Z",
+  "firstTerminalAt": "2026-06-07T14:25:22.910Z"
+}
