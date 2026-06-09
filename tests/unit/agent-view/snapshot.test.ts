@@ -223,4 +223,20 @@ describe('groupByStatus (v2.2.4: completed section)', () => {
     expect(groups.busy).toHaveLength(1);
     expect(groups.completed).toHaveLength(0);
   });
+
+  test('v2.3: stopped session(name with 🛑 prefix, completed=true) goes into completed group', () => {
+    // jobStateToSession 把 state=stopped 也映射成 status=idle + completed=true,
+    // 然后 snapshot-fetcher 给 name 加 🛑 前缀。groupByStatus 不需要特判 — 现有
+    // completed 逻辑已经把它正确归类。这条断言锁住该约束。
+    const sessions = [
+      mk({ name: '🛑 stopped task', status: 'idle', completed: true }),
+      mk({ name: '✅ just settled', status: 'idle', completed: true }),
+      mk({ name: 'still idle', status: 'idle' }),
+    ];
+    const groups = groupByStatus(sessions);
+    expect(groups.completed).toHaveLength(2);
+    expect(groups.idle).toHaveLength(1);
+    expect(groups.completed.map(s => s.name)).toContain('🛑 stopped task');
+    expect(groups.completed.map(s => s.name)).toContain('✅ just settled');
+  });
 });
