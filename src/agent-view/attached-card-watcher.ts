@@ -89,6 +89,7 @@ export class AttachedCardWatcher {
  () => {
  // skip overlap, 同 live-progress.ts:115
  if (this.inFlightTick) return;
+ logger.info(`[DIAG] AttachedCardWatcher setInterval fire: openId=${this.deps.openId}, cardMessageId=${this.deps.cardMessageId}, inFlight=${!!this.inFlightTick}`);
  this.inFlightTick = this.tick()
  .catch(err => logger.error(`AttachedCardWatcher tick error: ${err}`))
  .finally(() => {
