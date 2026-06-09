@@ -23,6 +23,13 @@ export interface AgentSession {
   // active(--json)上报的 busy / waiting / idle 都是 false。
   // 视觉上由 buildListCard 单独渲染"已完成"section,与 active idle 区分。
   completed?: boolean;
+  // v2.3 state.json 新增字段
+  /** state.json.linkScanPath — JSONL 绝对路径;running/working 时为空 */
+  linkScanPath?: string;
+  /** state.json.detail — 活动摘要 / 等待问题 / 完成总结,列表卡副标题用 */
+  detail?: string;
+  /** state.json.intent — 原始派发命令,detail 空时回退用 */
+  intent?: string;
 }
 
 export type AgentSessionGroup = {

@@ -16,6 +16,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { CLAUDE_JOBS_DIR } from '../utils/paths';
 import { logger } from '../utils/logger';
+import type { AgentSession, AgentSessionStatus } from './types';
 
 /** CLI 在 state.json 里写出的所有已知 state 值(forward-compat:未知值透传)。 */
 export type JobStateValue = 'running' | 'working' | 'blocked' | 'done' | 'stopped';
@@ -168,4 +169,63 @@ export function readAllJobStates(
     if (env) envs.push(env);
   }
   return envs;
+}
+
+/**
+ * 把 JobStateEnvelope 映射成 AgentSession。
+ *
+ * State machine:
+ *   running / working  → busy
+ *   blocked            → waiting (waitingFor = needs)
+ *   done               → idle + completed=true
+ *   stopped            → idle + completed=true  (UI 层在 name 前加 🛑 区分)
+ *   unknown / 其他      → 'unknown' status (UI 渲染为"未知"组)
+ *
+ * source 字段:state.json 没有 dispatch.source,统一标 'unknown';
+ *   后续 attachRosterSources 会从 roster.json / daemon.log 补上。
+ */
+export function jobStateToSession(env: JobStateEnvelope): AgentSession | null {
+  const f = env.state;
+  const stateVal = f.state;
+
+  let status: AgentSessionStatus;
+  let completed: true | undefined;
+  let waitingFor: string | undefined;
+
+  switch (stateVal) {
+    case 'running':
+    case 'working':
+      status = 'busy';
+      break;
+    case 'blocked':
+      status = 'waiting';
+      waitingFor = f.needs ?? undefined;
+      break;
+    case 'done':
+      status = 'idle';
+      completed = true;
+      break;
+    case 'stopped':
+      status = 'idle';
+      completed = true;
+      break;
+    default:
+      status = 'unknown';
+  }
+
+  return {
+    pid: 0,  // state.json 不带 pid,需要时从 roster.json 补
+    cwd: f.cwd ?? '',
+    kind: 'background',
+    startedAt: env.mtimeMs,  // 没有真启动时间;mtime 作 elapsed 近似
+    sessionId: f.resumeSessionId ?? env.short,
+    name: f.name ?? env.short,
+    status,
+    source: 'unknown',
+    ...(waitingFor !== undefined ? { waitingFor } : {}),
+    ...(completed ? { completed } : {}),
+    ...(f.linkScanPath ? { linkScanPath: f.linkScanPath } : {}),
+    ...(f.detail ? { detail: f.detail } : {}),
+    ...(f.intent ? { intent: f.intent } : {}),
+  };
 }
