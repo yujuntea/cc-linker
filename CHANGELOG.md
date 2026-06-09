@@ -4,6 +4,82 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-06-09
+
+### 飞书 Attach 后自动刷新内容卡 (Agent View 增强)
+
+Attach 成功后,飞书侧紧跟一条可交互内容卡,每 10s 自动 patch 该 session
+的 status + recentOutput,user 不用切回 CLI 就能"挂着看"。
+
+#### Added
+- **`buildAttachedCard`** 渲染器(`src/agent-view/card.ts`):reuse `buildPeekCard` 骨架,
+  header title `📡 Watching · \`name\``(蓝色),按钮组
+  `[Refresh] [Stop Watching] [Reply] [Stop session]`
+- **25KB 智能截断**(`truncateRecentForCard`):recentOutput 优先 2048 → 1024 → 512 → 256
+  字符,任一档 build 后 ≤25KB 即用,全超则降级为 warning 文字。watch 永不停
+- **`AttachedCardWatcher`** 类(`src/agent-view/attached-card-watcher.ts`):
+  setInterval / inFlightTick mutex / patchFailureCount / maxTicks 镜像
+  `LiveProgressWatcher` 设计
+- **`AttachedWatchers`** 管理器:per openId 单 watch,supersede 静默 stop
+  旧 watcher 并清 map
+- **5 个 stop reasons** (per-reason header title):
+  `idle_settled` → ✅ 已结束 / `user_chat` → 🔌 Watch stopped · 收到新消息 /
+  `user_stop` → 🔌 Watch stopped / `max_ticks` → ⏱ Watch stopped (timeout) /
+  `session_gone` → ❌ Session 已结束 / `superseded` → 🔄 Watch replaced
+- **`agentView.handleStopWatching`**:[Stop Watching] 按钮 handler
+- **busy 路径升级**:`bot.handleChat` busy 路径(`bot.ts:988`)先 check `roster.workers`
+  有无 bg worker,有则升级发 3 按钮 bg-conflict 卡,无则维持原 1 按钮 busy 卡
+- **`handleChat` 入口 hook**:user 发任何文本立即 fire-and-forget 停 watch
+  (reason='user_chat'),不阻碍 chat 路由
+- **`handleCardAction` 新 case** `agent_view_stop_watching`:派发到
+  `handleStopWatching`
+- **`FeishuBot.shutdown` 集成** `attachedWatchers.stopAll()`:SIGTERM 干净收尾
+
+#### Fixed (since 0.4.2)
+- **C3**:final patch 失败时 watcher 也要 stop(防无限重试到 max_ticks=2.2h)
+- **B1**:max_ticks 触发时也要 patch final 卡(header `⏱ Watch stopped (timeout)`)
+- **B2**:per-reason header title 通过 `FINAL_HEADER_TITLES` map + `patchFinalCard` helper
+- **修 3**:**AttachedWatchers 缓存 no-op patchFn 引用 bug**(用户报"卡片没刷新"根因)
+  `start.ts:234` 初始化 `let patchFn = async () => null` no-op stub,后续 `line 417`
+  才赋真值;`AttachedWatchers` 构造时缓存了 no-op 引用,后续替换看不到。修:用 getter
+  `() => deps.patchFn` 每次取最新
+- **patchFn 默认 1200ms 延迟**:`patch.ts:56` 旧值 `delayMs=1200`,跟 JSDoc
+  + `start.ts:408` 注释说"默认 0"不一致。改 0ms,attach 后 patch 立刻发出
+- **superseded 静默 stop UX bug**:用户 re-attach 时老卡没指示,容易被误以为
+  "没刷新"。修:supersede 时 PATCH 老卡显示 `🔄 Watch replaced`
+- **bg-conflict 路径不标 degraded**:`runChatSDK:1495` 之前硬标
+  `sessionStatus: 'degraded'`,触发 `/switch` 阻断 + "自动修复"误导。改 `'active'`,
+  清掉 `error` 字段(避免 `last_error: 'bg_worker_conflict'` 误导信号)
+- **`_doStopAndSend` 等 1s → 3s**:治 stop bg 后新 worker 太快 respawn 触发
+  `runChatSDK` 又检测到 bg worker 又弹冲突卡的 race
+- **AgentSnapshotFetcher.fetch mock 泄漏**:`mock.module` 不能跨文件撤销,
+  改 `(AgentSnapshotFetcher as any).fetch = mock(...)` + `afterEach` 恢复 pattern
+- **handleStopAndSend 错误恢复**:`_doStopAndSend` 内 `claude stop` 报"No job matching"
+  视为成功(worker 已自然 settle),不冒泡
+- **sessionUuid 短 hash 展开**:`runChatSDK` 防御性 short→full 转换 + CAS 回写
+  UserManager(防 SDK 拒短 hash)
+- **JSDoc 过期引用**:`renderAttachedCardJson` JSDoc 删过时 "Task 3" 引用
+- **test name 笔误**:"shows 4 buttons" → "shows 3 buttons"
+
+#### Tests
+- 16 new tests covering buildAttachedCard rendering (10), 25KB truncation cascade (3),
+  AttachedCardWatcher lifecycle (3), tick behavior (9:happy/snapshot-fail/session-gone/
+  idle+completed/active-idle/JSONL-miss/1-fail/3-fail/max_ticks), AttachedWatchers manager
+  (6:start/super-sede/stop/missing-openId/identity-check/inFlightTick-mutex),
+  manager integration (4:start-watch/super-sede/stop/no-op), bot cardAction dispatch (1),
+  bot handleChat hook (3:has-watch/no-watch/with-cancel), AgentSnapshotFetcher mock fix (6)
+- **789 pass / 0 fail / 11844 expect() calls / 74 files**
+
+#### Deploys Since 0.4.2
+- 5 deploys covering the full feature rollout + 4 critical bug fixes
+- PID updates: 19013 → 75481 → 47808 → 85665 → 86163 → 82603 → 58849 → 59177 → (current)
+
+## [0.4.2] - 2026-06-08
+
+### Background
+
+Patch release of 0.4.1 — bumped version to push 0.4.1 changes through deploy.
+
 ## [0.4.1] - 2026-06-08
 
 ### 飞书 /list 过滤 Task tool 派生的 subagent sessions
