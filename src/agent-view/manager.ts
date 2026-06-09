@@ -627,8 +627,8 @@ export class AgentViewManager {
           return;
         }
       }
-      // 2. 等 supervisor 释放
-      await new Promise(r => setTimeout(r, 1000));
+      // 2. 等 supervisor 释放(2026-06-09:1s → 3s,治新 bg worker 太快 respawn 的 race)
+      await new Promise(r => setTimeout(r, 3000));
 
       // 3. 总是 fallback 到 parent(除非没 parent)
       const effectiveSessionUuid = hasParent && parentUuid ? parentUuid : sessionId;
