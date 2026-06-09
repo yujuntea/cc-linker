@@ -278,6 +278,48 @@ describe('AttachedCardWatcher.tick()', () => {
     await watcher.tick();
     expect(onStop).toHaveBeenCalledWith('ou_test', 'max_ticks', watcher);
   });
+
+  test('session_gone + final patch fails: still stops (no infinite retry)', async () => {
+    // C3 回归:final patch 失败时,watcher 也必须 stop,否则会无限重试直到 max_ticks
+    fetchSpy.mockResolvedValue({ ok: true, sessions: [] });
+    patchFn.mockRejectedValue(new Error('card deleted by feishu'));
+    const watcher = new AttachedCardWatcher({
+      openId: 'ou_test',
+      sessionId: 'abc12345-9be0-4d5e-8b3f-1234567890ab',
+      shortId: 'abc12345',
+      name: 'test',
+      cwd: '/tmp',
+      cardMessageId: 'om_test',
+      patchFn,
+      config: { ...DEFAULT_ATTACHED_WATCH_CONFIG, intervalMs: 50 },
+      resolveContent,
+      onStop,
+    });
+    await watcher.tick();
+    // final patch throw 被吞,stop('session_gone') 仍要调
+    expect(onStop).toHaveBeenCalledWith('ou_test', 'session_gone', watcher);
+    expect(patchFn).toHaveBeenCalledTimes(1); // 只调 1 次(不会重试)
+  });
+
+  test('idle_settled + final patch fails: still stops (no infinite retry)', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, sessions: [makeSession('idle', true)] });
+    patchFn.mockRejectedValue(new Error('card deleted by feishu'));
+    const watcher = new AttachedCardWatcher({
+      openId: 'ou_test',
+      sessionId: 'abc12345-9be0-4d5e-8b3f-1234567890ab',
+      shortId: 'abc12345',
+      name: 'test',
+      cwd: '/tmp',
+      cardMessageId: 'om_test',
+      patchFn,
+      config: { ...DEFAULT_ATTACHED_WATCH_CONFIG, intervalMs: 50 },
+      resolveContent,
+      onStop,
+    });
+    await watcher.tick();
+    expect(onStop).toHaveBeenCalledWith('ou_test', 'idle_settled', watcher);
+    expect(patchFn).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('AttachedWatchers manager', () => {

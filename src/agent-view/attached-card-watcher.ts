@@ -110,6 +110,7 @@ export class AttachedCardWatcher {
     const session = result.sessions.find(s => s.sessionId === this.deps.sessionId);
     if (!session) {
       // session 已不存在:patch final + stop
+      // final patch 包 try/catch:卡可能已删/限流,即便失败也要停,否则 watcher 会无限重试
       const card = buildAttachedCard({
         name: this.deps.name,
         status: 'unknown',
@@ -120,7 +121,14 @@ export class AttachedCardWatcher {
         outputFormat: 'markdown',
         lastWatchedAt: new Date().toLocaleTimeString(),
       });
-      await this.deps.patchFn(this.deps.cardMessageId, card);
+      try {
+        await this.deps.patchFn(this.deps.cardMessageId, card);
+      } catch (err: any) {
+        logger.warn(
+          `AttachedCardWatcher final patch failed for session_gone: ` +
+          `cardMessageId=${this.deps.cardMessageId}: ${err?.message ?? err}`,
+        );
+      }
       // 不 await:stop() 内部 await inFlightTick,会自死锁;stopped=true 已同步设,后续 tick 会被 line 99 guard 拦下
       void this.stop('session_gone');
       return;
@@ -141,7 +149,14 @@ export class AttachedCardWatcher {
         outputFormat: content.format,
         lastWatchedAt: new Date().toLocaleTimeString(),
       });
-      await this.deps.patchFn(this.deps.cardMessageId, card);
+      try {
+        await this.deps.patchFn(this.deps.cardMessageId, card);
+      } catch (err: any) {
+        logger.warn(
+          `AttachedCardWatcher final patch failed for idle_settled: ` +
+          `cardMessageId=${this.deps.cardMessageId}: ${err?.message ?? err}`,
+        );
+      }
       // 不 await:同 session_gone(避免 self-deadlock on inFlightTick)
       void this.stop('idle_settled');
       return;
