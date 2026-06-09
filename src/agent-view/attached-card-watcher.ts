@@ -135,9 +135,11 @@ export class AttachedCardWatcher {
  async tick(): Promise<void> {
     if (this.stopped) return;
     this.tickCount++;
+    logger.info(`[DIAG] tick #${this.tickCount} start: cardMessageId=${this.deps.cardMessageId}`);
 
     // 1) snapshot
     const result: FetchResult = await AgentSnapshotFetcher.fetch();
+    logger.info(`[DIAG] tick #${this.tickCount} snapshot: ok=${result.ok}, sessions=${result.ok ? result.sessions.length : 'N/A'}`);
     if (!result.ok) {
       logger.warn(`AttachedCardWatcher tick snapshot failed: ${result.reason}`);
       return; // 不 patch, 不 stop(spec §3.7)
@@ -146,6 +148,7 @@ export class AttachedCardWatcher {
     // 2) 找 session
     const session = result.sessions.find(s => s.sessionId === this.deps.sessionId);
     if (!session) {
+      logger.info(`[DIAG] tick #${this.tickCount} session NOT in snapshot`);
       // session 已不存在:patch final + stop
       await this.patchFinalCard('session_gone', {
         status: 'unknown',
@@ -155,9 +158,11 @@ export class AttachedCardWatcher {
       void this.stop('session_gone');
       return;
     }
+    logger.info(`[DIAG] tick #${this.tickCount} session found: status=${session.status}, completed=${session.completed}`);
 
     // 3) idle + completed: final + stop
     if (session.status === 'idle' && session.completed) {
+      logger.info(`[DIAG] tick #${this.tickCount} idle_settled path`);
       const content = await this.deps.resolveContent(this.deps.shortId, 2048);
       await this.patchFinalCard('idle_settled', {
         status: session.status,
@@ -175,6 +180,7 @@ export class AttachedCardWatcher {
     const content = await this.deps.resolveContent(this.deps.shortId, 2048);
     this.lastRecentOutput = content.text ?? '(无可用输出)';
     this.lastOutputFormat = content.format;
+    logger.info(`[DIAG] tick #${this.tickCount} resolveContent: textLen=${content.text?.length ?? 0}`);
 
     // 5) build card(内含 25KB 智能截断)
     const card = buildAttachedCard({
@@ -189,11 +195,13 @@ export class AttachedCardWatcher {
       outputFormat: content.format,
       lastWatchedAt: new Date().toLocaleTimeString(),
     });
+    logger.info(`[DIAG] tick #${this.tickCount} card built, calling patchFn`);
 
     // 6) patch + 失败计数
     try {
       await this.deps.patchFn(this.deps.cardMessageId, card);
       this.patchFailureCount = 0;
+      logger.info(`[DIAG] tick #${this.tickCount} patchFn SUCCESS`);
     } catch (err: any) {
       this.patchFailureCount++;
       logger.warn(
