@@ -26,8 +26,17 @@ export class ExpectedReplyState {
   ) {}
 
   /**
-   * 设置 expectedReply 状态。CAS 写入 user-mapping(同 openId 旧 entry 被覆盖)。
-   * 失败抛错(让调用方决定降级)。
+   * 设置 expectedReply 状态。CAS 写入 user-mapping。
+   *
+   * v2.3.3 智能 CAS:user-mapping 当前 entry 可能是:
+   *   - null → 直接写
+   *   - `last_agent_list_card`(上一次 /agents 留下的 list 卡 pointer)
+   *   - `pending_agent_reply`(上一个 reply 没走完 cleanup,如 timeout 前又点 Reply)
+   *   - `session` / `pending_new_session` / `pending_new_session_claimed` → 真"另一端在操作"
+   *
+   * transient entry (前 3 种)自动清掉再写,真 active state (后 3 种)throw 让调用方报错。
+   * 修这个之前,用户 attach 后再点 /agents 的 Reply 永远 throw(因为 user-mapping 残留 session entry
+   * 但 handleReplyRequest 只清 last_agent_list_card)。
    */
   async set(openId: string, info: ExpectedReplyInfo): Promise<void> {
     const now = Date.now();
@@ -42,10 +51,27 @@ export class ExpectedReplyState {
       shortId: info.shortId,
       casToken,
     };
-    // CAS: expected = null(覆盖任何旧 type)
+    // 智能 CAS:探测当前 entry,transient 类型的自动清,active 类型的 throw
+    const current = this.userManager.getEntry(openId);
+    const transientTypes = new Set(['last_agent_list_card', 'pending_agent_reply']);
+    if (current && !transientTypes.has(current.type)) {
+      // 真 active state:另一端在 session/pending_new_session
+      throw new Error(
+        `Failed to set expectedReply for ${openId}: existing entry is '${current.type}'`,
+      );
+    }
+    if (current) {
+      // transient — 先清,再写
+      const cleared = await this.userManager.compareAndSwap(openId, current, null);
+      if (!cleared) {
+        // 极罕见 race:有人在我们清之前抢着改了 entry。直接 throw 让用户重试。
+        throw new Error(`Failed to set expectedReply for ${openId}: CAS conflict on transient clear`);
+      }
+    }
+    // 现在 slot 是 null 了,写 pending_agent_reply
     const ok = await this.userManager.compareAndSwap(openId, null, newEntry);
     if (!ok) {
-      throw new Error(`Failed to set expectedReply for ${openId}: CAS failed`);
+      throw new Error(`Failed to set expectedReply for ${openId}: CAS failed on write`);
     }
     // in-memory
     const internal: InternalEntry = {

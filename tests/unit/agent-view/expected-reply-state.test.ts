@@ -41,7 +41,7 @@ describe('ExpectedReplyState — basic set/clear', () => {
 });
 
 describe('ExpectedReplyState — CAS conflict', () => {
-  test('set fails when existing entry has different type', async () => {
+  test('set fails when existing entry is a real active session (other end busy)', async () => {
     const userManager = new UserManager(tmpMapping);
     await userManager.compareAndSwap('open1', null, {
       type: 'session', sessionUuid: 'u', cwd: '/x', createdAt: new Date().toISOString(),
@@ -49,6 +49,38 @@ describe('ExpectedReplyState — CAS conflict', () => {
     const state = new ExpectedReplyState(userManager, 300_000);
     await expect(state.set('open1', { shortId: 's1', sessionId: 'u1', cwd: '/a' }))
       .rejects.toThrow();
+  });
+
+  test('v2.3.3: set auto-clears transient last_agent_list_card entry', async () => {
+    // 模拟:用户发 /agents → handleList 写了 last_agent_list_card entry →
+    // 用户点 Reply → handleReplyRequest 进来前 entry 仍是 last_agent_list_card
+    const userManager = new UserManager(tmpMapping);
+    await userManager.compareAndSwap('open1', null, {
+      type: 'last_agent_list_card',
+      sessionUuid: null,
+      createdAt: new Date().toISOString(),
+      cardMessageId: 'om_list_1',
+      updatedAt: new Date().toISOString(),
+    });
+    const state = new ExpectedReplyState(userManager, 300_000);
+    // 不应该 throw — 智能 CAS 自动清 transient
+    await state.set('open1', { shortId: 's1', sessionId: 'u1', cwd: '/a' });
+    expect(state.get('open1')?.shortId).toBe('s1');
+    expect(userManager.getEntry('open1')?.type).toBe('pending_agent_reply');
+  });
+
+  test('v2.3.3: set auto-clears stale pending_agent_reply entry (timeout 前重 click)', async () => {
+    const userManager = new UserManager(tmpMapping);
+    // 模拟一个上一次的 pending_agent_reply(还没 timeout)
+    await userManager.compareAndSwap('open1', null, {
+      type: 'pending_agent_reply', sessionUuid: 'old', cwd: '/a',
+      createdAt: new Date().toISOString(), startedAt: new Date().toISOString(),
+      timeoutMs: 300_000, shortId: 'olds', casToken: 'old-token',
+    });
+    const state = new ExpectedReplyState(userManager, 300_000);
+    await state.set('open1', { shortId: 'newS', sessionId: 'newUuid', cwd: '/b' });
+    expect(state.get('open1')?.shortId).toBe('newS');
+    expect((userManager.getEntry('open1') as any)?.sessionUuid).toBe('newUuid');
   });
 });
 
