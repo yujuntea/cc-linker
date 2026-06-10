@@ -125,9 +125,9 @@ The `withSync()` helper in `src/index.ts` wraps this. Some commands skip sync wi
 
 ### Agent View (Remote Session Takeover)
 
-`src/agent-view/` lets users from Feishu inspect and steer any background `claude` session running on the terminal. It depends on the `claude agents --json` interface and uses `claude logs <shortId>` / `claude stop <shortId>` for per-session actions.
+`src/agent-view/` lets users from Feishu inspect and steer any background `claude` session running on the terminal. **Primary data source is `~/.claude/jobs/<short>/state.json`** (the Claude CLI's authoritative state machine — covers `running` / `working` / `blocked` / `done` / `stopped`). The CLI's `claude agents --json` is kept only as a smoke test; in v2.1.163 it returns `status: "idle"` for every background session and is no longer trustworthy as a status source. `claude logs <shortId>` is the Tier-3 Peek fallback; `claude stop <shortId>` is still the per-session stop primitive.
 
-- `AgentSnapshotFetcher.fetch()` (`snapshot-fetcher.ts`) shells out to `claude agents --json` (version-guarded via `VersionGuard`, daemon-presence-checked via `DaemonProbe`); `snapshot.ts` parses the JSON into `AgentSession[]` keyed by status (`busy` / `waiting` / `idle`).
+- `AgentSnapshotFetcher.fetch()` (`snapshot-fetcher.ts`) version-guards via `VersionGuard`, daemon-presence-checks via `DaemonProbe`, runs `claude agents --json` as a smoke test (return value discarded), then reads `~/.claude/jobs/*/state.json` via `readAllJobStates()` (`job-state.ts`), maps each envelope to `AgentSession[]` via `jobStateToSession()` (waiting/busy/idle/completed with 🛑 / ✅ prefixes), attaches `dispatch.source` from `roster.json` + `daemon.log` `bg claimed-spare` tail, and falls back to `deriveNameFromJsonl` only when `state.json.name` is null (cold path).
 - `AgentViewManager` (`manager.ts`) owns the user-facing flow: `handleList` → `handlePeek` → `handleReplyRequest` (Step A) → `handleReply` (Step B, re-runs status guard) → `handleStop` (with `handleStopConfirm` two-step) → `handleAttach`. Step B re-fetches the snapshot before proxying the user's reply text through `runChatSDK` to defend against a status flip between the click and the text.
 - `ExpectedReplyState` (`expected-reply-state.ts`) persists `pending_agent_reply` in `user-mapping.json` with CAS, sets a 5-minute timeout, and restores on bot startup.
 - Card builders (`card.ts`) emit Feishu interactive cards; `Refresh` actions are debounced by 2s and the original `messageId` is verified before patching to avoid stomping on an already-overwritten card.
@@ -162,7 +162,8 @@ The `withSync()` helper in `src/index.ts` wraps this. Some commands skip sync wi
 | `src/runtime/state-coordinator.ts` | Single-process lock |
 | `src/scanner/index.ts` | Pre-command sync orchestration |
 | `src/agent-view/manager.ts` | AgentViewManager — `/agents` list / Peek / Reply / Stop / Attach flow |
-| `src/agent-view/snapshot-fetcher.ts` | Live session snapshot via `claude agents --json` |
+| `src/agent-view/snapshot-fetcher.ts` | Pipeline orchestrator — VersionGuard / DaemonProbe / smoke-test → readAllJobStates → mapping → source attribution |
+| `src/agent-view/job-state.ts` | `readJobState` / `readAllJobStates` / `jobStateToSession` — `~/.claude/jobs/<short>/state.json` primary reader (v2.3) |
 | `src/agent-view/expected-reply-state.ts` | Per-user `pending_agent_reply` slot (CAS-protected) |
 | `src/agent-view/card.ts` | Feishu interactive card builders (list / peek / waiting / stop-confirm / error / empty) |
 | `src/utils/config.ts` | Config manager with env overrides |
