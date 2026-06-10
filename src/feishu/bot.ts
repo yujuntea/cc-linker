@@ -1359,8 +1359,18 @@ export class FeishuBot {
     isNew?: boolean;
     /** Spool messageId — used for cancellation check against cancelledMessageIds. */
     messageId?: string;
+    /**
+     * v2.3.5: 标记这是 AgentView 触发的 reply 路径(用户在飞书侧点 [Reply] 按钮表达
+     * "接管 bg session" 意图)。若 true 且 bg conflict 检测到 live worker,
+     * **自动** `claude stop` + 3s wait + 递归 runChatSDK 一次(skipBgConflict: true),
+     * 不弹 3 按钮冲突卡。
+     *
+     * 第二次 reply 时 bg worker 已被停,conflict 检查不命中,直接 SDK。
+     * 普通 chat 路径(没设此 flag)行为不变,3 按钮让用户决策。
+     */
+    fromAgentViewReply?: boolean;
   }): Promise<{ result: SendMessageResult; handler: PermissionHandler; cardMessageId: string | null }> {
-    const { openId, sessionUuid: inputSessionUuid, cwd, settingsPath, promptText, serialKey, isNew = false, messageId } = params;
+    const { openId, sessionUuid: inputSessionUuid, cwd, settingsPath, promptText, serialKey, isNew = false, messageId, fromAgentViewReply = false } = params;
     // v2.2.14: defense-in-depth —— UserManager.sessionUuid 可能是 8 字符 short hash
     // (历史 settled bg 走旧 snapshot-fetcher 路径时种下),`claude -p --resume <short>`
     // 会被 SDK 拒(报 "Provided value ... is not a UUID")。handleAttach 已尝试
@@ -1431,11 +1441,45 @@ export class FeishuBot {
       // 新行为(v2.2.11):探测到冲突 → 不调 SDK,直接发拒绝卡(buildBgConflictCard)
       // 让用户选 [🛑 停 bg 后继续发送] / [🌿 开新会话发送] / [❌ 取消]。
       // 把决定权交给用户,默认 safe。
+      //
+      // v2.3.5 修正:AgentView reply 路径(fromAgentViewReply: true)下用户已经点
+      // [Reply] 表达"接管 bg session"意图,弹冲突卡反 UX — 改成自动 `claude stop`
+      // + 3s wait + 递归 SDK 一次。第二次 reply 时 bg 已被停,直接走 SDK。
       if (sessionUuid && !isNew) {
         const roster = _bgConflictHooks.readRoster();
         const short = sessionUuid.slice(0, 8);
         const worker = roster?.workers?.[short];
         if (worker) {
+          // v2.3.5:AgentView reply 路径下,用户已点 [Reply] 表达"接管"意图,
+          // 自动 stop bg + 3s wait + 递归 runChatSDK 一次(skipBgConflict 跳过本次检查)。
+          // 第二次 reply 时 bg 已没,直接走 SDK。普通 chat 路径仍弹 3 按钮让用户决策。
+          if (fromAgentViewReply) {
+            logger.info(
+              `runChatSDK: reply 路径自动 stop bg worker ${short}(pid=${worker.pid}),` +
+                `等 3s 后递归 SDK`,
+            );
+            try {
+              await new Promise<void>((resolve, reject) => {
+                require('node:child_process').execFile(
+                  'claude', ['stop', short],
+                  (err: any) => {
+                    // v2.2.19: "No job matching" 算成功(bg 已自然 settle)
+                    const msg = err?.stderr || err?.message || String(err);
+                    if (err && !/No job matching/i.test(msg)) {
+                      logger.warn(`runChatSDK: reply 路径 claude stop 失败 (graceful continue): ${msg}`);
+                    }
+                    resolve();
+                  },
+                );
+              });
+              // v2.2.19 / v2.3.5:1s 升 3s,治新 bg worker 太快 respawn 的 race
+              await new Promise(r => setTimeout(r, 3000));
+            } catch {
+              // 任何意外都让递归继续尝试
+            }
+            // 递归 SDK,跳过本次 conflict 检查
+            return await this.runChatSDK({ ...params, fromAgentViewReply: false });
+          }
           const workerPid = (worker as any).pid;
           const workerName = (worker as any).dispatch?.seed?.name || short;
           // v2.2.13: 在拒绝时 pre-compute parent UUID(从 roster.launch.sessionId 提取

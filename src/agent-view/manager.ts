@@ -63,6 +63,8 @@ export interface AgentViewDeps {
     openId: string; sessionUuid: string; cwd: string;
     promptText: string; serialKey: string; isNew?: boolean;
     settingsPath?: string; messageId?: string;
+    /** v2.3.5: 标记 AgentView reply 路径,bot 会自动 stop bg + 递归 SDK */
+    fromAgentViewReply?: boolean;
   }) => Promise<{ result: any; handler: any; cardMessageId: string | null }>;
   expectedReplyTimeoutMs?: number;
 }
@@ -875,6 +877,8 @@ export class AgentViewManager {
     }
 
     // 3. runChatSDK,try/finally 保证 clear 必发(v2.2 critical)
+    // v2.3.5: 传 fromAgentViewReply: true — bot runChatSDK 检测到 bg conflict 时
+    // 自动 stop bg + 3s wait + 递归 SDK(不再弹 3 按钮冲突卡),符合用户"接管"预期。
     let sdkError: any = null;
     try {
       await this.deps.runChatSDK({
@@ -884,6 +888,7 @@ export class AgentViewManager {
         promptText: text,
         serialKey: info.sessionId,
         isNew: false,
+        fromAgentViewReply: true,
       });
     } catch (err: any) {
       sdkError = err;
