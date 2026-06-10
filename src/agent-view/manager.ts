@@ -829,11 +829,13 @@ export class AgentViewManager {
       return;
     }
     // 3. 发独立提示消息(纯文本,无 button —— 飞书 IM 限制)
+    // v2.3.9 文案与 v2.3.4 旧版一致化:reply 是 一次 一次 的(完成即清),
+    // 后续 reply 必须重新点 [Reply] 按钮(实际 bot 端 v2.3.8 pre-step stop 让流程一气呵成)。
     await this.deps.replyFn(
       `↩️ 回复会话: ${session.name}\n` +
-      `请直接发送文字消息(5 分钟内有效)。\n` +
-      `发 /cancel 退出等待。\n` +
-      `可继续多次发文字,直到 Claude 不再需要输入。`,
+      `请直接发送一条文字消息。\n` +
+      `若想中断等待,发 /cancel。\n` +
+      `若需继续 reply,在飞书 Agent View 重新点 [Reply] 即可(每次 reply 都是一次独立操作)。`,
       { openId },
     );
   }
