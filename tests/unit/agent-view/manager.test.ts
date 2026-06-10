@@ -685,21 +685,13 @@ describe('handleReplyRequest (Step A)', () => {
     expect(mgr.expectedReply.get('ou_rr_busy')).toBeUndefined();
   });
 
-  test('sets expectedReply and patches the list card on success', async () => {
-    const { mgr, userManager, replyFn, patchFn, cardReplyFn } = makeMgrWithSpies();
+  test('v2.3.4: sets expectedReply + sends clear standalone prompt text (no patch依赖)', async () => {
+    const { mgr, replyFn, cardReplyFn, patchFn } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
       ok: true,
       sessions: [waiting],
     }));
-
-    // Seed a last_agent_list_card entry so handleReplyRequest patches it.
-    await mgr.handleList('ou_rr_ok');
-    const listEntry = userManager.getEntry('ou_rr_ok');
-    expect(listEntry?.type).toBe('last_agent_list_card');
-    patchFn.mockClear();
-    cardReplyFn.mockClear();
-    replyFn.mockClear();
 
     await mgr.handleReplyRequest('ou_rr_ok', waiting.sessionId.slice(0, 8), waiting.sessionId, waiting.cwd);
 
@@ -708,17 +700,44 @@ describe('handleReplyRequest (Step A)', () => {
     expect(info).toBeDefined();
     expect(info?.sessionId).toBe(waiting.sessionId);
     expect(info?.cwd).toBe(waiting.cwd);
-    // List card patched first with a waiting card (yellow template)
-    expect(patchFn).toHaveBeenCalledTimes(1);
-    expect(patchFn.mock.calls[0][0]).toBe('om_list_card_001');
-    const patched = JSON.parse(patchFn.mock.calls[0][1] as string);
-    expect(patched.header.template).toBe('yellow');
-    // Prompt text sent
+    // v2.3.4 新设计:不再 patch list 卡 — 飞书纯文本消息没 button,patch 反而误导用户
+    expect(patchFn).not.toHaveBeenCalled();
+    expect(cardReplyFn).not.toHaveBeenCalled();
+    // 只发独立 prompt 消息,文案不含误导"点按钮"
     expect(replyFn).toHaveBeenCalledTimes(1);
-    expect(replyFn.mock.calls[0][0]).toContain('回复会话');
+    const msg = replyFn.mock.calls[0][0] as string;
+    expect(msg).toContain('回复会话');
+    expect(msg).toContain('请直接发送文字消息');
+    expect(msg).toContain('/cancel');
+    // 不再提"点 [取消等待] 按钮"(飞书纯文本不能放 button)
+    expect(msg).not.toContain('[取消等待] 按钮');
+    expect(msg).toContain('可继续多次发文字');
 
     // Clean up timer
     await mgr.expectedReply.clear('ou_rr_ok');
+  });
+
+  test('v2.3.4: 真冲突场景 — user-mapping 有 pending_agent_reply 旧 entry → 智能 CAS 自动清', async () => {
+    // 模拟上一次的 pending_agent_reply 残留(用户连点 2 次 [Reply])
+    const { mgr, userManager, replyFn, runChatSDK: _runSDK } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [waiting],
+    }));
+    await userManager.compareAndSwap('ou_rr_dup', null, {
+      type: 'pending_agent_reply', sessionUuid: 'old', cwd: '/a',
+      createdAt: new Date().toISOString(), startedAt: new Date().toISOString(),
+      timeoutMs: 300_000, shortId: 'olds', casToken: 'old-token',
+    });
+    replyFn.mockClear();
+
+    await mgr.handleReplyRequest('ou_rr_dup', waiting.sessionId.slice(0, 8), waiting.sessionId, waiting.cwd);
+
+    // 不应该 throw,应该成功 set
+    expect(mgr.expectedReply.get('ou_rr_dup')?.sessionId).toBe(waiting.sessionId);
+    expect(userManager.getEntry('ou_rr_dup')?.type).toBe('pending_agent_reply');
+    expect((userManager.getEntry('ou_rr_dup') as any)?.sessionUuid).toBe(waiting.sessionId);
   });
 });
 
@@ -731,13 +750,21 @@ describe('handleReply (Step B)', () => {
     expect(runSpy).not.toHaveBeenCalled();
   });
 
-  test('clears expectedReply after runChatSDK success', async () => {
+  test('clears expectedReply when session no longer waiting (busy)', async () => {
     const { mgr, userManager } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
-    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
-      ok: true,
-      sessions: [waiting],
-    }));
+    // 第 1 次 fetch (Step B guard): waiting → 通过
+    // 第 2 次 fetch (持续 reply 检查): busy → 不重新 set
+    let fetchCount = 0;
+    (AgentSnapshotFetcher as any).fetch = mock(async () => {
+      fetchCount++;
+      return {
+        ok: true,
+        sessions: fetchCount === 1
+          ? [waiting]
+          : [{ ...waiting, status: 'busy' }],   // 第 2 次变 busy
+      };
+    });
     await mgr.expectedReply.set('ou_reply_ok', {
       shortId: waiting.sessionId.slice(0, 8),
       sessionId: waiting.sessionId,
@@ -750,17 +777,19 @@ describe('handleReply (Step B)', () => {
 
     expect(runSpy).toHaveBeenCalledTimes(1);
     expect((runSpy.mock.calls[0][0] as any).promptText).toBe('hello back');
+    // session 变 busy → 不持续 reply,slot 清掉
     expect(mgr.expectedReply.get('ou_reply_ok')).toBeUndefined();
     expect(userManager.getEntry('ou_reply_ok')).toBeUndefined();
   });
 
-  test('clears expectedReply even when runChatSDK throws (try/finally)', async () => {
-    const { mgr, userManager } = makeMgrWithSpies();
+  test('v2.3.4: clears expectedReply when runChatSDK throws (try/catch+reply)', async () => {
+    const { mgr, userManager, replyFn } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
-    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
-      ok: true,
-      sessions: [waiting],
-    }));
+    let fetchCount = 0;
+    (AgentSnapshotFetcher as any).fetch = mock(async () => {
+      fetchCount++;
+      return { ok: true, sessions: fetchCount === 1 ? [waiting] : [] };
+    });
     await mgr.expectedReply.set('ou_reply_err', {
       shortId: waiting.sessionId.slice(0, 8),
       sessionId: waiting.sessionId,
@@ -769,20 +798,42 @@ describe('handleReply (Step B)', () => {
     mgr.deps.runChatSDK = (async () => {
       throw new Error('runChatSDK boom');
     }) as any;
+    replyFn.mockClear();
 
-    // handleReply should swallow downstream errors so the user is not stuck;
-    // either way the expectedReply slot must be cleared.
-    let caught: any;
-    try {
-      await mgr.handleReply('ou_reply_err', 'kaboom');
-    } catch (err) {
-      caught = err;
-    }
-    // The try/finally re-throws; what matters is the slot was cleared.
+    // v2.3.4: try/catch 后用 replyFn 报错,不再 re-throw,确保 user-mapping 释放
+    await mgr.handleReply('ou_reply_err', 'kaboom');
     expect(mgr.expectedReply.get('ou_reply_err')).toBeUndefined();
     expect(userManager.getEntry('ou_reply_err')).toBeUndefined();
-    // We accept either swallowed or rethrown — assert behavior matches code: rethrows.
-    expect(caught?.message).toBe('runChatSDK boom');
+    // 用户被告知错误(不抛到 caller)
+    const errMsg = replyFn.mock.calls.find(c => (c[0] as string).includes('Reply 失败'))?.[0] as string;
+    expect(errMsg).toContain('runChatSDK boom');
+  });
+
+  test('v2.3.4: 持续 reply — session 仍 waiting → 重新 set 让用户继续发文字', async () => {
+    const { mgr, userManager, replyFn } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    // 两次 fetch 都返回 waiting(模拟 Claude 跑完一轮 turn 又再问)
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [waiting],
+    }));
+    await mgr.expectedReply.set('ou_reply_cont', {
+      shortId: waiting.sessionId.slice(0, 8),
+      sessionId: waiting.sessionId,
+      cwd: waiting.cwd,
+    });
+    mgr.deps.runChatSDK = mock(async () => ({ result: {}, handler: {}, cardMessageId: '' })) as any;
+    replyFn.mockClear();
+
+    await mgr.handleReply('ou_reply_cont', '第一条');
+
+    // 重新 set 之后 user-mapping 仍是 pending_agent_reply
+    expect(mgr.expectedReply.get('ou_reply_cont')?.sessionId).toBe(waiting.sessionId);
+    expect(userManager.getEntry('ou_reply_cont')?.type).toBe('pending_agent_reply');
+    // 提示用户可继续发
+    const continueMsg = replyFn.mock.calls.find(c => (c[0] as string).includes('仍在等输入'))?.[0] as string;
+    expect(continueMsg).toBeDefined();
+    expect(continueMsg).toContain('/cancel');
   });
 });
 

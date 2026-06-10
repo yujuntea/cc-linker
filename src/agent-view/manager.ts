@@ -812,41 +812,26 @@ export class AgentViewManager {
       return;
     }
     // 2. 持久化 expectedReply
-    // ExpectedReplyState.set CAS-expects null, so any existing entry (e.g.
-    // last_agent_list_card from the /agents that triggered this Reply click)
-    // makes set() throw. Capture the trigger card's messageId first, then
-    // clear that entry to free the slot for set(). v2.2 intent: after set()
-    // succeeds we patch the captured cardMessageId to a waiting card BEFORE
-    // sending the prompt text.
-    const preListEntry = this.deps.userManager.getEntry(openId);
-    const triggerCardMessageId =
-      preListEntry?.type === 'last_agent_list_card' ? preListEntry.cardMessageId : undefined;
-    if (preListEntry?.type === 'last_agent_list_card') {
-      const cleared = await this.deps.userManager.compareAndSwap(openId, preListEntry, null);
-      if (!cleared) {
-        await this.deps.replyFn('请先刷新列表后重试', { openId });
-        return;
-      }
-    }
+    // 智能 CAS(expectedReplyState v2.3.3):transient / 同 session 自动清,真冲突 throw。
+    // 不再依赖"patch 触发的 list 卡为等待输入卡"——v2.2 这条路要求 preListEntry 是
+    // last_agent_list_card(飞书能 patch),但 v2.3.3 之后用户从 attach 切到 reply 时
+    // preListEntry 是 session 类型,triggerCardMessageId=undefined,patch 步骤不进
+    // → 文本消息却提"点 [取消等待] 按钮"(飞书纯文本无 button)→ 用户看不见按钮。
+    // 新设计:不用 patch 触发卡,改用 replyFn 发清晰文案 + 后续 reply 完成时
+    // 自动 restore expectedReply(见 handleReply 后段,让用户能连续发 reply)。
     try {
       await this.expectedReply.set(openId, { shortId: _shortId, sessionId, cwd });
-    } catch (_err: any) {
-      await this.deps.replyFn('⚠️ 另一端正在操作,请先在对方客户端取消', { openId });
+    } catch (err: any) {
+      // 真正"另一端在操作" — 给明确指引让用户取消
+      await this.deps.replyFn(`⚠️ ${err.message.replace(/^Failed to set expectedReply for .+?: /, '')}`, { openId });
       return;
     }
-    // 3. patch 触发的 list 卡为等待输入卡(v2.2 顺序:先 patch,后发文本)
-    if (triggerCardMessageId) {
-      const waitingCard = buildWaitingCard({
-        name: session.name,
-        status: session.status,
-        waitingFor: session.waitingFor,
-        cwd,
-      });
-      await this.deps.patchFn(triggerCardMessageId, waitingCard);
-    }
-    // 4. 发独立文本消息
+    // 3. 发独立提示消息(纯文本,无 button —— 飞书 IM 限制)
     await this.deps.replyFn(
-      `↩️ 回复会话: ${session.name}\n请直接发送文字消息作为回复(5 分钟内有效)\n可点 [取消等待] 按钮,或发 /cancel 取消`,
+      `↩️ 回复会话: ${session.name}\n` +
+      `请直接发送文字消息(5 分钟内有效)。\n` +
+      `发 /cancel 退出等待。\n` +
+      `可继续多次发文字,直到 Claude 不再需要输入。`,
       { openId },
     );
   }
@@ -890,6 +875,7 @@ export class AgentViewManager {
     }
 
     // 3. runChatSDK,try/finally 保证 clear 必发(v2.2 critical)
+    let sdkError: any = null;
     try {
       await this.deps.runChatSDK({
         openId,
@@ -899,8 +885,37 @@ export class AgentViewManager {
         serialKey: info.sessionId,
         isNew: false,
       });
+    } catch (err: any) {
+      sdkError = err;
     } finally {
       await this.expectedReply.clear(openId);
+    }
+    if (sdkError) {
+      await this.deps.replyFn(`❌ Reply 失败:${sdkError?.message ?? sdkError}`, { openId });
+      return;
+    }
+    // 4. v2.3.4 持续 reply:SDK 跑完一轮 turn 后,bg session 状态可能仍然是 waiting
+    // (Claude 再次询问)或已经变 busy / done。如果还 waiting,自动重新 set expectedReply,
+    // 让用户能继续发文字 reply,不用再点 [Reply] 按钮——否则用户感觉"再发消息没反应"。
+    try {
+      const post = await AgentSnapshotFetcher.fetch();
+      if (post.ok) {
+        const sess = post.sessions.find(s => s.sessionId === info.sessionId);
+        if (sess && sess.status === 'waiting') {
+          await this.expectedReply.set(openId, {
+            shortId: info.shortId,
+            sessionId: info.sessionId,
+            cwd: info.cwd,
+          });
+          await this.deps.replyFn(
+            `↩️ Claude 仍在等输入,可继续发文字(5 分钟内有效)\n` +
+            `若想中断,发 /cancel。`,
+            { openId },
+          );
+        }
+      }
+    } catch {
+      // 后台 refresh 失败不影响主要 reply 流程
     }
   }
 
