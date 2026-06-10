@@ -160,11 +160,44 @@ describe('AgentSnapshotFetcher.fetch — state.json mapping', () => {
     expect(r.sessions[0].name).toBe('🛑 bash loop');
   });
 
-  test('unknown state → filtered out', async () => {
-    mockJobs([makeEnv({ state: 'future_paused', name: 'mystery' })]);
-    const r = await AgentSnapshotFetcher.fetch();
-    expect(r.ok).toBe(true); if (!r.ok) return;
-    expect(r.sessions.length).toBe(0);
+  test('unknown state → filtered out + warn logged once (v2.3.1)', async () => {
+    // Spy on logger.warn
+    const { logger } = require('../../../src/utils/logger');
+    const origWarn = logger.warn;
+    const warnCalls: string[] = [];
+    logger.warn = (msg: string) => { warnCalls.push(msg); };
+    try {
+      mockJobs([
+        makeEnv({ state: 'future_paused', name: 'mystery1', resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111' }),
+        makeEnv({ state: 'experimental', name: 'mystery2', resumeSessionId: 'aaaaaaa2-2222-2222-2222-222222222222' }),
+      ]);
+      const r = await AgentSnapshotFetcher.fetch();
+      expect(r.ok).toBe(true); if (!r.ok) return;
+      expect(r.sessions.length).toBe(0);  // both filtered
+      // 1 warn 聚合通知,含两种 unknown state 值
+      const agentViewWarn = warnCalls.find(m => m.includes('[agent-view]'));
+      expect(agentViewWarn).toBeDefined();
+      expect(agentViewWarn).toContain('dropped 2 session');
+      expect(agentViewWarn).toContain('future_paused');
+      expect(agentViewWarn).toContain('experimental');
+    } finally {
+      logger.warn = origWarn;
+    }
+  });
+
+  test('no warn when all states known', async () => {
+    const { logger } = require('../../../src/utils/logger');
+    const origWarn = logger.warn;
+    const warnCalls: string[] = [];
+    logger.warn = (msg: string) => { warnCalls.push(msg); };
+    try {
+      mockJobs([makeEnv({ state: 'running', name: 'r', resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111' })]);
+      await AgentSnapshotFetcher.fetch();
+      const agentViewWarn = warnCalls.find(m => m.includes('[agent-view] dropped'));
+      expect(agentViewWarn).toBeUndefined();
+    } finally {
+      logger.warn = origWarn;
+    }
   });
 
   test('mixed envelopes preserve all states with right prefix', async () => {

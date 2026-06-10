@@ -170,7 +170,7 @@ export class AgentViewManager {
   ): Promise<{ text: string | null; format: 'markdown' | 'terminal' }> {
     // Tier 1a (v2.3):state.json.linkScanPath 直达(blocked / done 时有值)
     //   优先于满磁盘扫,延迟 + 准确度都更好
-    const env = AgentViewManager._peekHooks.readJobState(shortId);
+    const env = await AgentViewManager._peekHooks.readJobState(shortId);
     const linkScanPath = env?.state?.linkScanPath ?? null;
     if (linkScanPath) {
       const text = AgentViewManager._peekHooks.extractRecentAssistantText(linkScanPath, maxChars);

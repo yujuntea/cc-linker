@@ -29,6 +29,7 @@ import { readRoster, buildRosterSourceMap } from './roster-source';
 import { readClaimedSources } from './daemon-log-reader';
 import { deriveNameFromJsonl } from './jsonl-name';
 import { readAllJobStates, jobStateToSession } from './job-state';
+import { logger } from '../utils/logger';
 import type { AgentSession, AgentSessionSource } from './types';
 
 export type FetchResult =
@@ -66,16 +67,31 @@ export const AgentSnapshotFetcher = {
     // 合并 map + filter unknown + 加 emoji prefix 在一个循环里,确保 env ↔ session
     // 配对始终用同一份 env(不依赖 sessionId.slice(0,8) 与 env.short 的隐含一致性,
     // 防 fork-from-active session 的 resumeSessionId 是 parent UUID 导致 prefix 漏加)。
-    const envs = _jobStateHooks.readAllJobStates();
+    const envs = await _jobStateHooks.readAllJobStates();
     let sessions: AgentSession[] = [];
+    let droppedUnknown = 0;
+    const droppedStates: Set<string> = new Set();
     for (const env of envs) {
       const s = jobStateToSession(env);
       if (!s) continue;
-      if (s.status === 'unknown') continue;  // unknown state 暂时丢弃
+      if (s.status === 'unknown') {
+        // 未来 Claude CLI 可能加新 state 值(如 'paused')。我们仍 graceful 丢弃,
+        // 但聚合一次警告让运维知道有 sessions 被吞了 — 避免"我的 session 消失了"无诊断。
+        droppedUnknown++;
+        droppedStates.add(String(env.state.state));
+        continue;
+      }
       let name = s.name;
       if (env.state.state === 'stopped' && !name.startsWith('🛑')) name = `🛑 ${name}`;
       else if (env.state.state === 'done' && !name.startsWith('✅')) name = `✅ ${name}`;
       sessions.push(name === s.name ? s : { ...s, name });
+    }
+    if (droppedUnknown > 0) {
+      logger.warn(
+        `[agent-view] dropped ${droppedUnknown} session(s) with unknown state values ` +
+        `[${[...droppedStates].join(', ')}] — Claude CLI may have added new state(s); ` +
+        `consider updating jobStateToSession mapping.`,
+      );
     }
 
     // roster.json 给 source 标签(spare/slash/fleet);settled 后 roster 已清,

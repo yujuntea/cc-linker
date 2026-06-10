@@ -5,8 +5,8 @@ import { jobStateToSession, listJobShorts, readAllJobStates, readJobState } from
 const FIX = join(import.meta.dir, '../../fixtures/job-state');
 
 describe('readJobState', () => {
-  test('parses blocked fixture into envelope', () => {
-    const env = readJobState('01-blocked-timer', FIX);
+  test('parses blocked fixture into envelope', async () => {
+    const env = await readJobState('01-blocked-timer', FIX);
     expect(env).not.toBeNull();
     expect(env!.short).toBe('01-blocked-timer');
     expect(env!.state.state).toBe('blocked');
@@ -16,20 +16,21 @@ describe('readJobState', () => {
     expect(env!.mtimeMs).toBeGreaterThan(0);
   });
 
-  test('returns null for missing file', () => {
-    expect(readJobState('does-not-exist', FIX)).toBeNull();
+  test('returns null for missing file', async () => {
+    expect(await readJobState('does-not-exist', FIX)).toBeNull();
   });
 
-  test('returns null for malformed JSON', () => {
-    expect(readJobState('neg-bad-json', FIX)).toBeNull();
+  test('returns null for malformed JSON (after one race retry)', async () => {
+    // 注意:fixture 是真实坏文件,retry 也会失败 → 2 次都挂,最终 null
+    expect(await readJobState('neg-bad-json', FIX)).toBeNull();
   });
 
-  test('returns null for wrong shape (missing state field)', () => {
-    expect(readJobState('neg-wrong-shape', FIX)).toBeNull();
+  test('returns null for wrong shape (missing state field)', async () => {
+    expect(await readJobState('neg-wrong-shape', FIX)).toBeNull();
   });
 
-  test('accepts unknown state value (forward compat)', () => {
-    const env = readJobState('neg-unknown-state', FIX);
+  test('accepts unknown state value (forward compat)', async () => {
+    const env = await readJobState('neg-unknown-state', FIX);
     expect(env).not.toBeNull();
     expect(env!.state.state).toBe('hypothetical_future_state');
   });
@@ -52,8 +53,8 @@ describe('listJobShorts', () => {
 });
 
 describe('readAllJobStates', () => {
-  test('parses all fixtures, drops malformed ones silently', () => {
-    const envs = readAllJobStates(FIX);
+  test('parses all fixtures, drops malformed ones silently', async () => {
+    const envs = await readAllJobStates(FIX);
     // 15 个 happy + 1 个 neg-unknown-state(unknown state 是 valid shape)
     // = 16 个 envelope;neg-bad-json + neg-wrong-shape 被丢
     expect(envs.length).toBe(16);
@@ -63,6 +64,37 @@ describe('readAllJobStates', () => {
     expect(states).toContain('working');
     expect(states.filter(s => s === 'done').length).toBe(10);
     expect(states.filter(s => s === 'stopped').length).toBe(2);
+  });
+});
+
+// v2.3.1: race-retry — 模拟 Claude CLI 撕裂写场景。
+// 用一个 tmp 文件:第一次读时给坏 JSON,20ms 后变成好 JSON。
+describe('readJobState race retry (v2.3.1)', () => {
+  test('first parse fails, retry after 20ms succeeds', async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = require('fs');
+    const { tmpdir } = require('os');
+    const dir = mkdtempSync(join(tmpdir(), 'race-retry-'));
+    const f = join(dir, 'racey.json');
+    // 先写撕裂 JSON
+    writeFileSync(f, '{"state": "running", "this is torn');
+
+    // 20ms 后切到合法 JSON
+    setTimeout(() => {
+      writeFileSync(f, JSON.stringify({
+        state: 'running', detail: null, needs: null, inFlight: null,
+        linkScanPath: null, linkScanOffset: 0,
+        name: 'recovered after race', nameSource: 'auto',
+      }));
+    }, 5);  // 5ms < retry 20ms
+
+    try {
+      const env = await readJobState('racey', dir);
+      expect(env).not.toBeNull();
+      expect(env!.state.state).toBe('running');
+      expect(env!.state.name).toBe('recovered after race');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

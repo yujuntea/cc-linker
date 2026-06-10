@@ -72,15 +72,22 @@ export function validateJobStateShape(raw: unknown): raw is JobStateFile {
 }
 
 /**
- * 读取单个 job 的 state.json。
+ * 读取单个 job 的 state.json。**Async** — 第一次 parse 失败时 await 20ms 重试一次
+ * 治 Claude CLI 撕裂写。
+ *
  * @param short 8 字符 hash(也是子目录名);测试可传 fixture 文件名(无 .json 后缀)
  *              如 'neg-bad-json',此时函数会查 jobsDir/<short>.json
  * @param jobsDir 默认 CLAUDE_JOBS_DIR,测试用 fixture 路径覆盖
+ *
+ * 并发写竞争(v2.3.1):Claude CLI 在 state transition 时写 state.json,
+ * 我们若同时读到撕裂字节 → JSON.parse 失败。第一次失败 await 20ms 重读一次,
+ * 治 race 让 session 不再"从飞书卡上消失 2-10 秒后才回来"。两次都失败才
+ * reportOnce 警告 + 返回 null。
  */
-export function readJobState(
+export async function readJobState(
   short: string,
   jobsDir: string = CLAUDE_JOBS_DIR,
-): JobStateEnvelope | null {
+): Promise<JobStateEnvelope | null> {
   // production:jobsDir/<short>/state.json
   // fixture:  jobsDir/<short>.json(测试模式)
   const candidate1 = join(jobsDir, short, 'state.json');
@@ -90,6 +97,20 @@ export function readJobState(
     : null;
   if (!path) return null;
 
+  // 读 + parse,失败时 async 等 20ms 重试一次治撕裂写
+  const env = tryReadOnce(short, path);
+  if (env) return env;
+  // race retry — async sleep 20ms 让 CLI 写完
+  await new Promise<void>(resolve => setTimeout(resolve, 20));
+  const env2 = tryReadOnce(short, path);
+  if (env2) return env2;
+  // 两次都挂 → 真坏文件,reportOnce 记日志(默认行为)
+  reportOnce(short, `state.json read/parse failed after one retry`);
+  return null;
+}
+
+/** Internal: single read + parse + shape validate. Returns envelope or null silently. */
+function tryReadOnce(short: string, path: string): JobStateEnvelope | null {
   let raw: string;
   let mtimeMs: number;
   try {
@@ -98,27 +119,14 @@ export function readJobState(
   } catch {
     return null;
   }
-
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    reportOnce(short, `state.json parse failed (malformed JSON)`);
-    return null;
+    return null;  // race-induced parse error — caller will retry
   }
-
-  if (!validateJobStateShape(parsed)) {
-    reportOnce(short, `state.json shape invalid (no .state field)`);
-    return null;
-  }
-
-  return {
-    short,
-    path,
-    state: parsed,
-    mtimeMs,
-    readAt: Date.now(),
-  };
+  if (!validateJobStateShape(parsed)) return null;
+  return { short, path, state: parsed, mtimeMs, readAt: Date.now() };
 }
 
 /**
@@ -158,17 +166,16 @@ export function listJobShorts(jobsDir: string = CLAUDE_JOBS_DIR): string[] {
 /**
  * 并行读取 jobsDir 下所有 short 的 state.json。
  * malformed / 缺失的 silently 丢弃(reportOnce 会在 readJobState 内打 warning)。
+ *
+ * 并行用 Promise.all —— readJobState 在 race retry 路径会 await 20ms,
+ * 串行会让 worst-case N×20ms 累加,并行让 worst-case 仍是 20ms。
  */
-export function readAllJobStates(
+export async function readAllJobStates(
   jobsDir: string = CLAUDE_JOBS_DIR,
-): JobStateEnvelope[] {
+): Promise<JobStateEnvelope[]> {
   const shorts = listJobShorts(jobsDir);
-  const envs: JobStateEnvelope[] = [];
-  for (const short of shorts) {
-    const env = readJobState(short, jobsDir);
-    if (env) envs.push(env);
-  }
-  return envs;
+  const results = await Promise.all(shorts.map(short => readJobState(short, jobsDir)));
+  return results.filter((e): e is JobStateEnvelope => e !== null);
 }
 
 /**
