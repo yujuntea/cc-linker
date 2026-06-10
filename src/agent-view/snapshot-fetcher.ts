@@ -35,10 +35,13 @@ export type FetchResult =
   | { ok: true; sessions: AgentSession[] }
   | { ok: false; reason: string };
 
-// 测试 hook:让 tests 替换数据源 + 冷路径
+// 测试 hook:让 tests 替换数据源 + 冷路径 + 副信号源(daemon.log claimed tail)
+// 全部走 mutable object 而非 mock.module — 后者在 Bun 跨文件不可撤销,会污染
+// daemon-log-reader.test.ts / daemon-probe.test.ts 等单元测试。
 export const _jobStateHooks = {
   readAllJobStates,
   deriveNameFromJsonl,
+  readClaimedSources,
 };
 
 export const AgentSnapshotFetcher = {
@@ -79,7 +82,7 @@ export const AgentSnapshotFetcher = {
     // daemon.log claimedSources 兜底
     const roster = readRoster();
     const rosterMap = buildRosterSourceMap(roster);
-    const claimedSources = readClaimedSources(24);
+    const claimedSources = _jobStateHooks.readClaimedSources(24);
     sessions = sessions.map(s => {
       const short = s.sessionId.slice(0, 8);
       const src: AgentSessionSource =

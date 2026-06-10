@@ -53,7 +53,7 @@ mock.module('node:child_process', () => {
 // intercept when snapshot-fetcher pulls in roster-source via destructure.
 import { AgentViewManager } from '../../src/agent-view/manager';
 import { UserManager } from '../../src/feishu/mapping';
-import { AgentSnapshotFetcher } from '../../src/agent-view/snapshot-fetcher';
+import { AgentSnapshotFetcher, _jobStateHooks } from '../../src/agent-view/snapshot-fetcher';
 
 // ── Per-test tempdir + restore snapshot fetcher mock between tests.
 let tmpDir: string;
@@ -66,9 +66,13 @@ afterAll(() => {
 // v2.2.1: 必须在每个 test 前重置 AgentSnapshotFetcher.fetch,
 // 否则之前 test 里 (AgentSnapshotFetcher as any).fetch = mock(...) 的 override
 // 会泄漏到下一个 test,影响 mock.execFile 的期望(只对真 fetch 路径生效)。
+const origReadAllJobStates = _jobStateHooks.readAllJobStates;
 beforeEach(() => {
   (AgentSnapshotFetcher as any).fetch = origFetch;
   execFileMock.mockReset();
+  // smoke test 默认成功(空 JSON 即可,fetch 不再 trust 它的内容)
+  execFileMock.mockImplementation((_cmd: string, _args: string[], cb: any) => cb(null, '[]', ''));
+  _jobStateHooks.readAllJobStates = origReadAllJobStates;
 });
 
 afterEach(() => {
@@ -264,19 +268,9 @@ describe('Agent View end-to-end', () => {
     expect(userManager.getEntry('ou_e2e_busy')).toBeUndefined();
   });
 
-  test('v2.2.2: only sub-agents (spare) are filtered; slash and fleet are kept (TUI parity)', async () => {
-    // 这个 test 走真 fetch 路径:
-    //   1) execFile('claude', ['agents', '--json']) 返回 3 个 session
-    //   2) 通过把 HOME 指向带 controlled roster.json 的 tmpdir,让真 readRoster()
-    //      读到我们造的 roster(slash/spare/fleet 各一)
-    // 期望:list 卡里能看到 slash + fleet(跟 TUI 一致),只过滤掉 spare
-    // worker key 必须等于 sessionId 的前 8 字符(实跑 roster.json 的规律)
-    const agentsJson = JSON.stringify([
-      { pid: 1, cwd: '/a', kind: 'background', startedAt: 1000, sessionId: 'slash000-1111-2222-3333-444444444444', name: 'user-dispatched-task', status: 'busy' },
-      { pid: 2, cwd: '/a', kind: 'background', startedAt: 1000, sessionId: 'spare000-1111-2222-3333-444444444444', name: 'sub-agent-spare', status: 'busy' },
-      { pid: 3, cwd: '/a', kind: 'background', startedAt: 1000, sessionId: 'fleet000-1111-2222-3333-444444444444', name: 'daemon-internal-fleet', status: 'busy' },
-    ]);
-    // 写真 roster 到一个 tmpdir,然后把 HOME 指向那里
+  test('v2.2.2 (v2.3 adapted): only sub-agents (spare) are filtered; slash and fleet are kept (TUI parity)', async () => {
+    // v2.3:数据源切到 state.json,roster 仍是 source 标签兜底。
+    // 喂 3 个 envelope + 真 roster.json(slash/spare/fleet 各一)→ 验证只 spare 被过滤。
     const fakeHome = mkdtempSync(join(tmpdir(), 'agent-view-int-roster-'));
     const rosterDir = join(fakeHome, '.claude', 'daemon');
     require('fs').mkdirSync(rosterDir, { recursive: true });
@@ -295,13 +289,23 @@ describe('Agent View end-to-end', () => {
     const realHome = process.env.HOME;
     process.env.HOME = fakeHome;
 
-    execFileMock.mockImplementation((cmd: string, args: string[], cb: any) => {
-      if (cmd === 'claude' && args[0] === 'agents') {
-        cb(null, agentsJson, '');
-      } else {
-        cb(null, '', '');
-      }
-    });
+    _jobStateHooks.readAllJobStates = mock(() => [
+      { short: 'slash000', path: '/x', mtimeMs: 1000, readAt: 1000,
+        state: { state: 'running', detail: null, needs: null, inFlight: null,
+          linkScanPath: null, linkScanOffset: 0,
+          name: 'user-dispatched-task', nameSource: 'auto',
+          resumeSessionId: 'slash000-1111-2222-3333-444444444444', cwd: '/a' } },
+      { short: 'spare000', path: '/x', mtimeMs: 1000, readAt: 1000,
+        state: { state: 'running', detail: null, needs: null, inFlight: null,
+          linkScanPath: null, linkScanOffset: 0,
+          name: 'sub-agent-spare', nameSource: 'auto',
+          resumeSessionId: 'spare000-1111-2222-3333-444444444444', cwd: '/a' } },
+      { short: 'fleet000', path: '/x', mtimeMs: 1000, readAt: 1000,
+        state: { state: 'running', detail: null, needs: null, inFlight: null,
+          linkScanPath: null, linkScanOffset: 0,
+          name: 'daemon-internal-fleet', nameSource: 'auto',
+          resumeSessionId: 'fleet000-1111-2222-3333-444444444444', cwd: '/a' } },
+    ]) as any;
 
     try {
       const { mgr, cardReplyFn } = makeEnv();
@@ -317,15 +321,15 @@ describe('Agent View end-to-end', () => {
       expect(md).toContain('user-dispatched-task');
       expect(md).toContain('daemon-internal-fleet');
       expect(md).not.toContain('sub-agent-spare');
-      // v2.2.1 tooltip 也要在
-      expect(md).toContain('claude agents --json');
+      // v2.3 tooltip:数据源改成 state.json
+      expect(md).toContain('state.json');
     } finally {
       process.env.HOME = realHome;
       rmSync(fakeHome, { recursive: true, force: true });
     }
   });
 
-  test('v2.2.1: when roster is unreadable, all sessions are kept (graceful degradation)', async () => {
+  test('v2.2.1 (v2.3 adapted): when roster is unreadable, all sessions are kept (graceful degradation)', async () => {
     // 模拟 daemon 跑着但 roster.json 损坏:文件存在(DaemonProbe pass)
     // 但 JSON.parse 失败(readRoster 返回 null)
     // filterUserDispatched 保留所有 source='unknown' session
@@ -337,17 +341,18 @@ describe('Agent View end-to-end', () => {
     const realHome = process.env.HOME;
     process.env.HOME = fakeHome;
 
-    const agentsJson = JSON.stringify([
-      { pid: 1, cwd: '/a', kind: 'background', startedAt: 1000, sessionId: 'uuid-aaaa-1111-2222-333333333333', name: 'task-a', status: 'busy' },
-      { pid: 2, cwd: '/a', kind: 'background', startedAt: 2000, sessionId: 'uuid-bbbb-1111-2222-333333333333', name: 'task-b', status: 'idle' },
-    ]);
-    execFileMock.mockImplementation((cmd: string, args: string[], cb: any) => {
-      if (cmd === 'claude' && args[0] === 'agents') {
-        cb(null, agentsJson, '');
-      } else {
-        cb(null, '', '');
-      }
-    });
+    _jobStateHooks.readAllJobStates = mock(() => [
+      { short: 'uuidaaaa', path: '/x', mtimeMs: 1000, readAt: 1000,
+        state: { state: 'running', detail: null, needs: null, inFlight: null,
+          linkScanPath: null, linkScanOffset: 0,
+          name: 'task-a', nameSource: 'auto',
+          resumeSessionId: 'uuidaaaa-1111-2222-3333-333333333333', cwd: '/a' } },
+      { short: 'uuidbbbb', path: '/x', mtimeMs: 2000, readAt: 2000,
+        state: { state: 'done', detail: 'finished', needs: null, inFlight: null,
+          linkScanPath: '/p.jsonl', linkScanOffset: 0,
+          name: 'task-b', nameSource: 'auto',
+          resumeSessionId: 'uuidbbbb-1111-2222-3333-333333333333', cwd: '/a' } },
+    ]) as any;
 
     try {
       const { mgr, cardReplyFn } = makeEnv();
@@ -359,7 +364,7 @@ describe('Agent View end-to-end', () => {
         .map(e => e.content)
         .join('\n');
       expect(md).toContain('task-a');
-      expect(md).toContain('task-b');
+      expect(md).toContain('task-b');  // ✅ prefix added for done
     } finally {
       process.env.HOME = realHome;
       rmSync(fakeHome, { recursive: true, force: true });

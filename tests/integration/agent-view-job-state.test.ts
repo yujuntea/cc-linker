@@ -35,21 +35,23 @@ mock.module('node:child_process', () => {
   return { ...real, execFileSync: execFileSyncMock, execFile: execFileMock };
 });
 
-// Mock daemon-log-reader (Task 10 retired readCompletedSessions)
-mock.module('../../src/agent-view/daemon-log-reader', () => ({
-  readClaimedSources: () => new Map(),
-}));
-
+// readClaimedSources defaults to empty Map via _jobStateHooks swap (no mock.module
+// — that would pollute daemon-log-reader.test.ts via Bun's irrevocable module mocks)
 const origReadAll = _jobStateHooks.readAllJobStates;
+const origReadClaimed = _jobStateHooks.readClaimedSources;
+const origDaemonCheck = DaemonProbe.check;
 let tmpDir: string;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'canary-'));
   (DaemonProbe as any).check = () => true;
+  _jobStateHooks.readClaimedSources = (() => new Map()) as any;
 });
 
 afterEach(() => {
   _jobStateHooks.readAllJobStates = origReadAll;
+  _jobStateHooks.readClaimedSources = origReadClaimed;
+  (DaemonProbe as any).check = origDaemonCheck;
   rmSync(tmpDir, { recursive: true, force: true });
 });
 

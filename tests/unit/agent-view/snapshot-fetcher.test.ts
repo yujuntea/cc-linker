@@ -19,15 +19,15 @@ mock.module('node:child_process', () => {
   };
 });
 
-// ── Mock daemon-log-reader (claim sources only — readCompletedSessions retired in Task 10) ──
+// ── readClaimedSources swap (via _jobStateHooks, not mock.module — the latter
+//    would pollute daemon-log-reader.test.ts via Bun's irrevocable module mocks) ──
 const readClaimedSourcesMock = mock((_h: number): Map<string, any> => new Map());
-mock.module('../../../src/agent-view/daemon-log-reader', () => ({
-  readClaimedSources: readClaimedSourcesMock,
-}));
 
 // ── Save / restore _jobStateHooks ──
 const origReadAll = _jobStateHooks.readAllJobStates;
 const origDerive = _jobStateHooks.deriveNameFromJsonl;
+const origReadClaimed = _jobStateHooks.readClaimedSources;
+const origDaemonCheck = DaemonProbe.check;
 
 beforeEach(() => {
   execFileSyncMock.mockReset();
@@ -40,6 +40,7 @@ beforeEach(() => {
   execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, '[]', ''));
   readClaimedSourcesMock.mockReset();
   readClaimedSourcesMock.mockImplementation(() => new Map());
+  _jobStateHooks.readClaimedSources = readClaimedSourcesMock;
 
   // DaemonProbe defaults to true (roster.json exists). Tests override per case.
   (DaemonProbe as any).check = () => true;
@@ -48,6 +49,8 @@ beforeEach(() => {
 afterEach(() => {
   _jobStateHooks.readAllJobStates = origReadAll;
   _jobStateHooks.deriveNameFromJsonl = origDerive;
+  _jobStateHooks.readClaimedSources = origReadClaimed;
+  (DaemonProbe as any).check = origDaemonCheck;
 });
 
 function mockJobs(envs: any[]) {
