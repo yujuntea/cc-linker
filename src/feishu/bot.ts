@@ -1446,17 +1446,19 @@ export class FeishuBot {
       // [Reply] 表达"接管 bg session"意图,弹冲突卡反 UX — 改成自动 `claude stop`
       // + 3s wait + 递归 SDK 一次。第二次 reply 时 bg 已被停,直接走 SDK。
       if (sessionUuid && !isNew) {
-        const roster = _bgConflictHooks.readRoster();
-        const short = sessionUuid.slice(0, 8);
-        const worker = roster?.workers?.[short];
-        if (worker) {
-          // v2.3.5:AgentView reply 路径下,用户已点 [Reply] 表达"接管"意图,
-          // 自动 stop bg + 3s wait + 递归 runChatSDK 一次(skipBgConflict 跳过本次检查)。
-          // 第二次 reply 时 bg 已没,直接走 SDK。普通 chat 路径仍弹 3 按钮让用户决策。
-          if (fromAgentViewReply) {
+        // v2.3.5 pre-step:AgentView reply 路径下,若 bg conflict 探测到 live worker,
+        // **提前** 自动 stop + 3s wait,等一切就绪后才走 SDK。原 SDK 流程(同一个
+        // CardUpdater)继续 → 只发 1 张"处理中"卡,不再有递归 SDK 引发的双卡问题。
+        // 第二次 reply 时 bg 已被停,conflict check 直接 pass,直接走 SDK。
+        // 普通 chat 路径(没设 fromAgentViewReply)行为不变,3 按钮让用户决策。
+        if (fromAgentViewReply) {
+          const roster = _bgConflictHooks.readRoster();
+          const short = sessionUuid.slice(0, 8);
+          const worker = roster?.workers?.[short];
+          if (worker) {
             logger.info(
               `runChatSDK: reply 路径自动 stop bg worker ${short}(pid=${worker.pid}),` +
-                `等 3s 后递归 SDK`,
+                `等 3s 让 supervisor 释放 cwd 锁`,
             );
             try {
               await new Promise<void>((resolve, reject) => {
@@ -1475,11 +1477,14 @@ export class FeishuBot {
               // v2.2.19 / v2.3.5:1s 升 3s,治新 bg worker 太快 respawn 的 race
               await new Promise(r => setTimeout(r, 3000));
             } catch {
-              // 任何意外都让递归继续尝试
+              // 任何意外都让原 SDK 流程继续(可能再触发 conflict 弹卡,acceptable)
             }
-            // 递归 SDK,跳过本次 conflict 检查
-            return await this.runChatSDK({ ...params, fromAgentViewReply: false });
           }
+        }
+        const roster = _bgConflictHooks.readRoster();
+        const short = sessionUuid.slice(0, 8);
+        const worker = roster?.workers?.[short];
+        if (worker) {
           const workerPid = (worker as any).pid;
           const workerName = (worker as any).dispatch?.seed?.name || short;
           // v2.2.13: 在拒绝时 pre-compute parent UUID(从 roster.launch.sessionId 提取
