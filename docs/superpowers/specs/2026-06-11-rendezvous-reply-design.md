@@ -71,9 +71,8 @@ pre-step (新逻辑):
    │   │   └─ return {ok, text, tokens, durationMs, reason}
    │   │
    │   ├─ if result.ok:
-   │   │   ├─ replyFn(text) → 走当前 replyTo 路径
-   │   │   ├─ spoolQueue.markReplied(msg.messageId, msg.serialKey)
-   │   │   └─ spoolQueue.markDone(msg.messageId, msg.serialKey)
+   │   │   ├─ replyAndFinalize(msg, text)  // 复用 v2.3.11 路径, 内含 replyTo + markReplied + markDone
+   │   │   └─ (若 readLastAssistantTurn 失败 → text 用 patch.detail 兜底, 仍调 replyAndFinalize)
    │   │
    │   └─ if !result.ok (no fallback possible, bg 已在处理):
    │       ├─ log error
@@ -361,17 +360,19 @@ Mock roster.json + state.json 在 temp dir：
 **config.toml**:
 ```toml
 [agent_view]
-rendezvous_enabled = true   # default true, 旧 CLI / 紧急时关
+# Phase 1: default false (待 PR 4 才翻)
+# Phase 2: default true (PR 4 之后)
+rendezvous_enabled = false
 rendezvous_timeout_ms = 60000
 ```
 
 ### 8.2 Rollout steps
 
-1. PR 1: 新模块 + 单测（**不接入 runChatSDK**）
-2. PR 2: 接入 runChatSDK pre-step，加 `rendezvous_enabled` flag 默认关
-3. PR 3: 本地 manual E2E 验证
-4. PR 4: 默认开启 `rendezvous_enabled = true`
-5. PR 5: 监控一周 fallback 占比，< 30% 可视为稳定
+1. PR 1: 新模块 + 单测（**不接入 runChatSDK**, `rendezvous_enabled` 不存在)
+2. PR 2: 接入 runChatSDK pre-step，加 `rendezvous_enabled` flag（**default false**）
+3. PR 3: 本地 manual E2E 验证 (把 flag 临时翻 true 跑)
+4. PR 4: flip default to `true`（grep -c fallback 占比监控一周）
+5. PR 5: fallback 占比 < 30% 可视为稳定
 
 ### 8.3 Rollback
 
@@ -388,8 +389,10 @@ rendezvous_timeout_ms = 60000
 
 ## 10. References
 
-- 实证探针见 `docs/qa/2026-06-11-rendezvous-probe-notes.md`（实施时补）
+- 实证探针（PR 1 实施时合并到本目录）：
+  - `docs/qa/2026-06-11-rendezvous-probe-notes.md` 记录 6 次探针（rv socket 协议 / 完整 state cycle / JSONL 末次 turn 验证）
 - 现有 v2.3.5/v2.3.6 改动：`src/feishu/bot.ts:1473-1526`（pre-step claude stop 块）
 - 现有 state.json 读取：`src/agent-view/job-state.ts`
 - 现有 roster.json 读取：`src/agent-view/roster-source.ts`
 - existing jsonl peek：`src/agent-view/jsonl-peek.ts`
+- 现有 replyAndFinalize 路径：`src/feishu/bot.ts:2530`
