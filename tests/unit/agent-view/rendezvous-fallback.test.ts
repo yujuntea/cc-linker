@@ -37,27 +37,28 @@ describe('checkRendezvousEligibility', () => {
     sockServer.listen(sockPath);
   }
 
-  test('bg waiting + new CLI + socket exists → canUse', async () => {
+  const testCtx = (ccHome: string) => ({
+    jobsDir: join(ccHome, 'jobs'),
+    rosterPath: join(ccHome, 'daemon', 'roster.json'),
+  });
+
+  test('bg waiting + socket exists → canUse', async () => {
     writeState({
       state: 'blocked',
       tempo: 'blocked',
       needs: '是否继续?',
       linkScanPath: '/tmp/x.jsonl',
-      cliVersion: '2.1.163',
     });
     writeRoster({
       workers: {
         dcb2ec25: {
-          cliVersion: '2.1.163',
           rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock'),
         },
       },
     });
     writeSocket();
 
-    const r = await checkRendezvousEligibility('dcb2ec25', {
-      ccHomeDir: ccHome,
-    });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(true);
     expect(r.reason).toBe('bg_waiting');
     expect(r.rendezvousSock).toBe(join(ccHome, 'daemon', 'rv-dcb2ec25.sock'));
@@ -66,74 +67,73 @@ describe('checkRendezvousEligibility', () => {
 
   test('bg busy (tempo=active) → bg_busy', async () => {
     writeState({ state: 'running', tempo: 'active', needs: '' });
-    writeRoster({ workers: { dcb2ec25: { cliVersion: '2.1.163', rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
+    writeRoster({ workers: { dcb2ec25: { rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
     writeSocket();
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(false);
     expect(r.reason).toBe('bg_busy');
   });
 
   test('state.json missing → daemon_down', async () => {
     // state.json was never created (only the directory was in beforeEach)
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(false);
     expect(r.reason).toBe('daemon_down');
   });
 
   test('roster missing → daemon_down', async () => {
     writeState({ state: 'blocked', tempo: 'blocked', needs: 'q' });
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(false);
     expect(r.reason).toBe('daemon_down');
   });
 
   test('no rendezvousSock in roster → no_rendezvous_sock', async () => {
     writeState({ state: 'blocked', tempo: 'blocked', needs: 'q' });
-    writeRoster({ workers: { dcb2ec25: { cliVersion: '2.1.163' } } });
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
+    writeRoster({ workers: { dcb2ec25: {} } });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(false);
     expect(r.reason).toBe('no_rendezvous_sock');
   });
 
-  test('CLI 2.1.138 → old_cli', async () => {
-    writeState({ state: 'blocked', tempo: 'blocked', needs: 'q' });
-    writeRoster({ workers: { dcb2ec25: { cliVersion: '2.1.138', rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
-    writeSocket();
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
-    expect(r.canUse).toBe(false);
-    expect(r.reason).toBe('old_cli');
-  });
-
-  test('CLI 2.1.139 (exact) → canUse', async () => {
-    writeState({ state: 'blocked', tempo: 'blocked', needs: 'q' });
-    writeRoster({ workers: { dcb2ec25: { cliVersion: '2.1.139', rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
-    writeSocket();
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
-    expect(r.canUse).toBe(true);
-  });
-
   test('socket file missing on disk → daemon_down', async () => {
     writeState({ state: 'blocked', tempo: 'blocked', needs: 'q' });
-    writeRoster({ workers: { dcb2ec25: { cliVersion: '2.1.163', rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
+    writeRoster({ workers: { dcb2ec25: { rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
     // no writeSocket() — physical file doesn't exist
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(false);
     expect(r.reason).toBe('daemon_down');
   });
 
   test('socket path is a regular file, not a socket → daemon_down', async () => {
     writeState({ state: 'blocked', tempo: 'blocked', needs: 'q' });
-    writeRoster({ workers: { dcb2ec25: { cliVersion: '2.1.163', rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
+    writeRoster({ workers: { dcb2ec25: { rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
     writeFileSync(join(ccHome, 'daemon', 'rv-dcb2ec25.sock'), 'not a socket');
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(false);
     expect(r.reason).toBe('daemon_down');
   });
 
   test('malformed state.json → daemon_down', async () => {
     writeFileSync(join(ccHome, 'jobs', 'dcb2ec25', 'state.json'), '{ not valid json');
-    const r = await checkRendezvousEligibility('dcb2ec25', { ccHomeDir: ccHome });
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
     expect(r.canUse).toBe(false);
     expect(r.reason).toBe('daemon_down');
+  });
+
+  test('tear-write state.json → retry succeeds (via readJobState)', async () => {
+    // Simulate tear-write: first write is truncated, then quickly fixed
+    writeFileSync(join(ccHome, 'jobs', 'dcb2ec25', 'state.json'), '{ partial');
+    writeRoster({ workers: { dcb2ec25: { rendezvousSock: join(ccHome, 'daemon', 'rv-dcb2ec25.sock') } } });
+    writeSocket();
+
+    // After 10ms, write the valid state (before readJobState's 20ms retry)
+    setTimeout(() => {
+      writeState({ state: 'blocked', tempo: 'blocked', needs: 'q' });
+    }, 10);
+
+    const r = await checkRendezvousEligibility('dcb2ec25', testCtx(ccHome));
+    // readJobState retries once after 20ms, so it should recover
+    expect(r.canUse).toBe(true);
   });
 });

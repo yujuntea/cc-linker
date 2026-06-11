@@ -179,16 +179,17 @@ describe('ExpectedReplyState — bot restart recovery (R8)', () => {
 describe('ExpectedReplyState.markSent (M1 fix)', () => {
   let userManager: UserManager;
   let state: ExpectedReplyState;
+  let tmpFile: string;
 
   beforeEach(() => {
-    const tmpFile = join(tmpdir(), `er-mark-test-${Date.now()}-${Math.random()}.json`);
+    tmpFile = join(tmpdir(), `er-mark-test-${Date.now()}-${Math.random()}.json`);
     userManager = new UserManager(tmpFile);
     state = new ExpectedReplyState(userManager);
   });
 
   afterEach(() => {
-    // cleanup temp file
-    try { rmSync(tmpMapping, { force: true }); } catch {}
+    // cleanup temp file created in beforeEach
+    try { rmSync(tmpFile, { force: true }); } catch {}
   });
 
   test('markSent clears in-memory state immediately', async () => {

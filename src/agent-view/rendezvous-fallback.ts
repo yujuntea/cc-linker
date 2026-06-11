@@ -1,10 +1,11 @@
 import { existsSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
+import { readJobState } from './job-state';
+import { CLAUDE_JOBS_DIR } from '../utils/paths';
 
 export type IneligibleReason =
   | 'bg_busy'            // tempo=active OR running/working 无 needs
   | 'no_rendezvous_sock' // roster 缺该字段
-  | 'old_cli'            // cliVersion < 2.1.139
   | 'daemon_down'        // state.json 缺失 / sock 物理不存在
   ;
 
@@ -16,94 +17,55 @@ export interface RendezvousEligibility {
 }
 
 export interface EligibilityContext {
-  /** Override $HOME for tests; default process.env.HOME */
-  ccHomeDir?: string;
+  /** Override jobs dir for tests; default CLAUDE_JOBS_DIR (~/.claude/jobs) */
+  jobsDir?: string;
+  /** Override roster path for tests; default ~/.claude/daemon/roster.json */
+  rosterPath?: string;
 }
 
-/** Minimum CLI version that exposes rendezvousSock. */
-const MIN_CLI_VERSION = '2.1.139';
-
 /**
- * Read state.json for a session short id. Returns null if missing or malformed.
+ * Read roster.json from a given path. Returns null if missing or malformed.
+ * This is a minimal wrapper; production uses readRoster() from roster-source.ts
+ * but that doesn't accept a custom path (needed for tests).
  */
-function readStateJson(short: string, ccHome: string): any | null {
-  const path = join(ccHome, 'jobs', short, 'state.json');
-  if (!existsSync(path)) return null;
+function readRosterFromPath(rosterPath: string): any | null {
+  if (!existsSync(rosterPath)) return null;
   try {
-    return JSON.parse(readFileSync(path, 'utf8'));
+    return JSON.parse(readFileSync(rosterPath, 'utf8'));
   } catch {
     return null;
   }
-}
-
-/**
- * Read roster.json from daemon dir. Returns null if missing or malformed.
- */
-function readRosterJson(ccHome: string): any | null {
-  const path = join(ccHome, 'daemon', 'roster.json');
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Parse "2.1.163" -> [2, 1, 163]. Non-numeric parts default to 0.
- */
-function parseVersion(s: string | undefined): number[] {
-  if (!s) return [0];
-  return s.split('.').map(p => {
-    const n = parseInt(p, 10);
-    return isNaN(n) ? 0 : n;
-  });
-}
-
-/**
- * Compare two semver-ish version arrays. Returns -1 / 0 / 1.
- */
-function compareVersions(a: number[], b: number[]): number {
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    const av = a[i] ?? 0;
-    const bv = b[i] ?? 0;
-    if (av < bv) return -1;
-    if (av > bv) return 1;
-  }
-  return 0;
 }
 
 /**
  * Decide whether the rendezvous socket path is usable for a given session.
  *
  * Decision tree:
- *   1. state.json exists & parseable?
+ *   1. state.json exists & parseable? (via readJobState with retry for torn writes)
  *      - No → daemon_down
  *   2. bg is in waiting state? (tempo=blocked + needs, OR running/working with needs)
  *      - No → bg_busy
  *   3. roster.json has this short with rendezvousSock?
- *      - No → no_rendezvous_sock
- *   4. CLI version >= 2.1.139?
- *      - No → old_cli
- *   5. rendezvousSock file exists on disk?
+ *      - No → no_rendezvous_sock or daemon_down
+ *   4. rendezvousSock file exists on disk and is a socket?
  *      - No → daemon_down
- *   6. → canUse=true, reason=bg_waiting
+ *   5. → canUse=true, reason=bg_waiting
+ *
+ * Note: CLI version check removed — rendezvousSock field is only populated
+ * by CLI >= 2.1.139, so its presence implies the version is new enough.
  */
 export async function checkRendezvousEligibility(
   short: string,
   ctx: EligibilityContext = {},
 ): Promise<RendezvousEligibility> {
-  const ccHome = ctx.ccHomeDir ?? process.env.HOME ?? '';
-  if (!ccHome) {
-    return { canUse: false, reason: 'daemon_down' };
-  }
+  const jobsDir = ctx.jobsDir ?? CLAUDE_JOBS_DIR;
 
-  // 1. state.json
-  const state = readStateJson(short, ccHome);
-  if (!state) {
+  // 1. state.json (with tear-write retry via readJobState)
+  const jobState = await readJobState(short, jobsDir);
+  if (!jobState) {
     return { canUse: false, reason: 'daemon_down' };
   }
+  const state = jobState.state;
 
   // 2. bg waiting check
   const isWaiting = (() => {
@@ -117,24 +79,18 @@ export async function checkRendezvousEligibility(
   }
 
   // 3. roster
-  const roster = readRosterJson(ccHome);
+  const rosterPath = ctx.rosterPath ?? join(process.env.HOME ?? '', '.claude', 'daemon', 'roster.json');
+  const roster = readRosterFromPath(rosterPath);
   if (!roster) {
     return { canUse: false, reason: 'daemon_down' };
   }
-  if (!roster.workers?.[short]?.rendezvousSock) {
+  const worker = roster.workers?.[short] as any;
+  if (!worker?.rendezvousSock) {
     return { canUse: false, reason: 'no_rendezvous_sock' };
   }
-  const worker = roster.workers[short];
   const sock: string = worker.rendezvousSock;
 
-  // 4. CLI version
-  const cliVer = parseVersion(worker.cliVersion ?? state.cliVersion);
-  const minVer = parseVersion(MIN_CLI_VERSION);
-  if (compareVersions(cliVer, minVer) < 0) {
-    return { canUse: false, reason: 'old_cli' };
-  }
-
-  // 5. sock file exists
+  // 4. sock file exists and is a socket
   if (!existsSync(sock)) {
     return { canUse: false, reason: 'daemon_down' };
   }

@@ -1386,12 +1386,19 @@ export class FeishuBot {
     logger.info(
       `rendezvous: inject short=${short} text_len=${promptText.length} reason=bg_waiting`,
     );
+    const timeoutMs = config.get<number>('agent_view.rendezvous_timeout_ms', 60_000);
     const rendezvousResult = await RendezvousClient.injectReply({
       short,
       text: promptText,
       rendezvousSock: eligibility.rendezvousSock,
-      timeoutMs: config.get<number>('agent_view.rendezvous_timeout_ms', 60_000),
+      timeoutMs,
     });
+
+    // Wait briefly for bg to flush JSONL after completion.
+    // The rendezvous socket signals completion (state.json transition) before
+    // the bg worker necessarily finishes writing the assistant turn to JSONL.
+    // Without this delay, readLastAssistantTurn may return a stale previous turn.
+    await new Promise(r => setTimeout(r, 500));
 
     // Read JSONL for response text (bg may have written its reply)
     const lastTurn = eligibility.jsonlPath
@@ -1402,9 +1409,10 @@ export class FeishuBot {
 
     if (rendezvousResult.ok) {
       // Success: compose response + token stats
-      const responseText = lastTurn?.text
-        ?? rendezvousResult.patches?.find(p => p.detail)?.detail
-        ?? '(bg 完成)';
+      // lastTurn may be null if JSONL hasn't flushed yet (race with bg write).
+      // Do NOT use patches[].detail as fallback — it contains state descriptors
+      // (e.g. 'killed', intent text), not actual response text.
+      const responseText = lastTurn?.text ?? '(bg 完成，请在 Agent View 查看完整回复)';
       const tokenCount = (lastTurn?.usage.input_tokens ?? 0)
         + (lastTurn?.usage.output_tokens ?? 0)
         + (lastTurn?.usage.cache_creation_input_tokens ?? 0)
@@ -1423,7 +1431,7 @@ export class FeishuBot {
         `rendezvous: inject failed reason=${rendezvousResult.reason} (no fallback)`,
       );
       replyText = rendezvousResult.reason === 'timeout'
-        ? `⏱ bg 处理超时（60s 内未完成），已停止等待。bg 可能仍在后台运行。`
+        ? `⏱ bg 处理超时（${Math.round(timeoutMs / 1000)}s 内未完成），已停止等待。bg 可能仍在后台运行。`
         : rendezvousResult.reason === 'socket_closed'
         ? `⚠️ Claude daemon 已停止，无法处理 reply。请联系管理员重启 daemon。`
         : `⚠️ Reply 失败：${rendezvousResult.reason}`;
@@ -1811,13 +1819,13 @@ export class FeishuBot {
       // that DO have a SpoolMessage (handleChat) handle the spool update inline.
 
       // P1-4: SDK fallback path for Agent View Reply — send a chat-text reply
-      // with response + token stats (rendezvous path already sent one in tryRendezvousReply).
-      if (fromAgentViewReply && result?.response) {
+      // ONLY when the card failed to initialize (cardInitFailed=true).
+      // When card succeeded, cardUpdater.complete() already delivered response +
+      // token stats via the interactive card — no need for a duplicate chat-text.
+      if (fromAgentViewReply && result?.response && cardInitFailed) {
         const tokenCount = (result.tokensIn ?? 0) + (result.tokensOut ?? 0);
-        const sdkReplyText = result.response.length > 0
-          ? `✅ Claude 已处理完你的消息。\n\n${result.response}\n\n` +
-            `⏱ ${result.durationMs}ms · ${formatTokenCount(tokenCount)} · 1 轮数`
-          : `✅ Claude 已处理完你的消息（无文本响应）。`;
+        const sdkReplyText = `✅ Claude 已处理完你的消息。\n\n${result.response}\n\n` +
+          `⏱ ${result.durationMs}ms · ${formatTokenCount(tokenCount)} · 1 轮数`;
         if (messageId) {
           await this.replyFn(sdkReplyText, { messageId, openId, requestUuid: stableUuid(messageId) });
         } else {

@@ -905,12 +905,11 @@ export class AgentViewManager {
     //    - rendezvous path (tryRendezvousReply in bot.ts): sends chat-text reply
     //      with response + token stats, returns rendezvousHandled: true.
     //    - SDK fallback path: cards get patched live, bot.ts sends chat-text reply
-    //      at the end of runChatSDK (P1-4 step).
+    //      at the end of runChatSDK (P1-4 step, only if card init failed).
     //    In BOTH cases, the completion message is handled inside runChatSDK.
     let sdkError: any = null;
-    let sdkResult: { rendezvousHandled?: boolean } | null = null;
     try {
-      sdkResult = await this.deps.runChatSDK({
+      await this.deps.runChatSDK({
         openId,
         sessionUuid: info.sessionId,
         cwd: info.cwd,
@@ -919,7 +918,7 @@ export class AgentViewManager {
         messageId: info.messageId,  // v2.4: 透传 card messageId
         isNew: false,
         fromAgentViewReply: true,
-      }) as { rendezvousHandled?: boolean };
+      });
     } catch (err: any) {
       sdkError = err;
     } finally {
@@ -931,19 +930,8 @@ export class AgentViewManager {
       return;
     }
 
-    // v2.4: 如果 rendezvous 或 SDK 路径已发送 chat-text 回复,跳过旧的完成消息。
-    // rendezvousHandled=true → tryRendezvousReply 已发 (bot.ts)
-    // rendezvousHandled=false/undefined → SDK 路径的 P1-4 step 已发 (bot.ts)
-    // 只有 sdkResult 完全为 null (不应发生) 才 fallback 到旧消息。
-    if (!sdkResult) {
-      // Defensive fallback — should not happen in practice
-      await this.deps.replyFn(
-        `✅ Claude 已处理完你的消息。\n` +
-        `若需继续 reply,在飞书 Agent View 重新点 [Reply] 即可。`,
-        { openId },
-      );
-    }
-    // 正常情况下不发额外消息 — bot.ts 的 tryRendezvousReply 或 SDK P1-4 已发过。
+    // v2.4: bot.ts 的 tryRendezvousReply 或 SDK P1-4 已发送 chat-text 回复,
+    // 这里不再发送旧的完成消息。
   }
 
   /**
