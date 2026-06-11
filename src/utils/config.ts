@@ -187,7 +187,7 @@ const DEFAULTS: ConfigData = {
     min_claude_version: '2.1.139',
     reply_throttle_ms: 500,
     // v2.4 defaults
-    rendezvous_enabled: false,       // PR 2 默认 off, PR 4 Task 10 翻 true
+    rendezvous_enabled: true,        // v2.4 GA
     rendezvous_timeout_ms: 60_000,
   },
 };
