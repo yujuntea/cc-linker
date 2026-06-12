@@ -843,6 +843,106 @@ describe('handleReply (Step B)', () => {
     const replyCalls = replyFn.mock.calls.filter(c => (c[0] as string).includes('已处理完'));
     expect(replyCalls.length).toBe(0);
   });
+
+  /**
+   * v2.4.x UX 改进: bg 处理完一轮又问新问题 (new_needs), handleReply
+   * 应该 re-set expectedReply, 让用户可以直接在 chat 输入框接着回, 不用
+   * 重新点 [Reply]。原 [↩️ 回复] 卡保留为历史, 处理中卡 transition 成新
+   * 等待卡 (runStreamingRendezvousReply 内部处理)。re-set 用的
+   * messageId 是新等待卡的 messageId, 用户接着敲的文本会被 handleChat
+   * 路由到新等待卡对应的 bg session。
+   */
+  test('v2.4.x: bg 问新问题 → re-set expectedReply 让用户接着敲', async () => {
+    const { mgr, userManager } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [waiting],
+    }));
+    await mgr.expectedReply.set('ou_reply_newq', {
+      shortId: waiting.sessionId.slice(0, 8),
+      sessionId: waiting.sessionId,
+      cwd: waiting.cwd,
+    });
+    // Mock 模拟 bot.ts: bg 跑了, 问了新问题, 处理中卡变成新等待卡 #om_new_wait
+    mgr.deps.runChatSDK = mock(async () => ({
+      result: {},
+      handler: {},
+      cardMessageId: 'om_new_wait_card',
+      rendezvousHandled: true,
+      bgAskedNewQuestion: true,
+    })) as any;
+
+    await mgr.handleReply('ou_reply_newq', '继续');
+
+    // expectedReply 应该是 set 的, 不是 cleared
+    const entry = mgr.expectedReply.get('ou_reply_newq');
+    expect(entry).toBeDefined();
+    // messageId 应该是新等待卡的, 不是原等待卡的
+    expect(entry?.messageId).toBe('om_new_wait_card');
+    // sessionId 跟原 waiting 一致
+    expect(entry?.sessionId).toBe(waiting.sessionId);
+    // user-mapping 也应该是 set 的
+    const userEntry = userManager.getEntry('ou_reply_newq');
+    expect(userEntry?.type).toBe('pending_agent_reply');
+  });
+
+  /**
+   * v2.4.x: bg 跑完不回头 (done) → expectedReply stays cleared, 用户需 /agents
+   */
+  test('v2.4.x: bg done → expectedReply stays cleared (用户需 /agents 重选)', async () => {
+    const { mgr, userManager } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [waiting],
+    }));
+    await mgr.expectedReply.set('ou_reply_done', {
+      shortId: waiting.sessionId.slice(0, 8),
+      sessionId: waiting.sessionId,
+      cwd: waiting.cwd,
+    });
+    // Mock: bg 跑完不回头, 处理中卡变成"✅ 完成"卡
+    mgr.deps.runChatSDK = mock(async () => ({
+      result: {},
+      handler: {},
+      cardMessageId: 'om_done_card',
+      rendezvousHandled: true,
+      bgAskedNewQuestion: false,
+    })) as any;
+
+    await mgr.handleReply('ou_reply_done', '继续');
+
+    // expectedReply 应该是 cleared (默认行为, 跟 v2.4 一致)
+    expect(mgr.expectedReply.get('ou_reply_done')).toBeUndefined();
+    expect(userManager.getEntry('ou_reply_done')).toBeUndefined();
+  });
+
+  /**
+   * v2.4.x: runChatSDK 抛错时, 仍按 finally 行为清空 (不 re-set)
+   */
+  test('v2.4.x: runChatSDK throws → expectedReply cleared (no re-set)', async () => {
+    const { mgr, userManager } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [waiting],
+    }));
+    await mgr.expectedReply.set('ou_reply_throw', {
+      shortId: waiting.sessionId.slice(0, 8),
+      sessionId: waiting.sessionId,
+      cwd: waiting.cwd,
+    });
+    // Mock: 抛错 (即使返 bgAskedNewQuestion 也不 re-set, 因为有 sdkError)
+    mgr.deps.runChatSDK = (async () => {
+      throw new Error('runChatSDK boom');
+    }) as any;
+
+    await mgr.handleReply('ou_reply_throw', '继续');
+
+    expect(mgr.expectedReply.get('ou_reply_throw')).toBeUndefined();
+    expect(userManager.getEntry('ou_reply_throw')).toBeUndefined();
+  });
 });
 
 describe('handleCancelReply', () => {

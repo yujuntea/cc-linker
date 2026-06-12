@@ -121,4 +121,108 @@ describe('readLastAssistantTurn', () => {
     const r = await readLastAssistantTurn(jsonlPath);
     expect(r!.text).toBe('final');
   });
+
+  /**
+   * v2.4.x UX: 处理中卡片要展示完整 bg 活动, 不只是最后一个 text 块。
+   * 提取 thinking 块 (concat) + text 块 (concat) + tool_use 名字 + input 摘要,
+   * 让卡片能展示 思考过程 / 当前操作 / 响应 三段。
+   */
+  test('extracts thinking blocks (concatenated)', async () => {
+    writeFileSync(jsonlPath, [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', text: '先想想...' },
+            { type: 'thinking', text: '再想想...' },
+            { type: 'text', text: '我来读文件' },
+          ],
+        },
+      }),
+    ].join('\n') + '\n');
+    const r = await readLastAssistantTurn(jsonlPath);
+    expect(r).not.toBeNull();
+    expect(r!.thinking).toBe('先想想...\n再想想...');
+    expect(r!.text).toBe('我来读文件');
+    expect(r!.toolUses).toEqual([]);
+  });
+
+  test('extracts tool_use names + input summary', async () => {
+    writeFileSync(jsonlPath, [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', text: '读文件' },
+            {
+              type: 'tool_use',
+              name: 'Read',
+              input: { file_path: '/tmp/foo.txt' },
+            },
+            {
+              type: 'tool_use',
+              name: 'Bash',
+              input: { command: 'ls -la /tmp' },
+            },
+            { type: 'text', text: '读完了' },
+          ],
+        },
+      }),
+    ].join('\n') + '\n');
+    const r = await readLastAssistantTurn(jsonlPath);
+    expect(r).not.toBeNull();
+    expect(r!.thinking).toBe('读文件');
+    expect(r!.toolUses.length).toBe(2);
+    expect(r!.toolUses[0].name).toBe('Read');
+    expect(r!.toolUses[0].inputSummary).toContain('/tmp/foo.txt');
+    expect(r!.toolUses[1].name).toBe('Bash');
+    expect(r!.toolUses[1].inputSummary).toContain('ls -la /tmp');
+    expect(r!.text).toBe('读完了');
+  });
+
+  test('tool_use with complex input 给出摘要字符串', async () => {
+    writeFileSync(jsonlPath, [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              name: 'Edit',
+              input: {
+                file_path: '/very/long/path/to/file/that/should/be/truncated.ts',
+                old_string: 'a long string...',
+                new_string: 'a long string...',
+              },
+            },
+          ],
+        },
+      }),
+    ].join('\n') + '\n');
+    const r = await readLastAssistantTurn(jsonlPath);
+    expect(r).not.toBeNull();
+    expect(r!.toolUses.length).toBe(1);
+    // 摘要不超过 80 字符
+    expect(r!.toolUses[0].inputSummary.length).toBeLessThanOrEqual(80);
+    expect(r!.toolUses[0].inputSummary).toContain('/very/long/path');
+  });
+
+  test('legacy 字段 (text) 仍然工作 (向后兼容)', async () => {
+    writeFileSync(jsonlPath, [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: '纯文本' }],
+        },
+      }),
+    ].join('\n') + '\n');
+    const r = await readLastAssistantTurn(jsonlPath);
+    expect(r!.text).toBe('纯文本');
+    expect(r!.thinking).toBe('');
+    expect(r!.toolUses).toEqual([]);
+  });
 });

@@ -65,7 +65,12 @@ export interface AgentViewDeps {
     settingsPath?: string; messageId?: string;
     /** v2.3.5: 标记 AgentView reply 路径,bot 会自动 stop bg + 递归 SDK */
     fromAgentViewReply?: boolean;
-  }) => Promise<{ result: any; handler: any; cardMessageId: string | null; rendezvousHandled?: boolean }>;
+  }) => Promise<{
+    result: any; handler: any; cardMessageId: string | null;
+    rendezvousHandled?: boolean;
+    /** v2.4.x: bg 跑了并问新问题 (new_needs) → handleReply re-set expectedReply */
+    bgAskedNewQuestion?: boolean;
+  }>;
   expectedReplyTimeoutMs?: number;
 }
 
@@ -820,22 +825,18 @@ export class AgentViewManager {
       );
       return;
     }
-    // 2. 持久化 expectedReply
-    // 智能 CAS(expectedReplyState v2.3.12):仅 pending_new_session_claimed 拒,
-    // 其他类型(session 任意 / pending_new_session / transient)都自动清。
-    try {
-      await this.expectedReply.set(openId, { shortId: _shortId, sessionId, cwd, messageId });
-    } catch (err: any) {
-      // 真正"另一端在操作" — 给明确指引让用户取消
-      await this.deps.replyFn(`⚠️ ${err.message.replace(/^Failed to set expectedReply for .+?: /, '')}`, { openId });
-      return;
-    }
-    // 3. 发交互卡 — header + 等待原因 + AI 最近输出 + [❌ 取消等待]
+    // 2. 发交互卡 — header + 等待原因 + AI 最近输出 + [❌ 取消等待]
     //
     // v2.3.13:之前是纯文本 prompt(replyFn),用户看不到 AI 上一句问的是什么 —
     // 在 bash loop / 长 agent 这种场景里,要先回到 list 卡点 Peek 看一眼,UX 痛。
     // 现在用 buildWaitingCard(已加 recentOutput 字段)发卡,跟 Peek 同款 markdown
     // 渲染 + Cancel 按钮,用户一眼能看到上下文。25KB 超限走 sendOrFallback 兜底文本。
+    //
+    // v2.4.x 修正顺序:先发卡拿到新 messageId, 再 set expectedReply。
+    // 原顺序反过来,导致 info.messageId 存的是上家卡(用户点 [Reply] 的 list 卡)
+    // 的 messageId, 而不是新等待卡的 messageId。后续 handleReply 拿到错的 id,
+    // adoptExistingCard 接管错卡, fallback 走 startProcessing 新发"处理中"卡,
+    // 用户看到两张卡并存。
     const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
     const peek = await this.resolvePeekContent(_shortId, peekMaxBytes);
     const card = buildWaitingCard({
@@ -846,7 +847,7 @@ export class AgentViewManager {
       recentOutput: peek.text ?? undefined,
       outputFormat: peek.format,
     });
-    await this.sendOrFallback(
+    const waitingCardMessageId = await this.sendOrFallback(
       card,
       { openId },
       `↩️ 回复会话: ${session.name}\n` +
@@ -854,6 +855,20 @@ export class AgentViewManager {
       `若想中断等待,发 /cancel。`,
       openId,
     );
+
+    // 3. 持久化 expectedReply — 用新等待卡的 messageId, 不用入参的旧 messageId。
+    // 智能 CAS(expectedReplyState v2.3.12):仅 pending_new_session_claimed 拒,
+    // 其他类型(session 任意 / pending_new_session / transient)都自动清。
+    try {
+      await this.expectedReply.set(openId, {
+        shortId: _shortId, sessionId, cwd,
+        messageId: waitingCardMessageId ?? messageId,
+      });
+    } catch (err: any) {
+      // 真正"另一端在操作" — 给明确指引让用户取消
+      await this.deps.replyFn(`⚠️ ${err.message.replace(/^Failed to set expectedReply for .+?: /, '')}`, { openId });
+      return;
+    }
   }
 
   /**
@@ -907,9 +922,14 @@ export class AgentViewManager {
     //    - SDK fallback path: cards get patched live, bot.ts sends chat-text reply
     //      at the end of runChatSDK (P1-4 step, only if card init failed).
     //    In BOTH cases, the completion message is handled inside runChatSDK.
+    //
+    // v2.4.x: 捕获 bgAskedNewQuestion + cardMessageId — 如果 bg 跑了并问新问题,
+    // finally clear 之后 re-set expectedReply 让用户可以直接在 chat 接着回。
+    let bgAskedNewQuestion = false;
+    let newCardMessageId: string | null = null;
     let sdkError: any = null;
     try {
-      await this.deps.runChatSDK({
+      const result = await this.deps.runChatSDK({
         openId,
         sessionUuid: info.sessionId,
         cwd: info.cwd,
@@ -919,6 +939,8 @@ export class AgentViewManager {
         isNew: false,
         fromAgentViewReply: true,
       });
+      bgAskedNewQuestion = result.bgAskedNewQuestion ?? false;
+      newCardMessageId = result.cardMessageId ?? null;
     } catch (err: any) {
       sdkError = err;
     } finally {
@@ -928,6 +950,26 @@ export class AgentViewManager {
     if (sdkError) {
       await this.deps.replyFn(`❌ Reply 失败:${sdkError?.message ?? sdkError}`, { openId });
       return;
+    }
+
+    // v2.4.x UX 改进: bg 跑了并问新问题 (new_needs), re-set expectedReply
+    // 让用户可以直接在 chat 接着回, 不用再点 [Reply]。新 messageId 是处理中卡
+    // transition 成等待卡的 messageId (runStreamingRendezvousReply 返的)。
+    if (bgAskedNewQuestion && newCardMessageId) {
+      try {
+        await this.expectedReply.set(openId, {
+          shortId: info.shortId,
+          sessionId: info.sessionId,
+          cwd: info.cwd,
+          messageId: newCardMessageId,
+        });
+        logger.info(
+          `handleReply: bg 问新问题, re-set expectedReply with new waiting card ${newCardMessageId}`,
+        );
+      } catch (err: any) {
+        // re-set 失败不阻塞 reply 已完成, 记日志即可
+        logger.warn(`handleReply: re-set expectedReply 失败: ${err?.message ?? err}`);
+      }
     }
 
     // v2.4: bot.ts 的 tryRendezvousReply 或 SDK P1-4 已发送 chat-text 回复,

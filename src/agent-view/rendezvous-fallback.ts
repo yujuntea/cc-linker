@@ -14,6 +14,12 @@ export interface RendezvousEligibility {
   reason: 'bg_waiting' | IneligibleReason;
   rendezvousSock?: string;
   jsonlPath?: string;
+  /**
+   * v2.4.x: jobs dir 路径 (~/.claude/jobs/)。传给 RendezvousClient.injectReply
+   * 的 stateJsonPath 选项, 启用"提交 + state.json 轮询"新协议。
+   * 不传 → RendezvousClient 走旧 long-lived-connection 实现(老 mock 路径)。
+   */
+  stateJsonPath?: string;
 }
 
 export interface EligibilityContext {
@@ -107,5 +113,6 @@ export async function checkRendezvousEligibility(
     reason: 'bg_waiting',
     rendezvousSock: sock,
     jsonlPath: state.linkScanPath ?? undefined,
+    stateJsonPath: jobsDir,
   };
 }
