@@ -84,7 +84,9 @@ export async function checkRendezvousEligibility(
     if (state.state === 'blocked') return true;
     if (state.state === 'done') return true;
     if (state.state === 'stopped') return true;
-    if (state.tempo === 'idle' && state.state !== 'done') return true;
+    // 'done' already caught above (line 85); this branch handles forward-compat
+    // unknown states with tempo=idle (probe 2026-06-13 forward-compat test).
+    if (state.tempo === 'idle') return true;
     if ((state.state === 'running' || state.state === 'working') && state.needs) return true;
     return false;
   })();

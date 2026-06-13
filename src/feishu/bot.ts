@@ -1063,10 +1063,14 @@ export class FeishuBot {
           }
           // 跟现有路径同款 spool 收尾 (mirrors lines 1103-1122)
           const { result, cardMessageId } = runResult;
+          // v2.4.x: 守护 last_error — rendezvous 路径没有 SDK 视角的错误信息,
+          // 不应该盲目清掉。message_count 始终 +1(不论谁处理)。
           this.registry.upsert(sessionUuid, {
             cwd, last_active: new Date().toISOString(),
             last_message_preview: preview(msg.text) || (msg.imagePaths?.length ? '[图片]' : ''),
-            last_error: result?.error ?? null,
+            // rendezvous 路径下保留旧 last_error(我们不知道 rendezvous 的内部错误状态);
+            // SDK fallback 路径下用 result.error。undefined 会被 upsert 过滤掉。
+            last_error: runResult.rendezvousHandled ? undefined : (result?.error ?? null),
             status: result?.sessionStatus === 'degraded' ? 'degraded' : 'active',
             jsonl_path: result?.jsonlPath ?? undefined,
             pending_jsonl_resolve: result?.jsonlPath ? false : currentEntry?.pending_jsonl_resolve,

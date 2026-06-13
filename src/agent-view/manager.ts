@@ -1005,7 +1005,15 @@ export class AgentViewManager {
     if (entry?.attachedAt) {
       const cleared: MappingEntry = { ...entry };
       delete cleared.attachedAt;
-      await this.deps.userManager.compareAndSwap(openId, entry, cleared);
+      const ok = await this.deps.userManager.compareAndSwap(openId, entry, cleared);
+      if (!ok) {
+        // Race window: another writer changed the entry between getEntry and CAS.
+        // attachedAt may still be set — subsequent chat will still take rendezvous path.
+        // Log for postmortem; user impact is bounded (next chat may route via rendezvous once).
+        logger.warn(
+          `handleBackToChat: failed to clear attachedAt for openId=${openId} (concurrent write)`,
+        );
+      }
     }
     await this.deps.replyFn(
       '已退出 Agent View,继续发送消息或 / 命令即可。下次进 /agents 视图重新打 /agents。',
@@ -1022,7 +1030,12 @@ export class AgentViewManager {
     if (entry?.attachedAt) {
       const cleared: MappingEntry = { ...entry };
       delete cleared.attachedAt;
-      await this.deps.userManager.compareAndSwap(openId, entry, cleared);
+      const ok = await this.deps.userManager.compareAndSwap(openId, entry, cleared);
+      if (!ok) {
+        logger.warn(
+          `handleStopWatching: failed to clear attachedAt for openId=${openId} (concurrent write)`,
+        );
+      }
     }
     return null;
   }
