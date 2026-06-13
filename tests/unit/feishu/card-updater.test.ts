@@ -263,3 +263,75 @@ describe('CardUpdater.patchAbortedTracking', () => {
     expect(md.content).not.toContain('随时发送新消息');
   });
 });
+
+/**
+ * 时序契约: setRendezvousShortId 必须在 startProcessing 之前调, 否则
+ * 首次渲染的"处理中"卡的 [🛑 停 bg] 按钮 value.shortId 为空串 (按钮可点
+ * 但点了也无效, handler 收到 empty shortId 调 claude stop 会失败)。
+ * 后续 updateStream → flushPending 的 patch 会用最新 shortId 覆盖, 所以
+ * 用户看到的是"第一张卡按钮坏,后续卡片按钮好" — 这种半工作状态最差。
+ * 本 describe 锁定"首次渲染"这个最关键时点的不变量。
+ */
+describe('CardUpdater.setRendezvousShortId — timing contract (first-render invariant)', () => {
+  function makeClient() {
+    return {
+      im: { v1: { message: {
+        create: mock(async () => ({ data: { message_id: 'om_timing' } })),
+        patch: mock(async () => ({})),
+      } } },
+    };
+  }
+
+  /** 解析 createFn 收到的首次渲染卡内容, 找 [🛑 停 bg] 按钮的 shortId。 */
+  function firstRenderStopBtnShortId(client: any): string {
+    const createCall = client.im.v1.message.create.mock.calls[0];
+    const card = JSON.parse(createCall[0].data.content);
+    const action = card.elements.find((e: any) => e.tag === 'action');
+    const stopBtn = action.actions.find((a: any) => a.value.tag === 'agent_view_rendezvous_stop_bg_request');
+    return stopBtn.value.shortId;
+  }
+
+  test('correct order: setRendezvousShortId BEFORE startProcessing → first render has shortId', async () => {
+    const client = makeClient();
+    const u = new CardUpdater(client, { buttons: 'rendezvous' });
+    u.setRendezvousShortId('abc12345');
+    await u.startProcessing('ou_user1');
+    expect(firstRenderStopBtnShortId(client)).toBe('abc12345');
+  });
+
+  test('wrong order: setRendezvousShortId AFTER startProcessing → first render has empty shortId', async () => {
+    const client = makeClient();
+    const u = new CardUpdater(client, { buttons: 'rendezvous' });
+    await u.startProcessing('ou_user1');  // 首次渲染发生在 set 之前
+    u.setRendezvousShortId('abc12345');   // 太晚, 下次 patch 才会用到
+    expect(firstRenderStopBtnShortId(client)).toBe('');
+  });
+
+  test('forgot to set: first render shortId is empty (graceful degrade, button is broken)', async () => {
+    const client = makeClient();
+    const u = new CardUpdater(client, { buttons: 'rendezvous' });
+    await u.startProcessing('ou_user1');
+    // 完全没调 setRendezvousShortId
+    expect(firstRenderStopBtnShortId(client)).toBe('');
+  });
+
+  test('documented production call site in bot.ts:setRendezvousShortId is before startProcessing', () => {
+    // 静态契约: bot.ts:1606 必须有"setRendezvousShortId 在 startProcessing 之前"的注释
+    // 这是防 regression 的最小保障 — 如果未来谁删了注释, 这个测试会失败提醒。
+    // 测试本身只 verify 注释存在 + 顺序对, 不依赖运行时行为。
+    const fs = require('fs');
+    const botTs = fs.readFileSync('src/feishu/bot.ts', 'utf8');
+    // 找 runStreamingRendezvousReply 内的 setRendezvousShortId 上下文
+    const setIdx = botTs.indexOf('cardUpdater.setRendezvousShortId(short);');
+    expect(setIdx).toBeGreaterThan(-1);
+    // 紧跟的 startProcessing 调用
+    const startIdx = botTs.indexOf('cardUpdater.startProcessing(openId);', setIdx);
+    expect(startIdx).toBeGreaterThan(-1);
+    // 在 setIdx 之前 (注释在调用之前) 找"必须在 startProcessing 之前"的提示语
+    const warnBeforeSet = botTs.lastIndexOf('必须在 startProcessing 之前', setIdx);
+    expect(warnBeforeSet).toBeGreaterThan(-1);
+    // 顺序: 注释 → setRendezvousShortId → startProcessing
+    expect(warnBeforeSet).toBeLessThan(setIdx);
+    expect(setIdx).toBeLessThan(startIdx);
+  });
+});

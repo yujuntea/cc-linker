@@ -478,6 +478,13 @@ export function buildStopConfirmCard(name: string, shortId: string, sessionId: s
  *   - 文案:强调"如果只想停止跟踪、让 bg 继续跑完,请关闭此卡返回上一卡点
  *     [🔙 不等了]"——给用户更轻的退出路径
  *   - 取消按钮 value.tag 是 'agent_view_refresh_list' (回到列表卡)
+ *
+ * **UX 限制**: 飞书 card 按钮回调是 one-shot,无法"取消当前卡回到上一卡点
+ * (rendezvous 流式卡)"。按 [← 取消] 后用户会被带到 /agents 列表卡,需要
+ * 重新 /agents → 进 session 才能看到流式卡。这是飞书平台的限制,不是 bug。
+ * 如果想做得更完美(取消后直接 patch 回流式卡),需要新加一个 tag
+ * 'agent_view_rendezvous_stop_cancel' 走 bot 端 handler 调 CardUpdater
+ * 重发流式卡 —— 但这超出当前 plan 范围。
  */
 export function buildRendezvousStopConfirmCard(shortId: string): string {
   return JSON.stringify({

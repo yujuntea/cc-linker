@@ -16,7 +16,7 @@ import { readLastAssistantTurn, waitForNewAssistantTurn, type LastAssistantTurn 
 import { readJobState } from '../agent-view/job-state';
 import { formatTokenCount } from './card-updater';
 import { StreamChunk } from '../proxy/stream-parser';
-import { CardUpdater } from './card-updater';
+import { CardUpdater, type CardState } from './card-updater';
 import { LiveProgressWatcher, isSessionProcessing, DEFAULT_LIVE_PROGRESS_CONFIG, type LiveProgressConfig } from './live-progress';
 import { PermissionHandler, type PermissionPrompt } from '../proxy/permission-handler';
 import { esc } from './markdown-escape';
@@ -177,6 +177,19 @@ export class FeishuBot {
    *  of orphan messages in processing/ that would be re-cycled on daemon restart.
    *  Default: 60 seconds. */
   private static readonly BUSY_TIMEOUT_MS = 60_000;
+
+  /**
+   * v2.x: CardUpdater 终态集合, 在 race-guard 守门 (review gap 2) 时检查
+   *   - complete: bg 已成功完成, 卡已显示 ✅ 处理完成
+   *   - error: bg 报失败, 卡已显示 ❌ 错误
+   *   - cancelled: 用户主动取消 (走 patchAbortedTracking)
+   * 用户点 [🔙 不等了] 或 [✅ 确认停止 bg] 时若 CardUpdater 已是这些状态
+   * 之一, 跳过 abort / 不覆盖终态卡 (避免从 "✅ 处理完成" 被覆盖成
+   * "🔙 已停止跟踪" 的 UX bug)。
+   */
+  private static readonly TERMINAL_CARD_STATES: ReadonlySet<CardState> = new Set<CardState>([
+    'complete', 'error', 'cancelled',
+  ]);
 
   constructor(opts: {
     userManager: UserManager;
@@ -1846,7 +1859,7 @@ export class FeishuBot {
     const earlyUpdater = this.rendezvousCardUpdaters.get(openId);
     if (earlyUpdater) {
       const earlyState = earlyUpdater.getState();
-      if (earlyState === 'complete' || earlyState === 'error' || earlyState === 'cancelled') {
+      if (FeishuBot.TERMINAL_CARD_STATES.has(earlyState as CardState)) {
         logger.info(
           `handleRendezvousAbortWait: skipped (terminal state=${earlyState}, openId=${openId}, ` +
           `bg 已先收尾, 不覆盖终态卡)`,
@@ -1908,6 +1921,10 @@ export class FeishuBot {
     openId: string,
     shortId: string,
   ): Promise<string | null> {
+    if (!this.cardReplyFn) {
+      logger.warn(`handleRendezvousStopBgRequest: no cardReplyFn wired (openId=${openId})`);
+      return null;
+    }
     const { buildRendezvousStopConfirmCard } = await import('../agent-view/card');
     const cardStr = buildRendezvousStopConfirmCard(shortId);
     const card = JSON.parse(cardStr);
@@ -1939,17 +1956,23 @@ export class FeishuBot {
     }
     // v2.x race 守门 2 (review gap 2): bg 在用户点 [✅ 确认] 之前已收尾,
     // 但终态块还没清 maps。检查 CardUpdater 状态避免重复 stop + 覆盖终态卡。
+    // 注: 此分支提前 return null, 不会进下面的 try/catch, 所以这里的 replyFn
+    // 调用单独 try/catch 防 reply 通道失败时整函数 throw。
     const earlyUpdater = this.rendezvousCardUpdaters.get(openId);
     if (earlyUpdater) {
       const earlyState = earlyUpdater.getState();
-      if (earlyState === 'complete' || earlyState === 'error' || earlyState === 'cancelled') {
+      if (FeishuBot.TERMINAL_CARD_STATES.has(earlyState as CardState)) {
         logger.info(
           `handleRendezvousStopBgConfirm: skipped claude stop (terminal state=${earlyState}, ` +
           `openId=${openId}, bg 已先收尾)`,
         );
         this.activeRendezvousWaits.delete(openId);
         this.rendezvousCardUpdaters.delete(openId);
-        await this.replyFn(`✅ \`${shortId}\` 已自然完成，无需停止`, { openId });
+        try {
+          await this.replyFn(`✅ \`${shortId}\` 已自然完成，无需停止`, { openId });
+        } catch (e: any) {
+          logger.warn(`handleRendezvousStopBgConfirm: reply failed in race-guard: ${e?.message ?? e}`);
+        }
         return null;
       }
     }
@@ -1984,24 +2007,38 @@ export class FeishuBot {
       } catch (e: any) {
         logger.warn(`handleRendezvousStopBgConfirm: restore user-mapping failed: ${e?.message ?? e}`);
       }
-
-      await this.replyFn(`✅ 已停止 ${shortId}`, { openId });
-      if (updater) {
-        try {
-          await updater.patchAbortedTracking({
-            headerTitle: '🛑 bg 已被终止',
-            headerTemplate: 'grey',
-            body: `\`${shortId}\` 已停止 · /agents 查看 session 状态`,
-          });
-          updater.cancelPending();
-        } catch (e: any) {
-          logger.warn(`handleRendezvousStopBgConfirm: patch failed: ${e?.message ?? e}`);
-        }
-      }
     } catch (err: any) {
-      await this.replyFn(`❌ Stop bg 失败: ${err?.message ?? err}`, { openId });
+      // 上面 try 只包 claude stop + supervisor wait + user-mapping restore。
+      // 这层 catch 是给 claude stop 失败的; replyFn / patchAbortedTracking 在 try
+      // 块外, 它们的失败不会触发"二次 replyFn 报失败"的双重调用。
+      logger.error(`handleRendezvousStopBgConfirm: claude stop failed: ${err?.message ?? err}`);
+      try {
+        await this.replyFn(`❌ Stop bg 失败: ${err?.message ?? err}`, { openId });
+      } catch (e: any) {
+        logger.warn(`handleRendezvousStopBgConfirm: failure reply also failed: ${e?.message ?? e}`);
+      }
       if (updater) {
         try { await updater.error(`❌ Stop bg 失败: ${err?.message ?? err}`); } catch { /* swallow */ }
+      }
+      return null;
+    }
+
+    // claude stop 成功路径: 回复 + patch 卡 (各自 try/catch 避免互相影响)
+    try {
+      await this.replyFn(`✅ 已停止 ${shortId}`, { openId });
+    } catch (e: any) {
+      logger.warn(`handleRendezvousStopBgConfirm: success reply failed: ${e?.message ?? e}`);
+    }
+    if (updater) {
+      try {
+        await updater.patchAbortedTracking({
+          headerTitle: '🛑 bg 已被终止',
+          headerTemplate: 'grey',
+          body: `\`${shortId}\` 已停止 · /agents 查看 session 状态`,
+        });
+        updater.cancelPending();
+      } catch (e: any) {
+        logger.warn(`handleRendezvousStopBgConfirm: patch failed: ${e?.message ?? e}`);
       }
     }
     return null;
