@@ -77,12 +77,28 @@ cc-linker 主进程
 
 ### 2.2 启动方式
 
+**默认行为变更**：`cc-linker start` 默认启动 IDE，不再需要 `--with-review` 开关。
+
 ```bash
-cc-linker start              # 启动飞书 Bot + 现有 CLI
-cc-linker review-server      # 启动 Review Engine + IDE
-# 或合并：
-cc-linker start --with-review  # 同一进程启动两者
+# 1) 默认（推荐）：飞书 Bot + 现有 CLI + Review Engine + IDE，全部同进程启动
+cc-linker start
+
+# 2) 无头/服务器环境：跳过 IDE，纯后台跑 Review Engine
+cc-linker start --no-ide
+
+# 3) 独立模式：仅 Review Engine + IDE（不挂飞书 Bot），便于资源隔离或纯本地开发
+cc-linker review-server
 ```
+
+**语义边界（Semantic Batching）**：
+
+| 模式 | 飞书 Bot | CLI | Review Engine | IDE |
+|------|---------|-----|---------------|-----|
+| `start`（默认） | ✅ | ✅ | ✅ | ✅ |
+| `start --no-ide` | ✅ | ✅ | ✅ | ❌ |
+| `review-server` | ❌ | ❌ | ✅ | ✅ |
+
+**进程模型不变量**：Review Engine 与 IDE 必须同进程（IDE 通过 SSE 订阅 in-memory state，避免跨进程 JSON 序列化开销）。`review-server` 与 `start` 的 Review Engine 是同一个子系统实例化出来的（共享 `engine.ts` / `pipeline-store.ts`），仅在入口层选择挂载哪些宿主。
 
 默认 IDE 端口 9821，监听 `127.0.0.1`，浏览器打开 `http://localhost:9821` 即可。
 
