@@ -11,6 +11,8 @@ interface CardUpdaterOptions {
   throttle_ms?: number;
   max_card_bytes?: number;
   show_thinking?: boolean;
+  /** 流式卡按钮模式。'default' = [🛑 停止处理]; 'rendezvous' = [🔙 不等了] + [🛑 停 bg]. */
+  buttons?: 'default' | 'rendezvous';
 }
 
 interface FeishuClient {
@@ -38,6 +40,10 @@ export class CardUpdater {
   private readonly throttleMs: number;
   private readonly maxCardBytes: number;
   private readonly showThinking: boolean;
+  /** v2.x: rendezvous 模式下 [🛑 停 bg] 按钮 value 里塞的 shortId。
+   *  必须在 startProcessing 之前 set, 否则首次渲染时按钮 value.shortId 为空。 */
+  private rendezvousShortId: string | null = null;
+  private readonly buttonsMode: 'default' | 'rendezvous';
   private state: CardState = 'processing';
 
   constructor(client: FeishuClient, options: CardUpdaterOptions = {}) {
@@ -45,6 +51,7 @@ export class CardUpdater {
     this.throttleMs = options.throttle_ms ?? config.get<number>('stream.throttle_ms', 1500);
     this.maxCardBytes = options.max_card_bytes ?? config.get<number>('stream.max_card_bytes', 25000);
     this.showThinking = options.show_thinking ?? config.get<boolean>('stream.show_thinking', true);
+    this.buttonsMode = options.buttons ?? 'default';
   }
 
   getCardMessageId(): string | null { return this.cardMessageId; }
@@ -267,6 +274,12 @@ export class CardUpdater {
   /** Allow external code to set cardMessageId for permission card patching */
   setCardMessageId(messageId: string): void {
     this.cardMessageId = messageId;
+  }
+
+  /** v2.x: rendezvous 模式按钮 value.shortId 注入。**必须在 startProcessing 之前调** —
+   *  startProcessing → buildProcessingCard → buildStreamingCard, 首次渲染就读 shortId。 */
+  setRendezvousShortId(short: string): void {
+    this.rendezvousShortId = short;
   }
 
   private buildPermissionCard(
@@ -524,17 +537,35 @@ export class CardUpdater {
       });
     }
     elements.push({ tag: 'markdown', content: `⏱ 已用时 ${elapsedSec}s` });
-    elements.push({
-      tag: 'action',
-      actions: [
-        {
+    if (this.buttonsMode === 'rendezvous') {
+      elements.push({
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔙 不等了' },
+            type: 'default',
+            value: { tag: 'agent_view_rendezvous_abort_wait' },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🛑 停 bg' },
+            type: 'danger',
+            value: { tag: 'agent_view_rendezvous_stop_bg_request', shortId: this.rendezvousShortId ?? '' },
+          },
+        ],
+      });
+    } else {
+      elements.push({
+        tag: 'action',
+        actions: [{
           tag: 'button',
           text: { tag: 'plain_text', content: '🛑 停止处理' },
           type: 'danger',
           value: { tag: 'stop' },
-        },
-      ],
-    });
+        }],
+      });
+    }
     return {
       config: { wide_screen_mode: true, update_multi: true },
       header: { title: { tag: 'plain_text', content: '💭 处理中' }, template: 'blue' },
