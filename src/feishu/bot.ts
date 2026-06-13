@@ -1582,16 +1582,36 @@ export class FeishuBot {
       return { handled: false, bgAskedNewQuestion: false, cardMessageId: null };
     }
 
+    // 在 startProcessing 之前读 user-mapping 的 attachedAt:
+    //  - from-Reply 路径: markSent 已清, entry 为 null → attachedAt undefined
+    //  - from-Attach 路径: entry = {type:'session', sessionUuid, attachedAt, ...} → attachedAt 有值
+    // handler abort 后用这个值条件化恢复 user-mapping
+    const entryAtStart = this.userManager.getEntry(openId);
+    const sourceAttachedAt = entryAtStart?.type === 'session' ? entryAtStart.attachedAt : undefined;
+
     // v2.4.x 分层卡片: 总是新发"处理中"卡。原"↩️ 回复"等待卡保留为
     // 历史不动, 不会被 transition。这样 chat 列表保留完整上下文:
     //   [旧等待卡(黄)] → 继续 → [新处理中卡(蓝)] → 终结 → [完成/新等待(绿/黄)]
     // 旧设计 "接管等待卡" 会丢掉 waiting reason / cwd / recent output,
     // 而且 transition 过程用户看不清卡在切换。
     const cardUpdater = new CardUpdater(this.feishuClient!, {
-      throttle_ms: 5000,  // v2.4.x: 流式 patch 5s 节流
+      throttle_ms: config.get<number>('stream.throttle_ms', 1500),
+      buttons: 'rendezvous',  // 渲染 [🔙 不等了] + [🛑 停 bg] 双按钮
     });
+    // ⚠️ 必须在 startProcessing 之前 — 否则首帧渲染时 [停 bg] 按钮 value.shortId 为空串
+    cardUpdater.setRendezvousShortId(short);
     // 总是新发"处理中"卡。原"↩️ 回复"等待卡保留为历史, 不动。
     await cardUpdater.startProcessing(openId);
+
+    // 注册 abort + cardUpdater + 原 session 上下文 (cwd 由 Step 0 沿调用链传下来)
+    const ac = new AbortController();
+    this.activeRendezvousWaits.set(openId, {
+      abort: ac,
+      sessionUuid,                                // 从 runStreamingRendezvousReply params
+      cwd,                                        // 来自 runStreamingRendezvousReply params (Step 0 穿透)
+      attachedAt: sourceAttachedAt,
+    });
+    this.rendezvousCardUpdaters.set(openId, cardUpdater);
 
     // Phase 2: 边 poll 边流式 patch
     const startTime = Date.now();
@@ -1609,8 +1629,9 @@ export class FeishuBot {
       short,
       stateJsonPath: eligibility.stateJsonPath!,
       timeoutMs,
-      // poll 间隔: 默认 500ms (RendezvousClient 内部), 配合 5s 卡片节流
-      // 形成 1Hz 卡片刷新节奏
+      signal: ac.signal,
+      // poll 间隔: 默认 500ms (RendezvousClient 内部), 配合 stream.throttle_ms
+      // (默认 1.5s) 卡片节流, 形成 ~3 polls/patch (≈1.5s/patch) 节奏
       onPoll: async (state) => {
         if (state.kind === 'active' && eligibility.jsonlPath) {
           // bg 在跑: 读 JSONL 末次 turn (含 thinking + tool_uses + text)
@@ -1743,25 +1764,36 @@ export class FeishuBot {
         // 不发错误消息, 让 v2.3.5 路径发"处理中"卡 + SDK 完成回复
         // 这里没有"撤掉处理中卡", v2.3.5 会在原卡上覆盖 (也合理:
         // 跟 chat-text "Claude daemon 已停止" 误报对比, 这是过渡版, 下次大改再做)
+        this.activeRendezvousWaits.delete(openId);
+        this.rendezvousCardUpdaters.delete(openId);
         return { handled: false, bgAskedNewQuestion: false, cardMessageId: null };
       }
-      try {
-        const errMsg = rendezvousResult.reason === 'timeout'
-          ? `⏱ bg 处理超时（${Math.round(timeoutMs / 1000)}s 内未完成）`
-          : `❌ Reply 失败：${rendezvousResult.reason}`;
-        await cardUpdater.error(errMsg);
-      } catch (err: any) {
-        logger.warn(`rendezvous: cardUpdater.error 失败: ${err?.message ?? err}`);
+      if (rendezvousResult.reason === 'aborted') {
+        // 用户点 [🔙 不等了] 或 [🛑 停 bg] 触发的 abort。终态卡 + user-mapping
+        // 恢复已由 handler 完成, 这里 log + 走收尾, 不发额外的 error 卡覆盖 handler 内容。
+        logger.info(`rendezvous: aborted by user action (openId=${openId})`);
+      } else {
+        try {
+          const errMsg = rendezvousResult.reason === 'timeout'
+            ? `⏱ bg 处理超时（${Math.round(timeoutMs / 1000)}s 内未完成）`
+            : `❌ Reply 失败：${rendezvousResult.reason}`;
+          await cardUpdater.error(errMsg);
+        } catch (err: any) {
+          logger.warn(`rendezvous: cardUpdater.error 失败: ${err?.message ?? err}`);
+        }
+        logger.error(
+          `rendezvous: inject failed reason=${rendezvousResult.reason} (no fallback)`,
+        );
       }
-      logger.error(
-        `rendezvous: inject failed reason=${rendezvousResult.reason} (no fallback)`,
-      );
     }
 
     // v2.4.x: 终态 patch 完必须 cancelPending, 否则 5s 节流的 pending timer
     // 会在终态后 fire, 把卡片从"↩️ 回复"/"✅ 完成"/"❌ 错误" revert 回
     // "💭 处理中"。用户就看到卡片卡在 3s 不刷新 (因为 revert 时刻的
     // elapsed 正是 3s 左右)。
+    // 清 rendezvous tracking maps (idempotent — handler 可能已清, deleted-twice 安全)
+    this.activeRendezvousWaits.delete(openId);
+    this.rendezvousCardUpdaters.delete(openId);
     cardUpdater.cancelPending();
 
     // 不发 chat-text, 卡片已经是反馈
