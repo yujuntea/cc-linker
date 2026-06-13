@@ -4,6 +4,21 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-06-13
+
+### Fixed
+
+- **scanner: stub session `last_active` fallback 误用扫描时刻**
+  (`src/scanner/jsonl.ts:parseFull`) — 当 JSONL 文件只有 marker 行
+  (`ai-title` / `agent-name` / `last-prompt` / `mode` / `permission-mode`),
+  没有任何 `user` / `assistant` 消息时, `last_active` 与 `created_at` 的
+  fallback 之前是 `new Date().toISOString()`, 即 scanner 扫描当前时间,导致
+  飞书 `/list` 卡片上 stub session 全部显示 "X 分钟前"(X 是 scanner 启动
+  那一秒, 不是 session 真实活跃时间)。修复后 fallback 改用 JSONL 文件本身
+  的 `mtime` (statSync), 反映 stub session 文件何时被创建/更新。
+- 用户报告的现场: 飞书 `/list` 第 4-10 个 session 全部显示 "19 分钟前" +
+  0 条消息, 实际文件 mtime 是 2 天前, 从未真实活跃过。
+
 ## [0.6.0] - 2026-06-13
 
 Agent View 在这个版本完成两次大改造:
