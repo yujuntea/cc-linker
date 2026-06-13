@@ -467,6 +467,54 @@ export function buildStopConfirmCard(name: string, shortId: string, sessionId: s
 }
 
 /**
+ * v2.4: Rendezvous 停止 bg 确认卡。
+ *
+ * 触发场景:用户在 rendezvous 流式卡(等 bg 响应的长轮询卡)上点 [🛑 停止 bg]
+ * 按钮 → 弹出本卡,让用户再次确认是否真的要 kill bg worker。
+ *
+ * 与 buildStopConfirmCard 的差异:
+ *   - 只接收 shortId(不需要 sessionId/name,因为 stop 走 claude stop CLI
+ *     只需要 shortId)
+ *   - 文案:强调"如果只想停止跟踪、让 bg 继续跑完,请关闭此卡返回上一卡点
+ *     [🔙 不等了]"——给用户更轻的退出路径
+ *   - 取消按钮 value.tag 是 'agent_view_refresh_list' (回到列表卡)
+ */
+export function buildRendezvousStopConfirmCard(shortId: string): string {
+  return JSON.stringify({
+    ...TEMPLATE_HEADER,
+    header: {
+      title: { tag: 'plain_text', content: `🔴 确认停止 bg? · \`${shortId}\`` },
+      template: 'red',
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content:
+          'bg 进行中的工作会被中断,已写文件保留。\n\n' +
+          '> 💡 如果只想停止跟踪、让 bg 继续跑完,请关闭此卡返回上一卡点 [🔙 不等了]。',
+      },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '✅ 确认停止 bg' },
+            type: 'danger',
+            value: { tag: 'agent_view_rendezvous_stop_bg_confirm', shortId },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '← 取消' },
+            type: 'default',
+            value: { tag: 'agent_view_refresh_list' },
+          },
+        ],
+      },
+    ],
+  });
+}
+
+/**
  * v2.2.11 + v2.2.13: bg-worker 并发冲突卡。
  *
  * 触发场景:用户在飞书侧 Attach 到一个仍被 daemon bg worker 持有的 session,
