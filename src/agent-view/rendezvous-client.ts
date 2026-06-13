@@ -263,11 +263,15 @@ export class RendezvousClient {
     const patches: StatePatch[] = [];
     let lastState: any = null;
     let stoppedByUser = false;
-    // v2.4.1: 抑制 supervisor 未反应的"假 done"
-    // 注入 reply 后, supervisor 通常 0-1s 内把 state.json 从 done/blocked → running。
-    // 第一次 poll 可能还是旧 state,误判为 terminal。
-    // 必须见过一次 active, 才信任后续的 done/stopped/blocked-needs。
-    let sawActive = false;
+    // v2.4.1: 抑制 supervisor 未反应的"假 terminal"
+    // 注入 reply 后第一次 poll 仍可能是 supervisor 还没反应的旧 state。
+    // 替换 sawActive 为 sawStateChange (任何 state/tempo 变化):
+    //   - done bg: supervisor 直接 done → blocked (不经 running), sawStateChange 触发
+    //   - stopped bg: supervisor stopped → running → blocked, sawStateChange 在 running 触发
+    //   - waiting bg: supervisor blocked+needs → running → blocked+needs, sawStateChange 在 running 触发
+    // 看到 state/tempo 任何变化后,后续 terminal 才信任。
+    let sawStateChange = false;
+    let firstState: any = null;
 
     while (Date.now() - start < timeoutMs) {
       const outcome = await pollStateJsonOnce(opts.short, opts.stateJsonPath);
@@ -283,17 +287,25 @@ export class RendezvousClient {
       lastState = stateObj;
       patches.push(patch);
 
+      // v2.4.1: 第一次 poll 捕获 firstState;后续 poll 对比 state/tempo 字段
+      // 任一变化就标记 sawStateChange=true (永不复位)
+      if (firstState === null) {
+        firstState = stateObj;
+      } else if (
+        stateObj.state !== firstState.state ||
+        stateObj.tempo !== firstState.tempo
+      ) {
+        sawStateChange = true;
+      }
+
       const kind = streamStateKind(stateObj);
 
-      // v2.4.1: 未见过 active 之前的 terminal state 可能是 supervisor 未反应的
-      // 旧 state (注入 reply 后 supervisor 还没把 state.json 改成 running)。
-      // 跳过本次分类,继续 poll。后续见到 active 后才信任 terminal。
-      if (kind !== 'active' && !sawActive) {
+      // v2.4.1: 未见 state 变化之前的 terminal state 可能是 supervisor 未反应的旧 state。
+      // 跳过本次分类,但仍调 onPoll 让 caller 更新 elapsed time (避免 card 卡在"0s")。
+      if (kind !== 'active' && !sawStateChange) {
+        await opts.onPoll({ kind, raw: stateObj });
         await new Promise(r => setTimeout(r, pollIntervalMs));
         continue;
-      }
-      if (kind === 'active') {
-        sawActive = true;
       }
 
       const userDecision = await opts.onPoll({ kind, raw: stateObj });

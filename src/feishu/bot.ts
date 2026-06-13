@@ -1624,6 +1624,14 @@ export class FeishuBot {
           // 判定 reason='new_needs'。卡片 patch 留给 caller 在终态统一处理
           // (调 patchWaitingCard 而不是 cancel, 避免"已取消"误报)。
           return 'stop';
+        } else {
+          // v2.4.1: pre-state-change (stale done/stopped) 或 terminal 中间状态。
+          // 也调一次 updateStream 维持 card elapsed time 滚动 (让用户知道 bot 活着)。
+          // 内容为空 (等 bg 真正写 turn 后再显示), 只是时间刷新。
+          // CardUpdater.updateStream 内部 5s 节流, 不会真每 500ms 都 patch。
+          await cardUpdater.updateStream(
+            '', '', Date.now() - startTime, [],
+          ).catch(err => logger.warn(`rendezvous: updateStream failed (pre-active): ${err?.message ?? err}`));
         }
       },
     });

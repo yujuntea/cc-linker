@@ -552,3 +552,178 @@ describe('RendezvousClient.pollStateJsonStreaming', () => {
     expect(polls).toContain('blocked-needs');
   });
 });
+
+/**
+ * v2.4.1 done-bg fix (sawStateChange gate):
+ *   之前的 sawActive gate 对 done bg 太严格 —— supervisor 把 done 直接转 blocked
+ *   (不经 running), sawActive 永远 false, 卡 "处理中 0s" 直到 timeout。
+ *   替换为 sawStateChange: 任何 state/tempo 字段变化 vs 首次 poll 即触发。
+ *
+ *   - done bg: done → blocked (no running phase) → sawStateChange 在 done→blocked 触发
+ *   - stopped bg: stopped → running → blocked → sawStateChange 在 stopped→running 触发
+ *   - waiting bg: blocked+needs → running → blocked+needs → sawStateChange
+ *   - frozen daemon (永不变化): 一直不变 → timeout
+ *
+ *   同时: skip 阶段 (stale done/stopped) 仍调 onPoll 让 caller 维持 elapsed time。
+ */
+describe('RendezvousClient.pollStateJsonStreaming - sawStateChange gate (v2.4.1 done-bg fix)', () => {
+  let jobsDir: string;
+  const SHORT = 'dcb2ec25';
+
+  beforeEach(() => {
+    jobsDir = mkdtempSync(join(tmpdir(), 'rendezvous-statechange-jobs-'));
+    mkdirSync(join(jobsDir, SHORT), { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(jobsDir, { recursive: true, force: true }); } catch {}
+  });
+
+  function writeState(state: any) {
+    writeFileSync(join(jobsDir, SHORT, 'state.json'), JSON.stringify(state));
+  }
+
+  test('done → blocked (no running phase) → returns new_needs', async () => {
+    // Simulate done bg that goes directly to blocked+needs after inject:
+    //   poll 1: {state: 'done', tempo: 'idle'}     (stale pre-inject)
+    //   poll 2: {state: 'done', tempo: 'idle'}     (still stale)
+    //   poll 3: {state: 'blocked', tempo: 'blocked', needs: '?'} (real transition)
+    // Expect: result.reason === 'new_needs', result.ok === true
+    // (sawStateChange=true at poll 3 because state field changed)
+    writeState({ state: 'done', tempo: 'idle', needs: '', detail: 'stale pre-inject', inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    // 60ms 后仍 stale
+    setTimeout(() => {
+      writeState({ state: 'done', tempo: 'idle', needs: '', detail: 'still stale', inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    }, 60);
+    // 120ms 后 supervisor 直接转 blocked+needs (不经 running)
+    setTimeout(() => {
+      writeState({ state: 'blocked', tempo: 'blocked', needs: 'pick one?', detail: null, inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    }, 120);
+
+    const polls: any[] = [];
+    const r = await RendezvousClient.pollStateJsonStreaming({
+      short: SHORT,
+      stateJsonPath: jobsDir,
+      timeoutMs: 3000,
+      pollIntervalMs: 30,
+      onPoll: (s) => { polls.push(s.kind); },
+    });
+
+    expect(r.ok).toBe(true);
+    expect(r.reason).toBe('new_needs');
+    // 证明经历了 done (stale skip) → blocked-needs (real terminal)
+    expect(polls).toContain('done');        // 至少一次 stale done
+    expect(polls[polls.length - 1]).toBe('blocked-needs');
+  });
+
+  test('stopped → running → blocked → returns new_needs', async () => {
+    // Same as before — should still work with sawStateChange gate
+    //   poll 1: {state: 'stopped', tempo: 'idle'}
+    //   poll 2: {state: 'running', tempo: 'active'}
+    //   poll 3: {state: 'blocked', tempo: 'blocked', needs: '?'}
+    // Expect: result.reason === 'new_needs'
+    writeState({ state: 'stopped', tempo: 'idle', needs: '', detail: 'stopped', inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    setTimeout(() => {
+      writeState({ state: 'running', tempo: 'active', needs: '', detail: null, inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    }, 60);
+    setTimeout(() => {
+      writeState({ state: 'blocked', tempo: 'blocked', needs: 'next?', detail: null, inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    }, 150);
+
+    const polls: any[] = [];
+    const r = await RendezvousClient.pollStateJsonStreaming({
+      short: SHORT,
+      stateJsonPath: jobsDir,
+      timeoutMs: 3000,
+      pollIntervalMs: 30,
+      onPoll: (s) => { polls.push(s.kind); },
+    });
+
+    expect(r.ok).toBe(true);
+    expect(r.reason).toBe('new_needs');
+    expect(polls).toContain('stopped');     // stale stopped
+    expect(polls).toContain('active');      // supervisor 反应 (sawStateChange 在此触发)
+    expect(polls[polls.length - 1]).toBe('blocked-needs');
+  });
+
+  test('stays in done forever (daemon not reacting) → timeout', async () => {
+    //   poll 1-N: always {state: 'done', tempo: 'idle'} (no change)
+    // Expect: result.reason === 'timeout'
+    writeState({ state: 'done', tempo: 'idle', needs: '', detail: 'frozen', inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    // 永不变化
+
+    const polls: any[] = [];
+    const r = await RendezvousClient.pollStateJsonStreaming({
+      short: SHORT,
+      stateJsonPath: jobsDir,
+      timeoutMs: 300,
+      pollIntervalMs: 30,
+      onPoll: (s) => { polls.push(s.kind); },
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('timeout');
+    // 证明 done 是 stale-skip 处理的,不是终态
+    // (sawStateChange 一直是 false, 不会触发 classifyPatchFromState)
+    expect(polls.length).toBeGreaterThan(0);
+  });
+
+  test('first poll shows active immediately → returns normally', async () => {
+    //   poll 1: {state: 'running', tempo: 'active'}
+    //   poll 2: {state: 'done', tempo: 'idle'}
+    // Expect: result.reason === 'done'
+    writeState({ state: 'running', tempo: 'active', needs: '', detail: null, inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    setTimeout(() => {
+      writeState({ state: 'done', tempo: 'idle', needs: '', detail: 'done', inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    }, 80);
+
+    const polls: any[] = [];
+    const r = await RendezvousClient.pollStateJsonStreaming({
+      short: SHORT,
+      stateJsonPath: jobsDir,
+      timeoutMs: 3000,
+      pollIntervalMs: 30,
+      onPoll: (s) => { polls.push(s.kind); },
+    });
+
+    expect(r.ok).toBe(true);
+    expect(r.reason).toBe('done');
+    // 第一次 poll 就是 active, sawStateChange 在第二次 poll (state done) 触发
+    expect(polls[0]).toBe('active');
+    expect(polls[polls.length - 1]).toBe('done');
+  });
+
+  test('onPoll fires during pre-state-change skip (for elapsed time update)', async () => {
+    // Track how many times onPoll was called
+    //   poll 1: {state: 'done', tempo: 'idle'} → onPoll called (skip branch)
+    //   poll 2: {state: 'done', tempo: 'idle'} → onPoll called (skip branch)
+    //   poll 3: {state: 'blocked', tempo: 'blocked'} → onPoll called (normal terminal)
+    //   poll 4: returns
+    // Expect: onPoll called ≥ 3 times (skip cases DO trigger onPoll)
+    writeState({ state: 'done', tempo: 'idle', needs: '', detail: 'stale1', inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    setTimeout(() => {
+      writeState({ state: 'done', tempo: 'idle', needs: '', detail: 'stale2', inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    }, 60);
+    setTimeout(() => {
+      writeState({ state: 'blocked', tempo: 'blocked', needs: 'q?', detail: null, inFlight: null, linkScanPath: null, linkScanOffset: 0, name: null });
+    }, 150);
+
+    let pollCount = 0;
+    const seenKinds: string[] = [];
+    const r = await RendezvousClient.pollStateJsonStreaming({
+      short: SHORT,
+      stateJsonPath: jobsDir,
+      timeoutMs: 3000,
+      pollIntervalMs: 30,
+      onPoll: (s) => { pollCount += 1; seenKinds.push(s.kind); },
+    });
+
+    expect(r.ok).toBe(true);
+    expect(r.reason).toBe('new_needs');
+    // 关键: skip 阶段 (stale done) 也调 onPoll, 不止终态那一次
+    expect(pollCount).toBeGreaterThanOrEqual(3);
+    // 证明 skip 阶段的 onPoll 也带上了 stale state 的 kind
+    expect(seenKinds).toContain('done');
+    expect(seenKinds).toContain('blocked-needs');
+  });
+});
