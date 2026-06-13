@@ -1424,7 +1424,7 @@ export class FeishuBot {
       return { handled: false, bgAskedNewQuestion: false, cardMessageId: null };
     }
     logger.info(
-      `rendezvous: inject short=${short} text_len=${promptText.length} reason=bg_waiting`,
+      `rendezvous: inject short=${short} text_len=${promptText.length} reason=${eligibility.reason}`,
     );
     const timeoutMs = config.get<number>('agent_view.rendezvous_timeout_ms', 60_000);
 
