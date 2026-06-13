@@ -14,6 +14,7 @@ export type RendezvousFailureReason =
   | 'socket_closed'
   | 'daemon_error'
   | 'state_error'
+  | 'aborted'
   ;
 
 export interface StatePatch {
