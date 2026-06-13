@@ -1908,6 +1908,98 @@ export class FeishuBot {
   }
 
   /**
+   * [🛑 停 bg] Step B: 真执行 claude stop + abort wait + 条件化恢复 user-mapping。
+   *
+   * Race 1: 用户点 [停 bg] → 确认卡发出 → 期间 bg 自然完成 (state=done) → poll 退出 →
+   * runStreamingRendezvousReply 终态块已清 activeRendezvousWaits → 用户再点
+   * [✅ 确认] 进入此函数时 get() 返 undefined → 走"已自然完成"分支, 不杀 bg。
+   *
+   * Race 2 (review gap 2): bg 在用户点 [✅ 确认] 之前的瞬间刚完成 → handler 进入时
+   * entry 还在 map (终态块还没清), 但 updater.getState() === 'complete'。此时不调
+   * claude stop (bg 已死了, 调了也是 "No job matching" 兜底), 走"已自然完成"分支。
+   *
+   * "No job matching" stderr 同 manager.ts:handleStopConfirm — 视为成功。
+   */
+  private async handleRendezvousStopBgConfirm(
+    openId: string,
+    shortId: string,
+  ): Promise<string | null> {
+    const entry = this.activeRendezvousWaits.get(openId);
+    if (!entry) {
+      await this.replyFn(`✅ \`${shortId}\` 已自然完成，无需停止`, { openId });
+      return null;
+    }
+    // v2.x race 守门 2 (review gap 2): bg 在用户点 [✅ 确认] 之前已收尾,
+    // 但终态块还没清 maps。检查 CardUpdater 状态避免重复 stop + 覆盖终态卡。
+    const earlyUpdater = this.rendezvousCardUpdaters.get(openId);
+    if (earlyUpdater) {
+      const earlyState = earlyUpdater.getState();
+      if (earlyState === 'complete' || earlyState === 'error' || earlyState === 'cancelled') {
+        logger.info(
+          `handleRendezvousStopBgConfirm: skipped claude stop (terminal state=${earlyState}, ` +
+          `openId=${openId}, bg 已先收尾)`,
+        );
+        this.activeRendezvousWaits.delete(openId);
+        this.rendezvousCardUpdaters.delete(openId);
+        await this.replyFn(`✅ \`${shortId}\` 已自然完成，无需停止`, { openId });
+        return null;
+      }
+    }
+    entry.abort.abort();
+    const updater = this.rendezvousCardUpdaters.get(openId);
+    this.activeRendezvousWaits.delete(openId);
+    this.rendezvousCardUpdaters.delete(openId);
+
+    try {
+      const cp = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execFileP = promisify(cp.execFile);
+      try {
+        await execFileP('claude', ['stop', shortId], { timeout: 5000 });
+      } catch (err: any) {
+        const msg = err?.stderr || err?.message || String(err);
+        if (!/No job matching/i.test(msg)) throw err;
+      }
+      await new Promise(r => setTimeout(r, 1000));  // 等 supervisor cleanup
+
+      // 条件化恢复 user-mapping
+      try {
+        const current = this.userManager.getEntry(openId) ?? null;
+        const newEntry: any = {
+          type: 'session' as const,
+          sessionUuid: entry.sessionUuid,
+          cwd: entry.cwd,
+          // MappingEntry 无 createdAt 字段 (review gap 3), 不写
+        };
+        if (entry.attachedAt) newEntry.attachedAt = entry.attachedAt;
+        await this.userManager.compareAndSwap(openId, current, newEntry);
+      } catch (e: any) {
+        logger.warn(`handleRendezvousStopBgConfirm: restore user-mapping failed: ${e?.message ?? e}`);
+      }
+
+      await this.replyFn(`✅ 已停止 ${shortId}`, { openId });
+      if (updater) {
+        try {
+          await updater.patchAbortedTracking({
+            headerTitle: '🛑 bg 已被终止',
+            headerTemplate: 'grey',
+            body: `\`${shortId}\` 已停止 · /agents 查看 session 状态`,
+          });
+          updater.cancelPending();
+        } catch (e: any) {
+          logger.warn(`handleRendezvousStopBgConfirm: patch failed: ${e?.message ?? e}`);
+        }
+      }
+    } catch (err: any) {
+      await this.replyFn(`❌ Stop bg 失败: ${err?.message ?? err}`, { openId });
+      if (updater) {
+        try { await updater.error(`❌ Stop bg 失败: ${err?.message ?? err}`); } catch { /* swallow */ }
+      }
+    }
+    return null;
+  }
+
+  /**
    * SDK-driven chat streaming lifecycle (public, reusable from Agent View reply).
    *
    * Drives the full SDK streaming pipeline: processing card → streaming updates →
