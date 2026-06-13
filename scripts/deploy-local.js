@@ -58,6 +58,13 @@ function isRunning(pid) {
   catch { return false; }
 }
 
+// P1-4 修: 同步 spin sleep (替代错语义的 Atomics.wait + new buffer)
+// 100-200ms 短 spin, 总 timeout 15s, ~1% CPU
+function spinUntil(ms) {
+  const t = Date.now() + ms;
+  while (Date.now() < t) { /* spin */ }
+}
+
 function sha256(file) {
   const h = createHash('sha256');
   h.update(readFileSync(file));
@@ -151,9 +158,13 @@ function installGlobal(tgz) {
   const globalCli = '/usr/local/lib/node_modules/cc-linker/dist/cli.js';
   const localSha = sha256(localCli);
 
-  // 备份当前 global cli.js
+  // 备份当前 global cli.js (review hardening: try/catch + 明确错误)
   if (existsSync(globalCli)) {
-    copyFileSync(globalCli, BACKUP_GLOBAL);
+    try {
+      copyFileSync(globalCli, BACKUP_GLOBAL);
+    } catch (e) {
+      die(`备份 global cli.js 失败 (${e.message}), deploy 终止 — 没 backup 可 rollback`);
+    }
   }
 
   log('📦 Installing globally:', tgz);
@@ -209,11 +220,11 @@ function restartDaemon() {
       logErr(`launchctl unload 失败: ${e.message}`);
     }
     // 等 daemon exit (launchd unload 后会等几秒)
+    // P1-4 修: 旧用 Atomics.wait + new buffer 是错语义 (新 buffer 立即满足条件, 立刻返回)
+    // 改用 sync spin sleep (15s timeout 总 spin 最多 150 次, ~1% CPU)
     const start = Date.now();
     while (isRunning(oldPid) && Date.now() - start < 15000) {
-      // busy wait
-      // eslint-disable-next-line no-undef
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      spinUntil(100);
     }
     if (isRunning(oldPid)) {
       logErr(`daemon PID ${oldPid} 15s 后仍在跑, kill -9`);
@@ -231,7 +242,7 @@ function restartDaemon() {
     log(`  (launchctl load: ${e.message.split('\n')[0]})`);
   }
 
-  // 等 daemon 起来
+  // 等 daemon 起来 (P1-4 修: 同上 spin)
   const start = Date.now();
   let newPid = null;
   while (Date.now() - start < 15000) {
@@ -239,8 +250,7 @@ function restartDaemon() {
       newPid = parseInt(readFileSync(PID_FILE, 'utf8').trim(), 10);
       if (isRunning(newPid)) break;
     }
-    // eslint-disable-next-line no-undef
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    spinUntil(200);
   }
   if (!newPid || !isRunning(newPid)) {
     die('daemon 15s 内未起来', 1);
@@ -257,8 +267,8 @@ function verifyNewVersion(version) {
     log(`⚠️  ${LOG_FILE} 不存在, 跳过版本验证`);
     return;
   }
-  // 等 daemon 写入启动 banner
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3000);
+  // 等 daemon 写入启动 banner (P1-4 修: 用 spin 替代 Atomics.wait)
+  spinUntil(3000);
 
   const logContent = readFileSync(LOG_FILE, 'utf8');
   // 找最新 "cc-linker daemon started" 段
@@ -372,6 +382,7 @@ try {
   logErr(`Deploy 失败: ${e.message}`);
   if (e.stack) console.error(e.stack);
   rollback();
+  cleanupBackup();  // review hardening: 失败时也清 backup, 防下次 deploy 误 rollback 到错版本
   cleanup();
   process.exit(1);
 }
