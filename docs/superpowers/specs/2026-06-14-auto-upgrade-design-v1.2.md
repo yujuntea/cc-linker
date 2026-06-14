@@ -123,6 +123,25 @@ src/feishu/updater-card.ts    # 静态卡片 JSON builder (无 action handler)
 | Daemon: `start --daemon` 后 | 一次 | post-init hook 触发 check；新版本 → setTimeout(sendCard, notify_delay_ms) | 静默 no-op |
 | Daemon 24h ticker | 每天 | 跟启动相同 | 静默 no-op |
 
+### 3.1 6 种 status 的统一语义
+
+```ts
+type UpdateStatus =
+  | 'up_to_date'        // current === latest
+  | 'update_available'  // current < latest, latest 是 stable
+  | 'local_newer'       // current > latest (用户在 pre-release 或 dev)
+  | 'prerelease_only'   // latest 是 pre-release, **不推送**
+  | 'check_failed'      // 网络/解析错误
+  | 'disabled';         // [updater] enabled = false
+```
+
+**`prerelease_only` 关键不变量**:
+- **检测**: `latest` 匹配 `/^\d+\.\d+\.\d+-/` (semver pre-release 形式)
+- **行为**: 任何 current 都返回 `prerelease_only`, 静默 no-op
+- **理由**: 即使维护者手滑 `npm publish` 不带 `--tag beta`, 端用户也不会被 pre-release 污染
+- **CLI banner**: `ℹ️  published latest 是 pre-release (v0.6.4-beta.1), 内部测试包不推送升级`
+- **Daemon**: 不发卡片, `logger.info("updater: latest is pre-release, skipping")`
+
 ---
 
 ## 4. 数据流 A：CLI
@@ -444,16 +463,28 @@ async function resolveRegistryUrl(): Promise<string> {
 
 **关键不变量：网络失败 = 静默 no-op**。
 
-### 7.2 版本解析
-| # | 触发 | 期望 |
-|---|------|------|
-| V1 | `0.6.3` vs `0.6.3` | `up_to_date` |
-| V2 | `0.6.3` vs `0.6.4` | `update_available` |
-| V3 | `0.6.3-dev` vs `0.6.3` | `local_newer` |
-| V4 | `0.6.3` vs `0.6.3-rc.1` | `prerelease_only` |
-| V5 | `0.6.3` vs `0.6.10` | `0.6.10 > 0.6.3`（用 semver） |
+### 7.2 版本解析（含 pre-release 防护）
 
-**关键不变量：永远以 `dist-tags.latest` 为准**。
+**核心规则**:
+1. 取 `dist-tags.latest`（**永远**不查 `next`/`beta`）
+2. **Pre-release 防护**: latest 匹配 `/^\d+\.\d+\.\d+-/` → 强制返回 `prerelease_only`, **不进 semver compare**
+3. 否则 semver compare `current` vs `latest`
+
+| # | current | latest (from dist-tags.latest) | status | 说明 |
+|---|---------|------------------------------|--------|------|
+| V1 | 0.6.3 | 0.6.3 (stable) | `up_to_date` | 相同 |
+| V2 | 0.6.3 | 0.6.4 (stable) | `update_available` | 正常升级 |
+| V3 | 0.6.3-dev | 0.6.3 (stable) | `local_newer` | dev 比 published 新 |
+| **V4** | **0.6.3** | **0.6.4-beta.1 (pre-release)** | **`prerelease_only`** | **维护者手滑防护, 静默 no-op** |
+| V5 | 0.6.3 | 0.6.10 | `update_available` | 防字符串陷阱（用 semver）|
+| V6 | 0.6.3-rc.1 | 0.6.3 (stable) | `update_available` | 端用户在 RC, 提示 stable 出了 |
+| V7 | 0.6.4-beta.1 | 0.6.4-beta.2 | `prerelease_only` | 都是 pre-release, 不推 |
+| V8 | 0.6.3 | 0.6.3-rc.1 | `prerelease_only` | latest 是 pre-release, 不推 |
+
+**关键不变量**:
+- **`dist-tags.latest` 是唯一真源**, 永远不查 `next`/`beta`
+- **pre-release 防护优先级高于 semver compare**
+- 内部测试者用 `npm i -g cc-linker@beta` opt-in, 不走 auto-upgrade 路径
 
 ### 7.3 并发（**v1.2 极简**）
 | # | 触发 | 期望 |
@@ -497,6 +528,9 @@ async function resolveRegistryUrl(): Promise<string> {
 | B10 | user-mapping.json 不存在（bot 没 init-feishu） | 通知静默 no-op；CLI 仍可用 |
 | B11 | Standalone binary 用户跑 `cc-linker upgrade` | 拒绝 + 提示下载新 binary；通知卡片照发 |
 | B12 | Bun-only 用户（无 node） | postinstall 失败 → 用户看得到，建议用 `cc-linker upgrade` 不用 `npm i -g` |
+| **B13** | **维护者手滑 `npm publish` 没带 `--tag beta`，pre-release 跑到 `latest`** | **CLI banner 提示 prerelease_only；daemon 静默不推卡片；log 写一行 info。端用户零感知。** |
+| **B14** | **端用户在 RC（`0.6.3-rc.1`），published latest 是 stable `0.6.3`** | **`update_available` 推卡片，提示"stable 出了，升级？"** |
+| **B15** | **端用户想测 beta** | **不通过 auto-upgrade。用 `npm i -g cc-linker@beta` 手动 opt-in。spec §14 决策。** |
 
 ### 7.7 配置
 | # | 触发 | 期望 |
@@ -531,6 +565,9 @@ async function resolveRegistryUrl(): Promise<string> {
 | `daemon Skip button` | mock Feishu action | patch 卡片 "已忽略", CAS 写 user-mapping |
 | `daemon 24h ticker` | mock Date.now() 推进 25h | ticker 触发 + 写 cache |
 | `standalone binary user` | mock D2 detect, 跑 `upgrade` | 拒绝 + 提示下载 binary |
+| **`prerelease_only` 防护** | mock latest = 0.6.4-beta.1, current = 0.6.3 | CLI banner 写 prerelease_only, daemon 不发卡片, log 提示 |
+| **`prerelease_only` 端用户在 RC** | mock latest = 0.6.3 (stable), current = 0.6.3-rc.1 | `update_available` 推卡片（V6 场景）|
+| **`prerelease_only` 内部测试者跑 upgrade** | mock install mode 探测, latest = 0.6.4-beta.1 | `cc-linker upgrade` 走 `npm i -g cc-linker@latest`（=0.6.3 stable），不装 beta |
 
 **v1.1 砍掉的测试**（~10 个 card-path case）：
 - ❌ Upgrader 子进程 mock
@@ -608,15 +645,17 @@ async function resolveRegistryUrl(): Promise<string> {
 | Day 2 上午+ | **`src/cli/commands/restart.ts` R2 改 launchd unload/load** + 单测 | ~50 + ~40 |
 | Day 2 下午 | `src/utils/paths.ts` + `src/utils/config.ts` + `package.json`（+ semver dep） | ~30 |
 | Day 2 晚+ | e2e 升级走通（fake registry + 真 daemon） | ~80 |
-| **合计** | | **~1520 LOC（含测试）** |
+| **合计** | | **~1570 LOC（含测试）** |
 
-**v1.2 初版 → 收尾 +R1+R2+R3 +160 LOC**:
-- R1: +10 (idempotent restart)
-- R2: +90 (launchd unload/load 改造, 含单测)
-- R3: +50 (install mode 卡片分支, 含单测)
-- 测试: 各 +10
+**v1.2 收尾版 +pre-release 防护 +50 LOC**:
+- check.ts 加 pre-release regex 检查: +20
+- notify.ts 加 prerelease_only banner: +10
+- 单测 + 集成测试 +3 case: +20
 
-**vs v1.1 (1850 LOC)**: 仍省 -18%, 但 v1.2 收尾后**功能更完整** (R2 修了已有 bug, R3 修了 standalone binary 体验)。
+**vs v1.1 (1850 LOC)**: 仍省 -15%, 但 v1.2 收尾后**功能更完整**:
+- R2 修了 launchd unload/load 已有 bug
+- R3 修了 standalone binary 卡片体验
+- pre-release 防护修了"维护者手滑"场景
 
 ---
 
@@ -658,10 +697,32 @@ async function resolveRegistryUrl(): Promise<string> {
 | 卡片触发点 | daemon 启动 + 24h tick | 每条飞书消息都查 |
 | 默认行为 | `enabled = true` | opt-in |
 | Skip TTL | 30 天滚动窗口 | 永久 |
-| Pre-release | 只看 `dist-tags.latest` | 也看 next |
+| Pre-release 防护 | **`dist-tags.latest` 匹配 `^\d+\.\d+\.\d+-/` 强制 `prerelease_only`, 不推送** | 信任维护者手不抖 |
+| Pre-release 内部测试 | 用 `npm i -g cc-linker@beta` opt-in, **不**走 auto-upgrade | 加 channel 机制（v1.3） |
 | Caching | 24h TTL + ETag | 1h TTL |
 | `check_interval_hours` 默认 | 24 | 6 |
 | **卡片 action 按钮** | **只 Skip + Changelog** | v1.1 的 Update |
+
+### 14.1 维护者发布规范（写进 README + CHANGELOG）
+
+```bash
+# 内部测试 (灰度)
+npm version 0.6.4-beta.1
+npm publish --tag beta          # ← 必须带 --tag beta/next/rc
+# dist-tags.beta = 0.6.4-beta.1
+# dist-tags.latest 仍是 0.6.3, 端用户无感
+
+# 正式发布
+npm version 0.6.4
+npm publish                     # ← 不带 --tag, 默认 latest
+# dist-tags.latest = 0.6.4
+# 端用户 24h 内收到通知
+```
+
+**关键纪律**:
+- beta/rc **永远**带 `--tag beta` / `--tag next` / `--tag rc`
+- `dist-tags.latest` **永远**只指稳定版
+- pre-release 防护是**第二道防线**——第一道是维护者纪律
 
 ---
 
