@@ -2785,11 +2785,10 @@ describe('runPipeline', () => {
   });
   afterEach(() => rmSync(tmpDir, { recursive: true }));
 
-  it('completes PRODUCING → R1 → R1_CLEAN → DONE', async () => {
+  it('completes PRODUCING → R1_CLEAN → DONE with history tracking', async () => {
     // Mock adapter: PRODUCING spawn returns shortId, then R1 returns "no issues"
     const workShortId = 'short-work';
-    const fixOutput = '```json\n{"per_issue": [], "all_real_fixed": true, "remaining_real_unfixed_count": 0}\n```';
-    const stateJson = { state: 'done', output: '{"issues": [], "unfixed_count": 0}' };
+    const r1Output = '{"issues": [], "unfixed_count": 0}';
     let callCount = 0;
 
     const mockAdapter = {
@@ -2798,7 +2797,7 @@ describe('runPipeline', () => {
         return { shortId: workShortId, sessionId: 'uuid-w' };
       },
       poll: async (shortId: string, timeoutMs: number) => {
-        return { ...stateJson, state: 'done' } as any;
+        return { state: 'done', output: r1Output } as any;
       },
       injectReply: async (opts: any) => ({ ok: true }),
       stop: async (shortId: string) => {},
@@ -2824,18 +2823,32 @@ describe('runPipeline', () => {
     };
     await store.saveRunning(record);
 
-    // Run pipeline with abort signal that fires immediately
-    const ac = new AbortController();
-    setTimeout(() => ac.abort(), 100);
-
+    // 不 abort，让 pipeline 跑完完整 cycle
     await runPipeline(record, profile, {
-      store, state, adapter: mockAdapter as any, signal: ac.signal,
-    }).catch(() => {/* abort throws */ });
+      store, state, adapter: mockAdapter as any,
+    });
 
-    // 验证状态机推进
-    const final = await store.readRunning('p1');
-    // aborted due to abort signal, OR reached terminal state
-    expect(final === null || ['DONE', 'ABORTED'].includes(final?.state.kind ?? '')).toBe(true);
+    // 验证：pipeline 移到 done/（已被 store.moveToTerminal 移除）
+    const finalRunning = await store.readRunning('p1');
+    expect(finalRunning).toBeNull();  // moveToTerminal 已移走
+
+    // 验证：done/ 目录里能找到 final record
+    const doneRecords = await store.listTerminal('done');
+    const final = doneRecords.find(r => r.pipelineId === 'p1');
+    expect(final).toBeDefined();
+    expect(final?.state.kind).toBe('DONE');
+
+    // 验证：history 记录了 transition（PRODUCING → SELF_REVIEW_R1 → DONE）
+    expect(final?.history.length).toBeGreaterThanOrEqual(2);
+    expect(final?.history.some(e => e.toState === 'SELF_REVIEW_R1')).toBe(true);
+    expect(final?.history.some(e => e.toState === 'DONE')).toBe(true);
+
+    // 验证：panes.work 已记录
+    expect(final?.panes.work?.sessionId).toBe('uuid-w');
+    expect(final?.panes.work?.currentRoundShortId).toBe(workShortId);
+
+    // 验证：PipelineState 已清理
+    expect(state.has('p1')).toBe(false);
   });
 });
 ```
@@ -2853,7 +2866,9 @@ Add to `src/review/engine.ts`:
 import type { PipelineStore } from './pipeline-store';
 import type { PipelineState } from './pipeline-state';
 import type { ClaudeBGAdapter } from './adapter';
-import { parseBgOutput, SelfReviewOutputSchema, FixingOutputSchema } from './output-contract';
+import { parseBgOutput, SelfReviewOutputSchema, FixingOutputSchema, JudgeOutputSchema } from './output-contract';
+import { readJobState } from '../agent-view/job-state';
+import { computeVerdict } from './verdict';
 import { logger } from '../utils/logger';
 import type { PipelineRecord, ReviewProfile, Issue, ReviewState } from './types';
 
@@ -2969,7 +2984,9 @@ async function stepPRODUCING(
   };
 
   // Poll until done
+  const startedAt = Date.now();
   const finalState = await opts.adapter.poll(shortId, 600_000, opts.signal);
+  record.totalCostUsd += extractCostUsd(finalState);
   return transitionWithContext(record, { type: 'WORK_PRODUCED' }, { maxRounds: profile.guards.max_rounds });
 }
 
@@ -2978,24 +2995,56 @@ async function stepSELF_REVIEW_R1(
   profile: ReviewProfile,
   opts: RunPipelineOpts,
 ): Promise<PipelineRecord> {
-  // Inject "review your work" prompt into work session
   if (!record.panes.work?.currentRoundShortId) throw new Error('work pane not initialized');
   await opts.adapter.injectReply({
     shortId: record.panes.work.currentRoundShortId,
     text: buildSelfReviewPrompt(record, profile, 'R1'),
     signal: opts.signal,
   });
-  // Poll for completion
   await opts.adapter.poll(record.panes.work.currentRoundShortId, 60_000, opts.signal);
 
-  // Read state.json.output, parse via Output Contract
-  const state = await import('../agent-view/job-state').then(m => m.readJobState(record.panes.work!.currentRoundShortId!));
-  const outputText = (state as any)?.output ?? '';
+  const stateJson = await readJobState(record.panes.work.currentRoundShortId);
+  const outputText = (stateJson as any)?.output ?? '';
   const parsed = parseBgOutput(outputText, SelfReviewOutputSchema);
+  record.totalCostUsd += extractCostUsd(stateJson);
+
   if (!parsed.ok || parsed.data.issues.length === 0) {
     return transitionWithContext(record, { type: 'R1_CLEAN' }, { maxRounds: profile.guards.max_rounds });
   }
-  return transitionWithContext(record, { type: 'R1_ISSUES', issues: enrichIssues(parsed.data.issues) }, { maxRounds: profile.guards.max_rounds });
+  return transitionWithContext(
+    record,
+    { type: 'R1_ISSUES', issues: enrichIssues(parsed.data.issues) },
+    { maxRounds: profile.guards.max_rounds },
+  );
+}
+
+async function stepSELF_REVIEW_R2(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  // R2 与 R1 同构，只是 round=R2
+  if (!record.panes.work?.currentRoundShortId) throw new Error('work pane not initialized');
+  await opts.adapter.injectReply({
+    shortId: record.panes.work.currentRoundShortId,
+    text: buildSelfReviewPrompt(record, profile, 'R2'),
+    signal: opts.signal,
+  });
+  await opts.adapter.poll(record.panes.work.currentRoundShortId, 60_000, opts.signal);
+
+  const stateJson = await readJobState(record.panes.work.currentRoundShortId);
+  const outputText = (stateJson as any)?.output ?? '';
+  const parsed = parseBgOutput(outputText, SelfReviewOutputSchema);
+  record.totalCostUsd += extractCostUsd(stateJson);
+
+  if (!parsed.ok || parsed.data.issues.length === 0) {
+    return transitionWithContext(record, { type: 'R2_CLEAN' }, { maxRounds: profile.guards.max_rounds });
+  }
+  return transitionWithContext(
+    record,
+    { type: 'R2_ISSUES', issues: enrichIssues(parsed.data.issues) },
+    { maxRounds: profile.guards.max_rounds },
+  );
 }
 
 async function stepFIXING(
@@ -3003,31 +3052,163 @@ async function stepFIXING(
   profile: ReviewProfile,
   opts: RunPipelineOpts,
 ): Promise<PipelineRecord> {
-  if (state.kind !== 'FIXING') throw new Error('expected FIXING');
-  // Inject "verify each issue + fix real ones" prompt
+  if (record.state.kind !== 'FIXING') throw new Error('expected FIXING');
   await opts.adapter.injectReply({
     shortId: record.panes.work!.currentRoundShortId!,
     text: buildFixingPrompt(record.state.inputIssues, record.state.source),
     signal: opts.signal,
   });
   await opts.adapter.poll(record.panes.work!.currentRoundShortId!, 120_000, opts.signal);
+
+  // Parse FIXING output via Output Contract (verify-first result)
+  const stateJson = await readJobState(record.panes.work!.currentRoundShortId!);
+  const outputText = (stateJson as any)?.output ?? '';
+  const parsed = parseBgOutput(outputText, FixingOutputSchema);
+  record.totalCostUsd += extractCostUsd(stateJson);
+
+  // 把 FIXING 结果记录到 history（spec §6.1 HistoryEvent）
+  record.history.push({
+    ts: new Date().toISOString(),
+    fromState: 'FIXING',
+    toState: 'FIXING',  // 自环：FIXING 完成后的 verify-first 结果
+    round: record.state.round,
+    role: 'work',
+    paneShortId: record.panes.work?.currentRoundShortId,
+    paneSessionId: record.panes.work?.sessionId,
+    providerAlias: profile.work.provider,
+    inputDigest: '',
+    outputDigest: '',
+    outputSizeBytes: outputText.length,
+    costUsd: 0,  // 已在 totalCostUsd 加
+    durationMs: 0,
+  });
+
   return transitionWithContext(record, { type: 'FIXING_DONE' }, { maxRounds: profile.guards.max_rounds });
 }
 
-// stepSELF_REVIEW_R2, stepEXTERNAL_REVIEW, stepJUDGE_BY_WORK 类似，省略详细实现
+async function stepEXTERNAL_REVIEW(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  // Promise.all 启 N 个 review pane（每个 provider 一个）
+  const startedAt = Date.now();
+  const spawnPromises = profile.review.providers.map(async (provider, i) => {
+    const role = `review-${String.fromCharCode(65 + i)}`;  // A, B, C...
+    const { shortId, sessionId } = await opts.adapter.startSession({
+      role: 'review',
+      provider,
+      prompt: buildReviewPrompt(record, profile, role),
+      cwd: record.input.cwd,
+    });
+    return { role, shortId, sessionId, provider };
+  });
+  const newReviews = await Promise.all(spawnPromises);
+  record.panes.reviews = newReviews.map(r => ({
+    role: r.role,
+    shortId: r.shortId,
+    sessionId: r.sessionId,
+    provider: r.provider,
+    round: record.state.round,
+    cycle: record.state.cycle,
+  }));
+
+  // 等所有 review pane done
+  await Promise.all(newReviews.map(r => opts.adapter.poll(r.shortId, 120_000, opts.signal)));
+
+  // 加 cost
+  for (const r of newReviews) {
+    const stateJson = await readJobState(r.shortId);
+    record.totalCostUsd += extractCostUsd(stateJson);
+  }
+
+  return transitionWithContext(record, { type: 'EXT_REVIEWS_DONE' }, { maxRounds: profile.guards.max_rounds });
+}
+
+async function stepJUDGE_BY_WORK(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  // 把所有 review 的 issues 收集起来，injectReply 让 work session 评判
+  const allIssues: Issue[] = [];
+  for (const review of record.panes.reviews) {
+    const stateJson = await readJobState(review.shortId);
+    const outputText = (stateJson as any)?.output ?? '';
+    const parsed = parseBgOutput(outputText, parseBgOutputSimple());
+    if (parsed.ok) {
+      allIssues.push(...((parsed as any).data.issues.map((iss: any) => ({
+        ...iss, source: review.role, id: `${review.role}-${allIssues.length + 1}`,
+      }))));
+    }
+  }
+
+  // Inject judge prompt
+  await opts.adapter.injectReply({
+    shortId: record.panes.work!.currentRoundShortId!,
+    text: buildJudgePrompt(allIssues),
+    signal: opts.signal,
+  });
+  await opts.adapter.poll(record.panes.work!.currentRoundShortId!, 60_000, opts.signal);
+
+  // Parse judge output
+  const stateJson = await readJobState(record.panes.work!.currentRoundShortId!);
+  const outputText = (stateJson as any)?.output ?? '';
+  const parsed = parseBgOutput(outputText, JudgeOutputSchema);
+  record.totalCostUsd += extractCostUsd(stateJson);
+
+  if (!parsed.ok) {
+    // parse 失败 → 视为全部 accept（保守）
+    return transitionWithContext(
+      record,
+      { type: 'JUDGE_VERDICT', verdict: 'accept', acceptedIssues: allIssues },
+      { maxRounds: profile.guards.max_rounds },
+    );
+  }
+
+  // Compute verdict via P0/P1 rejection ratio algorithm (spec §5.4)
+  const verdict = computeVerdict(
+    [{ role: 'work', issues: allIssues.map(i => ({ id: i.id, severity: i.severity, location: i.location, description: i.description })) }],
+    parsed.data.per_issue,
+    profile.guards.p0_p1_reject_threshold,
+  );
+
+  const acceptedIssues = allIssues.filter(i => {
+    const decision = parsed.data.per_issue.find(d => d.issue_id === i.id);
+    return decision?.decision !== 'reject';  // accept 或 partial 都接受
+  });
+
+  return transitionWithContext(
+    record,
+    { type: 'JUDGE_VERDICT', verdict, acceptedIssues },
+    { maxRounds: profile.guards.max_rounds },
+  );
+}
+
+// ============ Prompt Builders ============
 
 function buildProducePrompt(record: PipelineRecord, profile: ReviewProfile): string {
   return profile.prompts['work.produce']?.system ?? `你正在编写一份 ${record.input.phase}。${record.input.rawInput}`;
 }
 
 function buildSelfReviewPrompt(record: PipelineRecord, profile: ReviewProfile, round: 'R1' | 'R2'): string {
-  const prompt = profile.prompts['work.self_review']?.system ?? `审查你的产出，识别问题：...`;
+  const prompt = profile.prompts['work.self_review']?.system ?? `审查你的产出（来自 ${round === 'R1' ? 'PRODUCING' : 'FIXING_AFTER_R1'} 阶段），识别问题：1. 仔细阅读 2. 列出 issues（severity P0/P1/P2/P3, location, description）3. 不修改文件。输出 JSON {issues, unfixed_count}`;
   return prompt.replace(/\{\{round\}\}/g, round);
 }
 
 function buildFixingPrompt(issues: Issue[], source: string): string {
-  return `你是修复节点（FIXING）。调用来源：${source} 阶段。待处理 issue 列表：${JSON.stringify(issues, null, 2)}。严格 verify-first 流程（每个 issue 都必须经过）：1. 验证真实性 2. 判定 real/hallucination 3. 修复（仅 real） 4. 验证修复。输出 JSON...`;
+  return `你是修复节点（FIXING）。调用来源：${source} 阶段。待处理 issue 列表：${JSON.stringify(issues, null, 2)}。严格 verify-first 流程（每个 issue 都必须经过）：1. 验证真实性 2. 判定 real/hallucination 3. 修复（仅 real）4. 验证修复。输出 JSON {per_issue, all_real_fixed, remaining_real_unfixed_count}`;
 }
+
+function buildReviewPrompt(record: PipelineRecord, profile: ReviewProfile, role: string): string {
+  return profile.prompts['review.code']?.system ?? `你正在 Review 一段 ${record.input.phase} 变更。${record.input.rawInput}。输出 JSON: { issues: [{ severity, category, location, description, suggestion }] }`;
+}
+
+function buildJudgePrompt(issues: Issue[]): string {
+  return `工作产物已生成。外部 review 提出的 issue 列表：${JSON.stringify(issues, null, 2)}。请你逐条评估每个 issue：1. accept（真问题）2. reject（不同意）3. partial（部分同意）。输出 JSON {per_issue: [{issue_id, decision, reason}], reasoning}。不要自己输出 verdict，由 engine 算法决定。`;
+}
+
+// ============ Helpers ============
 
 function enrichIssues(rawIssues: any[]): Issue[] {
   return rawIssues.map((ri, i) => ({
@@ -3037,6 +3218,28 @@ function enrichIssues(rawIssues: any[]): Issue[] {
     description: ri.description,
     source: 'work',
   }));
+}
+
+function parseBgOutputSimple() {
+  // Review pane output 用宽松 schema（spec §7.5.4 degraded 模式）
+  const z = require('zod');
+  return z.object({
+    issues: z.array(z.object({
+      severity: z.enum(['P0', 'P1', 'P2', 'P3']),
+      category: z.string().optional(),
+      location: z.string(),
+      description: z.string(),
+      suggestion: z.string().optional(),
+    })),
+  });
+}
+
+function extractCostUsd(stateJson: any): number {
+  // state.json 可能含 usage / cost 字段；如果没有，估算 0（保守）
+  if (!stateJson) return 0;
+  const usage = (stateJson as any).usage;
+  if (usage && typeof usage.costUsd === 'number') return usage.costUsd;
+  return 0;
 }
 
 async function cleanupOnAbort(pipelineId: string, reason: string, opts: RunPipelineOpts): Promise<void> {
@@ -3104,17 +3307,50 @@ export async function reviewRun(task: string, opts: {
   console.log(`✓ Pipeline 启动: ${pipelineId.slice(0, 8)}... (phase=${phase}, max_rounds=${maxRounds})`);
 
   if (opts.watch === false) {
-    // detach mode: run in background, user uses `review status <id>` to check
+    // detach mode: run in background, SIGINT triggers graceful abort
+    const detachCleanup = async () => {
+      ac.abort();
+      // 等待 engine 清理（最多 30s）
+      await new Promise<void>(resolve => {
+        const timeout = setTimeout(resolve, 30_000);
+        const check = setInterval(() => {
+          if (!state.has(pipelineId)) {
+            clearTimeout(timeout);
+            clearInterval(check);
+            resolve();
+          }
+        }, 500);
+      });
+      process.exit(0);
+    };
+    process.once('SIGINT', () => {
+      console.log('\n[review] SIGINT received, aborting pipeline gracefully...');
+      detachCleanup().catch(err => {
+        logger.error(`[review] cleanup failed: ${err.message}`);
+        process.exit(1);
+      });
+    });
+    // runPipeline 后台跑，错误仅 log（不 throw 退出 CLI）
     runPipeline(record, profile, { store, state, adapter, signal: ac.signal })
       .catch(err => logger.error(`[review] pipeline ${pipelineId} failed: ${err.message}`));
-    console.log(`Detached. 重连: cc-linker review status ${pipelineId} --follow`);
+    console.log(`✓ Pipeline ${pipelineId} detached. 重连: cc-linker review status ${pipelineId}`);
   } else {
-    // foreground: show CLI watch
+    // foreground: show CLI watch + run engine in parallel
+    // 任一结束（pipeline 完 / 用户 Ctrl-C / 错误）即退出
     const { watchPipeline } = await import('../../review/cli-watch');
-    await Promise.race([
-      watchPipeline(pipelineId, ac.signal),
-      runPipeline(record, profile, { store, state, adapter, signal: ac.signal }),
-    ]);
+    process.once('SIGINT', () => {
+      console.log('\n[review] SIGINT received, aborting pipeline...');
+      ac.abort();  // 让 runPipeline 走 cleanup 路径，不直接 process.exit
+    });
+    try {
+      await Promise.race([
+        watchPipeline(pipelineId, ac.signal),
+        runPipeline(record, profile, { store, state, adapter, signal: ac.signal }),
+      ]);
+    } catch (err) {
+      logger.error(`[review] pipeline error: ${(err as Error).message}`);
+      process.exit(1);
+    }
   }
 }
 
@@ -3140,14 +3376,28 @@ providers = ["kimi-for-coding"]
 max_rounds = 1
 EOF
 
-# 2. run
-bun run dev review run "say hello world" --phase code --profile test --no-watch &
-PIPELINE_ID=$(bun run dev review status --no-watch 2>/dev/null | head -1) || true
+# 2. 后台启动 pipeline，从输出提取 pipelineId
+bun run dev review run "say hello world" --phase code --profile test --no-watch 2>&1 | tee /tmp/review-run.log &
+RUN_PID=$!
+sleep 3
+PIPELINE_ID=$(grep -oP 'Pipeline \K[a-z0-9]{8}' /tmp/review-run.log | head -1)
+if [ -z "$PIPELINE_ID" ]; then
+  echo "FAIL: could not extract pipelineId from review run output"
+  kill $RUN_PID 2>/dev/null
+  exit 1
+fi
 
-# 3. check status
+# 3. check status (用 --no-follow 模式)
 sleep 5
-bun run dev review status $PIPELINE_ID 2>/dev/null
+bun run dev review status $PIPELINE_ID
 # Expected: state in DONE/ABORTED/PRODUCING
+
+# 4. 等 pipeline 结束
+wait $RUN_PID 2>/dev/null
+
+# 5. 清理：找 final record
+bun run dev review report $PIPELINE_ID --format md 2>/dev/null | head -30
+# Expected: 看到 timeline / issues / verdict 等
 ```
 
 - [ ] **Step 7: Commit**
@@ -3182,16 +3432,18 @@ bun run dev review doctor
 bun run dev review profiles
 # Expected: lists 'default' (or error if ~/.claude/providers/ missing)
 
-# 3. dry-run pipeline (T1-T7 ready but engine wiring incomplete)
-bun run dev review run "say hello" --phase code
-# Expected: prints pipeline start info; engine wiring TBD (will be wired in Phase 2 of plan execution)
+# 3. 实际跑 mini pipeline (T1-T9 全部就绪后)
+bun run dev review run "say hello" --phase code --profile default --no-watch
+sleep 5
+bun run dev review profiles
+# Expected: Pipeline 启动 + 跑 + DONE/ABORTED
 ```
 
 - [ ] **Step 12: Final commit + push**
 
 ```bash
 git add docs/superpowers/plans/2026-06-14-multi-model-review-engine-v2.1-plan.md
-git commit -m "docs(plan): v2.1 Phase 1 implementation plan (T1-T8, ~5 weeks)"
+git commit -m "docs(plan): v2.1 Phase 1 implementation plan (T1-T9, ~5-7 weeks)"
 git push origin feat/multi-model-review-engine-v2
 ```
 
