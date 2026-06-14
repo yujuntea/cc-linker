@@ -1,0 +1,1155 @@
+# cc-linker Multi-Model Review Engine v2.1 设计
+
+**日期：** 2026-06-14
+**版本：** v2.1（v2 patch：实测 `claude --bg` 行为 + 13 项修正）
+**状态：** 待评审
+**作者：** Claude Code（v2 spec + 实测验证 session + brainstorm patch）
+
+## Preconditions（v2.1 必加）
+
+- **Claude CLI ≥ 2.1.163**（`claude --bg` 稳定；老版本无此能力）
+- **cc-linker ≥ 0.6.3**（当前 master，`c5a8b8d`）
+- **`~/.claude/providers/` 至少配置 3 个 provider**（work + ≥1 review + arbiter），缺失会由 `cc-linker review doctor` 报错
+
+## 修订记录
+
+| 版本 | 日期 | 关键变更 |
+|---|---|---|
+| v1 | 2026-06-06 | 初版，13 个新模块全栈自建（`src/review/` 子目录） |
+| v2 | 2026-06-13 | 复用 Agent View 已有能力；新建 7 个模块；CLI 主输出 + 简版 IDE |
+| **v2.1** | **2026-06-14** | **本次 patch。17 项变更：**<br>1) **§3.1 复用层** —— 实测 `claude --bg` 是真 bg session 入口（v2 假定但未验证），adapter 重写为 `Bun.spawn(['claude', '--bg', ...])`<br>2) **§4.2 work session 长生命周期** —— 每轮 `--bg` 起新 shortId 但 sessionId 跨轮不变；`panes.work` 同时追踪两者<br>3) **§5.1 JUDGE_BY_WORK / JUDGE_ARBITER / FIXING** —— 走 `RendezvousClient.injectReply()`（daemon 协议），**不**起新 bg session；v2 错误地假定用 `startSession` + `--resume`<br>4) **§6.1 PaneRegistry** —— 新增 `currentRoundShortId` 字段（每轮变）+ `sessionId` 字段（跨轮不变）<br>5) **§10.1 新增错误** —— daemon crash 检测（`~/.claude/daemon/roster.json`）+ 网络瞬态 503 重试 + CLI 版本校验<br>6) **§5.2 max_rounds 减半** —— Spec=4 / Plan=5 / Code=8 / Global=6（v2 的 8/10/15/12 跑满 ≈ 2h，太长）<br>7) **§8 Phase 1 砍 IDE** —— cc-linker 没有 HTTP 框架；Phase 1 改 CLI `--watch` 模式（rich terminal），Phase 2 再补 IDE<br>8) **§6.4 Reconciler 改保守策略** —— pane bg session 丢失 → `PANE_LOST` 状态 + CLI 询问用户（retry/abort/skip），不再直接 FAILED<br>9) **§3.3 CLI 改 subcommand group** —— 跟 `daemon` / `hook` 一致：`cc-linker review run/status/abort/report/decide/cancel/doctor` 7 个子命令<br>10) **§10.1 HUMAN_DECIDE 超时** —— 24h → 1h 默认，可配<br>11) **§9 PhaseDetector 加启发式 4** —— rawInput 含 `.ts/.py/.go` 后缀或 `line N/L:N` 引用 → 强制 code<br>12) **新增 `cc-linker review doctor`** —— 启动前验证：profile 引用的 provider 是否在 `~/.claude/providers/` + CLI 版本 + daemon 健康<br>13) **新增 `/cancel review <id>`** —— 用户飞书/CLI 中止正在跑的 review，自动清理 4 个 pane bg session（`claude stop <short>` × 4）<br>14) **§11/§12 明确 review 不改源文件** —— Phase 1 review 只输出 Markdown 报告到 `<cwd>/.claude/reviews/<pipelineId>.md`，**不**修改用户项目源码；修改留 Phase 2 IDE<br>15) **§6.2 5 目录** —— 修 v2 写的"6 目录"，review pipeline 用 5 目录（running/human_pending/done/failed/aborted），**不**用 pending/<br>16) **§8 "1+N+1 pane"** —— v2 写的"4 pane"是默认配置；实际 = 1 work + N review providers + 1 arbiter；profile 可配 N<br>17) **§12.1 Phase 1 重排** —— W6 IDE 任务删除；新增 T8 CLI `--watch` 模式任务 |
+
+> v2 的"§2 复用层（0 行新代码）"v2.1 **保留并加强**——实测 `claude --bg` + `--settings` + `--reply-on-resume` + `state.json` + `readJobState` + `RendezvousClient.injectReply` + `claude stop` + `claude logs` 全部现成可用。
+
+---
+
+## 1. 问题陈述
+
+使用 AI Coding（Claude Code 等）后，开发流程从"写代码 → 人审"变成了多轮自审 + 多模型交叉 Review 的工作流：
+
+```
+写 Spec → AI 自查 → 模型 A 交叉 Review → 模型 B 交叉 Review → 修改 → 再 Review
+写 Plan → AI 自查 → 模型 A 交叉 Review → 模型 B 交叉 Review → 修改 → 再 Review
+写代码 → AI 自查 → 模型 A 交叉 Review → 模型 B 交叉 Review → 修复 → 再 Review
+```
+
+由于 Claude Code 限制，不方便在终端直接切换不同模型（kimi-2.6、qwen3.6-plus、mimo-2.5-pro 等），每次评审都需手动换 settings、重新启动进程。同时，多个模型的交叉 Review 意见如何汇总、是否采纳、是否需要仲裁，缺少一个集中的"裁决 + 流程编排"机制。
+
+v1 spec（2026-06-06）已经设计了一个完整的 Review Engine 解决方案（13 个新模块全栈自建）。
+v2 spec（2026-06-13）重新设计的目标是：**深度复用 Agent View 已有基础设施**，将新建模块从 13 个缩到 7 个。
+v2.1 patch（本文档）在 v2 基础上做了 13 项修正，关键变化是**实测 `claude --bg` 行为并据此重写 adapter**——v2 的"0 行新代码复用"承诺现在能兑现。
+
+## 2. 目标与非目标
+
+### 2.1 目标（本版必须支持）
+
+| # | 目标 | 优先级 |
+|---|------|--------|
+| G1 | 多模型交叉 Review 编排：驱动"工作模型 → 外部 Review 模型 → 裁决 → 修复"的完整流水线 | P0 |
+| G2 | 层次化裁决机制：工作模型自评 → 外部 Review → 工作模型评判意见 → 仲裁 → 人工兜底 | P0 |
+| G3 | 三阶段支持：Spec / Plan / Code，每个阶段可配置不同的提示词、护栏、Review 模型组合 | P0 |
+| G4 | 电脑端便利：CLI 主输出 + `--watch` 模式（rich terminal）实时看 1+N+1 pane 状态 | P0（Phase 1） |
+| G5 | 可恢复状态机：每次 Review 是一个有状态的、跨进程崩溃可恢复的工作流 | P0 |
+| G6 | **深度复用 Agent View**：实测 `claude --bg` + `--settings` + `--reply-on-resume` + `state.json` + `readJobState` + `RendezvousClient.injectReply` + `claude stop` 全部 0 行重复代码 | P0 |
+| G7 | 1+N+1 个 bg session 自动出现在 `~/.claude/jobs/`，飞书 `/agents` 列表**免费**看到（Phase 2 飞书集成） | P1 |
+| G8 | **`cc-linker review doctor`** 启动前健康检查（profile 引用 + CLI 版本 + daemon 健康） | P0 |
+
+### 2.2 非目标
+
+- 不替代现有 `/new` `/list` `/switch` `/model` 等飞书命令
+- 不修改 `ProviderManager` 已有逻辑
+- 不修改 `ClaudeSessionManager` 签名（仅复用其接口）
+- 不修改 `AgentViewManager` 任何代码（v2.1 设计 0 侵入 Agent View）
+- 不做云端协同 / 团队共享（仍是单机单用户）
+- **不做 Phase 1 IDE**（v2.1 砍掉，Phase 1 改 `--watch` rich terminal；Phase 2 单独排期）
+- 不修改 `~/.claude/providers/*.json` 任何内容（只读取）
+- **不修改用户项目源文件**（review 只产出 Markdown 报告；修改留 Phase 2 IDE + 用户主动应用）
+- **不**做 cloud-hosted multi-agent review（Anthropic 已有 `claude ultrareview` 但那是云端）
+
+## 3. 架构总览
+
+### 3.1 复用层（实测 0 行新代码）
+
+**v2.1 关键修正**：v2 写"adapter.startSession 内部调 `ClaudeSessionManager.sendMessage`"——**实测错**。`sendMessage` 是 `claude -p`（前台一次性），不会产生 bg session。v2.1 重写为直接 `Bun.spawn(['claude', '--bg', ...])`。
+
+| 能力 | 复用什么 | v2.1 验证状态 |
+|------|---------|--------------|
+| Spawn bg session（work/review/arbiter） | `Bun.spawn(['claude', '--bg', prompt, '--settings', settingsPath])` → 返回 `shortId` 落到 `~/.claude/jobs/<short>/state.json` | ✅ 实测 OK（见附录 A） |
+| Provider 切换 | `--settings ~/.claude/providers/<name>.json` | ✅ 实测 OK（state.json `respawnFlags` 记录 settings 路径，`providerEnv` 切换） |
+| Resume work session 跨 R1/R2/JUDGE/FIX | `--bg <newPrompt> --resume <sessionId> --reply-on-resume` | ✅ 实测 OK（每次新 shortId，sessionId 跨轮不变） |
+| 注入 judge prompt 到 work session | `RendezvousClient.injectReply({ short, text, rendezvousSock, timeoutMs })`（已存在，`src/agent-view/rendezvous-client.ts:151`）走 daemon TCP socket，**不**用 `--resume`（实测 `--resume` 在 running bg 上会报错） | ✅ 走 daemon 协议 |
+| 读 pane 状态 | `readJobState(shortId)`（`src/agent-view/job-state.ts:87`）读 `~/.claude/jobs/<short>/state.json` | ✅ 0 行新代码 |
+| 偷看 pane 输出 | `resolvePeekContent(shortId, maxChars)`（`src/agent-view/manager.ts:209`）三级降级：state.json.linkScanPath → JsonlIndex.lookup → `claude logs <short>` | ✅ 0 行新代码 |
+| Stop 任意 pane | `Bun.spawn(['claude', 'stop', short])` | ✅ 实测 OK（state.json state→'stopped'） |
+| Session 状态权威 | `~/.claude/jobs/<short>/state.json`（CLI 维护，含 `state` `tempo` `detail` `needs` `output` `sessionId` `resumeSessionId`） | ✅ 0 行新代码 |
+| Provider 配置文件 schema | `~/.claude/providers/<name>.json`（已存在：kimi / qwen / mimo 等 8 个） | ✅ 0 行新代码 |
+| 飞书 `/agents` 列表 Phase 2 集成 | `claude agents --json` 已列出 `kind: "background"` 的 pane，零代码 | ✅ Phase 2 准备 |
+
+**v2.1 关键洞察**：v2 假设的"复用 `runChatSDK` / `ExpectedReplyState`"经实测均**不可复用**：
+- `runChatSDK`（`src/feishu/bot.ts:2075-2468`）Feishu 强耦合（CardUpdater + SpoolQueue + permission handler + activePermissionHandlers map）
+- `ExpectedReplyState` 语义错配（"用户主动 reply" vs "engine 注入 judge prompt"），需要新建 `PipelineReplyState`（在 PipelineRecord 里加字段，~20 行）
+
+### 3.2 新建层（8 个模块）
+
+```
+src/review/
+├── engine.ts            # 状态机驱动（10 状态 + 1 个新 PANE_LOST）
+├── pipeline-store.ts    # 持久化：5 目录（running / human_pending / done / failed / aborted）
+├── pipeline-state.ts    # engine 层面的 in-memory active pipeline Map（key: pipelineId, value: { record, abortController, watchClientSet }）
+├── profile.ts           # ReviewProfile TOML 加载 + per-phase 深度 merge + provider 校验
+├── phase-detect.ts      # 启发式：file path → git ref → 关键词 → 文件后缀/行号（启发式 4）→ PhaseUnknownError
+├── adapter.ts           # v2.1 重写：ClaudeBGAdapter 包装 `claude --bg` + `RendezvousClient.injectReply` + `claude stop` + `claude logs`
+├── cli-watch.ts         # v2.1 替换 v2 的 ide-server.ts：CLI `--watch` 模式，rich terminal UI（chalk + ANSI 进度条 + 状态条）
+├── review-doctor.ts     # v2.1 新增：`cc-linker review doctor` 命令，profile / provider / CLI 版本 / daemon 健康检查
+└── reconciler.ts        # 启动扫描 running/ + human_pending/ 恢复 in-memory active set + pane 丢失检测（→ PANE_LOST）
+```
+
+**v2.1 新增的两个模块说明**：
+- `pipeline-state.ts`：内存中追踪 active pipeline 列表 + 每条 pipeline 的 `AbortController`（用于 `review abort` / `review cancel` 时打断 polling 循环）+ 当前 `review status --follow` 客户端列表（用于 SIGINT/SIGTERM 时通知 UI）。**不**持久化（重启后由 Reconciler 从 PipelineStore 重建）。
+- `review-doctor.ts`：作为 `cc-linker review run` 启动前的健康门禁，输出诊断报告（见 §10.5）。也可独立运行 `cc-linker review doctor`。
+
+**CLI 子命令注册**：`src/cli/commands/review.ts` 作为 subcommand group 入口（与 `daemon` / `hook` 一致），分发到上面 8 个模块；不像 Agent View 那样有 `manager.ts` 中央调度（review engine 的协调在 `engine.ts` 内部）。
+
+### 3.3 CLI 入口（v2.1 改 subcommand group）
+
+```bash
+# v2.1 标准用法（mirrors daemon / hook 子命令风格）
+cc-linker review run <task>     [--phase spec|plan|code] [--profile default] [--max-rounds N] [--watch] [--cwd <path>]
+cc-linker review status <id>    [--follow]
+cc-linker review abort <id>     # 清理所有 pane bg session
+cc-linker review report <id>    [--format md|json] [--out <file>]
+cc-linker review decide <id>    --accept-all | --accept "1,3" | --reject-all   # HUMAN_DECIDE 接收
+cc-linker review cancel <id>    # 用户主动中止（区别于 abort 的 max_rounds 触发）
+cc-linker review doctor         # 启动前健康检查：profile 引用 / provider 存在 / CLI 版本 / daemon 健康
+cc-linker review profiles       # 列出 ~/.cc-linker/review-profiles/*.toml（每条 profile 显示 work/review/arbiter provider 名 + max_rounds 默认）
+```
+
+**v2.1 修正点**：
+- v2 写的 flat command（`cc-linker review <target>`）改成 subcommand group，与 `daemon` / `hook` 一致（`src/index.ts:181-184`）
+- 新增 `review cancel`（用户主动中止，区别于 `abort` 是 max_rounds 触发的被动中止）
+- 新增 `review doctor`（启动前健康检查，避免运行时才发现 provider 缺失）
+- `run` 子命令加 `--watch`（默认开启）和 `--cwd`（指定 work dir）
+- `status` 子命令加 `--follow`（持续输出，类似 `tail -f`）
+
+### 3.4 启动方式
+
+| 命令 | 行为 |
+|------|------|
+| `cc-linker review run <task>` | 一次性跑 pipeline（最常用，Phase 1 主力入口） |
+| `cc-linker review status <id> --follow` | 接 SSE 等价物（v2.1 简化为：每 500ms 复读 `~/.cc-linker/review-pipelines/running/<id>.json`） |
+| `cc-linker review-server` | 长驻 Review Engine + 多 pipeline 管理（Phase 2 引入，Phase 1 不做） |
+| `cc-linker start` | **不**启动 Review Engine（避免给所有用户加重负担），Review Engine 按需启动 |
+
+**v2.1 关键修正**：v2 提的"Bun.serve 9821 + 单 HTML 页 IDE"砍掉。Phase 1 改 CLI `--watch` 模式：
+- 复用 cc-linker 现有的 `chalk` + ANSI 输出（参考 `src/cli/commands/daemon.ts`）
+- 状态条用 ASCII 进度条（不依赖 TUI 框架）
+- 时间线用滚动列表
+- Phase 2 单独排期 IDE
+
+### 3.5 与现有模块的边界
+
+| 现有模块 | v2.1 复用方式 | 新增代码 |
+|---------|-------------|---------|
+| `claude --bg` | adapter 直接 spawn | 0 |
+| `claude --settings <path>` | adapter 直接传 | 0 |
+| `claude --resume <uuid> --reply-on-resume` | adapter 工作 pane R1/R2 续接用 | 0 |
+| `claude stop <short>` | adapter 清理 pane 用 | 0 |
+| `claude logs <short>` | adapter 偷看 pane 输出用 | 0 |
+| `RendezvousClient.injectReply()`（`src/agent-view/rendezvous-client.ts:151`） | adapter JUDGE/FIXING 阶段注入用 | 0（包一层 callback） |
+| `readJobState(shortId)`（`src/agent-view/job-state.ts:87`） | engine + adapter + cli-watch 都调 | 0 |
+| `AgentSnapshotFetcher.fetch()` | cli-watch 拉 pane 列表时调（Phase 2 飞书集成时复用更多） | 0 |
+| `manager.resolvePeekContent` | cli-watch 拉 pane 详情时调 | 0 |
+| SpoolQueue 设计思想（writeAtomic + 6 目录） | PipelineStore 完全照搬 | 80%（持久化范式） |
+| `Config` | 扩展 `[review]` 段：max_concurrent_pipelines、max_rounds 默认、HUMAN_DECIDE_TIMEOUT、CLI watch 刷新间隔 | 5% |
+| `logger` | ReviewEngine 自己的日志 `~/.cc-linker/review-engine.log` | 0 |
+
+## 4. 数据流
+
+### 4.1 一次完整 pipeline 的事件序列（v2.1 修正）
+
+```
+时间轴  组件                       动作
+─────  ─────────────────         ────────────────────────────────────────────────
+T0    用户                        cc-linker review run "帮我修 NPE in auth.ts"
+T1    CLI (review doctor)         验证：profile.default 引用 provider + CLI ≥ 2.1.163 + daemon 健康
+T2    Engine                      调 phase-detect.detect(...) → 'code'
+T3    Engine                      调 profile.load('default') → merged profile（含 provider 路径校验）
+T4    Engine                      调 adapter.startSession({ role:'work', provider:'claude-sonnet-4', prompt:'NPE in auth.ts', isNew:true })
+T5    Adapter                     Bun.spawn(['claude','--bg','NPE in auth.ts','--settings',sonnetPath])
+T6    CLI (Claude)                spawn bg session, 写 ~/.claude/jobs/<short1>/state.json, 返回 shortId
+T7    Adapter                     解析 stdout "backgrounded · short1" + 轮询 readJobState 拿 sessionId
+T8    Engine                      写 PipelineRecord 到 running/<pipelineId>.json
+                                  panes.work = { sessionId: '<uuid>', currentRoundShortId: 'short1', startedAt: ... }
+T9    CLI (watch mode)            ANSI 进度条更新：state=PRODUCING, panes=[work:busy]
+T10   CLI (Claude work bg)        ...处理中...
+T11   CLI (Claude work bg)        state.json.state: 'running' → 'done'（CLI 维护）
+T12   Adapter.poll(short1)        detect state.json.state == 'done' → emit 'work_produced'
+T13   Engine                      transition: PRODUCING → SELF_REVIEW_R1
+T14   Engine                      调 adapter.resumeWorkSession({ sessionId, prompt:'review 你的产出...', provider:'claude-sonnet-4' })
+T15   Adapter                     Bun.spawn(['claude','--bg','review...','--resume',sessionId,'--reply-on-resume','--settings',sonnetPath])
+T16   CLI (Claude work bg)        state.json 中 respawnFlags 加 --reply-on-resume；supervisor 唤醒 session，新 shortId2
+T17   Engine                      panes.work.currentRoundShortId = 'short2'（sessionId 不变）
+T18   CLI (watch mode)            ANSI 更新：state=SELF_REVIEW_R1, panes=[work:busy, review-A:idle, review-B:idle, arbiter:idle]
+T19   ...                         R1 收敛 → 走 R2 → R2 不收敛
+T20   Engine                      transition: SELF_REVIEW_R2 → EXTERNAL_REVIEW (round++)
+T21   Engine                      Promise.all([
+                                    adapter.startSession({ role:'review', provider:'kimi-for-coding', prompt:'review X...', isNew:true }),
+                                    adapter.startSession({ role:'review', provider:'bailian-qwen3.6', prompt:'review X...', isNew:true }),
+                                  ])
+T22   Adapter × 2                 同时 spawn 2 个 bg session，shortId3/4
+T23   Engine                      panes.reviews = [{role:'review-A', shortId:'short3', round:1}, {role:'review-B', shortId:'short4', round:1}]
+T24   CLI (watch mode)            state=EXTERNAL_REVIEW, panes=[work:done, review-A:busy, review-B:busy, arbiter:idle]
+T25   CLI × 2                     ...并行 review...
+T26   Adapter.poll(short3) + poll(short4)  两个都 done → emit 'external_opinions_ready'
+T27   Engine                      transition: EXTERNAL_REVIEW → JUDGE_BY_WORK (round++)
+T28   Engine                      调 adapter.injectReply({ shortId:'short2', prompt:'judge opinions A,B...' })
+T29   Adapter                     RendezvousClient.injectReply() → TCP socket → daemon → 注入到 short2 bg session
+T30   CLI (Claude work bg)        处理中；state.json.state: 'running'
+T31   Adapter.poll(short2)        state.json.state == 'done' + output.result 含 verdict → emit 'work_verdict: partial'
+T32   Engine                      transition: JUDGE_BY_WORK → FIXING（如果 verdict=='accept'）→ FIXING → ARBITRATION（如果 verdict=='reject/partial'）
+T33   Engine                      调 adapter.startSession({ role:'arbiter', provider:'claude-opus-4', prompt:'arbitrate opinions...' })
+T34   Adapter                     spawn bg session，shortId5
+T35   ...                         arbiter 完成 → Engine 调 adapter.injectReply({ shortId:'short2', prompt:'judge arbiter opinion...' })
+T36   ...                         verdict='accept' → transition: JUDGE_ARBITER → FIXING
+T37   Engine                      调 adapter.injectReply({ shortId:'short2', prompt:'apply accepted fixes...' })
+T38   Adapter.poll(short2)        done → emit 'fix_complete'
+T39   Engine                      transition: FIXING → SELF_REVIEW_R1 (cycle: 'postfix')
+T40   ...                         循环直到 R1/R2 收敛 → DONE
+T41   Engine                      写 PipelineRecord 到 done/，CLI 输出 state=DONE + Markdown 报告路径
+```
+
+### 4.2 bg session 之间"传递内容"（v2.1 修正）
+
+**v2.1 关键修正**：v2 假定 work session 是"长生命周期 bg session 通过 --resume 跨多轮续接"。实测 `--resume` 在 running bg session 上**直接报错**（"is currently running as a background agent"）。正确路径：
+
+| 角色 | 生命周期 | 启动方式 | 跨轮续接方式 |
+|------|---------|---------|------------|
+| `work` | 长生命周期（sessionId 跨轮不变） | 第一次 `claude --bg <prompt>` → 新 shortId1 + sessionId；后续每轮 `claude --bg <newPrompt> --resume <sessionId> --reply-on-resume` → 新 shortId2/3/4... | 每次新 shortId，但同一 sessionId |
+| `review-A/B/...` | 轮次性（每轮新 session） | 永远 `claude --bg <prompt>`（不传 --resume） | 不续接，每轮新 |
+| `arbiter` | 轮次性（每次 ARBITRATION 新） | 永远 `claude --bg <prompt>` | 不续接 |
+
+**work pane 的"长生命周期"实现**（v2.1）：
+- `panes.work.sessionId`：跨 R1/R2/JUDGE/FIX/postfix 全部不变（来自第一次 spawn 的 `state.json.sessionId`）
+- `panes.work.currentRoundShortId`：每轮变（每次 `--bg` 都产生新 shortId）
+- `panes.work.roundShortIds`：数组，记录每轮的 shortId（诊断用）
+
+**JUDGE_BY_WORK / JUDGE_ARBITER / FIXING 注入实现**（v2.1 关键修正）：
+- **不**调用 `adapter.startSession` + `--resume`（实测会报错）
+- **改用** `adapter.injectReply({ shortId: currentRoundShortId, text, rendezvousSock })`
+- 内部走 `RendezvousClient.injectReply()`（已存在）→ TCP socket → daemon → 注入到 bg session 的 stdin / rendezvous 通道
+- 注入完成后 bg session 处理新 prompt，处理完成后 state.json state→'done'，Adapter.poll 即可探测
+
+### 4.3 判定"work 产出完成" / "review 收齐"
+
+不自己 parse 进程 stdout，**只**看 `~/.claude/jobs/<short>/state.json.state`：
+
+| state 值 | 含义 |
+|---------|------|
+| `running` / `working` + tempo=`active` | 还在跑 |
+| `running` / `working` + tempo=`blocked` + `needs` 非空 | 等用户输入（v2.1：注入 reply 后会从 blocked 转到 active） |
+| `blocked` | 等用户输入（同步 polling state.json） |
+| `done` | 已完成（看 `output.result` 字段拿最终输出） |
+| `stopped` | 被 stop 或用户中止 |
+| `failed` | Claude 进程异常（v2.1 新增区分；v2 把它当 unknown） |
+| 其他（forward-compat） | 视为 unknown，记录 warning |
+
+**实现位置**：`adapter.poll(shortId, timeoutMs)` 包装 `readJobState` 轮询（500ms 一次），超时抛 `PollTimeoutError`。
+
+**v2.1 修正**：v2 写"state.json 写盘 100-200ms"——**实测错**。Claude CLI 只在状态转换时写 state.json，不连续 poll。500ms 轮询是合理平衡，但用户 IDE/CLI 看到的状态变化会有 0-500ms 抖动。
+
+### 4.4 并发控制
+
+| 并发维度 | 谁决定 | 怎么控 |
+|---------|--------|--------|
+| Pipeline 之间 | PipelineStore 的 `running/` 目录 | 默认 1 个同时跑（profile 可配 `guards.max_concurrent_pipelines`） |
+| Pipeline 内的 pane | 状态机驱动 | R1/R2 串行（同 work session resume）；EXTERNAL_REVIEW 轮次内 review-A/B Promise.all 并行；ARBITER 串行在 EXTERNAL 之后 |
+| bg session 并发 | Claude CLI daemon | 实测 3+ 并行 OK；review engine 1 个 pipeline 最多 1+N+1 = 最多 ~6 个 bg session |
+| Polling 频率 | adapter 内部 | 500ms 一次 |
+
+**v2.1 实测**：实测同时 spawn 3 个 `claude --bg` session 全部正常，daemon 不限制并发。
+
+### 4.5 SSE 协议 → 简化为文件轮询（v2.1 修正）
+
+v2 设计的 `Bun.serve` + SSE 协议在 v2.1 砍掉（Phase 1 不做 IDE）。CLI `--watch` 模式简化为：
+
+```typescript
+// cli-watch.ts 的核心循环
+async function watchPipeline(pipelineId: string): Promise<void> {
+  while (true) {
+    const record = await pipelineStore.readRunning(pipelineId);
+    if (record.state.kind === 'DONE' || isTerminal(record.state.kind)) {
+      renderTerminal(record);
+      return;
+    }
+    renderLive(record);  // ANSI 重绘，不清屏
+    await Bun.sleep(500);
+  }
+}
+```
+
+**优势**：0 行 HTTP / SSE 代码，依赖最小；跟现有 `cc-linker daemon status` / `cc-linker list` 的输出风格一致。
+**劣势**：多个终端不能同时看同一个 pipeline（Phase 2 IDE 解决）。
+
+## 5. 状态机
+
+### 5.1 ReviewState 枚举（v2.1 修正）
+
+```typescript
+type ReviewState =
+  // === Produce 阶段 ===
+  | { kind: 'PRODUCING';         pipelineId; round: number; pane: 'work' }
+  // === 自查阶段（带 cycle 区分）===
+  | { kind: 'SELF_REVIEW_R1';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
+  | { kind: 'SELF_REVIEW_R2';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
+  // === 外审（可能并行 N 个 pane）===
+  | { kind: 'EXTERNAL_REVIEW';   pipelineId; round: number; cycle: 'initial' | 'postfix';
+                                  panes: { role: 'review-A' | 'review-B' | ...; shortId: string }[] }
+  // === 评判（v2.1 修正：走 injectReply 不走 startSession）===
+  | { kind: 'JUDGE_BY_WORK';     pipelineId; round: number; pane: 'work' }
+  // === 仲裁 + 二次评判 ===
+  | { kind: 'ARBITRATION';       pipelineId; round: number; pane: 'arbiter' }
+  | { kind: 'JUDGE_ARBITER';     pipelineId; round: number; pane: 'work' }
+  // === 修复（v2.1 修正：走 injectReply）===
+  | { kind: 'FIXING';            pipelineId; round: number; pane: 'work' }
+  // === v2.1 新增：pane 丢失（用户询问，不直接 FAILED）===
+  | { kind: 'PANE_LOST';         pipelineId; round: number; lostPane: 'work' | 'review-A' | 'review-B' | ... | 'arbiter';
+                                  lostShortId: string; detectedAt: string }
+  // === 人工兜底（逃生通道）===
+  | { kind: 'HUMAN_DECIDE';      pipelineId; round: number; pending: ArbitrationContext }
+  // === 终态 ===
+  | { kind: 'DONE';              pipelineId; round: number; totalCostUsd; issueTrail }
+  | { kind: 'FAILED';            pipelineId; round: number; reason; totalCostUsd }
+  | { kind: 'ABORTED';           pipelineId; round: number; reason; abortedBefore };
+```
+
+**v2.1 相对 v2 的 4 个关键调整**：
+1. **JUDGE_BY_WORK / FIXING 走 injectReply**：v2 错把它们当 `startSession` + `--resume`，v2.1 改走 `RendezvousClient.injectReply()`，daemon 协议
+2. **新增 `PANE_LOST` 状态**：v2 写"丢失直接 FAILED"，v2.1 改为进入 `PANE_LOST` 等用户决策（retry/abort/skip）
+3. **`panes: { ...; shortId }[]`**：v2.1 明确每个 pane 跟踪 shortId，配合 §6.1 PaneRegistry
+4. **EXTERNAL_REVIEW 支持 N pane**：v2.1 删"4 pane"硬编码，改"N pane"（profile 可配）
+
+### 5.2 max_rounds 计数规则（v2.1 减半）
+
+| 类别 | 状态 | 计入 round？ |
+|------|------|------------|
+| **计数** | `SELF_REVIEW_R1` / `R2` / `EXTERNAL_REVIEW` / `JUDGE_BY_WORK` / `ARBITRATION` / `JUDGE_ARBITER` | ✅ +1 |
+| **免费** | `PRODUCING` / `FIXING` / `DONE` / `FAILED` / `ABORTED` / `PANE_LOST` | ❌ |
+| **逃生** | `HUMAN_DECIDE` | ❌（永远可达） |
+
+**默认值**（v2.1 减半）：
+| Phase | v2 默认 | v2.1 默认 | 单轮 token 估算 | 满跑耗时估算 |
+|-------|---------|-----------|----------------|--------------|
+| Spec  | 8       | **4**     | ~50k tokens    | ~10 分钟     |
+| Plan  | 10      | **5**     | ~80k tokens    | ~15 分钟     |
+| Code  | 15      | **8**     | ~120k tokens   | ~25 分钟     |
+| Global | 12     | **6**     | -              | -            |
+
+**理由**（v2.1）：实测 review 平均 2-3 轮收敛，v2 的 8/10/15 是上限但实际跑满罕见；15 轮 × ~8 pane × ~60s ≈ 2 小时过长。
+
+### 5.3 状态转换图（v2.1 简版）
+
+```
+                    ┌──────────────┐
+                    │  PRODUCING   │ ← claude --bg <prompt> 新 shortId1 + sessionId
+                    └──────┬───────┘
+                           ↓
+                    ┌──────────────┐
+                    │ SELF_REVIEW_R1│ ← claude --bg <newPrompt> --resume <sessionId> --reply-on-resume
+                    └──────┬───────┘ 新 shortId2（同 sessionId）
+                           ↓ (issues: 0)
+                           ↓ (issues: N) ↓
+                    ┌──────────────┐
+                    │ SELF_REVIEW_R2│ ← 同上
+                    └──────┬───────┘
+                           ↓ (issues: 0 → DONE)
+                           ↓ (issues: N) ↓
+                    ┌──────────────┐
+              ┌────│EXTERNAL_REVIEW│ ← Promise.all 起 N 个 claude --bg（review 角色）
+              │    └──────┬───────┘
+              │           ↓ opinions 收齐
+              │    ┌──────────────┐
+              │    │ JUDGE_BY_WORK│ ← adapter.injectReply() 注入到 work session（走 RendezvousClient）
+              │    └──────┬───────┘
+              │           ↓ verdict: 'accept' → FIXING
+              │           ↓ verdict: 'reject' / 'partial'
+              │    ┌──────────────┐
+              │    │  ARBITRATION │ ← claude --bg（arbiter 角色）
+              │    └──────┬───────┘
+              │           ↓ arbiter opinion
+              │    ┌──────────────┐
+              │    │JUDGE_ARBITER │ ← adapter.injectReply()
+              │    └──────┬───────┘
+              │           ↓ verdict: 'accept' → FIXING
+              │           ↓ verdict: 'reject' → HUMAN_DECIDE
+              │    ┌──────────────┐
+              │    │ HUMAN_DECIDE │ ← cc-linker review decide CLI 命令
+              │    └──────┬───────┘
+              │           ↓ decision
+              │           ↓
+              │    ┌──────────────┐
+              └────│    FIXING    │ ← adapter.injectReply() 注入 fix prompt
+                   └──────┬───────┘
+                          ↓
+                   ┌──────────────┐
+                   │SELF_REVIEW_R1│ ← cycle: 'postfix'（重新 spawn bg session，新 shortId）
+                   │  (postfix)   │
+                   └──────┬───────┘
+                          ↓
+                    (回到 SELF_REVIEW_R2 → EXTERNAL_REVIEW 循环)
+
+              ┌──────────────┐
+              │  PANE_LOST   │ ← v2.1 新增：daemon crash / bg session 消失
+              │  (等待用户)   │    cc-linker review status <id> 提示 retry/abort/skip
+              └──────┬───────┘
+                     ↓ user.choice
+                     retry → 重新 spawn 该 pane
+                     abort → ABORTED
+                     skip  → 用 0 opinions 推进到下一状态（degraded 模式）
+```
+
+## 6. PipelineStore & Reconciler
+
+### 6.1 PipelineRecord 数据结构（v2.1 修正）
+
+```typescript
+interface PipelineRecord {
+  pipelineId: string;           // ULID
+  createdAt: string;
+  updatedAt: string;
+  ownerOpenId?: string;         // Phase 2 飞书集成用
+  state: ReviewState;           // 当前状态
+  input: {
+    rawInput: string;           // 任务描述 / 文件路径 / git ref
+    phase: 'spec' | 'plan' | 'code' | 'unknown';
+    profile: string;
+    maxRounds: number;          // 实际生效的 max_rounds
+    cwd: string;                // v2.1 新增：明确记录 work dir
+  };
+  panes: PaneRegistry;          // v2.1 修正：跨多状态机持续追踪 pane 的 shortId + sessionId
+  history: HistoryEvent[];      // 每条 history 带 pane shortId + sessionId
+  totalCostUsd: number;
+}
+
+interface PaneRegistry {
+  work?: {
+    sessionId: string;          // v2.1 新增：跨轮不变的 sessionId（来自第一次 spawn）
+    currentRoundShortId?: string;  // v2.1 新增：当前 round 的 shortId
+    provider: string;
+    startedAt: string;
+    roundShortIds: string[];    // v2.1 新增：每轮 shortId 数组（诊断用）
+  };
+  reviews: {
+    role: 'review-A' | 'review-B' | ...;
+    shortId: string;
+    sessionId: string;
+    provider: string;
+    round: number;
+    cycle: 'initial' | 'postfix';
+  }[];
+  arbiter?: {
+    sessionId: string;          // v2.1 新增（每次 arbiter 都新 sessionId）
+    currentRoundShortId?: string;
+    provider: string;
+    round: number;
+  };
+}
+
+interface HistoryEvent {
+  ts: string;
+  fromState: ReviewState['kind'] | null;
+  toState: ReviewState['kind'];
+  round: number;
+  role: 'work' | 'review' | 'arbiter' | 'human';
+  paneShortId?: string;         // 哪个 shortId 跑了这一步
+  paneSessionId?: string;       // v2.1 新增：哪个 sessionId（跨轮续接时不变）
+  providerAlias?: string;
+  inputDigest: string;          // sha256 of input text（前 16 字符）
+  outputDigest: string;
+  outputSizeBytes: number;
+  costUsd: number;
+  durationMs: number;
+  issues?: Issue[];
+  verdict?: 'accept' | 'partial' | 'reject';
+}
+```
+
+**v2.1 相对 v2 的 3 个关键调整**：
+1. **`work.sessionId` + `currentRoundShortId`**：跨轮不变 vs 每轮变，必须分开追踪
+2. **`paneSessionId`** 字段（每条 history）：诊断用，复盘时知道"这一步是续接自哪个 session"
+3. **`work.roundShortIds[]` 数组**：记录 work pane 每轮的 shortId 切换历史
+
+### 6.2 持久化目录（v2.1 修正）
+
+```
+~/.cc-linker/review-pipelines/
+├── running/         # 正在跑（最多 max_concurrent_pipelines 个文件）
+├── human_pending/   # 等待人工决策
+├── done/            # 已完成
+├── failed/          # 失败
+└── aborted/         # 用户中止或 max_rounds 触发
+```
+
+**v2.1 修正**：v2 写的"6 目录（pending / running / human_pending / done / failed / aborted）"——review engine **不使用 pending/**。`cc-linker review run` 创建 PipelineRecord 后**直接写 running/**（不经过 pending/），所以是 **5 目录**。Reconciler 启动时不需要检查 pending/（目录不存在是正常状态；存在但为空也是正常；启动时如果看到陌生目录会 warn 一次）。
+
+**原子写规则**（v2.1 与 v2 一致）：
+```typescript
+async function saveRunning(record: PipelineRecord): Promise<void> {
+  const path = `~/.cc-linker/review-pipelines/running/${record.pipelineId}.json`;
+  const tmpPath = `${path}.tmp`;
+  await Bun.write(tmpPath, JSON.stringify(record, null, 2));
+  await rename(tmpPath, path);   // 原子 rename
+}
+
+async function moveToTerminal(record: PipelineRecord): Promise<void> {
+  const srcPath = `~/.cc-linker/review-pipelines/running/${record.pipelineId}.json`;
+  const destDir = `~/.cc-linker/review-pipelines/${terminalDir(record.state.kind)}/`;
+  const destPath = `${destDir}${record.pipelineId}.json`;
+  await rename(srcPath, destPath);
+}
+```
+
+### 6.3 幂等性保证（v2.1 与 v2 一致）
+
+```typescript
+async function transition(pipeline: PipelineRecord, event: EngineEvent): Promise<void> {
+  // 1. 读 history last event
+  const lastEvent = pipeline.history[pipeline.history.length - 1];
+
+  // 2. 如果 lastEvent.toState 已经是目标 state，幂等返回
+  if (lastEvent && lastEvent.toState === computeNextState(pipeline.state, event).kind) {
+    logger.info(`[engine] pipeline ${pipeline.pipelineId} 已在 ${lastEvent.toState}，幂等跳过`);
+    return;
+  }
+
+  // 3. 否则正常推进
+  const nextState = computeNextState(pipeline.state, event);
+  const newEvent: HistoryEvent = { ... };
+  await pipelineStore.appendHistory(pipeline.pipelineId, newEvent);
+  pipeline.state = nextState;
+  pipeline.history.push(newEvent);
+  await pipelineStore.saveRunning(pipeline);
+  await cliWatch.notify(pipeline.pipelineId, { type: 'state_change', state: nextState });
+}
+```
+
+**幂等的 3 道防线**：
+1. History 去重：`lastEvent.toState === 目标 state` → 跳过
+2. State machine 转换函数本身幂等：纯函数，相同 input 永远相同 output
+3. Polling 间隔去重：adapter.poll 500ms 一次，但只在 state 变化时 emit 事件
+
+### 6.4 Reconciler（v2.1 改保守策略）
+
+```typescript
+export async function reconcile(): Promise<void> {
+  const store = new PipelineStore();
+  const fetcher = new AgentSnapshotFetcher();
+  const adapter = new ClaudeBGAdapter();
+
+  // 1. 扫描 running/ 中所有未到终态的 pipeline
+  for (const record of await store.listRunning()) {
+    if (isTerminal(record.state.kind)) {
+      await store.moveToTerminal(record);
+      continue;
+    }
+
+    // 2. v2.1：验证每个 pane bg session 是否还活着
+    const liveShortIds = (await fetcher.fetch())?.sessions
+      .filter(s => s.kind === 'background')
+      .map(s => s.daemonShort) ?? [];
+    const deadPanes = findDeadPanes(record.panes, liveShortIds);
+
+    if (deadPanes.length > 0) {
+      // v2.1 改：进入 PANE_LOST，不直接 FAILED
+      logger.warn(`[reconciler] pipeline ${record.pipelineId} 有 ${deadPanes.length} 个 pane 已消失: ${deadPanes.join(', ')}`);
+      record.state = {
+        kind: 'PANE_LOST',
+        round: record.state.round,
+        lostPane: deadPanes[0].role,
+        lostShortId: deadPanes[0].shortId,
+        detectedAt: new Date().toISOString(),
+      };
+      await store.saveRunning(record);
+      continue;
+    }
+
+    // 3. 加回内存中的 active set
+    engine.continuePipeline(record);
+
+    // 4. 幂等推进
+  }
+
+  // 5. human_pending/ 中所有 pipeline：发 CLI 通知（如果用户当前在 review status --follow）
+  for (const record of await store.listHumanPending()) {
+    await cliWatch.notifyHumanPending(record);
+  }
+}
+```
+
+**Reconciler 关键决策**（v2.1 改 v2）：
+
+| 场景 | v2 行为 | v2.1 行为 | 理由 |
+|------|---------|----------|------|
+| running/ 中 pipeline + 所有 pane 都还活着 | 继续推进 | 继续推进 | 幂等恢复 |
+| running/ 中 pipeline + **部分** pane 已消失 | 直接 FAILED | **PANE_LOST** + 用户决策 | 用户可能想 retry 或 skip；自动 FAILED 浪费 30min 工作 |
+| running/ 中 pipeline + **全部** pane 已消失 | FAILED | **PANE_LOST**（同样） | 同上 |
+| human_pending/ 中 pipeline | 发 IDE 通知，不主动推进 | 发 CLI watch 通知，不主动推进 | 等用户决策；超时由 `HUMAN_DECIDE_TIMEOUT` 控制（v2.1: 1h 默认） |
+
+**PANE_LOST 用户决策**（v2.1 新增交互）：
+```
+⚠️ Pipeline 01HXYZK9... PANE_LOST
+  Lost pane: review-A (shortId: abc12345)
+  其他 pane: work (def67890, alive), review-B (ghi11111, alive)
+  
+  选项:
+    retry → cc-linker review status <id> 然后选 retry（重启该 pane）
+    abort → cc-linker review abort <id>
+    skip  → cc-linker review status <id> 然后选 skip（用 0 opinions 推进）
+  
+  默认: 24h 后自动 ABORTED（reason: pane_lost_timeout）
+```
+
+### 6.5 并发控制（v2.1 与 v2 一致）
+
+```typescript
+async function acquirePipelineSlot(profile: ReviewProfile): Promise<boolean> {
+  const maxConcurrent = profile.guards.max_concurrent_pipelines ?? 1;
+  const running = await store.listRunning();
+  if (running.length >= maxConcurrent) return false;
+  return true;
+}
+```
+
+**默认 1 个 pipeline 同时跑**（避免 token 用量爆炸），profile 可配 `guards.max_concurrent_pipelines = 3`。
+
+## 7. ReviewProfile（v2.1 与 v2 一致）
+
+### 7.1 存储位置
+
+`~/.cc-linker/review-profiles/<name>.toml`
+
+### 7.2 完整配置示例
+
+```toml
+[meta]
+name = "default"
+description = "通用默认：sonnet 工作 + kimi/qwen 双 Review + opus 仲裁"
+
+[work]
+provider = "claude-sonnet-4"   # 直接映射到 ~/.claude/providers/<name>.json
+
+[review]
+mode = "parallel"
+providers = ["kimi-for-coding", "bailian-qwen3.6"]   # 数组决定 EXTERNAL_REVIEW 几个 pane
+
+[arbiter]
+provider = "claude-opus-4"
+trigger_on = "disagree_significantly"  # reject | disagree_significantly | low_acceptance
+
+[guards]
+max_rounds = 6                  # v2.1 改：默认 6
+max_concurrent_pipelines = 1
+human_decide_timeout_ms = 3600000  # v2.1 改：1h 默认（v2 是 24h）
+
+[prompts.work.produce.system]
+template = """
+你正在编写一份 {phase}。
+{task}
+"""
+
+[prompts.work.judge.system]
+template = """
+工作产物：
+{artifact}
+待评判意见：
+{opinions}
+请输出 JSON: { verdict: 'accept' | 'partial' | 'reject', accepted_issues: [...] }
+"""
+
+[prompts.review.code.system]
+template = """
+你正在 Review 一段代码变更。
+{artifact}
+请输出 JSON: { issues: [{ severity, category, location, description, suggestion }] }
+"""
+
+[phase_overrides.code]
+review.providers = ["kimi-for-coding", "bailian-qwen3.6", "xiaomi-mimo"]   # 完全替换
+guards.max_rounds = 8           # v2.1 改：Code phase 默认 8（v2 是 15）
+```
+
+### 7.3 per-phase 深度 merge 规则
+
+照搬 v1 spec §4.3：
+- 标量字段（string/number/bool）：phase 值完全覆盖 top-level
+- 数组字段（providers）：phase 值完全替换 top-level 数组（不追加）
+- table 字段（prompts）：phase 的子表与 top-level 子表深度 merge
+
+### 7.4 Provider 字段 → settingsPath 映射（v2.1 强化 fail fast）
+
+```typescript
+async function resolveSettingsPath(provider: string): Promise<string> {
+  const home = process.env.HOME!;
+  const path = `${home}/.claude/providers/${provider}.json`;
+  if (!existsSync(path)) {
+    // v2.1 强化：fail fast 在 doctor 阶段，错误信息明确告诉用户怎么修
+    throw new ProfileError({
+      code: 'PROVIDER_NOT_FOUND',
+      message: `provider '${provider}' 不在 ~/.claude/providers/`,
+      remediation: `放置 ~/.claude/providers/${provider}.json (格式参考其他 provider) 或运行 'cc-linker review doctor' 看详细诊断`,
+    });
+  }
+  return path;
+}
+```
+
+**关键不变量**：
+- `~/.cc-linker/review-profiles/*.toml` —— 用户编辑
+- `~/.claude/providers/*.json` —— 用户已配置（kimi / qwen3.6 / mimo 等已存在）
+- Review Engine **不**修改 providers，只**读取**
+
+## 8. Phase 1 电脑端 UX（v2.1 砍 IDE 改 `--watch`）
+
+### 8.1 CLI 主输出：rich terminal
+
+```bash
+# 一次性跑 pipeline
+cc-linker review run "帮我修 NPE in auth.ts" --phase code --profile default
+
+# 跑起来后 CLI 默认进入 --watch 模式：
+#
+# ╭─ cc-linker Review Engine v2.1 ─────────────────────────────────╮
+# │ Pipeline: 01HXYZK9... │ Phase: code │ Profile: default          │
+# │ Round: 3/8  │ Cost: $0.42  │ ⏱ 12:34  │ State: EXTERNAL_REVIEW  │
+# ╰──────────────────────────────────────────────────────────────────╯
+#
+# Pane Status:
+#   🔧 work       short2 (claude-sonnet-4)  done       $0.10  8.2s
+#   👁 review-A   short3 (kimi-for-coding)  busy       $0.05  4.2s
+#   👁 review-B   short4 (bailian-qwen3.6)  busy       $0.07  4.0s
+#   ⚖  arbiter    -                         idle       $0.00  -
+#
+# Timeline:
+#   [12:30] ✓ PRODUCING (short1, sonnet)         $0.012  2.3s
+#   [12:31] ✓ SELF_REVIEW_R1 (short2, sonnet)    $0.008  1.8s
+#   [12:32] ⚠ SELF_REVIEW_R2 (short2, sonnet)    $0.009  2.1s  (2 issues)
+#   [12:33] ⟳ EXTERNAL_REVIEW (short3+short4)    -       -
+#
+# [Ctrl-C] detach; pipeline 继续在后台跑
+# 重连: cc-linker review status 01HXYZK9... --follow
+
+# 显式指定 cwd
+cc-linker review run "..." --cwd /Users/me/my-project
+
+# 禁用 watch 模式（脚本/CI 用，只打印最终报告）
+cc-linker review run "..." --no-watch
+```
+
+**v2.1 关键设计**：
+- **chalk + ANSI**：复用 cc-linker 现有依赖（参考 `src/cli/commands/daemon.ts:108`）
+- **状态变更才重绘**：每 500ms 一次 poll，但只在 state 变化时输出（不刷屏）
+- **Ctrl-C 友好**：用户 Ctrl-C 后 pipeline 在后台继续跑，重连用 `review status --follow`
+- **不依赖 TUI 框架**：纯 ANSI，0 行 TUI 库代码
+
+### 8.2 错误时的 UX
+
+| 错误 | 终端输出 |
+|------|---------|
+| Provider 找不到（doctor 阶段） | ❌ `provider 'kimi-2.6' 不在 ~/.claude/providers/` + `remediation: 放置 ~/.claude/providers/kimi-2.6.json 或运行 'cc-linker review doctor'` |
+| CLI 版本过低（doctor 阶段） | ❌ `Claude CLI 2.1.139 不支持 --bg，需要 ≥ 2.1.163` + `remediation: claude update` |
+| daemon crash（运行时） | ⚠️ `daemon unhealthy (roster.json missing or stale)`, Pipeline 进入 PANE_LOST |
+| bg session 启动失败 | ❌ `work session 启动失败: <err>` + 标记 FAILED |
+| 网络瞬态 503 | 🔄 retry 3 次 + backoff（每次 2s, 4s, 8s），最终失败 → FAILED `network_timeout` |
+| Review 返回 50+ issues | 自动截断到 top 10 + 终端告警 `还有 N 条未列出` |
+| HUMAN_DECIDE 超时（1h） | 自动 ABORTED + 终端输出 `human_decision_timeout` |
+| PANE_LOST 24h 超时 | 自动 ABORTED + 终端输出 `pane_lost_timeout` |
+
+### 8.3 飞书交互（v2.1 明确）
+
+review 跑期间：
+- 用户**不能**通过飞书聊天发消息到 work session（被 engine 占用）
+- 飞书端收到 `[🤖 Review Engine] Pipeline 01HXYZK9... 正在使用当前 session，飞书聊天暂时禁用。review 完成后会自动恢复。`
+- review 完成后飞书聊天自动恢复
+- 用户可以 `/cancel review <id>` 中止（v2.1 新增）
+
+### 8.4 review 产物（v2.1 明确：不改源文件）
+
+review 跑完后，**不修改用户项目源文件**，只产出 Markdown 报告：
+
+```
+<cwd>/.claude/reviews/<pipelineId>.md
+├── Header: pipelineId / createdAt / phase / profile / totalCostUsd
+├── Timeline: 所有 state transition 摘要
+├── Issues: 所有 review 提出的 issue（去重 + 按 severity 排序）
+├── Decisions: 每个 issue 的 verdict（accept/partial/reject）+ 理由
+└── Report: 自然语言总结（"修改建议 + 风险 + 后续 action"）
+```
+
+用户用 `cc-linker review report <id>` 查看，或 IDE 浏览（Phase 2 集成）。
+
+**v2.1 不做**：自动 apply fixes、自动 commit、自动 PR。这些都涉及修改用户源文件，超出 Phase 1 范围。
+
+## 9. PhaseDetector（v2.1 加启发式 4）
+
+```typescript
+function detect(input: { rawInput: string; filePath?: string; gitRef?: string }): 'spec' | 'plan' | 'code' {
+  // 启发式 1: 文件路径
+  if (input.filePath) {
+    if (/\.(ts|js|py|go|rs|java|swift|c|cpp|h)$/.test(input.filePath)) return 'code';
+    if (input.filePath.includes('docs/') || input.filePath.includes('specs/')) return 'spec';
+    if (input.filePath.includes('plans/') || input.filePath.includes('design/')) return 'plan';
+  }
+
+  // 启发式 2: git ref
+  if (input.gitRef) return 'code';
+
+  // 启发式 3: 文本内容关键词
+  const text = input.rawInput.toLowerCase();
+  if (text.match(/(requirements?|user stor(y|ies)|acceptance criteria)/)) return 'spec';
+  if (text.match(/(architecture|task breakdown|milestone|dependencies?)/)) return 'plan';
+  if (text.match(/(implement|fix|debug|optimize|refactor)/)) return 'code';
+
+  // 启发式 4 (v2.1 新增): 文件后缀或行号引用 → 强制 code
+  if (/\.(ts|js|py|go|rs|java|swift|c|cpp|h)\b/.test(input.rawInput)) return 'code';
+  if (/\b(line\s+\d+|L:\d+|\.go:\d+|\.ts:\d+)/.test(input.rawInput)) return 'code';
+
+  // 启发式 5: LLM 分类（Phase 3 才实现）
+  if (config.review.phaseDetect.llmFallback) {
+    return await llmClassify(input.rawInput);
+  }
+  throw new PhaseUnknownError(rawInput);
+}
+```
+
+**v2.1 加启发式 4 的理由**：v2 的启发式 3 关键词匹配会把 "Refactor the auth design document" 误判为 code（关键词命中但其实是 spec）。启发式 4 用文件后缀和行号引用做强信号，覆盖 80% 的边界 case。
+
+**用户可在 CLI / IDE 上手动覆盖**：
+```bash
+cc-linker review run "..." --phase code   # 显式指定
+cc-linker review run "..."                # 自动识别失败抛 PhaseUnknownError
+```
+
+## 10. 错误处理（v2.1 强化）
+
+### 10.1 错误分类（v2.1 补全）
+
+| 错误类别 | v2.1 触发场景 | v2.1 处理 |
+|---------|------------|----------|
+| **Provider 不可用** | 模型 provider alias 不存在 | **doctor 阶段 fail fast**（v2 是运行时检测，v2.1 提前到 doctor） |
+| **CLI 版本过低** | claude --bg 不可用 | **doctor 阶段 fail fast**（v2.1 新增） |
+| **daemon 不健康** | `~/.claude/daemon/roster.json` 不存在或 stale | **运行时检测**：进入 PANE_LOST |
+| **Claude 进程启动失败** | SDK 启动报错 | 不重试（v2 一致；ClaudeSessionManager 内部已有重试） |
+| **bg session 启动后立即失败** | state.json state='failed' detail='启动失败' | 标记 FAILED |
+| **bg session 消失** | daemon crash / 进程被 kill | **PANE_LOST**（v2.1 改，不直接 FAILED） |
+| **网络瞬态 503** | Claude API 暂时不可用 | retry 3 次 + backoff 2s/4s/8s，最终失败 FAILED `network_timeout`（v2.1 新增） |
+| **Claude 进程超时** | hard_timeout | max_rounds 计数器 +1 |
+| **JSON 解析失败** | Review Model 返回非合法 Issue | raw response 存为 `parse_failed` 事件；该轮 Review 视为 0 意见 |
+| **Issue 数过多** | 50+ issues | 自动按 severity 截断到 top 10 + 提示"还有 N 条未列出" |
+| **磁盘写入失败** | PipelineStore 原子写失败 | 立即停止状态机推进；状态保留在内存；终端输出 ❌ + 提示重试 |
+| **进程崩溃** | cc-linker SIGKILL | Reconciler 扫描 running/ 恢复 |
+| **人工决策超时** | HUMAN_DECIDE 1h 未响应（v2.1: 24h→1h） | 自动 ABORTED `human_decision_timeout` |
+| **pane 丢失超时** | PANE_LOST 24h 未决策（v2.1 新增） | 自动 ABORTED `pane_lost_timeout` |
+| **max_rounds 达到** | 计数器到上限 | 自动 ABORTED `max_rounds_exceeded` |
+| **CLI watch 客户端断连** | 用户 Ctrl-C | engine 继续在后台跑，pipeline 不中断（v2.1 设计目标） |
+
+### 10.2 Graceful degradation vs fail fast（v2.1 与 v2 一致）
+
+| 错误 | 处理 | 理由 |
+|------|------|------|
+| 单个 review pane 启动失败 | **降级**：用 0 opinions 推进到 JUDGE（标记 `degraded: true`） | 不要让 1 个 review 失败整条 pipeline |
+| Work pane 启动失败 | **Fail fast**：标记 FAILED | 没有 work pane 整条 pipeline 没法继续 |
+| Arbiter pane 启动失败 | **降级**：跳过 ARBITRATION，直接进 HUMAN_DECIDE | arbiter 是 fallback 路径 |
+| Profile 加载失败 | **Fail fast**：CLI 立即退出码 1 | 错误配置不该跑 pipeline |
+| Provider 配置文件 schema 错 | **Fail fast**：profile.load 验证 JSON schema | 错配置会污染整轮 review |
+
+### 10.3 Retry 策略（v2.1 强化）
+
+```typescript
+async function startSession(opts: StartSessionOptions): Promise<SessionHandle> {
+  // Layer 1: ClaudeSessionManager 内部已有 1 次重试
+  // Layer 2: v2.1 新增：网络瞬态 503 重试（adapter 包装）
+  let lastErr: Error;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await claudeBGStart(opts);
+    } catch (err) {
+      lastErr = err as Error;
+      if (!isTransientError(err)) throw err;  // 非网络错误立即 throw
+      const delay = 2000 * Math.pow(2, attempt);  // 2s, 4s, 8s
+      logger.warn(`[adapter] 启动失败 retry ${attempt + 1}/3: ${err.message}, wait ${delay}ms`);
+      await Bun.sleep(delay);
+    }
+  }
+  throw lastErr!;
+}
+
+function isTransientError(err: Error): boolean {
+  // 5xx 错误 + 网络超时 + ECONNRESET
+  return /\b(5\d\d|timeout|ECONNRESET|ENOTFOUND)\b/i.test(err.message);
+}
+```
+
+### 10.4 HUMAN_DECIDE 接收方式（v2.1 与 v2 一致，CLI 简化）
+
+```bash
+# 1. pipeline 进入 HUMAN_DECIDE 后，CLI 输出：
+#   ⏸️ Pipeline 01HXYZK9... 等待人工决策（默认 1h 超时）
+#   Issue 1: <description>  (Review A 提出)
+#   Issue 2: <description>  (Review B 提出)
+#   Work verdict: reject
+#   Arbiter verdict: reject
+#
+#   选项:
+#     a) 接受所有 issue → 修复: cc-linker review decide 01HXYZK9... --accept-all
+#     b) 接受子集       → 修复: cc-linker review decide 01HXYZK9... --accept "1,3"
+#     c) 拒绝所有      → 中止: cc-linker review decide 01HXYZK9... --reject-all
+#     d) 推迟          → 等你: 什么都不做，1h 后自动 ABORTED
+
+# 2. 用户决策后，pipeline 自动继续
+```
+
+**Phase 2** 才做 IDE 内按钮（飞书 / 浏览器）。
+
+### 10.5 `cc-linker review doctor` 命令（v2.1 新增）
+
+```bash
+cc-linker review doctor
+
+# 输出:
+# ✓ Claude CLI: 2.1.163 (>= 2.1.163 required)
+# ✓ Daemon: healthy (roster.json mtime < 5min)
+# ✓ Profile 'default' loaded
+# ✓ Provider 'claude-sonnet-4' (work): ~/.claude/providers/claude-sonnet-4.json exists
+# ✓ Provider 'kimi-for-coding' (review-A): ~/.claude/providers/kimi-for-coding.json exists
+# ✓ Provider 'bailian-qwen3.6' (review-B): ~/.claude/providers/bailian-qwen3.6.json exists
+# ✓ Provider 'claude-opus-4' (arbiter): ~/.claude/providers/claude-opus-4.json exists
+# ✓ Pipeline dir: ~/.cc-linker/review-pipelines/ writable
+# ✓ Config [review] section present
+#
+# All checks passed. Run `cc-linker review run <task>` to start.
+```
+
+**v2.1 必加**：避免运行时才发现配置错误。`cc-linker review run` 内部先调 doctor 再启动 engine。
+
+## 11. 测试策略（v2.1 补全）
+
+### 11.1 测试分层
+
+| 层级 | v2.1 覆盖 | 工具 |
+|------|----------|------|
+| **单元测试** | 状态机转换函数、Profile 加载 + per-phase merge、PhaseDetector 5 个启发式、prompt 模板替换、Issue/ReviewOpinion 解析、max_rounds 计数、panes Registry 追踪 | `bun:test` + 纯函数 fixture |
+| **集成测试** | Adapter（mock ClaudeBGAdapter）+ Engine（mock Adapter）+ PipelineStore（真写盘）+ CLI watch（fetch + 内存 state） | `bun:test` + fixtures |
+| **持久化测试** | Reconciler 在不同崩溃点下的恢复行为（running/ 中有 pane 消失、human_pending/ 中有 pipeline 等） | 真 PipelineStore + mock Adapter |
+| **E2E 测试** | CLI `cc-linker review run <fixture task>` → 走完一个 mini pipeline → 验证产出的 PipelineRecord + Markdown 报告 | `bun:test` + 真实 claude CLI + 真 provider |
+| **手工 QA** | gstack `/qa` + `/browse` | gstack skills |
+
+### 11.2 关键测试场景（v2.1 补 4 个）
+
+**v1/v2 的 12 个场景**全部保留，**v2.1 新增 4 个**：
+
+1. **`claude --bg` spawn 集成测试**（v2.1 新增）：验证 adapter.startSession 真的 spawn bg session 落到 `~/.claude/jobs/<short>/`
+2. **`RendezvousClient.injectReply` 集成测试**（v2.1 新增）：验证 judge/fix 注入能 work session 收到 + 处理完成
+3. **PANE_LOST 状态转换**（v2.1 新增）：模拟 daemon crash → reconciler 检测 → 进入 PANE_LOST → 用户 retry → pipeline 继续
+4. **`cc-linker review doctor` 完整性**（v2.1 新增）：mock 各种 provider 缺失 / daemon 不健康 / CLI 版本过低场景
+
+### 11.3 单测覆盖目标
+
+| 模块 | 行覆盖率目标 | 关键场景 |
+|------|------------|---------|
+| `engine.ts` | 90%+ | 状态机所有转换路径（含 PANE_LOST） |
+| `adapter.ts` | 85%+ | claude --bg spawn / poll / injectReply / stop 4 个 API |
+| `profile.ts` | 95%+ | TOML 解析 + per-phase 深度 merge + provider 校验 |
+| `pipeline-store.ts` | 90%+ | 5 目录原子写 + 移动到终态 |
+| `reconciler.ts` | 85%+ | running/ + human_pending/ 恢复 + pane 丢失检测 → PANE_LOST |
+| `phase-detect.ts` | 90%+ | 5 个启发式（v2.1 加启发式 4） + PhaseUnknown |
+| `cli-watch.ts` | 75%+ | ANSI 重绘 + state 变化触发 + Ctrl-C 清理 |
+| `review-doctor.ts` | 90%+ | 各种 provider 缺失 / daemon 不健康场景 |
+
+### 11.4 关键 E2E 场景（Phase 1 必须通过）
+
+```bash
+# Scenario 1: Mini spec pipeline (R1 收敛 → 外审 → 0 issues → DONE)
+cc-linker review run "写一个 hello world 函数的 spec" --phase spec --profile default
+# 期望: ≤ 30s 跑完，PipelineRecord.state.kind == 'DONE'
+
+# Scenario 2: Mini plan pipeline (R1 不收敛 → R2 收敛 → 外审 → 1 issue → fix → DONE)
+cc-linker review run "设计一个 todo list 的实现 plan" --phase plan --profile default
+# 期望: ≤ 60s 跑完，PipelineRecord.history 含 5+ 条 events
+
+# Scenario 3: Ctrl-C 退出 + 重连（v2.1 强调：pipeline 不中断）
+cc-linker review run "long task" --phase code --no-watch
+PIPELINE_ID=$(...)  # 从输出复制
+cc-linker review status $PIPELINE_ID --follow
+# 期望: 状态正确显示，pipeline 在后台继续跑
+
+# Scenario 4: doctor 校验（v2.1 新增）
+# 临时 rename 一个 provider.json
+mv ~/.claude/providers/kimi-for-coding.json ~/.claude/providers/kimi-for-coding.json.bak
+cc-linker review doctor
+# 期望: 报告 kimi-for-coding 缺失，exit code 1
+mv ~/.claude/providers/kimi-for-coding.json.bak ~/.claude/providers/kimi-for-coding.json
+
+# Scenario 5: PANE_LOST 模拟（v2.1 新增）
+# 跑 review 到 EXTERNAL_REVIEW 状态后，手动 claude stop 一个 review pane
+# 期望: 进入 PANE_LOST，CLI 提示 retry/abort/skip
+```
+
+## 12. 分阶段路线（v2.1 重排）
+
+### 12.1 Phase 1：MVP（5-6 周）—— 砍 IDE，改 `--watch`
+
+| Week | 任务 | 交付 | 验收 |
+|------|------|------|------|
+| W1 | T1 Profile 加载 + provider 校验 + doctor | `profile.ts` + `review-doctor.ts` + 单元测试 + fixture | TOML 解析 / per-phase merge / provider 存在性校验 / CLI 版本校验 100% |
+| W1 | T2 PipelineStore + Reconciler | `pipeline-store.ts` + `reconciler.ts` + 集成测试 | 5 目录原子写 / 移动到终态 / 启动恢复 / pane 丢失 → PANE_LOST |
+| W2 | T3 PhaseDetector | `phase-detect.ts` + 单元测试 | 5 个启发式（含启发式 4）+ PhaseUnknownError |
+| W2 | T4 Adapter（**v2.1 重点**） | `adapter.ts` + 集成测试（mock ClaudeBGAdapter 或真 `claude --bg`） | `claude --bg` spawn / `RendezvousClient.injectReply` / `claude stop` / `claude logs` 4 个 API |
+| W3-W4 | T5 Engine 状态机（基础） | `engine.ts` + 12 个状态转换单测 | PRODUCING / SELF_REVIEW_R1 / R2 / EXTERNAL_REVIEW / JUDGE_BY_WORK / FIXING / DONE / FAILED / ABORTED / PANE_LOST 10 状态 |
+| W4 | T6 Engine 状态机（扩展） | + 集成测试 | ARBITRATION / JUDGE_ARBITER / HUMAN_DECIDE |
+| W5 | T7 CLI 命令（subcommand group） | `src/cli/commands/review.ts` + E2E 测试 | run / status / abort / report / decide / cancel / doctor 7 个命令 |
+| W5-W6 | T8 CLI `--watch` 模式（v2.1 替换 IDE） | `cli-watch.ts` + E2E | ANSI 重绘 + state 变化触发 + Ctrl-C 友好 + multiple pane status |
+
+**v2.1 Phase 1 验收**：
+- ✅ `cc-linker review run <task>` 端到端跑通 3 个 mini pipeline（spec / plan / code 各 1）
+- ✅ `--watch` 模式实时看 1+N+1 pane 状态变化
+- ✅ Ctrl-C 退出 + `review status --follow` 重连
+- ✅ 进程崩溃后启动 Reconciler 恢复（含 PANE_LOST 处理）
+- ✅ `cc-linker review doctor` 报告完整
+- ✅ 10 个状态机单测 + 8 个 E2E 测试全过
+
+### 12.2 Phase 2：体验优化（+4-5 周）
+
+| 任务 | 交付 |
+|------|------|
+| Bun.serve IDE（Bun.serve + SSE + 单 HTML 页） | `ide-server.ts` + `ide-static/index.html` |
+| 完整 2×2 网格 + Pane 全屏模式 | IDE 升级 |
+| 飞书 `/review` 命令（轻量启动 + 关键事件通知） | `src/feishu/commands/review.ts` + 通知 dispatcher |
+| 自动 apply fixes（Phase 1 不做） | `review-fix.ts` + CLI `review apply <id>` |
+| 报告生成（Markdown + JSON + HTML） | `review-report.ts` 升级 |
+| Per-phase 提示词模板加载 | `prompts.<role>.<phase>.system` 模板引擎 |
+| HUMAN_DECIDE IDE 按钮 | 浏览器按钮 |
+
+### 12.3 Phase 3：进阶（+2-3 周，按需）
+
+| 任务 | 价值 |
+|------|------|
+| LLM 分类 fallback（PhaseDetector 启发式 5） | 长任务描述识别更准 |
+| 配置热更新（修改 profile 无需重启） | 调参体验 |
+| Pipeline 并行（一个 IDE 同时跑多个 pipeline） | 对比不同 profile |
+| Token 预算（与 max_rounds 并列的软约束） | 成本控制 |
+| Review 意见去重（多 model 提了同一 issue） | 减少噪声 |
+
+### 12.4 Phase 1 任务依赖图（v2.1）
+
+```
+T1 Profile ─────────┐
+                     ↓
+T3 PhaseDetect ────→ T5 Engine (基础 10 状态)
+T2 PipelineStore ───┤        ↓
+                     │   T6 Engine (扩展 3 状态)
+T4 Adapter ──────────┘        ↓
+                              ├─→ T7 CLI
+                              └─→ T8 CLI --watch
+                                       ↓
+                                  E2E 测试
+```
+
+**并行机会**：
+- T1 / T2 / T3 / T4 都可并行（无依赖）
+- T5 依赖 T1+T2+T3+T4 全部
+- T7 / T8 可并行（互不依赖，都依赖 T5+T6）
+
+## 13. 评审 Checklist（v2.1 补全）
+
+### 13.1 v1 9 条（全部保留）
+
+- [ ] 状态机转换是否覆盖所有设计路径？
+- [ ] max_rounds 计数规则是否与三类状态（计数/免费/逃生）一致？
+- [ ] PipelineStore 5 目录设计是否能覆盖所有状态？
+- [ ] Reconciler 幂等性是否被 history 充分保证？
+- [ ] ReviewProfile per-phase 覆盖机制是否清晰？
+- [ ] CLI watch 模式是否满足"多会话协调 + 集中控制"的需求？
+- [ ] 默认 max_rounds 4/5/8/6 + per-phase 覆盖（Spec 4, Plan 5, Code 8）是否合理？
+- [ ] 错误处理是否能覆盖常见故障（Provider 不可用、daemon crash、CLI 版本过低）？
+- [ ] 安全考量（Provider snapshot、PipelineRecord 不存完整 prompt）是否充分？
+
+### 13.2 v2 8 条（全部保留）
+
+- [ ] `panes: PaneRegistry` 跨状态机持续追踪 work session 的 sessionId + currentRoundShortId 是否足够？
+- [ ] bg session 生命周期策略（work 长生命周期 sessionId 跨轮不变、review/arbiter 一次性）是否清晰？
+- [ ] Polling state.json（不 parse stdout）作为判定方式是否稳定？
+- [ ] Provider 加载阶段 fail fast vs pipeline 跑起来才检测，哪种更好？
+- [ ] 单个 review pane 失败走 degraded 模式（用 0 opinions 推进）是否对？
+- [ ] Reconciler 检测到 pane 丢失时**进入 PANE_LOST 询问用户**的保守策略是否对？
+- [ ] CLI 主输出 + `--watch` rich terminal 的电脑端 UX 是否符合"方便使用能用"的目标？
+- [ ] HUMAN_DECIDE 在 Phase 1 简化为 `review decide` CLI 命令（不是 IDE 按钮）是否够用？
+
+### 13.3 v2.1 新增 8 条
+
+- [ ] `claude --bg` spawn 行为是否稳定？CLI 版本升级是否会破坏？
+- [ ] `RendezvousClient.injectReply` 注入到 running bg session 是否能正确接收 + 处理新 prompt？
+- [ ] work session 跨 R1/R2/JUDGE/FIX 的 sessionId 是否真的一致（而不是被 daemon 重新生成）？
+- [ ] `--reply-on-resume` 配合 `--bg` + `--resume` 是否真的实现"daemon 唤醒 session 处理新 prompt"？
+- [ ] doctor 阶段 fail fast 是否覆盖所有启动错误（profile/provider/CLI/daemon）？
+- [ ] PANE_LOST 状态的 retry/abort/skip 选项是否在 CLI watch 中可触发？
+- [ ] max_rounds 减半后，用户超限场景是否有合理的 fallback（abort 而非 FAILED）？
+- [ ] review 不改源文件只产 Markdown 报告的设计，对用户来说够用吗？还是需要 Phase 2 自动 apply？
+
+## 14. 关键风险（v2.1 新增识别）
+
+| 风险 | 影响 | 缓解 |
+|------|------|------|
+| **CLI 版本 < 2.1.163** | `claude --bg` 不可用 | `cc-linker review doctor` fail fast + 升级提示 |
+| **`claude --bg` 行为变化** | CLI 升级可能改 spawn 行为 | VersionGuard 在 doctor 阶段校验 + 测试覆盖真实 spawn |
+| **work session resume 链断裂** | work session 跨多轮时如果 sessionId 变化（CLI 内部可能 restart） | Adapter 在每次 resume 前验证 sessionId 仍存在；不存在则 PANE_LOST → retry |
+| **Provider settingsPath 改了** | 用户跑 pipeline 途中改了 `~/.claude/providers/*.json`，导致后续 review 走错模型 | PipelineRecord.input 锁住 `provider` 字段 + 启动时复制 settingsPath 到 `~/.cc-linker/review-pipelines/running/<id>/providers/`（snapshot） |
+| **daemon crash 中断所有 bg session** | daemon 挂了 = 整个 pipeline 瘫了 | Reconciler 检测 → PANE_LOST → 用户 retry |
+| **Polling 500ms 抖动** | 用户看 CLI watch 时 pane 状态变化有 0-500ms 延迟 | Phase 1 接受；Phase 2 用 file watcher (chokidar) 监听 `state.json` mtime 触发 |
+| **状态机 driver + Reconciler 抢同一个 pipeline** | Reconciler 恢复时 engine 也在跑，可能双重写 | Reconciler 加 `~/.cc-linker/review-pipelines/reconciler.lock` 文件锁；engine 启动前等锁释放 |
+| **CLI Ctrl-C 退出后 pipeline 继续跑，没人看** | pipeline 跑着但没观察者 | `--no-watch` 模式下 engine 启动 daemon 化（`process.daemon()` 或 `setsid`） |
+
+## 15. 文档链接
+
+- **v1 spec**：`docs/superpowers/specs/2026-06-06-multi-model-review-engine-design.md`（保留作历史参考）
+- **v2 spec**：`docs/superpowers/specs/2026-06-13-multi-model-review-engine-v2-design.md`（保留作历史参考）
+- **v2.1 spec（本文件）**：`docs/superpowers/specs/2026-06-14-multi-model-review-engine-v2.1-design.md`
+- **v2.1 plan（待写）**：`docs/superpowers/plans/2026-06-14-multi-model-review-engine-v2.1-plan.md`（由 writing-plans skill 输出）
+- **复用的 Agent View spec**：`docs/superpowers/specs/2026-06-01-feishu-agent-view-design.md`
+
+---
+
+## 附录 A：`claude --bg` 实测行为（2026-06-14）
+
+**环境**：Claude CLI 2.1.163 on macOS 24.6.0
+
+| 测试 | 命令 | 结果 |
+|------|------|------|
+| Spawn bg session | `claude --bg "say hi"` | ✅ 返回 `backgrounded · 3f219846`，session 落到 `~/.claude/jobs/3f219846/state.json`，非阻塞 |
+| Spawn with provider | `claude --bg "say hi" --settings ~/.claude/providers/kimi-for-coding.json` | ✅ state.json `respawnFlags` 记录 settings 路径，`providerEnv.ANTHROPIC_MODEL` 切换 |
+| 并发 spawn | 3 个连续 `claude --bg` | ✅ 3 个独立 shortId 同时跑 |
+| Status 读 | `cat ~/.claude/jobs/<short>/state.json` | ✅ 含 `state` `tempo` `detail` `needs` `output` `sessionId` `resumeSessionId` `daemonShort` 等字段 |
+| Stop | `claude stop 3f219846` | ✅ state.json state 立即变 `stopped` |
+| Logs | `claude logs 3f219846` | ✅ 返回 markdown 输出（10s timeout） |
+| Resume (直接) | `claude --resume <running-short-uuid> "next prompt"` | ❌ 报错："Session ... is currently running as a background agent (bg). Use `claude agents` to find and attach to it, or add --fork-session" |
+| Resume (via bg+reply-on-resume) | `claude --bg "next prompt" --resume <sessionId> --reply-on-resume` | ✅ 产生新 shortId，sessionId 跨轮不变 |
+| claude agents --json 列出 | `claude agents --json` | ✅ 含 `kind: "background"` 的 session（区别于 `kind: "interactive"`） |
+
+**结论**：`claude --bg` + `--settings` + `--resume --reply-on-resume` + `claude stop` + `claude logs` + `~/.claude/jobs/` state.json 全链路可用。**直接 `--resume` 在 running bg 上不可用，必须用 daemon rendezvous 协议**（`RendezvousClient.injectReply()`）。
+
+---
+
+## 附录 B：复用的 Agent View 模块清单
+
+| 模块 | 路径 | 复用方式 |
+|------|------|---------|
+| `readJobState` | `src/agent-view/job-state.ts:87` | adapter / engine / cli-watch 全调，0 行新代码 |
+| `JobStateFile` interface | `src/agent-view/job-state.ts:25-42` | 直接复用，type import |
+| `listJobShorts` | `src/agent-view/job-state.ts:141-167` | cli-watch 列表时调 |
+| `readAllJobStates` | `src/agent-view/job-state.ts:173-179` | Phase 2 飞书集成时调 |
+| `jobStateToSession` | `src/agent-view/job-state.ts:196-260` | Phase 2 飞书集成时调 |
+| `RendezvousClient.injectReply` | `src/agent-view/rendezvous-client.ts:151` | adapter JUDGE/FIXING 阶段调，0 行新代码 |
+| `resolvePeekContent` | `src/agent-view/manager.ts:209-250` | cli-watch 拉 pane 详情时调 |
+| `AgentSnapshotFetcher.fetch` | `src/agent-view/snapshot-fetcher.ts:48-130` | cli-watch 列表时调（filter `kind: 'background'`） |
+| `VersionGuard.check` | `src/agent-view/version-guard.ts` | doctor 阶段校验 CLI ≥ 2.1.139（Agent View 最低要求）。review engine **额外**校验 ≥ 2.1.163（review-doctor.ts 内 hardcode 常量，不复用 VersionGuard.MIN_VERSION 因为改 VersionGuard 会影响 Agent View） |
+| `DaemonProbe.check` | `src/agent-view/daemon-probe.ts` | doctor 阶段校验 daemon 健康 |
+| `CLAUDE_JOBS_DIR` | `src/utils/paths.ts:55` | adapter / cli-watch 直接 import |
+| `chalk` | 现有依赖 | cli-watch 直接用 |
