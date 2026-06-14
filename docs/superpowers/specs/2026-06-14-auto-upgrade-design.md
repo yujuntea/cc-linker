@@ -1,9 +1,13 @@
 # cc-linker 轻量自动升级 v1 设计
 
 **日期：** 2026-06-14
-**版本：** v1
-**状态：** 设计稿（待评审）
+**版本：** v1 (v1.1 终版, **已被 v1.2 简化版替代**)
+**状态：** ⚠️ **DEPRECATED** — 请看 [`2026-06-14-auto-upgrade-design-v1.2.md`](./2026-06-14-auto-upgrade-design-v1.2.md)
 **作者：** wuyujun + brainstorm session
+
+> v1.1 试图做"飞书卡片一键升级"，4 轮 review 后放弃。v1.2 砍掉 upgrader 子进程模型，改为"飞书通知卡片 + 用户在 terminal 跑 `cc-linker upgrade`"。详见 v1.2 §0 "v1.1 教训"。
+>
+> 保留 v1 文件仅供 git 历史参考。
 
 ---
 
