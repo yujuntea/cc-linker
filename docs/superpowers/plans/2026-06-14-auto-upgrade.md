@@ -228,7 +228,7 @@ export type InstallMode = 'npm_global' | 'standalone_binary' | 'dev' | 'bun_link
 
 export interface SkippedVersionEntry {
   version: string;
-  skippedAt: string;        // ISO 8601 with Z
+  skipped_at: string;        // ISO 8601 with Z (snake_case matches user-mapping.json convention)
 }
 
 /**
@@ -324,8 +324,8 @@ git commit -m "feat(config): add [updater] section with 10 fields"
 Create `tests/unit/updater/cache.test.ts`:
 
 ```ts
-import { describe, it, expect, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { readCache, writeCache, CacheCorruptError } from '../../../src/updater/cache';
@@ -337,6 +337,12 @@ let cachePath: string;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'updater-cache-'));
   cachePath = join(tmpDir, '.update-check.json');
+});
+
+afterEach(() => {
+  if (tmpDir && existsSync(tmpDir)) {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 describe('updater/cache', () => {
@@ -357,13 +363,11 @@ describe('updater/cache', () => {
     });
 
     it('renames corrupt file to .bak.<ts> and returns null', async () => {
-      const { writeFileSync } = await import('fs');
       writeFileSync(cachePath, '{ broken json');
       const result = await readCache(cachePath);
       expect(result).toBeNull();
-      // original moved to .bak.*
       expect(existsSync(cachePath)).toBe(false);
-      const bakFiles = require('fs').readdirSync(tmpDir).filter((f: string) => f.includes('.bak.'));
+      const bakFiles = readdirSync(tmpDir).filter((f: string) => f.includes('.bak.'));
       expect(bakFiles.length).toBeGreaterThan(0);
     });
   });
@@ -385,24 +389,11 @@ describe('updater/cache', () => {
         data: { status: 'up_to_date', current: '0.6.3', latest: '0.6.3', checkedAt: 100 },
       };
       await writeCache(cachePath, data);
-      const files = require('fs').readdirSync(tmpDir);
+      const files = readdirSync(tmpDir);
       expect(files.filter((f: string) => f.includes('.tmp.'))).toHaveLength(0);
     });
   });
 });
-
-afterEach(() => {
-  if (tmpDir && existsSync(tmpDir)) {
-    rmSync(tmpDir, { recursive: true, force: true });
-  }
-});
-```
-
-Add this afterEach block to the file:
-
-```ts
-import { afterEach } from 'bun:test';
-// ... after the describe blocks
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -421,7 +412,7 @@ Create `src/updater/cache.ts`:
  * Corrupt files are backed up to .bak.<ts> and treated as missing.
  */
 
-import { readFile, writeFile, rename, stat } from 'fs/promises';
+import { readFile, writeFile, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import type { CachedCheck } from './types';
 
@@ -622,11 +613,14 @@ function mockFetch(handler: (url: string) => Promise<Response>): typeof fetch {
 }
 
 describe('updater/check', () => {
+  const URL = 'https://registry.npmjs.org/cc-linker/latest';
+
   describe('pre-release guard', () => {
     it('returns prerelease_only when latest is pre-release', async () => {
       const info = await check({
         current: '0.6.3',
         cachePath: join(tmpDir, '.update-check.json'),
+        url: URL,
         fetchImpl: mockFetch(async () => new Response(JSON.stringify({ version: '0.6.4-beta.1' }))),
         ttlMs: 0,
       });
@@ -638,6 +632,7 @@ describe('updater/check', () => {
       const info = await check({
         current: '0.6.3',
         cachePath: join(tmpDir, '.update-check.json'),
+        url: URL,
         fetchImpl: mockFetch(async () => new Response(JSON.stringify({ version: '0.6.4' }))),
         ttlMs: 0,
       });
@@ -649,6 +644,7 @@ describe('updater/check', () => {
       const info = await check({
         current: '0.6.3',
         cachePath: join(tmpDir, '.update-check.json'),
+        url: URL,
         fetchImpl: mockFetch(async () => new Response(JSON.stringify({ version: '0.6.3' }))),
         ttlMs: 0,
       });
@@ -659,6 +655,7 @@ describe('updater/check', () => {
       const info = await check({
         current: '0.6.3',
         cachePath: join(tmpDir, '.update-check.json'),
+        url: URL,
         fetchImpl: mockFetch(async () => new Response(JSON.stringify({ version: '0.6.2' }))),
         ttlMs: 0,
       });
@@ -669,6 +666,7 @@ describe('updater/check', () => {
       const info = await check({
         current: '0.6.3',
         cachePath: join(tmpDir, '.update-check.json'),
+        url: URL,
         fetchImpl: mockFetch(async () => new Response('error', { status: 500 })),
         ttlMs: 0,
       });
@@ -680,6 +678,7 @@ describe('updater/check', () => {
       const info = await check({
         current: '0.6.3',
         cachePath: join(tmpDir, '.update-check.json'),
+        url: URL,
         fetchImpl: mockFetch(async () => new Response('<html>not json</html>', {
           status: 200, headers: { 'content-type': 'text/html' },
         })),
@@ -703,6 +702,7 @@ describe('updater/check', () => {
       const info = await check({
         current: '0.6.3',
         cachePath,
+        url: URL,
         fetchImpl: mockFetch(async () => { fetchCalled = true; return new Response('{}'); }),
         ttlMs: 24 * 60 * 60 * 1000, // 24h
       });
@@ -734,6 +734,7 @@ Create `src/updater/check.ts`:
  * Caller can force a fresh fetch with force: true.
  */
 
+import semver from 'semver';
 import { readCache, writeCache } from './cache';
 import { isPreRelease, type UpdateInfo } from './types';
 
@@ -825,7 +826,6 @@ export async function check(opts: CheckOptions): Promise<UpdateInfo> {
   }
 
   // 5. Semver compare
-  const { default: semver } = await import('semver');
   let cmp: number;
   try {
     cmp = semver.compare(current, latest);
@@ -1258,7 +1258,7 @@ describe('updater/lifecycle', () => {
       writeFileSync(mappingPath, JSON.stringify({
         'ou_owner': {
           type: 'session', sessionUuid: 'xxx', casToken: 1,
-          skipped_versions: [{ version: '0.6.4', skippedAt: recentSkippedAt }],
+          skipped_versions: [{ version: '0.6.4', skipped_at: recentSkippedAt }],
         },
       }));
       const skips = getActiveSkips(mappingPath, 'ou_owner');
@@ -1271,7 +1271,7 @@ describe('updater/lifecycle', () => {
       writeFileSync(mappingPath, JSON.stringify({
         'ou_owner': {
           type: 'session', sessionUuid: 'xxx', casToken: 1,
-          skipped_versions: [{ version: '0.6.4', skippedAt: expiredSkippedAt }],
+          skipped_versions: [{ version: '0.6.4', skipped_at: expiredSkippedAt }],
         },
       }));
       const skips = getActiveSkips(mappingPath, 'ou_owner');
@@ -1291,14 +1291,14 @@ describe('updater/lifecycle', () => {
       expect(skips[0].version).toBe('0.6.4');
     });
 
-    it('skippedAt is ISO 8601 with Z', () => {
+    it('skipped_at is ISO 8601 with Z', () => {
       writeFileSync(mappingPath, JSON.stringify({
         'ou_owner': { type: 'session', sessionUuid: 'xxx', casToken: 1 },
       }));
       addSkippedVersion(mappingPath, 'ou_owner', '0.6.4');
-      const raw = JSON.parse(require('fs').readFileSync(mappingPath, 'utf-8'));
+      const raw = JSON.parse(readFileSync(mappingPath, 'utf-8'));
       const skip = raw['ou_owner'].skipped_versions[0];
-      expect(skip.skippedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
+      expect(skip.skipped_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
     });
 
     it('returns false when entry is not in session state', () => {
@@ -1342,7 +1342,7 @@ Create `src/updater/lifecycle.ts`:
  * 30 days (rolling window) so users are re-prompted for new versions.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, renameSync } from 'fs';
 import { lockSync, unlockSync } from 'proper-lockfile';
 import type { SkippedVersionEntry } from './types';
 
@@ -1368,7 +1368,6 @@ function writeMapping(path: string, data: Record<string, OwnerEntry>): void {
   // atomic write
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, JSON.stringify(data, null, 2));
-  const { renameSync } = require('fs');
   renameSync(tmp, path);
 }
 
@@ -1383,7 +1382,7 @@ export function getActiveSkips(mappingPath: string, openid: string): SkippedVers
 
   const now = Date.now();
   return entry.skipped_versions.filter(s => {
-    const ts = new Date(s.skippedAt).getTime();
+    const ts = new Date(s.skipped_at).getTime();
     return now - ts < THIRTY_DAYS_MS;
   });
 }
@@ -1391,6 +1390,20 @@ export function getActiveSkips(mappingPath: string, openid: string): SkippedVers
 /**
  * Add a skipped version via CAS retry. Returns true on success, false on
  * failure (entry in wrong state, or CAS exhausted retries).
+ *
+ * Race semantics: read-modify-write is non-atomic, but acceptable for the
+ * Skip use case:
+ *   - Single user, single owner openid. The user can only click Skip
+ *     once per card; two simultaneous Skip clicks on the same version
+ *     are practically impossible.
+ *   - In the rare concurrent case, both writers' results merge
+ *     (skipped_versions = [A, B]) — never lost, just redundant. The
+ *     30d expiry filter handles dup detection on read.
+ *   - proper-lockfile serializes the critical section to prevent
+ *     interleaved writes from corrupting the file.
+ *
+ * Do NOT reuse this pattern for general CAS; for that, use a true
+ * read-version-write-check pattern instead.
  */
 export function addSkippedVersion(
   mappingPath: string,
@@ -1412,7 +1425,7 @@ export function addSkippedVersion(
     const existing = entry.skipped_versions ?? [];
     const newEntry: SkippedVersionEntry = {
       version,
-      skippedAt: new Date().toISOString(),  // always with Z (UTC)
+      skipped_at: new Date().toISOString(),  // always with Z (UTC)
     };
 
     mapping[openid] = {
@@ -1540,6 +1553,7 @@ Create `src/cli/commands/upgrade.ts`:
 
 import chalk from 'chalk';
 import { execFileSync } from 'child_process';
+import semver from 'semver';
 import inquirer from 'inquirer';
 import { PKG_VERSION } from '../version';
 import { UPDATE_CHECK_CACHE_PATH } from '../utils/paths';
@@ -1570,7 +1584,7 @@ export function buildUpgradePlan(opts: UpgradeOpts & { latest?: string; current?
     if (opts.to === current) {
       return { kind: 'noop', reason: `Already on v${current}` };
     }
-    const cmp = require('semver').compare(opts.to, current);
+    const cmp = semver.compare(opts.to, current);
     return {
       kind: 'apply',
       targetVersion: opts.to,
@@ -1697,13 +1711,10 @@ export async function upgrade(opts: UpgradeOpts): Promise<void> {
  */
 function detectGlobalNodeModules(): string {
   try {
-    const { execFileSync } = require('child_process');
     const binPath = execFileSync('which', ['cc-linker'], { encoding: 'utf-8' }).trim();
     // /usr/local/bin/cc-linker → /usr/local/lib/node_modules
     // /opt/homebrew/bin/cc-linker → /opt/homebrew/lib/node_modules
-    return binPath
-      .replace(/\/bin\/cc-linker$/, '/lib/node_modules')
-      .replace(/\/bin\/cc-linker$/, '/lib/node_modules');
+    return binPath.replace(/\/bin\/cc-linker$/, '/lib/node_modules');
   } catch {
     return '/usr/local/lib/node_modules';
   }
@@ -2097,6 +2108,83 @@ describe('runtime/updater-tick', () => {
       expect(sentCard).toBe(false);
     });
   });
+
+  describe('tick (24h dedup wrapper)', () => {
+    it('skips checkAndNotify when notifiedAt within 24h window', async () => {
+      // Pre-populate cache with recent notifiedAt
+      const { writeCache } = await import('../../../src/updater/cache');
+      const cachePath = join(tmpDir, '.update-check.json');
+      await writeCache(cachePath, {
+        meta: { schemaVersion: 1 },
+        data: {
+          status: 'update_available',
+          current: '0.6.3', latest: '0.6.4',
+          checkedAt: Date.now() - 1000,
+          notifiedAt: Date.now() - 60_000,  // 1 min ago
+        },
+      });
+
+      let checkImplCalled = false;
+      let sentCard = false;
+      const result = await tick({
+        cachePath,
+        checkImpl: async () => { checkImplCalled = true; throw new Error('should not be called'); },
+        sendCard: async () => { sentCard = true; },
+        config: { registry_url: 'auto', notify_channel: 'feishu' as const },
+        detectMode: async () => 'npm_global',
+        dedupWindowMs: 24 * 60 * 60 * 1000,
+      });
+      expect(result.action).toBe('deduped');
+      expect(checkImplCalled).toBe(false);
+      expect(sentCard).toBe(false);
+    });
+
+    it('proceeds when notifiedAt is older than 24h', async () => {
+      const { writeCache } = await import('../../../src/updater/cache');
+      const cachePath = join(tmpDir, '.update-check.json');
+      await writeCache(cachePath, {
+        meta: { schemaVersion: 1 },
+        data: {
+          status: 'update_available',
+          current: '0.6.3', latest: '0.6.4',
+          checkedAt: Date.now(),
+          notifiedAt: Date.now() - 25 * 60 * 60 * 1000,  // 25h ago
+        },
+      });
+
+      let sentCard = false;
+      const result = await tick({
+        cachePath,
+        checkImpl: async () => ({
+          status: 'update_available',
+          current: '0.6.3', latest: '0.6.4', checkedAt: Date.now(),
+        }),
+        sendCard: async () => { sentCard = true; },
+        config: { registry_url: 'auto', notify_channel: 'feishu' as const },
+        detectMode: async () => 'npm_global',
+        dedupWindowMs: 24 * 60 * 60 * 1000,
+      });
+      expect(result.action).toBe('sent');
+      expect(sentCard).toBe(true);
+    });
+
+    it('proceeds when no cache exists (first run)', async () => {
+      let sentCard = false;
+      const result = await tick({
+        cachePath: join(tmpDir, '.update-check.json'),
+        checkImpl: async () => ({
+          status: 'update_available',
+          current: '0.6.3', latest: '0.6.4', checkedAt: Date.now(),
+        }),
+        sendCard: async () => { sentCard = true; },
+        config: { registry_url: 'auto', notify_channel: 'feishu' as const },
+        detectMode: async () => 'npm_global',
+        dedupWindowMs: 24 * 60 * 60 * 1000,
+      });
+      expect(result.action).toBe('sent');
+      expect(sentCard).toBe(true);
+    });
+  });
 });
 ```
 
@@ -2141,7 +2229,7 @@ export interface CheckAndNotifyDeps {
   detectMode: () => Promise<InstallMode>;
 }
 
-export type NotifyAction = 'sent' | 'logged' | 'none';
+export type NotifyAction = 'sent' | 'logged' | 'none' | 'deduped';
 
 export async function checkAndNotify(deps: CheckAndNotifyDeps): Promise<{ action: NotifyAction }> {
   const info = await deps.checkImpl();
@@ -2184,6 +2272,44 @@ export async function checkAndNotify(deps: CheckAndNotifyDeps): Promise<{ action
 
   return { action: 'sent' };
 }
+
+export interface TickDeps extends CheckAndNotifyDeps {
+  dedupWindowMs?: number;  // default 24h
+}
+
+/**
+ * Wrapper for the 24h ticker: reads cache, checks notifiedAt, and only
+ * calls checkAndNotify if outside the dedup window. Returns 'deduped'
+ * if skipped, otherwise the underlying checkAndNotify result.
+ *
+ * This is the function the bot's 24h setTimeout chain should call.
+ */
+export async function tick(deps: TickDeps): Promise<{ action: NotifyAction }> {
+  const dedupWindowMs = deps.dedupWindowMs ?? 24 * 60 * 60 * 1000;
+  const cached = await readCache(deps.cachePath);
+  if (cached?.data?.notifiedAt && Date.now() - cached.data.notifiedAt < dedupWindowMs) {
+    return { action: 'deduped' };
+  }
+  return checkAndNotify(deps);
+}
+
+/**
+ * Schedule the next 24h tick. Uses setTimeout chain (not setInterval) so
+ * the daemon can cleanly clearTimeout on graceful shutdown.
+ *
+ * Returns the timer handle so the caller can clearTimeout.
+ */
+export function scheduleNextTick(
+  deps: TickDeps,
+  delayMs: number,
+  onError?: (e: Error) => void,
+): NodeJS.Timeout {
+  return setTimeout(() => {
+    tick(deps)
+      .catch((e) => onError?.(e))
+      .finally(() => scheduleNextTick(deps, delayMs, onError));
+  }, delayMs);
+}
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -2205,7 +2331,132 @@ git commit -m "feat(runtime): checkAndNotify with channel routing + dedup"
 **Files:**
 - Create: `src/feishu/updater-card.ts`
 
-- [ ] **Step 1: Write the implementation**
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/unit/feishu/updater-card.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { onSkipClick } from '../../../src/feishu/updater-card';
+import { USER_MAPPING_PATH } from '../../../src/utils/paths';
+
+// Mock LarkClient with capture
+function mockClient() {
+  const calls: any[] = [];
+  return {
+    calls,
+    im: { v1: { message: {
+      patch: async (req: any) => { calls.push({ method: 'patch', ...req }); return { code: 0 }; },
+    } } },
+  };
+}
+
+describe('feishu/updater-card onSkipClick', () => {
+  let tmpHome: string;
+  let originalMappingPath: string;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'updater-card-'));
+    originalMappingPath = USER_MAPPING_PATH;
+    // Redirect USER_MAPPING_PATH for test by setting HOME
+    process.env.HOME = tmpHome;
+  });
+
+  afterEach(() => {
+    process.env.HOME = originalMappingPath;
+    if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it('patches card to "已忽略" on CAS success', async () => {
+    // Seed user-mapping.json with a session entry
+    const mappingDir = join(tmpHome, '.cc-linker');
+    const { mkdirSync } = await import('fs');
+    mkdirSync(mappingDir, { recursive: true });
+    const mappingPath = join(mappingDir, 'user-mapping.json');
+    writeFileSync(mappingPath, JSON.stringify({
+      'ou_owner': { type: 'session', sessionUuid: 'abc', casToken: 1 },
+    }));
+
+    const client = mockClient();
+    await onSkipClick({
+      client: client as any,
+      openid: 'ou_owner',
+      messageId: 'om_xxx',
+      targetVersion: '0.6.4',
+    });
+
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0].method).toBe('patch');
+    expect(client.calls[0].message_id).toBe('om_xxx');
+    const content = JSON.parse(client.calls[0].content);
+    expect(content.header.title.content).toContain('已忽略');
+
+    // Verify user-mapping.json was updated
+    const after = JSON.parse(readFileSync(mappingPath, 'utf-8'));
+    expect(after['ou_owner'].skipped_versions).toHaveLength(1);
+    expect(after['ou_owner'].skipped_versions[0].version).toBe('0.6.4');
+  });
+
+  it('patches card with error when entry not in session state', async () => {
+    const mappingDir = join(tmpHome, '.cc-linker');
+    const { mkdirSync } = await import('fs');
+    mkdirSync(mappingDir, { recursive: true });
+    const mappingPath = join(mappingDir, 'user-mapping.json');
+    writeFileSync(mappingPath, JSON.stringify({
+      'ou_owner': { type: 'pending_new_session' },
+    }));
+
+    const client = mockClient();
+    await onSkipClick({
+      client: client as any,
+      openid: 'ou_owner',
+      messageId: 'om_xxx',
+      targetVersion: '0.6.4',
+    });
+
+    expect(client.calls).toHaveLength(1);
+    const content = JSON.parse(client.calls[0].content);
+    expect(content.header.title.content).toContain('Skip 失败');
+  });
+
+  it('does not throw when card patch API fails', async () => {
+    const mappingDir = join(tmpHome, '.cc-linker');
+    const { mkdirSync } = await import('fs');
+    mkdirSync(mappingDir, { recursive: true });
+    const mappingPath = join(mappingDir, 'user-mapping.json');
+    writeFileSync(mappingPath, JSON.stringify({
+      'ou_owner': { type: 'session', sessionUuid: 'abc', casToken: 1 },
+    }));
+
+    const client = {
+      im: { v1: { message: {
+        patch: async () => { throw new Error('Feishu API down'); },
+      } } },
+    };
+
+    // Should not throw
+    await onSkipClick({
+      client: client as any,
+      openid: 'ou_owner',
+      messageId: 'om_xxx',
+      targetVersion: '0.6.4',
+    });
+    // user-mapping.json should still be updated (CAS succeeded)
+    const after = JSON.parse(readFileSync(mappingPath, 'utf-8'));
+    expect(after['ou_owner'].skipped_versions).toHaveLength(1);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bun test tests/unit/feishu/updater-card.test.ts`
+Expected: FAIL (module not found)
+
+- [ ] **Step 3: Write implementation**
 
 Create `src/feishu/updater-card.ts`:
 
@@ -2220,7 +2471,7 @@ Create `src/feishu/updater-card.ts`:
  * No "Update" button — v1.1 lesson learned.
  */
 
-import { LarkClient } from '../feishu/client';  // adjust to actual client import
+import type { LarkClient } from '../feishu/client';  // adjust to actual client import
 import { addSkippedVersion } from '../updater/lifecycle';
 import { USER_MAPPING_PATH } from '../utils/paths';
 import { logger } from '../utils/logger';
@@ -2274,16 +2525,16 @@ export async function onSkipClick(deps: SkipClickDeps): Promise<void> {
 }
 ```
 
-- [ ] **Step 2: Verify typecheck passes**
+- [ ] **Step 4: Run test to verify it passes**
 
-Run: `bun run typecheck`
-Expected: exit 0 (if LarkClient type is wrong, adjust import to match actual codebase)
+Run: `bun test tests/unit/feishu/updater-card.test.ts`
+Expected: PASS, 3 tests
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add src/feishu/updater-card.ts
-git commit -m "feat(feishu): Skip action handler with CAS write + card patch"
+git add src/feishu/updater-card.ts tests/unit/feishu/updater-card.test.ts
+git commit -m "feat(feishu): Skip action handler with CAS + card patch + tests"
 ```
 
 ---
@@ -2310,14 +2561,15 @@ import { PKG_VERSION } from '../version';
 import { resolveRegistryUrl } from '../updater/registry';
 import { check as runCheck } from '../updater/check';
 import { detectInstallMode } from '../updater/detect-install-mode';
+import { getConfig } from '../utils/config';
 
 // In bot init, after WSClient connect + registry sync:
 setTimeout(async () => {
   try {
-    const config = configManager.get('updater.notify_channel', 'feishu') as 'feishu' | 'cli' | 'none';
+    const config = getConfig<'feishu' | 'cli' | 'none'>('updater.notify_channel', 'feishu');
     if (config === 'none') return;
 
-    const url = await resolveRegistryUrl(configManager.get('updater.registry_url', 'auto'));
+    const url = await resolveRegistryUrl(getConfig('updater.registry_url', 'auto'));
     await checkAndNotify({
       cachePath: UPDATE_CHECK_CACHE_PATH,
       checkImpl: () => runCheck({
@@ -2328,9 +2580,9 @@ setTimeout(async () => {
       }),
       sendCard: async (payload) => {
         // Build Feishu card JSON and send to owner
-        const ownerOpenid = configManager.get('feishu_bot.owner_open_id', '');
-        const targetOpenid = configManager.get('updater.test_mode', false)
-          ? configManager.get('updater.test_openid', 'ou_test')
+        const ownerOpenid = getConfig('feishu_bot.owner_open_id', '');
+        const targetOpenid = getConfig<boolean>('updater.test_mode', false)
+          ? getConfig('updater.test_openid', 'ou_test')
           : ownerOpenid;
         if (!targetOpenid) return;
 
