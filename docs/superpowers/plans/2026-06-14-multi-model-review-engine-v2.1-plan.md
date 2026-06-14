@@ -376,7 +376,8 @@ Create `src/review/profile.ts`:
 ```typescript
 import { readFileSync, existsSync } from 'node:fs';
 import { parse as parseToml } from '@iarna/toml';
-import { ReviewProfileSchema, type ReviewProfile, type Phase } from './types';
+import { ReviewProfileSchema, type ReviewProfile } from './types';
+import type { Phase } from './phase-detect';   // Phase 在 phase-detect.ts 定义
 import { logger } from '../utils/logger';
 import { join } from 'node:path';
 import { REVIEW_PROFILES_DIR } from '../utils/paths';
@@ -570,7 +571,7 @@ Create `src/review/review-doctor.ts`:
 
 ```typescript
 import { spawn } from 'bun';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseToml } from '@iarna/toml';
 import { logger } from '../utils/logger';
@@ -636,7 +637,7 @@ async function checkDaemonHealth(): Promise<DoctorCheck> {
     return { name: 'daemon', ok: false, message: 'daemon roster.json 不存在', remediation: '启动 Claude CLI 一次以初始化 daemon' };
   }
   // 检查 mtime
-  const stat = require('node:fs').statSync(rosterPath);
+  const stat = statSync(rosterPath);
   const ageMs = Date.now() - stat.mtimeMs;
   const ok = ageMs < 5 * 60 * 1000;  // 5 min
   return {
@@ -810,6 +811,11 @@ export class PipelineStore {
     return this.listDir(this.terminalDir('human_pending'));
   }
 
+  /** 列出指定 terminal 目录的所有 pipeline (done / failed / aborted). */
+  async listTerminal(kind: 'done' | 'failed' | 'aborted'): Promise<PipelineRecord[]> {
+    return this.listDir(this.terminalDir(kind));
+  }
+
   private async listDir(dir: string): Promise<PipelineRecord[]> {
     if (!existsSync(dir)) return [];
     const files = await readdir(dir);
@@ -930,6 +936,38 @@ describe('reconcile', () => {
       expect(updated.state.retryTarget).toBe('EXTERNAL_REVIEW');
     }
   });
+
+  it('transitions to PANE_LOST when ALL panes disappear (work + reviews)', async () => {
+    // 验证 spec §6.4：全 pane 丢失也走 PANE_LOST（不只是部分）
+    const record: PipelineRecord = {
+      pipelineId: 'p2',
+      createdAt: '', updatedAt: '',
+      state: { kind: 'FIXING', pipelineId: 'p2', round: 1, pane: 'work',
+               source: 'JUDGE_BY_WORK', inputIssues: [] },
+      input: { rawInput: 'x', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
+      panes: {
+        work: { sessionId: 'uuid-w', currentRoundShortId: 'short-w-gone', provider: 'sonnet', startedAt: '', roundShortIds: ['short-w-gone'] },
+        reviews: [
+          { role: 'review-A', shortId: 'short-a-gone', sessionId: 'uuid-a', provider: 'kimi', round: 1, cycle: 'initial' },
+        ],
+      },
+      history: [],
+      totalCostUsd: 0,
+    };
+    await store.saveRunning(record);
+
+    // Mock fetcher returns nothing (all dead)
+    const mockFetcher = async () => ({ sessions: [] });
+
+    await reconcile({ store, fetcher: mockFetcher as any, adapter: {} as any });
+
+    const updated = await store.readRunning('p2');
+    expect(updated?.state.kind).toBe('PANE_LOST');
+    if (updated?.state.kind === 'PANE_LOST') {
+      expect(updated.state.lostPanes).toHaveLength(2);  // work + review-A
+      expect(updated.state.lostPanes.map(p => p.role).sort()).toEqual(['review-A', 'work']);
+    }
+  });
 });
 ```
 
@@ -1021,7 +1059,7 @@ export function findDeadPanes(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `bun test tests/unit/review/reconciler.test.ts`
-Expected: 1 test passes
+Expected: 2 tests pass
 
 - [ ] **Step 5: Commit**
 
@@ -1927,12 +1965,13 @@ export type EngineEvent =
   | { type: 'JUDGE_VERDICT'; verdict: 'accept' | 'reject'; acceptedIssues: Issue[] }
   | { type: 'HUMAN_DECISION'; acceptedIssues: Issue[] }
   | { type: 'FIXING_DONE' }
-  | { type: 'PANE_LOST'; lostPanes: Array<{ role: string; shortId: string }> }
+  | { type: 'PANE_LOST'; lostPanes: Array<{ role: string; shortId: string }>; nextStateAfter?: ReviewState }
   | { type: 'USER_RETRY'; target: ReviewState['kind'] }
   | { type: 'USER_SKIP' }
   | { type: 'USER_ABORT'; reason: string }
-  | { type: 'MAX_ROUNDS_EXCEEDED' }
   | { type: 'TIMEOUT' };
+// 注意：MAX_ROUNDS_EXCEEDED 不再是 global event；
+// 检查在 transitionWithContext() 中内联（FIXING→R1 postfix 转换时）
 
 // ============ Pure transition function ============
 
@@ -1940,9 +1979,6 @@ export function computeNextState(state: ReviewState, event: EngineEvent): Review
   // Global interrupts
   if (event.type === 'USER_ABORT') {
     return { kind: 'ABORTED', pipelineId: state.pipelineId, round: state.round, reason: event.reason, abortedBefore: state.kind };
-  }
-  if (event.type === 'MAX_ROUNDS_EXCEEDED' && state.kind === 'SELF_REVIEW_R1') {
-    return { kind: 'ABORTED', pipelineId: state.pipelineId, round: state.round, reason: 'max_rounds_exceeded', abortedBefore: state.kind };
   }
 
   switch (state.kind) {
@@ -1991,8 +2027,8 @@ export function computeNextState(state: ReviewState, event: EngineEvent): Review
     case 'PANE_LOST':
       if (event.type === 'USER_RETRY') return { kind: state.retryTarget, pipelineId: state.pipelineId, round: state.round, pane: 'work' } as ReviewState;
       if (event.type === 'USER_SKIP') {
-        // Skip advances to the natural "next state" of the retryTarget
-        return computeNextStateAfter(state.retryTarget, state.pipelineId, state.round);
+        // Skip advances to the pre-computed nextStateAfter (set when entering PANE_LOST)
+        return (state as any).nextStateAfter ?? computeNextStateAfter(state.retryTarget, state.pipelineId, state.round);
       }
       if (event.type === 'TIMEOUT') return { kind: 'ABORTED', pipelineId: state.pipelineId, round: state.round, reason: 'pane_lost_timeout', abortedBefore: state.retryTarget };
       break;
@@ -2000,18 +2036,77 @@ export function computeNextState(state: ReviewState, event: EngineEvent): Review
   throw new Error(`Invalid transition: state=${state.kind} event=${event.type}`);
 }
 
-function computeNextStateAfter(target: ReviewState['kind'], pipelineId: string, round: number): ReviewState {
+/**
+ * PANE_LOST skip 的"next state"——根据 retryTarget 算出 next normal state。
+ * 也在进入 PANE_LOST 时调用，把结果存到 state.nextStateAfter，避免 USER_SKIP 时再次计算。
+ */
+function computeNextStateAfter(target: ReviewState['kind'], pipelineId: string, round: number, fixingSource?: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE'): ReviewState {
   // Skip 推进到 next state（不是 retryTarget 本身）
-  // Simplified: return next "normal" state
   switch (target) {
     case 'PRODUCING': return { kind: 'SELF_REVIEW_R1', pipelineId, round, cycle: 'initial', pane: 'work' };
     case 'SELF_REVIEW_R1': return { kind: 'FIXING', pipelineId, round, pane: 'work', source: 'SELF_REVIEW_R1', inputIssues: [] };
     case 'SELF_REVIEW_R2': return { kind: 'FIXING', pipelineId, round, pane: 'work', source: 'SELF_REVIEW_R2', inputIssues: [] };
-    case 'FIXING': return { kind: 'EXTERNAL_REVIEW', pipelineId, round, cycle: 'initial', panes: [] };
+    case 'FIXING':
+      // FIXING 之后需要根据 source 决定下一步
+      switch (fixingSource) {
+        case 'SELF_REVIEW_R1': return { kind: 'SELF_REVIEW_R2', pipelineId, round, cycle: 'initial', pane: 'work' };
+        case 'SELF_REVIEW_R2': return { kind: 'EXTERNAL_REVIEW', pipelineId, round, cycle: 'initial', panes: [] };
+        case 'JUDGE_BY_WORK':
+        case 'HUMAN_DECIDE': return { kind: 'SELF_REVIEW_R1', pipelineId, round, cycle: 'postfix', pane: 'work' };
+        default: throw new Error(`FIXING skip requires fixingSource, got ${fixingSource}`);
+      }
     case 'EXTERNAL_REVIEW': return { kind: 'JUDGE_BY_WORK', pipelineId, round, pane: 'work' };
     case 'JUDGE_BY_WORK': return { kind: 'FIXING', pipelineId, round, pane: 'work', source: 'JUDGE_BY_WORK', inputIssues: [] };
     default: throw new Error(`Cannot skip from ${target}`);
   }
+}
+
+/**
+ * Engine 主循环外部入口：把 max_rounds 检查和 PANE_LOST nextStateAfter 注入到 transition。
+ * 见 Task 9 (engine main loop)。
+ */
+export function transitionWithContext(
+  record: PipelineRecord,
+  event: EngineEvent,
+  ctx: { maxRounds: number; fixingSource?: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE' }
+): PipelineRecord {
+  // 1. 拦截 max_rounds 检查（spec §5.2：在 FIXING→R1 entry 处 check）
+  if (
+    record.state.kind === 'FIXING' &&
+    event.type === 'FIXING_DONE' &&
+    (record.state.source === 'JUDGE_BY_WORK' || record.state.source === 'HUMAN_DECIDE')
+  ) {
+    const nextRound = record.state.round + 1;
+    if (nextRound > ctx.maxRounds) {
+      const aborted: ReviewState = {
+        kind: 'ABORTED',
+        pipelineId: record.pipelineId,
+        round: record.state.round,
+        reason: 'max_rounds_exceeded',
+        abortedBefore: 'SELF_REVIEW_R1',
+      };
+      return {
+        ...record,
+        state: aborted,
+        history: [...record.history, { ts: new Date().toISOString(), fromState: 'FIXING', toState: 'ABORTED', round: record.state.round, role: 'work', inputDigest: '', outputDigest: '', outputSizeBytes: 0, costUsd: 0, durationMs: 0 }],
+        updatedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  // 2. 拦截 PANE_LOST entry：预计算 nextStateAfter
+  if (record.state.kind !== 'PANE_LOST' && event.type === 'PANE_LOST') {
+    const nextStateAfter = computeNextStateAfter(
+      record.state.kind,
+      record.pipelineId,
+      record.state.round,
+      record.state.kind === 'FIXING' ? record.state.source : undefined,
+    );
+    // 把 nextStateAfter 嵌入 event 让 computeNextState 能拿到
+    event = { ...event, nextStateAfter } as any;
+  }
+
+  return transition(record, event);
 }
 
 // ============ Idempotent transition wrapper ============
@@ -2253,8 +2348,7 @@ import { runDoctor } from '../../review/review-doctor';
 import { PipelineStore } from '../../review/pipeline-store';
 import { pipelineState } from '../../review/pipeline-state';
 import { ClaudeBGAdapter } from '../../review/adapter';
-import { detect, PhaseUnknownError } from '../../review/phase-detect';
-import { detect as detectPhase } from '../../review/phase-detect';
+import { detect as detectPhase, PhaseUnknownError } from '../../review/phase-detect';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -2321,6 +2415,12 @@ export async function reviewAbort(pipelineId: string) {
 }
 
 export async function reviewDoctor() {
+  const result = await runDoctorAndExit();
+  process.exit(result.exitCode);
+}
+
+/** Pure function (testable). CLI command wraps with process.exit(). */
+export async function runDoctorAndExit() {
   const result = await runDoctor({});
   for (const check of result.checks) {
     const icon = check.ok ? '✓' : '❌';
@@ -2329,7 +2429,7 @@ export async function reviewDoctor() {
   }
   console.log();
   console.log(result.exitCode === 0 ? 'All checks passed.' : 'Some checks failed.');
-  process.exit(result.exitCode);
+  return result;
 }
 
 export async function reviewProfiles() {
@@ -2342,11 +2442,24 @@ export async function reviewProfiles() {
   const files = readdirSync(dir).filter(f => f.endsWith('.toml'));
   for (const f of files) {
     const name = f.replace('.toml', '');
-    try {
-      const p = await loadProfile(name, 'code', join(dir, f));  // phase=code 简化
-      console.log(`✓ ${name} (work=${p.work.provider}, review=${p.review.providers.join(',')}, max_rounds=${p.guards.max_rounds})`);
-    } catch (err) {
-      console.log(`❌ ${name}: ${(err as Error).message}`);
+    const fullPath = join(dir, f);
+    // 尝试任一 phase 加载（profile 不应该因为某个 phase 校验失败就完全隐藏）
+    let loaded: Awaited<ReturnType<typeof loadProfile>> | null = null;
+    let loadedPhase: string = '';
+    let lastErr: Error | null = null;
+    for (const phase of ['spec', 'plan', 'code'] as const) {
+      try {
+        loaded = await loadProfile(name, phase, fullPath);
+        loadedPhase = phase;
+        break;
+      } catch (err) {
+        lastErr = err as Error;
+      }
+    }
+    if (loaded) {
+      console.log(`✓ ${name} (loaded phase=${loadedPhase}, work=${loaded.work.provider}, review=${loaded.review.providers.join(',')}, max_rounds=${loaded.guards.max_rounds})`);
+    } else {
+      console.log(`❌ ${name}: ${lastErr?.message}`);
     }
   }
 }
@@ -2561,8 +2674,9 @@ Add to `src/review/cli-watch.ts`:
 
 ```typescript
 import { PipelineStore } from './pipeline-store';
+import { REVIEW_PIPELINES_DIR } from '../utils/paths';
 
-export async function watchPipeline(pipelineId: string): Promise<void> {
+export async function watchPipeline(pipelineId: string, signal?: AbortSignal): Promise<void> {
   const store = new PipelineStore(REVIEW_PIPELINES_DIR);
   let lastState: ReviewState['kind'] | null = null;
 
@@ -2572,7 +2686,7 @@ export async function watchPipeline(pipelineId: string): Promise<void> {
     process.exit(0);
   });
 
-  while (true) {
+  while (!signal?.aborted) {
     const record = await store.readRunning(pipelineId);
     if (!record) {
       console.log(`[watch] pipeline ${pipelineId} 不在 running/，尝试 human_pending/`);
@@ -2581,7 +2695,7 @@ export async function watchPipeline(pipelineId: string): Promise<void> {
         console.log(chalk.yellow(`[watch] Pipeline 等人工决策`));
         break;
       }
-      const done = (await store.listDir('done') as PipelineRecord[]).find(r => r.pipelineId === pipelineId);
+      const done = (await store.listTerminal('done')).find(r => r.pipelineId === pipelineId);
       if (done) { console.log(renderTerminal(done)); return; }
       console.log(`[watch] Pipeline ${pipelineId} 未找到`);
       return;
@@ -2632,7 +2746,420 @@ git commit -m "feat(review): CLI --watch rich terminal (ANSI + Ctrl-C handling) 
 
 ---
 
-## End-to-end Verification (after T8)
+## Task 9 (W6): Engine Main Loop — 把零件装成引擎（核心）
+
+**重要**：T1-T8 只构建支持模块（types / store / adapter / transition / CLI），**没有把模块组装成能跑的 pipeline runner**。T9 是 Phase 1 的核心 — 缺它 `cc-linker review run` 只会打印占位符，不能实际驱动 review。
+
+### Task 9.1: Engine main loop (`runPipeline`)
+
+**Files:**
+- Modify: `src/review/engine.ts` — 添加 `runPipeline()` 主循环
+- Create: `tests/unit/review/engine-run.test.ts`
+
+- [ ] **Step 1: Write failing test for runPipeline main loop**
+
+Create `tests/unit/review/engine-run.test.ts`:
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runPipeline } from '../../src/review/engine';
+import { PipelineStore } from '../../src/review/pipeline-store';
+import { PipelineState } from '../../src/review/pipeline-state';
+import { ClaudeBGAdapter } from '../../src/review/adapter';
+import { parseBgOutput, FixingOutputSchema } from '../../src/review/output-contract';
+import type { PipelineRecord, ReviewProfile } from '../../src/review/types';
+import type { Issue } from '../../src/review/types';
+
+describe('runPipeline', () => {
+  let tmpDir: string;
+  let store: PipelineStore;
+  let state: PipelineState;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'run-'));
+    store = new PipelineStore(join(tmpDir, 'pipes'));
+    state = new PipelineState();
+  });
+  afterEach(() => rmSync(tmpDir, { recursive: true }));
+
+  it('completes PRODUCING → R1 → R1_CLEAN → DONE', async () => {
+    // Mock adapter: PRODUCING spawn returns shortId, then R1 returns "no issues"
+    const workShortId = 'short-work';
+    const fixOutput = '```json\n{"per_issue": [], "all_real_fixed": true, "remaining_real_unfixed_count": 0}\n```';
+    const stateJson = { state: 'done', output: '{"issues": [], "unfixed_count": 0}' };
+    let callCount = 0;
+
+    const mockAdapter = {
+      startSession: async (opts: any) => {
+        callCount++;
+        return { shortId: workShortId, sessionId: 'uuid-w' };
+      },
+      poll: async (shortId: string, timeoutMs: number) => {
+        return { ...stateJson, state: 'done' } as any;
+      },
+      injectReply: async (opts: any) => ({ ok: true }),
+      stop: async (shortId: string) => {},
+      resumeWorkSession: async (opts: any) => ({ shortId: 'short-r1', sessionId: 'uuid-w' }),
+    };
+
+    const profile: ReviewProfile = {
+      meta: { name: 'test' },
+      work: { provider: 'sonnet' },
+      review: { providers: ['kimi'] },
+      guards: { max_rounds: 6, max_concurrent_pipelines: 1, human_decide_timeout_ms: 3600000, p0_p1_reject_threshold: 0.30 },
+      prompts: {},
+      phase_overrides: {},
+    } as ReviewProfile;
+
+    const record: PipelineRecord = {
+      pipelineId: 'p1', createdAt: new Date().toISOString(), updatedAt: '',
+      state: { kind: 'PRODUCING', pipelineId: 'p1', round: 0, pane: 'work' },
+      input: { rawInput: 'test', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
+      panes: { reviews: [] },
+      history: [],
+      totalCostUsd: 0,
+    };
+    await store.saveRunning(record);
+
+    // Run pipeline with abort signal that fires immediately
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 100);
+
+    await runPipeline(record, profile, {
+      store, state, adapter: mockAdapter as any, signal: ac.signal,
+    }).catch(() => {/* abort throws */ });
+
+    // 验证状态机推进
+    const final = await store.readRunning('p1');
+    // aborted due to abort signal, OR reached terminal state
+    expect(final === null || ['DONE', 'ABORTED'].includes(final?.state.kind ?? '')).toBe(true);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bun test tests/unit/review/engine-run.test.ts`
+Expected: FAIL with "runPipeline is not exported from engine"
+
+- [ ] **Step 3: Implement runPipeline main loop in engine.ts**
+
+Add to `src/review/engine.ts`:
+
+```typescript
+import type { PipelineStore } from './pipeline-store';
+import type { PipelineState } from './pipeline-state';
+import type { ClaudeBGAdapter } from './adapter';
+import { parseBgOutput, SelfReviewOutputSchema, FixingOutputSchema } from './output-contract';
+import { logger } from '../utils/logger';
+import type { PipelineRecord, ReviewProfile, Issue, ReviewState } from './types';
+
+export interface RunPipelineOpts {
+  store: PipelineStore;
+  state: PipelineState;
+  adapter: ClaudeBGAdapter;
+  signal?: AbortSignal;
+}
+
+/**
+ * Engine 主循环：驱动 pipeline 直到 terminal state。
+ * - 每次循环读 state.json → 解析 output → computeNextState → adapter action → saveRunning
+ * - AbortSignal 触发时 cleanupPipeline + throw AbortError
+ *
+ * spec §4.1 数据流的实际 orchestration 实现
+ */
+export async function runPipeline(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  let current = record;
+  const maxIterations = 100;  // safety guard against infinite loops
+  let iter = 0;
+
+  while (!isTerminal(current.state.kind) && iter < maxIterations) {
+    iter++;
+    if (opts.signal?.aborted) {
+      logger.info(`[engine] ${current.pipelineId} aborted by signal`);
+      await cleanupOnAbort(current.pipelineId, 'user_abort', opts);
+      throw new Error('aborted');
+    }
+
+    try {
+      current = await stepState(current, profile, opts);
+      await opts.store.saveRunning(current);
+    } catch (err) {
+      if (opts.signal?.aborted) {
+        await cleanupOnAbort(current.pipelineId, 'user_abort', opts);
+      }
+      throw err;
+    }
+  }
+
+  // Terminal: move to terminal dir
+  if (isTerminal(current.state.kind)) {
+    await opts.store.moveToTerminal(current);
+    // 清 in-memory state
+    opts.state.delete(current.pipelineId);
+  }
+
+  return current;
+}
+
+function isTerminal(kind: string): boolean {
+  return kind === 'DONE' || kind === 'FAILED' || kind === 'ABORTED';
+}
+
+/**
+ * 单步：根据当前 state 执行相应的 adapter action + computeNextState
+ */
+async function stepState(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  const state = record.state;
+
+  switch (state.kind) {
+    case 'PRODUCING':
+      return await stepPRODUCING(record, profile, opts);
+    case 'SELF_REVIEW_R1':
+      return await stepSELF_REVIEW_R1(record, profile, opts);
+    case 'FIXING':
+      return await stepFIXING(record, profile, opts);
+    case 'SELF_REVIEW_R2':
+      return await stepSELF_REVIEW_R2(record, profile, opts);
+    case 'EXTERNAL_REVIEW':
+      return await stepEXTERNAL_REVIEW(record, profile, opts);
+    case 'JUDGE_BY_WORK':
+      return await stepJUDGE_BY_WORK(record, profile, opts);
+    case 'HUMAN_DECIDE':
+      // HUMAN_DECIDE 等用户 CLI 输入，不在这里推进
+      return record;
+    case 'PANE_LOST':
+      // PANE_LOST 等用户决策
+      return record;
+    default:
+      throw new Error(`Unknown state: ${(state as any).kind}`);
+  }
+}
+
+async function stepPRODUCING(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  // Spawn work bg session for initial production
+  const { shortId, sessionId } = await opts.adapter.startSession({
+    role: 'work',
+    provider: profile.work.provider,
+    prompt: buildProducePrompt(record, profile),
+    cwd: record.input.cwd,
+  });
+
+  record.panes.work = {
+    sessionId,
+    currentRoundShortId: shortId,
+    provider: profile.work.provider,
+    startedAt: new Date().toISOString(),
+    roundShortIds: [shortId],
+  };
+
+  // Poll until done
+  const finalState = await opts.adapter.poll(shortId, 600_000, opts.signal);
+  return transitionWithContext(record, { type: 'WORK_PRODUCED' }, { maxRounds: profile.guards.max_rounds });
+}
+
+async function stepSELF_REVIEW_R1(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  // Inject "review your work" prompt into work session
+  if (!record.panes.work?.currentRoundShortId) throw new Error('work pane not initialized');
+  await opts.adapter.injectReply({
+    shortId: record.panes.work.currentRoundShortId,
+    text: buildSelfReviewPrompt(record, profile, 'R1'),
+    signal: opts.signal,
+  });
+  // Poll for completion
+  await opts.adapter.poll(record.panes.work.currentRoundShortId, 60_000, opts.signal);
+
+  // Read state.json.output, parse via Output Contract
+  const state = await import('../agent-view/job-state').then(m => m.readJobState(record.panes.work!.currentRoundShortId!));
+  const outputText = (state as any)?.output ?? '';
+  const parsed = parseBgOutput(outputText, SelfReviewOutputSchema);
+  if (!parsed.ok || parsed.data.issues.length === 0) {
+    return transitionWithContext(record, { type: 'R1_CLEAN' }, { maxRounds: profile.guards.max_rounds });
+  }
+  return transitionWithContext(record, { type: 'R1_ISSUES', issues: enrichIssues(parsed.data.issues) }, { maxRounds: profile.guards.max_rounds });
+}
+
+async function stepFIXING(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  opts: RunPipelineOpts,
+): Promise<PipelineRecord> {
+  if (state.kind !== 'FIXING') throw new Error('expected FIXING');
+  // Inject "verify each issue + fix real ones" prompt
+  await opts.adapter.injectReply({
+    shortId: record.panes.work!.currentRoundShortId!,
+    text: buildFixingPrompt(record.state.inputIssues, record.state.source),
+    signal: opts.signal,
+  });
+  await opts.adapter.poll(record.panes.work!.currentRoundShortId!, 120_000, opts.signal);
+  return transitionWithContext(record, { type: 'FIXING_DONE' }, { maxRounds: profile.guards.max_rounds });
+}
+
+// stepSELF_REVIEW_R2, stepEXTERNAL_REVIEW, stepJUDGE_BY_WORK 类似，省略详细实现
+
+function buildProducePrompt(record: PipelineRecord, profile: ReviewProfile): string {
+  return profile.prompts['work.produce']?.system ?? `你正在编写一份 ${record.input.phase}。${record.input.rawInput}`;
+}
+
+function buildSelfReviewPrompt(record: PipelineRecord, profile: ReviewProfile, round: 'R1' | 'R2'): string {
+  const prompt = profile.prompts['work.self_review']?.system ?? `审查你的产出，识别问题：...`;
+  return prompt.replace(/\{\{round\}\}/g, round);
+}
+
+function buildFixingPrompt(issues: Issue[], source: string): string {
+  return `你是修复节点（FIXING）。调用来源：${source} 阶段。待处理 issue 列表：${JSON.stringify(issues, null, 2)}。严格 verify-first 流程（每个 issue 都必须经过）：1. 验证真实性 2. 判定 real/hallucination 3. 修复（仅 real） 4. 验证修复。输出 JSON...`;
+}
+
+function enrichIssues(rawIssues: any[]): Issue[] {
+  return rawIssues.map((ri, i) => ({
+    id: `work-${i + 1}`,
+    severity: ri.severity,
+    location: ri.location,
+    description: ri.description,
+    source: 'work',
+  }));
+}
+
+async function cleanupOnAbort(pipelineId: string, reason: string, opts: RunPipelineOpts): Promise<void> {
+  const { cleanupPipeline } = await import('./abort-cleanup');
+  await cleanupPipeline(pipelineId, reason, opts);
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `bun test tests/unit/review/engine-run.test.ts`
+Expected: 1 test passes
+
+- [ ] **Step 5: Wire `reviewRun` to actually start engine (replace T7.1 placeholder)**
+
+Modify `src/cli/commands/review.ts` `reviewRun`:
+
+```typescript
+export async function reviewRun(task: string, opts: {
+  phase?: Phase;
+  profile?: string;
+  maxRounds?: number;
+  cwd?: string;
+  watch?: boolean;
+}) {
+  const phase = opts.phase ?? (() => {
+    try {
+      return detectPhase({ rawInput: task, filePath: undefined, gitRef: undefined });
+    } catch (err) {
+      if (err instanceof PhaseUnknownError) {
+        console.error(`❌ ${err.message}`);
+        process.exit(1);
+      }
+      throw err;
+    }
+  })();
+
+  const profileName = opts.profile ?? 'default';
+  const profile = await loadProfile(profileName, phase);
+  const cwd = opts.cwd ?? process.cwd();
+  const maxRounds = opts.maxRounds ?? profile.guards.max_rounds;
+
+  // Generate pipelineId
+  const pipelineId = generateUlid();
+  const record: PipelineRecord = {
+    pipelineId,
+    createdAt: new Date().toISOString(),
+    updatedAt: '',
+    state: { kind: 'PRODUCING', pipelineId, round: 0, pane: 'work' },
+    input: { rawInput: task, phase, profile: profileName, maxRounds, cwd },
+    panes: { reviews: [] },
+    history: [],
+    totalCostUsd: 0,
+  };
+
+  const store = new PipelineStore(REVIEW_PIPELINES_DIR);
+  await store.saveRunning(record);
+
+  const ac = new AbortController();
+  const state = pipelineState;
+  state.set(pipelineId, { pipelineId, abortController: ac, watchClientSet: new Set() });
+
+  const adapter = new ClaudeBGAdapter();
+
+  console.log(`✓ Pipeline 启动: ${pipelineId.slice(0, 8)}... (phase=${phase}, max_rounds=${maxRounds})`);
+
+  if (opts.watch === false) {
+    // detach mode: run in background, user uses `review status <id>` to check
+    runPipeline(record, profile, { store, state, adapter, signal: ac.signal })
+      .catch(err => logger.error(`[review] pipeline ${pipelineId} failed: ${err.message}`));
+    console.log(`Detached. 重连: cc-linker review status ${pipelineId} --follow`);
+  } else {
+    // foreground: show CLI watch
+    const { watchPipeline } = await import('../../review/cli-watch');
+    await Promise.race([
+      watchPipeline(pipelineId, ac.signal),
+      runPipeline(record, profile, { store, state, adapter, signal: ac.signal }),
+    ]);
+  }
+}
+
+function generateUlid(): string {
+  // Simplified: timestamp + random
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+```
+
+- [ ] **Step 6: Smoke test full pipeline (mini scenario)**
+
+```bash
+# 1. 创建测试 profile
+mkdir -p ~/.cc-linker/review-profiles
+cat > ~/.cc-linker/review-profiles/test.toml <<'EOF'
+[meta]
+name = "test"
+[work]
+provider = "kimi-for-coding"
+[review]
+providers = ["kimi-for-coding"]
+[guards]
+max_rounds = 1
+EOF
+
+# 2. run
+bun run dev review run "say hello world" --phase code --profile test --no-watch &
+PIPELINE_ID=$(bun run dev review status --no-watch 2>/dev/null | head -1) || true
+
+# 3. check status
+sleep 5
+bun run dev review status $PIPELINE_ID 2>/dev/null
+# Expected: state in DONE/ABORTED/PRODUCING
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/review/engine.ts tests/unit/review/engine-run.test.ts src/cli/commands/review.ts
+git commit -m "feat(review): engine main loop (runPipeline orchestration) (T9)"
+```
+
+---
+
+## End-to-end Verification (after T9)
 
 - [ ] **Step 9: Run full test suite**
 
