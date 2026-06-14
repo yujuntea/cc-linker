@@ -840,7 +840,18 @@ export async function check(opts: CheckOptions): Promise<UpdateInfo> {
   else if (cmp > 0) status = 'local_newer';
   else status = 'update_available';
 
-  const info: UpdateInfo = { status, current, latest, checkedAt: Date.now() };
+  // Preserve notifiedAt from previous cache so the 24h dedup window
+  // survives a `cc-linker upgrade` force-fetch or any other check() call.
+  // Without this, the daemon's tick() would re-send the card 24h after
+  // the original notification (Bug fix: check() must not clear dedup state).
+  const oldCache = await readCache(cachePath);
+  const info: UpdateInfo = {
+    status,
+    current,
+    latest,
+    checkedAt: Date.now(),
+    notifiedAt: oldCache?.data?.notifiedAt,
+  };
   await writeCache(cachePath, { meta: { schemaVersion: 1 }, data: info });
   return info;
 }
@@ -2025,7 +2036,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { checkAndNotify } from '../../../src/runtime/updater-tick';
+import { checkAndNotify, tick } from '../../../src/runtime/updater-tick';
 import type { UpdateInfo } from '../../../src/updater/types';
 
 let tmpDir: string;
@@ -2337,11 +2348,10 @@ Create `tests/unit/feishu/updater-card.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { onSkipClick } from '../../../src/feishu/updater-card';
-import { USER_MAPPING_PATH } from '../../../src/utils/paths';
 
 // Mock LarkClient with capture
 function mockClient() {
@@ -2355,27 +2365,19 @@ function mockClient() {
 }
 
 describe('feishu/updater-card onSkipClick', () => {
-  let tmpHome: string;
-  let originalMappingPath: string;
+  let tmpDir: string;
+  let mappingPath: string;
 
   beforeEach(() => {
-    tmpHome = mkdtempSync(join(tmpdir(), 'updater-card-'));
-    originalMappingPath = USER_MAPPING_PATH;
-    // Redirect USER_MAPPING_PATH for test by setting HOME
-    process.env.HOME = tmpHome;
+    tmpDir = mkdtempSync(join(tmpdir(), 'updater-card-'));
+    mappingPath = join(tmpDir, 'user-mapping.json');
   });
 
   afterEach(() => {
-    process.env.HOME = originalMappingPath;
-    if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
   });
 
   it('patches card to "已忽略" on CAS success', async () => {
-    // Seed user-mapping.json with a session entry
-    const mappingDir = join(tmpHome, '.cc-linker');
-    const { mkdirSync } = await import('fs');
-    mkdirSync(mappingDir, { recursive: true });
-    const mappingPath = join(mappingDir, 'user-mapping.json');
     writeFileSync(mappingPath, JSON.stringify({
       'ou_owner': { type: 'session', sessionUuid: 'abc', casToken: 1 },
     }));
@@ -2386,6 +2388,7 @@ describe('feishu/updater-card onSkipClick', () => {
       openid: 'ou_owner',
       messageId: 'om_xxx',
       targetVersion: '0.6.4',
+      mappingPath,  // explicit override (USER_MAPPING_PATH is a module-load constant)
     });
 
     expect(client.calls).toHaveLength(1);
@@ -2401,10 +2404,6 @@ describe('feishu/updater-card onSkipClick', () => {
   });
 
   it('patches card with error when entry not in session state', async () => {
-    const mappingDir = join(tmpHome, '.cc-linker');
-    const { mkdirSync } = await import('fs');
-    mkdirSync(mappingDir, { recursive: true });
-    const mappingPath = join(mappingDir, 'user-mapping.json');
     writeFileSync(mappingPath, JSON.stringify({
       'ou_owner': { type: 'pending_new_session' },
     }));
@@ -2415,6 +2414,7 @@ describe('feishu/updater-card onSkipClick', () => {
       openid: 'ou_owner',
       messageId: 'om_xxx',
       targetVersion: '0.6.4',
+      mappingPath,
     });
 
     expect(client.calls).toHaveLength(1);
@@ -2423,10 +2423,6 @@ describe('feishu/updater-card onSkipClick', () => {
   });
 
   it('does not throw when card patch API fails', async () => {
-    const mappingDir = join(tmpHome, '.cc-linker');
-    const { mkdirSync } = await import('fs');
-    mkdirSync(mappingDir, { recursive: true });
-    const mappingPath = join(mappingDir, 'user-mapping.json');
     writeFileSync(mappingPath, JSON.stringify({
       'ou_owner': { type: 'session', sessionUuid: 'abc', casToken: 1 },
     }));
@@ -2443,6 +2439,7 @@ describe('feishu/updater-card onSkipClick', () => {
       openid: 'ou_owner',
       messageId: 'om_xxx',
       targetVersion: '0.6.4',
+      mappingPath,
     });
     // user-mapping.json should still be updated (CAS succeeded)
     const after = JSON.parse(readFileSync(mappingPath, 'utf-8'));
@@ -2481,10 +2478,17 @@ export interface SkipClickDeps {
   openid: string;
   messageId: string;
   targetVersion: string;
+  /**
+   * Path to user-mapping.json. Defaults to USER_MAPPING_PATH but can be
+   * overridden for tests (USER_MAPPING_PATH is a module-load constant
+   * computed from $HOME, so changing HOME at runtime has no effect).
+   */
+  mappingPath?: string;
 }
 
 export async function onSkipClick(deps: SkipClickDeps): Promise<void> {
-  const ok = addSkippedVersion(USER_MAPPING_PATH, deps.openid, deps.targetVersion, {
+  const mappingPath = deps.mappingPath ?? USER_MAPPING_PATH;
+  const ok = addSkippedVersion(mappingPath, deps.openid, deps.targetVersion, {
     maxRetries: 2,
   });
 
@@ -2555,7 +2559,7 @@ Run: `grep -rn "WSClient.connect\|registry.sync" src/feishu/ src/runtime/ | head
 After the existing init code, add:
 
 ```ts
-import { checkAndNotify } from '../runtime/updater-tick';
+import { checkAndNotify, tick, scheduleNextTick } from '../runtime/updater-tick';
 import { UPDATE_CHECK_CACHE_PATH } from '../utils/paths';
 import { PKG_VERSION } from '../version';
 import { resolveRegistryUrl } from '../updater/registry';
@@ -2564,71 +2568,79 @@ import { detectInstallMode } from '../updater/detect-install-mode';
 import { getConfig } from '../utils/config';
 
 // In bot init, after WSClient connect + registry sync:
-setTimeout(async () => {
-  try {
-    const config = getConfig<'feishu' | 'cli' | 'none'>('updater.notify_channel', 'feishu');
-    if (config === 'none') return;
 
-    const url = await resolveRegistryUrl(getConfig('updater.registry_url', 'auto'));
-    await checkAndNotify({
+// Build shared deps once (reused by initial tick + 24h scheduler)
+const updaterConfig = getConfig<'feishu' | 'cli' | 'none'>('updater.notify_channel', 'feishu');
+if (updaterConfig !== 'none') {
+  const url = await resolveRegistryUrl(getConfig('updater.registry_url', 'auto'));
+  const ownerOpenid = getConfig('feishu_bot.owner_open_id', '');
+  const targetOpenid = getConfig<boolean>('updater.test_mode', false)
+    ? getConfig('updater.test_openid', 'ou_test')
+    : ownerOpenid;
+
+  const tickDeps = {
+    cachePath: UPDATE_CHECK_CACHE_PATH,
+    checkImpl: () => runCheck({
+      current: PKG_VERSION,
       cachePath: UPDATE_CHECK_CACHE_PATH,
-      checkImpl: () => runCheck({
-        current: PKG_VERSION,
-        cachePath: UPDATE_CHECK_CACHE_PATH,
-        url,
-        ttlMs: 24 * 60 * 60 * 1000,
-      }),
-      sendCard: async (payload) => {
-        // Build Feishu card JSON and send to owner
-        const ownerOpenid = getConfig('feishu_bot.owner_open_id', '');
-        const targetOpenid = getConfig<boolean>('updater.test_mode', false)
-          ? getConfig('updater.test_openid', 'ou_test')
-          : ownerOpenid;
-        if (!targetOpenid) return;
+      url,
+      ttlMs: 24 * 60 * 60 * 1000,
+    }),
+    sendCard: async (payload: { header: string; body: string; actions: any[] }) => {
+      if (!targetOpenid) return;
+      await feishuClient.im.v1.message.create({
+        params: { receive_id_type: 'open_id' },
+        data: {
+          receive_id: targetOpenid,
+          msg_type: 'interactive',
+          content: JSON.stringify({
+            config: { wide_screen_mode: true },
+            header: { template: 'blue', title: { tag: 'plain_text', content: payload.header } },
+            elements: [
+              { tag: 'div', text: { tag: 'lark_md', content: payload.body } },
+              {
+                tag: 'action',
+                actions: payload.actions.map((a: any) => {
+                  if (a.type === 'url') {
+                    return { tag: 'button', text: { tag: 'plain_text', content: a.text }, type: 'primary', url: a.url };
+                  }
+                  return {
+                    tag: 'button',
+                    text: { tag: 'plain_text', content: a.text },
+                    type: 'default',
+                    value: a.value,
+                  };
+                }),
+              },
+            ],
+          }),
+        },
+      });
+    },
+    log: (line: string) => logger.info(line),
+    config: { registry_url: 'auto', notify_channel: updaterConfig },
+    detectMode: async () => detectInstallMode({
+      globalNodeModules: '/usr/local/lib/node_modules',  // heuristic; can be improved
+      argv1: process.argv[1] ?? '',
+    }),
+  };
 
-        await feishuClient.im.v1.message.create({
-          params: { receive_id_type: 'open_id' },
-          data: {
-            receive_id: targetOpenid,
-            msg_type: 'interactive',
-            content: JSON.stringify({
-              config: { wide_screen_mode: true },
-              header: { template: 'blue', title: { tag: 'plain_text', content: payload.header } },
-              elements: [
-                { tag: 'div', text: { tag: 'lark_md', content: payload.body } },
-                {
-                  tag: 'action',
-                  actions: payload.actions.map((a: any) => {
-                    if (a.type === 'url') {
-                      return { tag: 'button', text: { tag: 'plain_text', content: a.text }, type: 'primary', url: a.url };
-                    }
-                    return {
-                      tag: 'button',
-                      text: { tag: 'plain_text', content: a.text },
-                      type: 'default',
-                      value: a.value,
-                    };
-                  }),
-                },
-              ],
-            }),
-          },
-        });
-      },
-      log: (line) => logger.info(line),
-      config: { registry_url: 'auto', notify_channel: config },
-      detectMode: async () => detectInstallMode({
-        globalNodeModules: '/usr/local/lib/node_modules',  // heuristic; can be improved
-        argv1: process.argv[1] ?? '',
-      }),
-    });
-  } catch (e: any) {
-    logger.warn(`updater tick failed: ${e.message}`);
-  }
-}, configManager.get('updater.notify_delay_ms', 30000));
+  // First tick after initial delay, then schedule 24h chain
+  const initialDelayMs = getConfig<number>('updater.notify_delay_ms', 30000);
+  const intervalMs = getConfig<number>('updater.check_interval_hours', 24) * 60 * 60 * 1000;
+  const onError = (e: Error) => logger.warn(`updater tick failed: ${e.message}`);
+
+  setTimeout(() => {
+    tick(tickDeps).catch(onError);
+    // Then schedule the 24h chain (NOT setInterval — setTimeout chain for clean shutdown)
+    scheduleNextTick(tickDeps, intervalMs, onError);
+  }, initialDelayMs);
+}
 ```
 
-(Adjust import paths and configManager API to match the actual codebase.)
+(Adjust import paths and `feishuClient` variable name to match the actual codebase.)
+
+(Adjust import paths to match the actual codebase. The `getConfig` helper is imported at the top of the file.)
 
 - [ ] **Step 3: Verify typecheck passes**
 
@@ -2794,7 +2806,21 @@ git commit -m "test(integration): upgrade flow end-to-end (CLI + daemon + card)"
 - [ ] **Step 1: Run all tests**
 
 Run: `bun test`
-Expected: all tests pass (target: 50+ tests across 8 files)
+Expected: all tests pass (target: 55+ tests across 10 files)
+
+Test count by file (target):
+- types: 8
+- cache: 5
+- registry: 4
+- check: 7
+- notify: 10
+- detect-install-mode: 4
+- lifecycle: 7
+- upgrade (buildUpgradePlan): 5
+- updater-tick (checkAndNotify + tick): 7
+- feishu updater-card (Skip): 3
+- integration upgrade-flow: 6
+**Total: ~66**
 
 - [ ] **Step 2: Run typecheck**
 
@@ -2842,7 +2868,7 @@ cc-linker can notify you when a new version is available and let you upgrade wit
 
 Add to `~/.cc-linker/config.toml`:
 
-\`\`\`toml
+```toml
 [updater]
 enabled = true                  # default: true
 notify_channel = "feishu"       # feishu | cli | none
@@ -2850,33 +2876,31 @@ notify_delay_ms = 30000         # delay after bot ready before sending card
 check_interval_hours = 24       # 24h ticker
 test_mode = false               # set true to send cards to test_openid
 test_openid = "ou_test"
-\`\`\`
+```
 
 ### Upgrade
 
-\`\`\`bash
+```bash
 cc-linker upgrade --check       # show update status, exit
 cc-linker upgrade --dry-run     # show what would be installed
 cc-linker upgrade               # upgrade to latest
 cc-linker upgrade --to 0.6.2    # install specific version
 cc-linker upgrade --yes         # skip confirmation
-\`\`\`
+```
 
 ### What you get in Feishu
 
 When a new stable version is published to npm, the daemon sends a card like:
 
-\`\`\`
+```
 🆕 cc-linker 有新版本
 当前 v0.6.3 → v0.6.4
 
 升级命令:
-\`\`\`
 cc-linker upgrade
-\`\`\`
 
 [View changelog] [Skip 30 天]
-\`\`\`
+```
 
 Click "Skip" to ignore this version for 30 days.
 
@@ -2905,7 +2929,6 @@ At the top of `CHANGELOG.md`, add a new section (the existing format uses `## [v
   - `Skip 30 天` button on notification card
   - `cc-linker restart` now uses `launchctl unload/load` on macOS launchd to force binary re-resolution
   - Configuration via `[updater]` section in `~/.cc-linker/config.toml`
-```
 
 - [ ] **Step 3: Commit**
 
@@ -2921,10 +2944,19 @@ git commit -m "docs: README + CHANGELOG for auto-upgrade v1.2"
 When all 20 tasks are checked off:
 
 - 5 new modules (`src/updater/`, `src/cli/commands/upgrade.ts`, `src/runtime/updater-tick.ts`, `src/feishu/updater-card.ts`)
-- 4 modified files (`src/utils/paths.ts`, `src/utils/config.ts`, `src/index.ts`, `src/cli/commands/status.ts`, `src/cli/commands/restart.ts`, `src/feishu/bot.ts`)
+- 6 modified files (`src/utils/paths.ts`, `src/utils/config.ts`, `src/index.ts`, `src/cli/commands/status.ts`, `src/cli/commands/restart.ts`, `src/feishu/bot.ts`)
 - 1 new dep (`semver@^7.6.0`)
 - ~1570 LOC total (incl. tests)
-- 12+ test cases covering all 6 status + 4 install modes + pre-release guard
+- 66 test cases across 10 files (5 updater core + 2 CLI + 1 Skip handler + 1 integration + 1 status)
 - README + CHANGELOG updated
+
+Key invariants enforced by tests:
+- Pre-release guard returns `prerelease_only` and never notifies
+- 24h dedup window preserved across `cc-linker upgrade` (force-fetch) calls
+- `check()` does NOT clear `notifiedAt` (so daemon doesn't re-send cards after CLI upgrade)
+- `scheduleNextTick` is wired in bot init (so 24h ticker actually runs)
+- `onSkipClick` has `mappingPath` parameter (so tests can pass tmp path)
+- `tick` is imported in test file (so typecheck passes)
+- README markdown has no broken backslash escapes
 
 Ready for α-stage dogfood (developer self-use + 1-2 internal testers) before γ-stage public rollout.
