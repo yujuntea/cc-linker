@@ -85,9 +85,15 @@ src/feishu/updater-card.ts    # Feishu 卡片构造
 
 | 触发点 | 频率 | 行为 | 失败处理 |
 |--------|------|------|---------|
-| CLI 启动 (`upgrade --check` / `status` / `start`) | 每次 | 查 registry（命中缓存就跳过），打印 banner | 静默 no-op |
-| Daemon 启动 | 一次 | 同步查一次（5s timeout），新版本 → 等 30s 后发卡片 | 跳过本次 |
+| CLI: `cc-linker upgrade --check` | 用户主动 | 查 registry（命中 24h 缓存就跳过），打印 banner 到 stdout | 静默 no-op |
+| CLI: `cc-linker status` | 用户主动 | 末尾追加 banner 行（命中缓存就跳过） | 静默 no-op |
+| CLI: `cc-linker start`（前台，非 daemon） | 用户主动 | 同步查一次（5s timeout），打印 banner 到 stdout 后再启 bot | 静默 no-op |
+| Daemon: `cc-linker start --daemon` 启动后 | 一次 | 同步查一次（5s timeout），新版本 → sleep 30s → 发 Feishu 卡片 | 跳过本次 |
 | Daemon 24h ticker | 每天 | 跟启动相同 | 静默 no-op |
+
+**关键差异**：
+- `cc-linker upgrade --check` / `status` / `start`（前台）= 走 24h 缓存（用 `check()` 共享函数）
+- `cc-linker upgrade`（无 flag，用户主动 apply）= **强制不走缓存**（用 `check({ force: true })`）
 
 ### 3.4 数据流（高层）
 
@@ -151,7 +157,7 @@ exit 0 (banner-only, 不报错)
 ```
 entry: cc-linker upgrade
   ↓
-check() (强制不走缓存)
+check({ force: true }) (强制不走缓存, 走 fresh fetch)
   ↓
 case status:
   up_to_date        → print "已是最新", exit 0
@@ -232,7 +238,10 @@ const child = spawn('cc-linker', ['upgrade', '--from-card'], {
   stdio: ['ignore', logFd, logFd],
 });
 child.unref();
-return card.patch({ state: 'upgrading' });
+return client.im.v1.message.patch({
+  message_id: originalMessageId,
+  content: JSON.stringify({ ...upgradeCard, state: 'upgrading' }),
+});
 // 后续 polling: child 退出后定时 poll .update-check.json
 // status 变 up_to_date 即视为升级成功 (60s 兜底 timeout)
 ```
@@ -358,8 +367,8 @@ skipped_ttl_days = 30
 | # | 触发 | 期望 |
 |---|------|------|
 | K1 | `enabled = false` | 立即返回 `disabled` |
-| K2 | `notify_channel = "cli"` | 写 log + status, 不发卡片 |
-| K3 | `notify_channel = "none"` | 静默, cache 仍写 |
+| K2 | `notify_channel = "cli"` | daemon 启动 / tick 时**不**发 Feishu 卡片，改写 `~/.cc-linker/cc-linker.log`（用 `logger.info`）一行 banner；CLI `status` / `upgrade --check` 仍照常 |
+| K3 | `notify_channel = "none"` | daemon 侧完全静默, 跳过发卡片 + 不写 log；cache 仍写（CLI 用） |
 | K4 | 删 `.update-check.json` | 下次 fresh fetch |
 | K5 | section 不存在 | 用默认值 |
 
@@ -477,14 +486,15 @@ skipped_ttl_days = 30
 
 ---
 
-## 12. Open Questions
+## 12. 落地决策
 
-- OQ1: `skipped_versions` 字段是写到现有 `<owner-openid>` entry，还是另起一个独立 `[updater]` section 在 user-mapping.json 根？
-  - 倾向：写到现有 entry，复用 CAS，最小改动
-- OQ2: 卡片 action handler 是用现成的 `lark-cli` 还是直接 SDK？
-  - 倾向：直接 SDK（跟 `card-updater.ts` 一致）
-- OQ3: 24h ticker 是用 `setInterval` 还是 `setTimeout` 链？
-  - 倾向：`setTimeout` 链（daemon 优雅退出时不留 dangling interval）
+> 原"Open Questions"已在本节内化为硬决策，避免实现期返工。
+
+- **D1**：`skipped_versions` 字段写到现有 `<owner-openid>` entry 的子字段（`user-mapping.json`），复用 `UserManager` 的 `casUpdate` 协议。**不**另起独立 section / 独立文件。
+- **D2**：卡片 action handler 直接用 `@larksuiteoapi/node-sdk` 的 `client.im.v1.message.patch`（跟 `src/feishu/card-updater.ts` 一致），**不**走 `lark-cli`。
+- **D3**：24h ticker 用 `setTimeout` 递归链（每次重排），不用 `setInterval`，daemon 优雅退出时不留 dangling interval。
+- **D4**：启动检查**只在 bot init 完成后**触发（`init-feishu` 之后），user-mapping.json 还不存在时静默 no-op。
+- **D5**：`cc-linker upgrade --from-card`（卡片按钮 spawn 出来的）跟用户主动 `cc-linker upgrade` 行为完全一致，**唯一差异**是 `--from-card` 时打印 `Card patch update status` 到 log（方便诊断卡片状态演化）。
 
 ---
 
