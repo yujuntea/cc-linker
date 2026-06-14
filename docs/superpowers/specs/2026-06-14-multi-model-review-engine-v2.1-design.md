@@ -383,78 +383,55 @@ type ReviewState =
 stateDiagram-v2
     direction LR
 
-    [*] --> PRODUCING : cc-linker review run
+    [*] --> PRODUCING : review run
 
-    %% === Engine Lane（happy path）===
-    PRODUCING --> SELF_REVIEW_R1 : work bg done<br/>(claude --bg spawn #1, sessionId)<br/><i>round += 1</i>
+    PRODUCING --> SELF_REVIEW_R1 : work bg done, round becomes 1
+    SELF_REVIEW_R1 --> SELF_REVIEW_R2 : R1 has issues
+    SELF_REVIEW_R1 --> DONE : R1 is clean
+    SELF_REVIEW_R2 --> EXTERNAL_REVIEW : R2 has issues
+    SELF_REVIEW_R2 --> DONE : R2 is clean
+    EXTERNAL_REVIEW --> JUDGE_BY_WORK : all reviews done
+    JUDGE_BY_WORK --> FIXING : verdict accept
+    JUDGE_BY_WORK --> ARBITRATION : verdict partial or reject
+    ARBITRATION --> JUDGE_ARBITER : arbiter done
+    JUDGE_ARBITER --> FIXING : verdict accept
+    JUDGE_ARBITER --> HUMAN_DECIDE : verdict reject
+    FIXING --> SELF_REVIEW_R1 : fix done, round plus 1
 
-    SELF_REVIEW_R1 --> SELF_REVIEW_R2 : R1 done,<br/>issues > 0
-    SELF_REVIEW_R1 --> DONE : R1 done,<br/>issues = 0
+    HUMAN_DECIDE --> FIXING : user accepts all
+    HUMAN_DECIDE --> ABORTED : user rejects all or 1h timeout
 
-    SELF_REVIEW_R2 --> EXTERNAL_REVIEW : R2 done,<br/>issues > 0
-    SELF_REVIEW_R2 --> DONE : R2 done,<br/>issues = 0
+    PANE_LOST --> ABORTED : user abort or 24h timeout
 
-    EXTERNAL_REVIEW --> JUDGE_BY_WORK : all N reviews done<br/>(Promise.all)
-
-    JUDGE_BY_WORK --> FIXING : verdict = accept<br/>(injectReply to work)
-    JUDGE_BY_WORK --> ARBITRATION : verdict = partial | reject
-
-    ARBITRATION --> JUDGE_ARBITER : arbiter bg done
-
-    JUDGE_ARBITER --> FIXING : verdict = accept<br/>(injectReply to work)
-    JUDGE_ARBITER --> HUMAN_DECIDE : verdict = reject
-
-    FIXING --> SELF_REVIEW_R1 : fix done<br/>(cycle = postfix)<br/><i>round += 1, check max_rounds</i>
-
-    %% === Human Lane ===
-    HUMAN_DECIDE --> FIXING : user: review decide<br/>--accept-all | --accept "1,3"
-    HUMAN_DECIDE --> ABORTED : user: review decide<br/>--reject-all
-    HUMAN_DECIDE --> ABORTED : 1h timeout<br/>(HUMAN_DECIDE_TIMEOUT)
-
-    %% === Trouble Lane ===
-    state "PANE_LOST" as PANE_LOST
-
-    PANE_LOST --> PRODUCING : user: retry
-    PANE_LOST --> SELF_REVIEW_R1 : user: retry
-    PANE_LOST --> SELF_REVIEW_R2 : user: retry
-    PANE_LOST --> EXTERNAL_REVIEW : user: retry
-    PANE_LOST --> JUDGE_BY_WORK : user: retry
-    PANE_LOST --> ARBITRATION : user: retry
-    PANE_LOST --> JUDGE_ARBITER : user: retry
-    PANE_LOST --> FIXING : user: retry
-    PANE_LOST --> ABORTED : user: abort
-    PANE_LOST --> ABORTED : 24h timeout<br/>(PANE_LOST_TIMEOUT)
-
-    note right of PANE_LOST
-        skip 选项：从 PANE_LOST 推进到
-        丢失前状态的 next state，
-        标记 degraded=true
-        （图中省略，详见 §5.3.3）
-    end note
-
-    %% === Terminal ===
     DONE --> [*]
-    FAILED --> [*] : bg spawn 失败 /<br/>profile 错 /<br/>doctor 验证失败
+    FAILED --> [*]
     ABORTED --> [*]
 
-    %% === 全局中断（注：图中不画边，详见 §5.3.4 表）===
+    note right of PANE_LOST
+      PANE_LOST retry restores to the state
+      where the loss was detected.
+      skip option marks the pipeline as degraded
+      and continues to the next state.
+    end note
+
     note left of PRODUCING
-        <b>全局中断（任意状态可被打断）</b><br/>
-        • bg session 消失 → PANE_LOST<br/>
-        • daemon unhealthy → PANE_LOST<br/>
-        • user: review cancel → ABORTED<br/>
-        • R1 entry 时 round ≥ max_rounds<br/>
-        &nbsp;&nbsp;→ ABORTED<br/>
-        详见 §5.3.4 状态转换表
+      Any state can be interrupted:
+      bg session lost or daemon unhealthy goes to PANE_LOST
+      user cancel command goes to ABORTED
+      R1 entry with round at or above max goes to ABORTED
+      See section 5.3.4 for the full transition table
     end note
 ```
 
 **图例说明**：
 - **实线箭头**：Engine 自动推进（bg session 完成触发）
-- **灰背景标识**：Human / Trouble / Terminal lane 状态
-- **`<br/>` 的标签**：multi-line transition label
-- **`<i>...</i>` 标签**：round 计数发生位置（仅 R1 entry 处，详见 §5.2）
-- **左侧 note**：全局中断规则（图中不画边避免视觉混乱，详见 §5.3.4 转换表）
+- **不同形状节点**：开始（`[*]`）/ 结束（`[*]`）/ 中间状态
+- **`note right/left`**：文字注释（不在边上的全局规则用 note 说明，避免图上线条过多）
+- **PANE_LOST → ABORTED**：所有 PANE_LOST 终止路径（retry/skip 用 note 解释，避免图上 8+ 条同标签 transition）
+- **round 计数位置**：仅 R1 entry（PRODUCING→R1 和 FIXING→R1），见 §5.2 round 语义
+- **全局中断规则**：见左侧 note + §5.3.4 状态转换表
+
+**v2.1 简化原因**：v2.1 早期版本用 HTML（`<br/>` `<i>` `<b>`）和 8 条 `PANE_LOST → X : user: retry` 同源同标签 transition，导致部分 Mermaid 渲染器（VS Code Markdown Preview 等）"Failed to load SVG into image" 报错。v2.1 简化为：(1) 标签纯文本无 HTML，(2) PANE_LOST 终止边只画 ABORTED 两条，retry/skip 用 note 解释。完整逻辑见 §5.3.3 PANE_LOST 决策流程和 §5.3.4 状态转换表。
 
 #### 5.3.2 ASCII 备查版（不渲染 Mermaid 的环境）
 
@@ -553,28 +530,29 @@ PANE_LOST 是唯一需要用户实时决策的状态，单独画：
 stateDiagram-v2
     direction TB
 
-    [*] --> PANE_LOST : bg session 消失<br/>或 daemon unhealthy<br/>(Reconciler 检测)
+    [*] --> PANE_LOST : bg session lost or daemon unhealthy
 
-    state "PANE_LOST\n(reason=lost pane role+shortId\ndetectedAt=ts)" as PANE_LOST
-
-    PANE_LOST --> resume_previous_state : user: review status <id><br/>+ retry
-    PANE_LOST --> degraded_continue : user: review status <id><br/>+ skip
-    PANE_LOST --> ABORTED : user: review abort <id>
-    PANE_LOST --> ABORTED : 24h timeout<br/>(PANE_LOST_TIMEOUT)
-
-    state "resume_previous_state" as R1
-    state "degraded_continue" as R2
-
-    R1 --> [previous_state_in_engine]
-    R2 --> [next_state_of_lost_state]
+    PANE_LOST --> ABORTED : user abort
+    PANE_LOST --> ABORTED : 24h timeout
 
     note right of PANE_LOST
-        • 用户在 CLI watch 看到 ⏸️ PANE_LOST 提示
-        • 提示包含：lost pane role + shortId
-        • 其他 pane 状态保持
-        • 倒计时：剩余 24h 后自动 ABORTED
+      PANE_LOST state holds:
+      - lostPane: which role (work or review-A or arbiter)
+      - lostShortId: the 8-char short ID
+      - detectedAt: ISO timestamp
+      - retryTarget: remembered state to restore to
+
+      Three user choices via review status command:
+      - retry: restore to retryTarget state, respawn lost pane
+      - skip: advance to next state with degraded flag set true
+      - abort: clean up all panes, move to ABORTED
     end note
 ```
+
+**文字补充（不在 Mermaid 内的细节）**：
+- `retryTarget` 字段在进入 PANE_LOST 时记录（`panes.X.shortId` 丢失前所在的状态）
+- 用户在 CLI watch 看到 `⚠️ PANE_LOST` 提示，含 lost pane role + shortId + 24h 倒计时
+- retry/skip/abort 通过 `cc-linker review status <id> --interact` 进入子菜单选择
 
 #### 5.3.4 状态转换表（穷举）
 
