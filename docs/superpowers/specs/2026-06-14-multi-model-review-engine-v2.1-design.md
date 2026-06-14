@@ -17,7 +17,7 @@
 |---|---|---|
 | v1 | 2026-06-06 | 初版，13 个新模块全栈自建（`src/review/` 子目录） |
 | v2 | 2026-06-13 | 复用 Agent View 已有能力；新建 7 个模块；CLI 主输出 + 简版 IDE |
-| **v2.1** | **2026-06-14** | **本次 patch。18 项变更：**<br>1) **§3.1 复用层** —— 实测 `claude --bg` 是真 bg session 入口（v2 假定但未验证），adapter 重写为 `Bun.spawn(['claude', '--bg', ...])`<br>2) **§4.2 work session 长生命周期** —— 每轮 `--bg` 起新 shortId 但 sessionId 跨轮不变；`panes.work` 同时追踪两者<br>3) **§5.1 JUDGE_BY_WORK / FIXING** —— 走 `RendezvousClient.injectReply()`（daemon 协议），**不**起新 bg session；v2 错误地假定用 `startSession` + `--resume`<br>4) **§6.1 PaneRegistry** —— 新增 `currentRoundShortId` 字段（每轮变）+ `sessionId` 字段（跨轮不变）<br>5) **§10.1 新增错误** —— daemon crash 检测（`~/.claude/daemon/roster.json`）+ 网络瞬态 503 重试 + CLI 版本校验<br>6) **§5.2 max_rounds 减半** —— Spec=4 / Plan=5 / Code=8 / Global=6（v2 的 8/10/15/12 跑满 ≈ 2h，太长）<br>7) **§8 Phase 1 砍 IDE** —— cc-linker 没有 HTTP 框架；Phase 1 改 CLI `--watch` 模式（rich terminal），Phase 2 再补 IDE<br>8) **§6.4 Reconciler 改保守策略** —— pane bg session 丢失 → `PANE_LOST` 状态 + CLI 询问用户（retry/abort/skip），不再直接 FAILED<br>9) **§3.3 CLI 改 subcommand group** —— 跟 `daemon` / `hook` 一致：`cc-linker review run/status/abort/report/decide/cancel/doctor` 7 个子命令<br>10) **§10.1 HUMAN_DECIDE 超时** —— 24h → 1h 默认，可配<br>11) **§9 PhaseDetector 加启发式 4** —— rawInput 含 `.ts/.py/.go` 后缀或 `line N/L:N` 引用 → 强制 code<br>12) **新增 `cc-linker review doctor`** —— 启动前验证：profile 引用的 provider 是否在 `~/.claude/providers/` + CLI 版本 + daemon 健康<br>13) **新增 `/cancel review <id>`** —— 用户飞书/CLI 中止正在跑的 review，自动清理 pane bg session（`claude stop <short>`）<br>14) **§11/§12 明确 review 不改源文件** —— Phase 1 review 只输出 Markdown 报告到 `<cwd>/.claude/reviews/<pipelineId>.md`，**不**修改用户项目源码；修改留 Phase 2 IDE<br>15) **§6.2 5 目录** —— 修 v2 写的"6 目录"，review pipeline 用 5 目录（running/human_pending/done/failed/aborted），**不**用 pending/<br>16) **§8 "1+N pane"** —— v2 写的"1+N+1 pane"改为"1+N pane"（无 arbiter）<br>17) **§12.1 Phase 1 重排** —— W6 IDE 任务删除；新增 T8 CLI `--watch` 模式任务<br>18) **§5.x R1/R2 改 self-review-and-fix + 删 ARBITRATION** —— R1/R2 先 fix 自己发现的问题再决定下一步；JUDGE_BY_WORK verdict 简化为 accept/reject 两值，由 P0/P1 rejection ratio 决定；删 ARBITRATION + JUDGE_ARBITER 两个状态；reject 直接走 HUMAN_DECIDE（不再起 arbiter bg session） |
+| **v2.1** | **2026-06-14** | **本次 patch。19 项变更：**<br>1) **§3.1 复用层** —— 实测 `claude --bg` 是真 bg session 入口（v2 假定但未验证），adapter 重写为 `Bun.spawn(['claude', '--bg', ...])`<br>2) **§4.2 work session 长生命周期** —— 每轮 `--bg` 起新 shortId 但 sessionId 跨轮不变；`panes.work` 同时追踪两者<br>3) **§5.1 JUDGE_BY_WORK / FIXING** —— 走 `RendezvousClient.injectReply()`（daemon 协议），**不**起新 bg session；v2 错误地假定用 `startSession` + `--resume`<br>4) **§6.1 PaneRegistry** —— 新增 `currentRoundShortId` 字段（每轮变）+ `sessionId` 字段（跨轮不变）<br>5) **§10.1 新增错误** —— daemon crash 检测（`~/.claude/daemon/roster.json`）+ 网络瞬态 503 重试 + CLI 版本校验<br>6) **§5.2 max_rounds 减半** —— Spec=4 / Plan=5 / Code=8 / Global=6（v2 的 8/10/15/12 跑满 ≈ 2h，太长）<br>7) **§8 Phase 1 砍 IDE** —— cc-linker 没有 HTTP 框架；Phase 1 改 CLI `--watch` 模式（rich terminal），Phase 2 再补 IDE<br>8) **§6.4 Reconciler 改保守策略** —— pane bg session 丢失 → `PANE_LOST` 状态 + CLI 询问用户（retry/abort/skip），不再直接 FAILED<br>9) **§3.3 CLI 改 subcommand group** —— 跟 `daemon` / `hook` 一致：`cc-linker review run/status/abort/report/decide/cancel/doctor` 7 个子命令<br>10) **§10.1 HUMAN_DECIDE 超时** —— 24h → 1h 默认，可配<br>11) **§9 PhaseDetector 加启发式 4** —— rawInput 含 `.ts/.py/.go` 后缀或 `line N/L:N` 引用 → 强制 code<br>12) **新增 `cc-linker review doctor`** —— 启动前验证：profile 引用的 provider 是否在 `~/.claude/providers/` + CLI 版本 + daemon 健康<br>13) **新增 `/cancel review <id>`** —— 用户飞书/CLI 中止正在跑的 review，自动清理 pane bg session（`claude stop <short>`）<br>14) **§11/§12 明确 review 不改源文件** —— Phase 1 review 只输出 Markdown 报告到 `<cwd>/.claude/reviews/<pipelineId>.md`，**不**修改用户项目源码；修改留 Phase 2 IDE<br>15) **§6.2 5 目录** —— 修 v2 写的"6 目录"，review pipeline 用 5 目录（running/human_pending/done/failed/aborted），**不**用 pending/<br>16) **§8 "1+N pane"** —— v2 写的"1+N+1 pane"改为"1+N pane"（无 arbiter）<br>17) **§12.1 Phase 1 重排** —— W6 IDE 任务删除；新增 T8 CLI `--watch` 模式任务<br>18) **§5.x R1/R2 改 self-review-and-fix + 删 ARBITRATION** —— R1/R2 先 fix 自己发现的问题再决定下一步；JUDGE_BY_WORK verdict 简化为 accept/reject 两值，由 P0/P1 rejection ratio 决定；删 ARBITRATION + JUDGE_ARBITER 两个状态；reject 直接走 HUMAN_DECIDE（不再起 arbiter bg session）<br>19) **§5.x R1/R2 拆出 FIXING 节点 + verify-first** —— R1/R2 改为 identify-only（不复修）；新增统一 FIXING 状态（source 字段区分 R1/R2/JUDGE/HUMAN 4 个调用点）；FIXING prompt 严格要求 "先验证每个 issue 是 real 还是 hallucination，对 real 的才修"；修复完成后由 source 决定下一状态（R1→R2 / R2→EXTERNAL_REVIEW / JUDGE→R1 postfix / HUMAN→R1 postfix） |
 
 > v2 的"§2 复用层（0 行新代码）"v2.1 **保留并加强**——实测 `claude --bg` + `--settings` + `--reply-on-resume` + `state.json` + `readJobState` + `RendezvousClient.injectReply` + `claude stop` + `claude logs` 全部现成可用。
 
@@ -185,34 +185,44 @@ T10   CLI (Claude work bg)        ...处理中...
 T11   CLI (Claude work bg)        state.json.state: 'running' → 'done'（CLI 维护）
 T12   Adapter.poll(short1)        detect state.json.state == 'done' → emit 'work_produced'
 T13   Engine                      transition: PRODUCING → SELF_REVIEW_R1 (**round=1**，R1 entry +1)
-T14   Engine                      调 adapter.resumeWorkSession({ sessionId, prompt:'review 你的产出...', provider:'claude-sonnet-4' })
+T14   Engine                      调 adapter.resumeWorkSession({ sessionId, prompt:'review 你的产出（identify only，不修复）...', provider:'claude-sonnet-4' })
 T15   Adapter                     Bun.spawn(['claude','--bg','review...','--resume',sessionId,'--reply-on-resume','--settings',sonnetPath])
 T16   CLI (Claude work bg)        state.json 中 respawnFlags 加 --reply-on-resume；supervisor 唤醒 session，新 shortId2
 T17   Engine                      panes.work.currentRoundShortId = 'short2'（sessionId 不变）
 T18   CLI (watch mode)            ANSI 更新：state=SELF_REVIEW_R1, panes=[work:busy, review-A:idle, review-B:idle]
-T19   ...                         R1 收敛 → 走 R2 → R2 不收敛
-T20   Engine                      transition: SELF_REVIEW_R2 → EXTERNAL_REVIEW（round 不变，仍=1）
-T21   Engine                      Promise.all([
+T19   ...                         R1 收敛 → R1 发现 3 issues
+T20   Engine                      transition: SELF_REVIEW_R1 → FIXING (source=R1)，inputIssues = R1 issues
+T21   Engine                      调 adapter.injectReply({ shortId:'short2', prompt:'verify each issue, fix real ones...' })
+T22   Adapter                     RendezvousClient.injectReply() → daemon → short2 bg session
+T23   CLI (Claude work bg)        处理中；state.json.state: 'running'
+T24   Adapter.poll(short2)        FIXING 完成，verify+fix 结果输出 → emit 'fix_complete'
+T25   Engine                      FIXING(source=R1) → SELF_REVIEW_R2（round 不变）
+T26   Engine                      调 adapter.resumeWorkSession({ sessionId, prompt:'review after fix...' })
+T27   Adapter                     Bun.spawn(['claude','--bg','review again...','--resume',sessionId,'--reply-on-resume'])
+T28   ...                         R2 发现 1 new issue
+T29   Engine                      transition: SELF_REVIEW_R2 → FIXING (source=R2)
+T30   ...                         FIXING(source=R2) → EXTERNAL_REVIEW（round 不变）
+T31   Engine                      Promise.all([
                                     adapter.startSession({ role:'review', provider:'kimi-for-coding', prompt:'review X...', isNew:true }),
                                     adapter.startSession({ role:'review', provider:'bailian-qwen3.6', prompt:'review X...', isNew:true }),
                                   ])
-T22   Adapter × 2                 同时 spawn 2 个 bg session，shortId3/4
-T23   Engine                      panes.reviews = [{role:'review-A', shortId:'short3', round:1}, {role:'review-B', shortId:'short4', round:1}]
-T24   CLI (watch mode)            state=EXTERNAL_REVIEW, panes=[work:done, review-A:busy, review-B:busy]
-T25   CLI × 2                     ...并行 review...
-T26   Adapter.poll(short3) + poll(short4)  两个都 done → emit 'external_opinions_ready'
-T27   Engine                      transition: EXTERNAL_REVIEW → JUDGE_BY_WORK（round 不变，仍=1）
-T28   Engine                      调 adapter.injectReply({ shortId:'short2', prompt:'judge opinions A,B...' })
-T29   Adapter                     RendezvousClient.injectReply() → TCP socket → daemon → 注入到 short2 bg session
-T30   CLI (Claude work bg)        处理中；state.json.state: 'running'
-T31   Adapter.poll(short2)        state.json.state == 'done' + output.result 含 per-issue accept/reject → engine 计算 verdict（P0/P1 rejection ratio） → emit 'work_verdict: accept'
-T32   Engine                      verdict='accept' → transition: JUDGE_BY_WORK → FIXING（round 不变）
+T32   Adapter × 2                 同时 spawn 2 个 bg session，shortId5/6
+T33   Engine                      panes.reviews = [{role:'review-A', shortId:'short5', round:1}, {role:'review-B', shortId:'short6', round:1}]
+T34   CLI (watch mode)            state=EXTERNAL_REVIEW, panes=[work:done, review-A:busy, review-B:busy]
+T35   CLI × 2                     ...并行 review...
+T36   Adapter.poll(short5) + poll(short6)  两个都 done → emit 'external_opinions_ready'
+T37   Engine                      transition: EXTERNAL_REVIEW → JUDGE_BY_WORK（round 不变，仍=1）
+T38   Engine                      调 adapter.injectReply({ shortId:'short2', prompt:'judge opinions A,B...' })
+T39   Adapter                     RendezvousClient.injectReply() → TCP socket → daemon → 注入到 short2 bg session
+T40   CLI (Claude work bg)        处理中；state.json.state: 'running'
+T41   Adapter.poll(short2)        state.json.state == 'done' + output.result 含 per-issue accept/reject → engine 计算 verdict（P0/P1 rejection ratio） → emit 'work_verdict: accept'
+T42   Engine                      verdict='accept' → transition: JUDGE_BY_WORK → FIXING (source=JUDGE)（round 不变）
                                                   verdict='reject' → transition: JUDGE_BY_WORK → HUMAN_DECIDE（移到 human_pending/）
-T33   Engine                      调 adapter.injectReply({ shortId:'short2', prompt:'apply accepted fixes...' })
-T34   Adapter.poll(short2)        done → emit 'fix_complete'
-T35   Engine                      transition: FIXING → SELF_REVIEW_R1 (cycle: 'postfix')，**round=2**，check max_rounds
-T36   ...                         循环直到 R1/R2 收敛 → DONE
-T37   Engine                      写 PipelineRecord 到 done/，CLI 输出 state=DONE + Markdown 报告路径
+T43   Engine                      调 adapter.injectReply({ shortId:'short2', prompt:'verify each accepted issue, fix real ones...' })
+T44   Adapter.poll(short2)        done → emit 'fix_complete'
+T45   Engine                      transition: FIXING(source=JUDGE) → SELF_REVIEW_R1 (cycle: 'postfix')，**round=2**，check max_rounds
+T46   ...                         循环直到 R1/R2 收敛 → DONE
+T47   Engine                      写 PipelineRecord 到 done/，CLI 输出 state=DONE + Markdown 报告路径
 ```
 
 ### 4.2 bg session 之间"传递内容"（v2.1 修正）
@@ -302,16 +312,18 @@ async function watchPipeline(pipelineId: string): Promise<void> {
 type ReviewState =
   // === Produce 阶段 ===
   | { kind: 'PRODUCING';         pipelineId; round: number; pane: 'work' }
-  // === 自查+自修（v2.1 变更 18：先 fix 再决定下一步）===
+  // === 自查阶段（v2.1 变更 19：identify-only，fix 在后续 FIXING 节点）===
   | { kind: 'SELF_REVIEW_R1';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
   | { kind: 'SELF_REVIEW_R2';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
+  // === 修复节点（v2.1 变更 19：从 R1/R2/JUDGE/HUMAN 4 个调用点统一进入）===
+  | { kind: 'FIXING';            pipelineId; round: number; pane: 'work';
+                                  source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE';
+                                  inputIssues: Issue[] }
   // === 外审（可能并行 N 个 pane）===
   | { kind: 'EXTERNAL_REVIEW';   pipelineId; round: number; cycle: 'initial' | 'postfix';
                                   panes: { role: 'review-A' | 'review-B' | ...; shortId: string }[] }
   // === 评判（v2.1 变更 18：2 值 verdict，不再有 ARBITRATION）===
   | { kind: 'JUDGE_BY_WORK';     pipelineId; round: number; pane: 'work' }
-  // === 修复（v2.1 修正：走 injectReply）===
-  | { kind: 'FIXING';            pipelineId; round: number; pane: 'work' }
   // === v2.1 新增：pane 丢失（用户询问，不直接 FAILED）===
   | { kind: 'PANE_LOST';         pipelineId; round: number;
                                   lostPane: 'work' | 'review-A' | 'review-B' | ...;
@@ -324,26 +336,27 @@ type ReviewState =
   | { kind: 'ABORTED';           pipelineId; round: number; reason; abortedBefore };
 ```
 
-**v2.1 相对 v2 的 5 个关键调整**：
+**v2.1 相对 v2 的 6 个关键调整**：
 1. **JUDGE_BY_WORK / FIXING 走 injectReply**：v2 错把它们当 `startSession` + `--resume`，v2.1 改走 `RendezvousClient.injectReply()`，daemon 协议
 2. **新增 `PANE_LOST` 状态**：v2 写"丢失直接 FAILED"，v2.1 改为进入 `PANE_LOST` 等用户决策（retry/abort/skip）
 3. **`panes: { ...; shortId }[]`**：v2.1 明确每个 pane 跟踪 shortId，配合 §6.1 PaneRegistry
 4. **EXTERNAL_REVIEW 支持 N pane**：v2.1 删"4 pane"硬编码，改"N pane"（profile 可配）
 5. **变更 18：删 ARBITRATION + JUDGE_ARBITER**：v2.1 verdict 从 3 值（accept/partial/reject）简化为 2 值（accept/reject）；reject 直接走 HUMAN_DECIDE；R1/R2 改 self-review-and-fix
+6. **变更 19：R1/R2 拆出 FIXING 节点**：R1/R2 改为 identify-only（不复修）；新增统一 FIXING 状态（source 字段区分 R1/R2/JUDGE/HUMAN 4 个调用点）；FIXING prompt 严格要求 "verify-first"（先验证 issue 是 real 还是 hallucination，对 real 的才修）
 
 ### 5.2 max_rounds 计数规则（v2.1 减半）
 
 **Round 语义（v2.1 明确）**：
-- **1 round = 1 个完整 cycle**：从 R1 entry 开始（含 initial / postfix），经历 R2 / ExtRev / Judge / FIXING，回到 R1 entry（或 DONE）
+- **1 round = 1 个完整 cycle**：从 R1 entry 开始（含 initial / postfix），经历 R2 / FIXING / ExtRev / Judge / FIXING，回到 R1 entry（或 DONE）
 - **`round` 计数器在每次进入 `SELF_REVIEW_R1` 时 +1**（无论 cycle 是 initial 还是 postfix）
-- **其他 counting 状态**（R2 / ExtRev / Judge）属于当 round 的子步骤，**不**独立 +1
+- **其他 counting 状态**（R2 / ExtRev / Judge / FIXING）属于当 round 的子步骤，**不**独立 +1
 - **`max_rounds` 检查在 `SELF_REVIEW_R1` entry 处**：round ≥ max_rounds → ABORTED
 
 | 类别 | 状态 | round 增量 |
 |------|------|-----------|
 | **Round start** | `SELF_REVIEW_R1`（initial + postfix，每次 entry） | ✅ **+1** |
-| **Round 中间** | `SELF_REVIEW_R2` / `EXTERNAL_REVIEW` / `JUDGE_BY_WORK` | 0（属于当 round 的子步骤） |
-| **免费** | `PRODUCING` / `FIXING` / `DONE` / `FAILED` / `ABORTED` / `PANE_LOST` | 0 |
+| **Round 中间** | `SELF_REVIEW_R2` / `FIXING` / `EXTERNAL_REVIEW` / `JUDGE_BY_WORK` | 0（属于当 round 的子步骤） |
+| **免费** | `PRODUCING` / `DONE` / `FAILED` / `ABORTED` / `PANE_LOST` | 0 |
 | **逃生** | `HUMAN_DECIDE` | 0（永远可达） |
 
 **默认值**（v2.1 减半）：
@@ -370,10 +383,12 @@ type ReviewState =
 
 | Lane | 状态 | 驱动者 | 含义 |
 |------|------|--------|------|
-| **Engine lane** | PRODUCING / SELF_REVIEW_R1 / R2 / EXTERNAL_REVIEW / JUDGE_BY_WORK / FIXING | Engine（自动） | 主流程，引擎自己推进 |
+| **Engine lane** | PRODUCING / SELF_REVIEW_R1 / R2 / FIXING / EXTERNAL_REVIEW / JUDGE_BY_WORK | Engine（自动） | 主流程，引擎自己推进 |
 | **Human lane** | HUMAN_DECIDE | User（CLI） | 人工决策逃生通道 |
 | **Trouble lane** | PANE_LOST | User + Engine | 异常恢复，需要用户决策 |
 | **Terminal** | DONE / FAILED / ABORTED | — | 终态 |
+
+**v2.1 变更 19**：R1/R2 改为 identify-only（不复修），FIXING 抽出来作为独立节点。所有修复都走 FIXING（source 字段区分 R1/R2/JUDGE/HUMAN 4 个调用点），FIXING prompt 强制 verify-first。
 
 **3 类驱动者**：
 - **Engine-driven transition**：claude bg session 完成 → engine 推下一状态
@@ -389,23 +404,35 @@ stateDiagram-v2
     [*] --> PRODUCING : review run
 
     PRODUCING --> SELF_REVIEW_R1 : work bg done, round becomes 1
-    SELF_REVIEW_R1 --> SELF_REVIEW_R2 : R1 has issues
-    SELF_REVIEW_R1 --> DONE : R1 is clean
-    SELF_REVIEW_R2 --> EXTERNAL_REVIEW : R2 has issues
-    SELF_REVIEW_R2 --> DONE : R2 is clean
+    SELF_REVIEW_R1 --> FIXING : R1 found issues
+    SELF_REVIEW_R1 --> DONE : R1 clean
+    FIXING --> SELF_REVIEW_R2 : verify and fix done (source R1)
+    SELF_REVIEW_R2 --> FIXING : R2 found issues
+    SELF_REVIEW_R2 --> DONE : R2 clean
+    FIXING --> EXTERNAL_REVIEW : verify and fix done (source R2)
     EXTERNAL_REVIEW --> JUDGE_BY_WORK : all reviews done
-    JUDGE_BY_WORK --> FIXING : verdict accept
+    JUDGE_BY_WORK --> FIXING : verdict accept (source JUDGE)
     JUDGE_BY_WORK --> HUMAN_DECIDE : verdict reject
-    FIXING --> SELF_REVIEW_R1 : fix done, round plus 1
+    FIXING --> SELF_REVIEW_R1 : fix done (source JUDGE or HUMAN), round plus 1
 
-    HUMAN_DECIDE --> FIXING : user accepts all
-    HUMAN_DECIDE --> ABORTED : user rejects all or 1h timeout
+    HUMAN_DECIDE --> FIXING : user accepts (source HUMAN)
+
+    HUMAN_DECIDE --> ABORTED : user rejects or 1h timeout
 
     PANE_LOST --> ABORTED : user abort or 24h timeout
 
     DONE --> [*]
     FAILED --> [*]
     ABORTED --> [*]
+
+    note right of FIXING
+      FIXING prompt requires verify-first:
+      1. Re-read code/context for each input issue
+      2. Decide real or hallucination
+      3. Fix only real issues
+      4. Verify fix correctness
+      Output JSON per issue plus all_real_fixed flag
+    end note
 
     note right of PANE_LOST
       PANE_LOST retry restores to the state
@@ -425,9 +452,9 @@ stateDiagram-v2
 
 **图例说明**：
 - **实线箭头**：Engine 自动推进（bg session 完成触发）
-- **不同形状节点**：开始（`[*]`）/ 结束（`[*]`）/ 中间状态
-- **`note right/left`**：文字注释（不在边上的全局规则用 note 说明，避免图上线条过多）
-- **PANE_LOST → ABORTED**：所有 PANE_LOST 终止路径（retry/skip 用 note 解释，避免图上 8+ 条同标签 transition）
+- **FIXING 节点 source 字段**：决定下一状态（R1→R2 / R2→EXTERNAL_REVIEW / JUDGE→R1 postfix / HUMAN→R1 postfix）
+- **FIXING prompt 统一模板**：所有 source 共用，prompt 内容要求 verify-first（见 §7 ReviewProfile `prompts.work.fixing`）
+- **`note right/left`**：文字注释（全局规则用 note 说明，避免图上线条过多）
 - **round 计数位置**：仅 R1 entry（PRODUCING→R1 和 FIXING→R1），见 §5.2 round 语义
 - **全局中断规则**：见左侧 note + §5.3.4 状态转换表
 
@@ -441,54 +468,77 @@ stateDiagram-v2
                           ╚══════════════════════════════════════════╝
 
   ┌──────────┐  work bg done   ┌──────────────┐  issues>0  ┌──────────────┐
-  │PRODUCING ├───────────────►│SELF_REVIEW_R1├──────────►│SELF_REVIEW_R2│
-  │          │  (spawn #1)    │              │            │              │
-  │ --bg N1  │                │ R1 done      │            │ R2 done      │
-  │ sessionId│                │ 0 issues ─┐  │            │ 0 issues ─┐  │
-  └──────────┘                │           │  │            │           │  │
-                              └───────────┼──┼────┐       └───────────┼──┼────┐
-                                          │  │    │ issues>0          │  │    │
-                                          ▼  ▼    ▼                   ▼  ▼    ▼
-                                       ┌──────────────┐ issues>0  ┌──────────────┐
-                                       │    DONE      │           │EXTERNAL_REVIEW│
-                                       │  (terminal)  │◄──────────┤              │
-                                       └──────────────┘           │ Promise.all  │
-                                                                   │ spawn N2,N3  │
-                                                                   └──────┬───────┘
-                                                                          │ all done
-                                                                          ▼
+  │PRODUCING ├───────────────►│SELF_REVIEW_R1├──────────►│    FIXING    │
+  │          │  (spawn #1)    │              │            │   (verify +  │
+  │ --bg N1  │                │ R1 done      │            │     fix)     │
+  │ sessionId│                │ 0 issues ─┐  │            │              │
+  └──────────┘                │           │  │            │ source=R1    │
+                              └───────────┼──┼────┐       │ (verify-first│
+                                          │  │    │       │  prompt)     │
+                                          ▼  ▼    ▼       └──────┬───────┘
+                                       ┌──────────────┐ verify    │
+                                       │    DONE      │ +fix done│
+                                       │  (terminal)  │◄─────────┤
+                                       └──────────────┘          │
+                                                  ┌─────────────┘  ▼ (source=R1→R2)
+                                                  │            ┌──────────────┐
+                                                  │  issues>0  │SELF_REVIEW_R2│
+                                                  └───────────►│              │
+                                                               │ R2 done      │
+                                                               │ 0 issues ─┐  │
+                                                               └───────────┼──┼────┐
+                                                                           │  │    │ issues>0
+                                                                           ▼  ▼    ▼
+                                                                        ┌──────────────┐
+                                                                        │    FIXING    │
+                                                                        │   (verify +  │
+                                                                        │     fix)     │
+                                                                        │ source=R2    │
+                                                                        └──────┬───────┘
+                                                                               │ verify+fix done
+                                                                               ▼ (source=R2→EXTERNAL_REVIEW)
+                                                                        ┌──────────────┐
+                                                                        │EXTERNAL_REVIEW│
+                                                                        │              │
+                                                                        │ Promise.all  │
+                                                                        │ spawn N2,N3  │
+                                                                        └──────┬───────┘
+                                                                               │ all done
+                                                                               ▼
   ╔══════════════════════════════════════════╗
   ║  Judge lane (work session 接收注入)      ║
   ╚══════════════════════════════════════════╝
-                                                                   ┌──────────────┐
-                                                  all opinions ──►│JUDGE_BY_WORK │
-                                                                   │ (injectReply)│
-                                                                   └──────┬───────┘
-                                                  ┌────────────────────┼────────────────┐
-                                                  ▼ verdict=accept     ▼ verdict=reject
-                                                  │                    │ (P0/P1 rejection ratio ≥ 30%)
-                                          ┌──────────────┐         ┌──────────────┐
-                                          │    FIXING    │         │ HUMAN_DECIDE │
-                                          │ (injectReply)│         │  (CLI 决策)  │
-                                          └──────┬───────┘         └──────┬───────┘
-                                                 │                        │
-                                          ╔══════════════════════════════════════════╗
-                                          ║  Human lane (人工兜底)                  ║
-                                          ╚══════════════════════════════════════════╝
-                                                 │  ╔═══════════════════════════╗ │          │
-                                                 │  ║ 1h timeout / --reject-all ║ │          │
-                                                 │  ╚═══════════════════════════╝ │          │
-                                                 │                                ▼          │
-                                                 │                          ┌──────────────┐│
-                                                 │                          │   ABORTED    │◄┘
-                                                 │                          │  (terminal)  │
-                                                 │                          └──────────────┘
-                                                 ▼ (FIXING 完成)
-                                          ┌──────────────────────────────────┐
-                                          │   SELF_REVIEW_R1 (cycle=postfix) │
-                                          │   ← 自此进入 postfix 循环        │
-                                          │   ← 回到本图顶部 R1              │
-                                          └──────────────────────────────────┘
+                                                                              ┌──────────────┐
+                                                              all opinions ──►│JUDGE_BY_WORK │
+                                                                              │ (injectReply)│
+                                                                              └──────┬───────┘
+                                                              ┌──────────────────┼─────────────────┐
+                                                              ▼ verdict=accept   ▼ verdict=reject  │
+                                                                                │ (P0/P1 rej ≥ 30%)
+                                                                      ┌──────────────┐         ┌──────────────┐
+                                                                      │    FIXING    │         │ HUMAN_DECIDE │
+                                                                      │ (injectReply)│         │  (CLI 决策)  │
+                                                                      │ source=JUDGE │         └──────┬───────┘
+                                                                      └──────┬───────┘                │
+                                                                             │                       │
+  ╔══════════════════════════════════════════╗                              │                       │
+  ║  Human lane (人工兜底)                  ║                              │  ╔════════════╗        │
+  ╚══════════════════════════════════════════╝                              │  ║ 1h timeout ║        │
+                                                                             │  ╚════════════╝        │
+                                                                             │                       ▼
+                                                                             │                ┌──────────────┐
+                                                                             │                │   ABORTED    │
+                                                                             │                │  (terminal)  │
+                                                                             │                └──────────────┘
+                                                                             │   HUMAN_DECIDE ──accept──► FIXING
+                                                                             │                       │ (source=HUMAN)
+                                                                             │                       ▼ verify+fix done
+                                                                             ▼ (FIXING 完成, source=JUDGE/HUMAN→R1)
+                                                                  ┌──────────────────────────────────┐
+                                                                  │   SELF_REVIEW_R1 (cycle=postfix) │
+                                                                  │   ← 自此进入 postfix 循环        │
+                                                                  │   ← 回到本图顶部 R1              │
+                                                                  └──────────────────────────────────┘
 
   ╔══════════════════════════════════════════╗
   ║  Trouble lane (任意状态可被打断)         ║
@@ -550,29 +600,32 @@ stateDiagram-v2
 | `[*]` | `cc-linker review run` | PRODUCING | doctor 验证 + 创建 PipelineRecord | — | 0 |
 | **PRODUCING** | work bg state=`done` | SELF_REVIEW_R1 | 记录 `panes.work.sessionId` | work (bg short1) | 0 → 1 |
 | **SELF_REVIEW_R1** | work bg done, issues=[] | DONE | 生成 report + 移到 `done/` | work (bg short2) | 1 |
-| **SELF_REVIEW_R1** | work bg done, issues=[N] | SELF_REVIEW_R2 | 记录 R1 issues | work (bg short2) |
+| **SELF_REVIEW_R1** | work bg done, issues=[N] | FIXING (source=R1) | 记录 R1 issues 作为 `inputIssues` | work (bg short2) |
 | **SELF_REVIEW_R2** | work bg done, issues=[] | DONE | 生成 report + 移到 `done/` | work (bg short3) |
-| **SELF_REVIEW_R2** | work bg done, issues=[N] | EXTERNAL_REVIEW | 记录 R2 issues | work (bg short3) |
+| **SELF_REVIEW_R2** | work bg done, issues=[N] | FIXING (source=R2) | 记录 R2 issues 作为 `inputIssues` | work (bg short3) |
+| **FIXING (source=R1)** | work bg done, verify+fix complete | SELF_REVIEW_R2 | 记录 `per_issue` (real/hallucination) + `all_real_fixed` | work (bg short4) |
+| **FIXING (source=R2)** | work bg done, verify+fix complete | EXTERNAL_REVIEW | 同上 | work (bg short5) |
 | **EXTERNAL_REVIEW** | all N reviews state=`done` | JUDGE_BY_WORK | 收集 N 条 opinions | reviews (×N) |
-| **JUDGE_BY_WORK** | work bg done, verdict=`accept` (P0/P1 rejection ratio < 30%) | FIXING | injectReply("apply these") | work (injectReply) |
+| **JUDGE_BY_WORK** | work bg done, verdict=`accept` (P0/P1 rejection ratio < 30%) | FIXING (source=JUDGE) | 记录 accepted issues 作为 `inputIssues` | work (injectReply) |
 | **JUDGE_BY_WORK** | work bg done, verdict=`reject` (P0/P1 rejection ratio ≥ 30%) | HUMAN_DECIDE | 移到 `human_pending/` | work (injectReply) |
-| **HUMAN_DECIDE** | user: `review decide --accept-all` | FIXING | 移到 `running/`，记录 decision | — |
-| **HUMAN_DECIDE** | user: `review decide --accept "1,3"` | FIXING | 移到 `running/`，记录 decision | — |
+| **HUMAN_DECIDE** | user: `review decide --accept-all` | FIXING (source=HUMAN) | 移到 `running/`，记录 decision + accepted issues | — |
+| **HUMAN_DECIDE** | user: `review decide --accept "1,3"` | FIXING (source=HUMAN) | 移到 `running/`，记录 decision + 子集 issues | — |
 | **HUMAN_DECIDE** | user: `review decide --reject-all` | ABORTED | `claude stop` × pane 数 + 移到 `aborted/` | — |
 | **HUMAN_DECIDE** | 1h timeout | ABORTED | 同上 | — |
-| **FIXING** | work bg state=`done` | SELF_REVIEW_R1 | cycle=`postfix`，**round += 1**（在 R1 entry 处） | work (injectReply) |
+| **FIXING (source=JUDGE)** | work bg done, verify+fix complete | SELF_REVIEW_R1 | cycle=`postfix`，**round += 1**（在 R1 entry 处） | work (injectReply) |
+| **FIXING (source=HUMAN)** | work bg done, verify+fix complete | SELF_REVIEW_R1 | cycle=`postfix`，**round += 1**（在 R1 entry 处） | work (injectReply) |
 | **任意状态 X** | bg session 消失 (Reconciler) | PANE_LOST | 记录 `lostPane` + `lostShortId` + `detectedAt` | lost pane | 不变 |
 | **任意状态 X** | user: `review cancel` | ABORTED | `claude stop` × pane 数 + 移到 `aborted/` | — | 不变 |
 | **R1 entry** | round ≥ max_rounds | ABORTED | reason=`max_rounds_exceeded` | — | 超过阈值 |
 | **PANE_LOST** | user: retry | 恢复到状态 X | 重新 spawn 该 pane | lost pane |
-| **PANE_LOST** | user: skip | 推进到 X 的 next state | 标记 `degraded=true`，用空 opinions | — |
+| **PANE_LOST** | user: skip | 推进到 X 的 next state（含 FIXING 节点） | 标记 `degraded=true`，用空 issues | — |
 | **PANE_LOST** | user: abort | ABORTED | `claude stop` × pane 数 | — |
 | **PANE_LOST** | 24h timeout | ABORTED | reason=`pane_lost_timeout` | — |
 | **PRODUCING** | work bg spawn 失败 | FAILED | reason=`bg_spawn_failed` | — |
 | **任意状态 X** | profile 加载失败（doctor 阶段） | FAILED | reason=`profile_invalid` | — |
 
 **状态转换的 3 个不变量**：
-1. **`round` 仅在 `SELF_REVIEW_R1` entry 处 +1**（无论 cycle 是 initial 还是 postfix）；其他 counting state（R2 / ExtRev / Judge / Arbiter / Judge_Arb）属于当 round 的子步骤，不独立 +1；`max_rounds` 检查也只在 R1 entry 处
+1. **`round` 仅在 `SELF_REVIEW_R1` entry 处 +1**（无论 cycle 是 initial 还是 postfix）；其他 counting state（R2 / FIXING / ExtRev / Judge）属于当 round 的子步骤，不独立 +1；`max_rounds` 检查也只在 R1 entry 处
 2. **任意状态**可被 cancel/max_rounds/pane_lost 打断 → 转到对应终态或 PANE_LOST
 3. **PANE_LOST 是可恢复的中转态**，不是终态——必须经用户决策后才离开
 
@@ -584,25 +637,26 @@ stateDiagram-v2
 |--------|------|-------|----------|-------------|------|
 | 0 | PRODUCING | (无) | work=idle | `Bun.spawn(['claude','--bg','fix NPE...','--settings',sonnet])` | new short1, sessionId1 |
 | 0+ | PRODUCING | (无) | work=busy | poll short1 @ 500ms | watch mode 显示进度 |
-| 60 | **SELF_REVIEW_R1** | **1** | work=done | 解析 short1 output → 3 issues | R1 entry：**round += 1** |
-| 60+ | SELF_REVIEW_R1 | 1 | work=busy | `claude --bg "review your fix..." --resume <sessionId1> --reply-on-resume` | new short2（sessionId1 不变） |
-| 80 | SELF_REVIEW_R2 | 1 | work=done | 解析 short2 output → 1 issue | cycle=initial |
-| 80+ | SELF_REVIEW_R2 | 1 | work=busy | `--bg "review again..." --resume <sessionId1>` | new short3 |
-| 105 | EXTERNAL_REVIEW | 1 | work=done, reviews=busy×2 | `Promise.all([--bg "review" kimi, --bg "review" qwen])` | new short4, short5 |
-| 145 | JUDGE_BY_WORK | 1 | work=busy (injectReply) | 收集 opinions → injectReply("judge...") | work sessionId1 |
-| 160 | JUDGE_BY_WORK | 1 | work=busy (injectReply) | 解析 per-issue accept/reject → engine 计算 P0/P1 rejection ratio | work sessionId1 |
-| 175 | FIXING | 1 | work=busy (injectReply) | verdict=`accept` → injectReply("apply accepted fixes") | work sessionId1 |
-| 175* | HUMAN_DECIDE | 1 | (idle, 等待用户) | verdict=`reject` (P0/P1 ratio ≥ 30%) → 移到 human_pending/ | work sessionId1 |
-| 250 | **SELF_REVIEW_R1** | **2** | work=done | 解析 → 0 issues | cycle=**postfix**, R1 entry：**round += 1** |
-| 250+ | — | — | — | — | → DONE（issues=0） |
+| 60 | **SELF_REVIEW_R1** | **1** | work=done | 解析 short1 output → 3 issues（identify only） | R1 entry：**round += 1** |
+| 60+ | **FIXING (source=R1)** | 1 | work=busy (injectReply) | injectReply("verify these 3 issues + fix real ones") | verify-first prompt |
+| 80 | FIXING → SELF_REVIEW_R2 | 1 | work=done | FIXING 完成（2 real fixed, 1 hallucination）→ 进 R2 | source=R1→R2 |
+| 80+ | SELF_REVIEW_R2 | 1 | work=busy | `--bg "review again after fix..." --resume <sessionId1>` | new short3 |
+| 105 | SELF_REVIEW_R2 → FIXING (source=R2) | 1 | work=done, work=busy | R2 发现 1 new issue → FIXING source=R2 | new short4 |
+| 130 | FIXING → EXTERNAL_REVIEW | 1 | work=done | FIXING 完成（1 real fixed）→ 进 EXTERNAL_REVIEW | source=R2→EXTERNAL_REVIEW |
+| 130+ | EXTERNAL_REVIEW | 1 | work=done, reviews=busy×2 | `Promise.all([--bg "review" kimi, --bg "review" qwen])` | new short5, short6 |
+| 170 | JUDGE_BY_WORK | 1 | work=busy (injectReply) | 收集 opinions → injectReply("judge these opinions...") | work sessionId1 |
+| 185 | JUDGE_BY_WORK | 1 | work=done | 解析 per-issue accept/reject → engine 计算 P0/P1 rejection ratio | ratio=0.10 < 30% |
+| 200 | FIXING (source=JUDGE) | 1 | work=busy (injectReply) | verdict=`accept` → injectReply("apply accepted fixes") | new short7 |
+| 245 | **SELF_REVIEW_R1** | **2** | work=done | FIXING(source=JUDGE) 完成 → cycle=**postfix** | R1 entry：**round += 1** |
+| 245+ | SELF_REVIEW_R2 | 2 | work=done | R2 → FIXING(source=R2) → EXTERNAL_REVIEW... | 假设还有 issues |
+| 350 | **SELF_REVIEW_R1** | **3** | work=done | 解析 → 0 issues | issues=0 → DONE |
 
-**总耗时**：~4 分钟，**2 cycles**（round=1 + round=2），1+N+1 pane 始终存在 work（sessionId 不变，shortId 每轮变）。
+**总耗时**：~6 分钟（v2.1 变更 19 后，每个 cycle 多 1 个 FIXING 节点 ~30s），**3 cycles**（round=1 + round=2 + round=3），1+N pane 始终存在 work（sessionId 不变，shortId 每轮变）。
 
 **对照 §5.2 round 语义**：
-- `round=1`：包含 PRODUCING → R1 → R2 → ExtRev → Judge → Arbiter → Judge_Arb → FIXING → R1(初始) = 1 个完整 cycle
-- `round=2`：包含 R1(postfix) → DONE = 1 个 cycle（中途 issues=0 提前结束）
-- 中间状态（R2 / ExtRev / Judge / Arbiter / Judge_Arb）**不独立 +1**，是 round=1 的子步骤
-- `max_rounds=8`（Code）意味着最多 8 个完整 cycle；本例用了 2 个 cycle 收敛
+- `round=1`：包含 PRODUCING → R1 → FIXING(source=R1) → R2 → FIXING(source=R2) → ExtRev → Judge → FIXING(source=JUDGE) → R1(postfix) = 1 个完整 cycle
+- 中间状态（R2 / FIXING / ExtRev / Judge）**不独立 +1**，是 round 的子步骤
+- `max_rounds=8`（Code）意味着最多 8 个完整 cycle；本例用了 3 个 cycle 收敛
 
 #### 5.3.6 异常路径示例
 
@@ -982,13 +1036,82 @@ template = """
 {task}
 """
 
+[prompts.work.self_review.system]
+template = """
+你的产出（来自 {previous_stage} 阶段）：
+{artifact}
+
+请审查你的产出，识别问题：
+1. 仔细阅读你的产出
+2. 列出所有发现的问题（severity: P0/P1/P2/P3, location, description）
+3. **不要修改文件**（修改在后续 FIXING 节点）
+
+输出 JSON:
+{
+  "issues": [
+    {"severity": "P0"|"P1"|"P2"|"P3", "location": "...", "description": "..."}
+  ],
+  "unfixed_count": N
+}
+"""
+
+[prompts.work.fixing.system]
+template = """
+你是修复节点（FIXING）。
+调用来源：{source} 阶段（self_review_r1 / self_review_r2 / judge_by_work / human_decide）
+待处理的问题列表：
+{input_issues}
+
+**严格 verify-first 流程**（每个 issue 都必须经过）：
+
+1. **仔细验证真实性**：
+   - 重新阅读相关代码/上下文
+   - 判断这是真问题（real）还是 reviewer 的幻觉（hallucination）
+   - 常见幻觉：reviewer 误读了代码 / reviewer 提出了 spec 之外的不合理要求 / reviewer 套用了错误的最佳实践
+
+2. **判定**：real | hallucination
+
+3. **修复（仅 real）**：
+   - 修改文件
+   - 修改要最小化，只解决该 issue，不做额外改动
+
+4. **验证修复**：
+   - 再次读相关代码，确认 fix 正确
+   - 确认 fix 没有引入新问题
+
+输出 JSON:
+{
+  "per_issue": [
+    {
+      "issue_id": "...",
+      "verdict": "real" | "hallucination",
+      "verdict_reason": "为什么判定为 real/hallucination",
+      "fix_applied": true | false,
+      "fix_summary": "修改了什么（如有）"
+    }
+  ],
+  "all_real_fixed": true | false,
+  "remaining_real_unfixed_count": 0
+}
+"""
+
 [prompts.work.judge.system]
 template = """
 工作产物：
 {artifact}
-待评判意见：
-{opinions}
-请输出 JSON: { verdict: 'accept' | 'partial' | 'reject', accepted_issues: [...] }
+
+外部 review 提出的 issue 列表：
+{reviews_json_for_each_role}
+
+请你逐条评估每个 issue（accept / reject / partial），不要自己输出 verdict，由 engine 根据 P0/P1 rejection ratio 算法决定。
+
+输出 JSON:
+{
+  "per_issue": [
+    {"issue_id": "...", "decision": "accept"|"reject"|"partial", "reason": "..."}
+  ],
+  "reasoning": "总体判断说明"
+}
 """
 
 [prompts.review.code.system]
