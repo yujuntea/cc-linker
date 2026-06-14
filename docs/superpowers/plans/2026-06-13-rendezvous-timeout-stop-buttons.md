@@ -111,7 +111,7 @@
 - [ ] **Step 2: 确认无 fixture 写死旧值**
 
 ```bash
-grep -rn "rendezvous_timeout_ms\b" /Users/wuyujun/Git/cc-linker/tests
+grep -rn "rendezvous_timeout_ms\b" /Users/tester/Git/cc-linker/tests
 ```
 Expected: 空（已 grep 验证）
 

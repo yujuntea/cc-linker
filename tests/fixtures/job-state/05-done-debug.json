@@ -12,18 +12,18 @@
   },
   "children": null,
   "linkScanOffset": 3876293,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun-Git-cc-linker/5bb2a103-eee2-41bd-8e9d-00af400ac813.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester-Git-cc-linker/5bb2a103-eee2-41bd-8e9d-00af400ac813.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--reply-on-resume",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "MiniMax-M3[1m]"
+    "claude-default[1m]"
   ],
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+    "ANTHROPIC_MODEL": "claude-default[1m]"
   },
   "intent": "Git 上也创建下新 Tag 呀，同时放上npm包",
   "name": "Debug peek card refresh state override",
@@ -32,7 +32,7 @@
   "resumeSessionId": "5bb2a103-eee2-41bd-8e9d-00af400ac813",
   "daemonShort": "5bb2a103",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun/Git/cc-linker",
+  "cwd": "/Users/tester/Git/cc-linker",
   "createdAt": "2026-06-08T16:02:36.860Z",
   "updatedAt": "2026-06-09T10:47:56.088Z",
   "firstTerminalAt": "2026-06-08T16:07:52.563Z",

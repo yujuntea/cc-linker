@@ -187,7 +187,7 @@ if (this.agentView.attachedWatchers.has(msg.openId)) {
 ```
 "launch": {
   "mode": "resume",
-  "sessionId": "/Users/wuyujun/.claude/projects/-Users-wuyujun/0307afb9-c11c-4536-bca6-e6a049c29413.jsonl",
+  "sessionId": "/Users/tester/.claude/projects/-Users-tester/0307afb9-c11c-4536-bca6-e6a049c29413.jsonl",
   "fork": true,
 }
 ```

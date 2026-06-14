@@ -122,7 +122,7 @@ describe('isSessionActive (combined)', () => {
     const cache = new SessionActivityCache();
     const entry = {
       sessionUuid: '55555555-5555-5555-5555-555555555555',
-      cwd: '/Users/wuyujun/Git/testLinker',
+      cwd: '/Users/tester/Git/testLinker',
       jsonl_path: null,
     };
     // SDK 在 sendSDKMessage 调 writeActivityMarker(... 'feishu' 'heartbeat' ...)
@@ -136,7 +136,7 @@ describe('isSessionActive (combined)', () => {
     const cache = new SessionActivityCache();
     const entry = {
       sessionUuid: '66666666-6666-6666-6666-666666666666',
-      cwd: '/Users/wuyujun/Git/testLinker',
+      cwd: '/Users/tester/Git/testLinker',
       jsonl_path: null,
     };
     writeActivityMarker('66666666-6666-6666-6666-666666666666', 'feishu', 'end');
@@ -150,7 +150,7 @@ describe('isSessionActive (combined)', () => {
     const cache = new SessionActivityCache();
     const entry = {
       sessionUuid: '77777777-7777-7777-7777-777777777777',
-      cwd: '/Users/wuyujun/Git/testLinker',
+      cwd: '/Users/tester/Git/testLinker',
       jsonl_path: null,
     };
     const r = await isSessionActive(entry, cache, 'feishu-detects-cli');

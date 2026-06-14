@@ -11,14 +11,14 @@
   "output": null,
   "children": null,
   "linkScanOffset": 95389,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/3a41fe73-0951-470a-bd2f-fb5a9f0fbe6b.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester/3a41fe73-0951-470a-bd2f-fb5a9f0fbe6b.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--reply-on-resume",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "MiniMax-M3[1m]"
+    "claude-default[1m]"
   ],
   "intent": "sleep 30 && echo done",
   "name": "timer command response",
@@ -27,10 +27,10 @@
   "resumeSessionId": "3a41fe73-0951-470a-bd2f-fb5a9f0fbe6b",
   "daemonShort": "3a41fe73",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun",
+  "cwd": "/Users/tester",
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+    "ANTHROPIC_MODEL": "claude-default[1m]"
   },
   "backend": "daemon",
   "createdAt": "2026-06-06T11:19:51.691Z",

@@ -12,16 +12,16 @@
   },
   "children": null,
   "linkScanOffset": 60849,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/098639ad-9be0-401a-8e1f-3b2eb18cbd50.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester/098639ad-9be0-401a-8e1f-3b2eb18cbd50.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--reply-on-resume",
     "--settings",
-    "/Users/wuyujun/.claude/providers/bailian-qwen3.6.json",
+    "/Users/tester/.claude/providers/provider-c.json",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "qwen3.6-plus[1m]"
+    "provider-c-model-lite[1m]"
   ],
   "intent": "sleep 30 && echo done",
   "name": "sleep command output",
@@ -30,10 +30,10 @@
   "resumeSessionId": "098639ad-9be0-401a-8e1f-3b2eb18cbd50",
   "daemonShort": "098639ad",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun",
+  "cwd": "/Users/tester",
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "qwen3.6-plus[1m]"
+    "ANTHROPIC_MODEL": "provider-c-model-lite[1m]"
   },
   "backend": "daemon",
   "createdAt": "2026-06-07T04:57:48.588Z",

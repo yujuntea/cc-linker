@@ -101,7 +101,7 @@ Claude Code 在 v2.1.139+ 引入 `claude agents` 命令,提供「Agent View」�
 [
   {
     "pid": 33348,
-    "cwd": "/Users/wuyujun/Git/cc-linker",
+    "cwd": "/Users/tester/Git/cc-linker",
     "kind": "background",
     "startedAt": 1780728421046,
     "sessionId": "92664deb-f4b6-48d3-9cdd-85cf8eea6dfc",
@@ -110,7 +110,7 @@ Claude Code 在 v2.1.139+ 引入 `claude agents` 命令,提供「Agent View」�
   },
   {
     "pid": 95189,
-    "cwd": "/Users/wuyujun/Git/cc-linker",
+    "cwd": "/Users/tester/Git/cc-linker",
     "kind": "interactive",
     "startedAt": 1780680484539,
     "sessionId": "e1d757b1-4480-4f54-a69d-823b9c83a6bf",

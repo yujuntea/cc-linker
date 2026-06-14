@@ -17,7 +17,7 @@ Add a `/listDir` command that lists subdirectories of the current working direct
 ```
 User: /listDir
 Bot:  [Card] 📂 目录浏览
-      当前路径: /Users/wuyujun/Git
+      当前路径: /Users/tester/Git
       ⬆️ 上级目录 [→ 进入]
       ─────────────
       📁 cc-linker  [→ 进入]
@@ -25,11 +25,11 @@ Bot:  [Card] 📂 目录浏览
       📁 dotfiles   [→ 进入]
 
 User: *clicks "→ 进入" on cc-linker*
-Bot:  ✅ 已切换到 /Users/wuyujun/Git/cc-linker
+Bot:  ✅ 已切换到 /Users/tester/Git/cc-linker
       发送消息即可在该目录创建新会话。
 
 User: hello
-Bot:  [creates new session in /Users/wuyujun/Git/cc-linker]
+Bot:  [creates new session in /Users/tester/Git/cc-linker]
 ```
 
 ## Design Decisions

@@ -293,13 +293,13 @@ describe('FeishuBot doSwitch overview card', () => {
 
 - [ ] **Step 2: 跑测试看它失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts`
 Expected: 6 个测试全失败——当前 `doSwitch` 仍发 text 消息（`✅ 已切换到会话 xxx`），不发卡片。
 
 - [ ] **Step 3: Commit 失败测试**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/feishu/bot-do-switch.test.ts
 git commit -m "test(bot): add doSwitch overview card test suite (red)"
 ```
@@ -377,18 +377,18 @@ function esc(text: string): string {
 
 - [ ] **Step 4: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过（`esc()` 已 Step 2 定义）。
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts`
 Expected: 6 个测试**仍然全失败**——doSwitch 还没改用 buildSessionOverviewCard。
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/feishu/bot.ts
 git commit -m "feat(bot): add buildSessionOverviewCard + isSessionRunning + local esc()"
 ```
@@ -465,12 +465,12 @@ git commit -m "feat(bot): add buildSessionOverviewCard + isSessionRunning + loca
 
 - [ ] **Step 2: 跑测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts`
 Expected: 6 个测试全过。
 
 - [ ] **Step 3: 跑现有 bot.test.ts 看 line 620 是否失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts 2>&1 | head -100`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts 2>&1 | head -100`
 Expected: `handleCardAction routes switch with UUID` 测试**会失败**（line 620），因为原断言 `expect(textReplies[0]).toContain('已切换到会话')` 不再成立（现在发卡片不是 text）。
 
 - [ ] **Step 4: 记录 bot.test.ts:620 失败**
@@ -480,7 +480,7 @@ Expected: `handleCardAction routes switch with UUID` 测试**会失败**（line 
 - [ ] **Step 5: Commit doSwitch 改造**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/feishu/bot.ts
 git commit -m "feat(bot): doSwitch sends overview card with running marker + text fallback"
 ```
@@ -722,13 +722,13 @@ describe('FeishuBot doCardList running marker', () => {
 
 - [ ] **Step 2: 跑测试看它失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-do-card-list.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-do-card-list.test.ts`
 Expected: 5 个测试全失败——当前 `buildListCard` 不接受 `runningUuids` 参数，`doCardList` 也没计算 runningUuids。
 
 - [ ] **Step 3: Commit 失败测试**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/feishu/bot-do-card-list.test.ts
 git commit -m "test(bot): add doCardList running marker tests (red)"
 ```
@@ -837,18 +837,18 @@ function buildListCard(
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-do-card-list.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-do-card-list.test.ts`
 Expected: 5 个测试全过（**前提：Step 4.5 的 `msg!` 修复已合**）。
 
 - [ ] **Step 6: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/feishu/bot.ts
 git commit -m "feat(bot): buildListCard/doCardList show running marker + text fallback consistency"
 ```
@@ -920,18 +920,18 @@ git commit -m "feat(bot): buildListCard/doCardList show running marker + text fa
 
 - [ ] **Step 2: 跑 bot.test.ts**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts`
 Expected: line 620 测试通过，**所有其他测试也通过**。
 
 - [ ] **Step 3: 跑 doCardList + doSwitch 测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts tests/unit/feishu/bot-do-card-list.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-do-switch.test.ts tests/unit/feishu/bot-do-card-list.test.ts`
 Expected: 11 个新测试全过（6 doSwitch + 5 doCardList）。
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/feishu/bot.test.ts
 git commit -m "test(bot): update handleCardAction switch test to assert overview card"
 ```
@@ -1069,13 +1069,13 @@ describe('Feishu concurrent commands integration', () => {
 
 - [ ] **Step 2: 跑集成测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/integration/feishu-concurrent-commands.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/integration/feishu-concurrent-commands.test.ts`
 Expected: 2 个集成测试全过。
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/integration/feishu-concurrent-commands.test.ts
 git commit -m "test(integration): add concurrent commands scenarios A and E"
 ```
@@ -1086,17 +1086,17 @@ git commit -m "test(integration): add concurrent commands scenarios A and E"
 
 - [ ] **Step 1: 跑全量单元 + 集成测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test`
+Run: `cd /Users/tester/Git/cc-linker && bun test`
 Expected: 全过。
 
 - [ ] **Step 2: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 3: 跑测试覆盖率**
 
-Run: `cd /cd-linker && bun test --coverage` 替换为 `cd /Users/wuyujun/Git/cc-linker && bun test --coverage`
+Run: `cd /cd-linker && bun test --coverage` 替换为 `cd /Users/tester/Git/cc-linker && bun test --coverage`
 Expected: bot.ts 覆盖率 ≥ 75%（doSwitch + doCardList + buildSessionOverviewCard + buildListCard 全部覆盖）。
 
 - [ ] **Step 4: 手动 smoke test**
@@ -1116,13 +1116,13 @@ Expected: bot.ts 覆盖率 ≥ 75%（doSwitch + doCardList + buildSessionOvervie
 
 - [ ] **Step 1: 检查 git status**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && git status`
+Run: `cd /Users/tester/Git/cc-linker && git status`
 Expected: 干净。
 
 - [ ] **Step 2: 推送到远端并创建 PR**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git push origin <branch-name>
 gh pr create --base master --title "feat(feishu): session overview card + list running marker" --body "$(cat <<'EOF'
 ## 概述

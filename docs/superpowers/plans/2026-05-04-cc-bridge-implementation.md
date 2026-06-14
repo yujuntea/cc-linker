@@ -80,7 +80,7 @@ cc-linker/
 - [ ] **Step 1: Initialize bun project**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 bun init -y
 ```
 
@@ -3015,7 +3015,7 @@ describe('CLI Commands Integration', () => {
   function run(args: string): string {
     try {
       return execSync(`bun run src/index.ts ${args}`, {
-        cwd: '/Users/wuyujun/Git/cc-linker',
+        cwd: '/Users/tester/Git/cc-linker',
         env,
         encoding: 'utf8',
       });

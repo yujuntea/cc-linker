@@ -110,7 +110,7 @@ For `4d9df1d2` (done/idle, fleet source):
   - `tempo`: `idle` → `blocked`
   - `needs`: null → `"收到探针信号 \`__PROBE_SENTINEL_mqbp8efi__\`。有什么需要我帮忙的吗？"`
   - `linkScanPath`: populated (was null while idle)
-- `~/.claude/projects/-Users-wuyujun/4d9df1d2-3319-4535-a175-f8011b0db673.jsonl`
+- `~/.claude/projects/-Users-tester/4d9df1d2-3319-4535-a175-f8011b0db673.jsonl`
   last 4 lines:
   ```
   user         role=user       | __PROBE_SENTINEL_mqbp8efi__

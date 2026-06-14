@@ -94,7 +94,7 @@ interface SessionEntry {
   origin: 'cli' | 'cc-connect';
   source: string;                    // "terminal" | "feishu:ou_xxx"
   platform: string | null;           // "feishu" | "weixin" | null
-  owner: string | null;              // "feishu:ou_xxx" | "terminal:wuyujun"
+  owner: string | null;              // "feishu:ou_xxx" | "terminal:tester"
   owner_user_key: string | null;     // "feishu:chat_id:user_id"
 
   // 路径

@@ -272,7 +272,7 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
         [bgShort]: {
           pid: 38207,
           sessionId: bgUuid,
-          cwd: '/Users/wuyujun',
+          cwd: '/Users/tester',
           startedAt: 0,
           dispatch: { source: 'slash', seed: { name: workerName } },
         },
@@ -288,7 +288,7 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
       result = await bot.runChatSDK({
         openId: 'ou_user_attach',
         sessionUuid: bgUuid,
-        cwd: '/Users/wuyujun',
+        cwd: '/Users/tester',
         promptText: '继续处理',
         serialKey: bgUuid,
         isNew: false,
@@ -317,7 +317,7 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
     const stopBtn = actions.find((a: any) => a.value?.tag === 'agent_view_stop_and_send');
     expect(stopBtn.value.text).toBe('继续处理');
     expect(stopBtn.value.sessionId).toBe(bgUuid);
-    expect(stopBtn.value.cwd).toBe('/Users/wuyujun');
+    expect(stopBtn.value.cwd).toBe('/Users/tester');
     const newBtn = actions.find((a: any) => a.value?.tag === 'agent_view_new_and_send');
     expect(newBtn.value.text).toBe('继续处理');
 
@@ -341,7 +341,7 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
       await bot.runChatSDK({
         openId: 'ou_user_plain',
         sessionUuid: plainUuid,
-        cwd: '/Users/wuyujun',
+        cwd: '/Users/tester',
         promptText: 'hi',
         serialKey: plainUuid,
         isNew: false,
@@ -402,7 +402,7 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
       await bot.runChatSDK({
         openId: 'ou_user_baddash',
         sessionUuid: bgUuid,
-        cwd: '/Users/wuyujun',
+        cwd: '/Users/tester',
         promptText: 'hi',
         serialKey: bgUuid,
         isNew: false,
@@ -432,7 +432,7 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
     const bgShort = '92664deb';
     const bgUuid = '92664deb-f4b6-48d3-9cdd-85cf8eea6dfc';
     const parentUuid = '57872373-61d8-483b-ae2d-306351e2d86e';
-    const parentPath = `/Users/wuyujun/.claude/projects/-Users-wuyujun-Git-cc-linker/${parentUuid}.jsonl`;
+    const parentPath = `/Users/tester/.claude/projects/-Users-tester-Git-cc-linker/${parentUuid}.jsonl`;
 
     readRosterMock.mockImplementation(() => ({
       proto: 1, updatedAt: 0,
@@ -450,7 +450,7 @@ describe('FeishuBot.runChatSDK — v2.2.11 bg-conflict refuse card', () => {
       await bot.runChatSDK({
         openId: 'ou_user_withparent',
         sessionUuid: bgUuid,
-        cwd: '/Users/wuyujun/Git/cc-linker',
+        cwd: '/Users/tester/Git/cc-linker',
         promptText: '继续处理',
         serialKey: bgUuid,
         isNew: false,
@@ -531,7 +531,7 @@ describe('FeishuBot.runChatSDK — v2.2.14 short→full expansion', () => {
     // 这里用一个 tmp dir mock JsonlIndex 不容易,改成直接 stub sessionManager
     // 并 stub JSONL 文件查找路径;实际我们让 JsonlIndex 走真实 CLAUDE_PROJECTS_DIR,
     // 选一个不冲突的 short(假设 00000000 不会命中),但用 roster-source 路径
-    // 不太合适 —— 改用真实路径 /Users/wuyujun/.claude/projects 测试全流程。
+    // 不太合适 —— 改用真实路径 /Users/tester/.claude/projects 测试全流程。
     //
     // 简化:验证 short 通过 stub 后**会被 expand** —— 我们 mock JsonlIndex 没办法,
     // 改用 6a6cba85 这种 demo short + 在真实 projects 里找一个存在的 UUID。
@@ -551,7 +551,7 @@ describe('FeishuBot.runChatSDK — v2.2.14 short→full expansion', () => {
       await bot.runChatSDK({
         openId: 'ou_user_fake_short',
         sessionUuid: fakeShort,
-        cwd: '/Users/wuyujun',
+        cwd: '/Users/tester',
         promptText: 'hi',
         serialKey: fakeShort,
         isNew: false,
@@ -584,7 +584,7 @@ describe('FeishuBot.runChatSDK — v2.2.14 short→full expansion', () => {
     await env.userManager.compareAndSwap('ou_user_real_short', null, {
       type: 'session',
       sessionUuid: realShort,
-      cwd: '/Users/wuyujun',
+      cwd: '/Users/tester',
       createdAt: new Date().toISOString(),
     });
 
@@ -592,7 +592,7 @@ describe('FeishuBot.runChatSDK — v2.2.14 short→full expansion', () => {
       await bot.runChatSDK({
         openId: 'ou_user_real_short',
         sessionUuid: realShort,
-        cwd: '/Users/wuyujun',
+        cwd: '/Users/tester',
         promptText: 'hi',
         serialKey: realShort,
         isNew: false,

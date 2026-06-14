@@ -8,15 +8,15 @@
   "template": "bg",
   "respawnFlags": [
     "--settings",
-    "/Users/wuyujun/.claude/providers/kimi-for-coding.json",
+    "/Users/tester/.claude/providers/provider-a.json",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "kimi-for-coding[256k]"
+    "provider-a[256k]"
   ],
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "kimi-for-coding[256k]"
+    "ANTHROPIC_MODEL": "provider-a[256k]"
   },
   "intent": "请你发布一个最新的 npm 正式包",
   "name": "Publish latest npm package",
@@ -24,7 +24,7 @@
   "sessionId": "bfc10ef1-d411-4386-84e5-df71f47abc44",
   "resumeSessionId": "bfc10ef1-d411-4386-84e5-df71f47abc44",
   "daemonShort": "bfc10ef1",
-  "cwd": "/Users/wuyujun/Git/cc-linker",
+  "cwd": "/Users/tester/Git/cc-linker",
   "createdAt": "2026-06-08T03:08:26.864Z",
   "updatedAt": "2026-06-09T11:23:22.792Z",
   "firstTerminalAt": null,

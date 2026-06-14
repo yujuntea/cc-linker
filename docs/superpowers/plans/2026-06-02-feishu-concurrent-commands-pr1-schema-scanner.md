@@ -59,13 +59,13 @@ export const RegistrySchema = z.object({
 
 - [ ] **Step 3: 跑 typecheck 验证**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 编译错误——`migrateV3toV4` 还没实现，`emptyRegistry` 还是 3，下游会失败。这是预期的。继续。
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/registry/types.ts
 git commit -m "feat(registry): bump schema v3→4, add last_user/last_assistant preview fields"
 ```
@@ -239,13 +239,13 @@ describe('migrateV3toV4', () => {
 
 - [ ] **Step 2: 跑测试看它失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/registry/migration-v3-v4.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/registry/migration-v3-v4.test.ts`
 Expected: 全部失败，因为 `migrateV3toV4` 未实现，`emptyRegistry` 还是 v3。`RegistrySchema.parse(v3 data)` 会抛错被 catch 走 `createEmpty`，但 `createEmpty` 当前用 v3 写盘，所以读盘再 parse 又会失败。
 
 - [ ] **Step 3: Commit 失败测试**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/registry/migration-v3-v4.test.ts
 git commit -m "test(registry): add migrateV3toV4 test suite (red)"
 ```
@@ -353,23 +353,23 @@ function migrateV3toV4(parsed: any): void {
 
 - [ ] **Step 6: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 7: 跑 migration 测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/registry/migration-v3-v4.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/registry/migration-v3-v4.test.ts`
 Expected: 7 个测试全过。
 
 - [ ] **Step 8: 跑现有 registry 相关测试，确保没破坏**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/mapping.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/mapping.test.ts`
 Expected: 全过（mapping 不依赖 schema version）。
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/registry/registry.ts
 git commit -m "feat(registry): implement migrateV3toV4 (idempotent) + 3 call sites + emptyRegistry v4"
 ```
@@ -470,13 +470,13 @@ describe('scan_cache schemaVersion', () => {
 
 - [ ] **Step 2: 跑测试看它失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/scanner/cache.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/scanner/cache.test.ts`
 Expected: 全部失败——当前 `loadCache` 把 v3 格式当 v4 格式读，会返回有数据的 Map；当前 `saveCache` 写纯对象无 meta 字段。
 
 - [ ] **Step 3: Commit 失败测试**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/scanner/cache.test.ts
 git commit -m "test(scanner): add cache schemaVersion test suite (red)"
 ```
@@ -535,23 +535,23 @@ export function saveCache(cache: FileCache, cachePath?: string): void {
 
 - [ ] **Step 2: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 3: 跑 cache 测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/scanner/cache.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/scanner/cache.test.ts`
 Expected: 7 个测试全过。
 
 - [ ] **Step 4: 跑现有 scanner 测试，确保不破坏**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/scanner/jsonl.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/scanner/jsonl.test.ts`
 Expected: 全过（jsonl 不依赖 cache 内部结构，只用 `FileCache` 类型）。
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/scanner/cache.ts
 git commit -m "feat(scanner): add schemaVersion to scan_cache, invalidate on version mismatch"
 ```
@@ -818,14 +818,14 @@ describe('JSONLScanner parseTail user/assistant preview', () => {
 
 - [ ] **Step 2: 跑测试看它失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/scanner/jsonl-preview.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/scanner/jsonl-preview.test.ts`
 Expected: **8 个**测试全失败——当前 `parseTail` / `parseFull` 还没提取 `lastUserPreview`，`parseTail` 也没有 4KB fallback 逻辑。
 （review 修正：原计划写"7 个"，但文件含 8 个测试：6 个基础 + 1 个 parseFull 跨 10 行 + 1 个 parseTail 4KB fallback）
 
 - [ ] **Step 3: Commit 失败测试**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/scanner/jsonl-preview.test.ts
 git commit -m "test(scanner): add last_user/last_assistant preview extraction tests (red)"
 ```
@@ -1021,23 +1021,23 @@ git commit -m "test(scanner): add last_user/last_assistant preview extraction te
 
 - [ ] **Step 5: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 6: 跑 jsonl-preview 测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/scanner/jsonl-preview.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/scanner/jsonl-preview.test.ts`
 Expected: **8 个**测试全过。
 
 - [ ] **Step 7: 跑现有 jsonl 测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/scanner/jsonl.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/scanner/jsonl.test.ts`
 Expected: 全过（保留 last_message_preview 不破坏老断言）。
 
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/scanner/jsonl.ts
 git commit -m "feat(scanner): extract last_user/last_assistant preview with 4KB fallback"
 ```
@@ -1152,18 +1152,18 @@ git commit -m "feat(scanner): extract last_user/last_assistant preview with 4KB 
 
 - [ ] **Step 3: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 4: 跑全部 scanner 测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/scanner/`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/scanner/`
 Expected: jsonl.test.ts + jsonl-preview.test.ts + cache.test.ts 全部通过。
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/scanner/jsonl.ts
 git commit -m "feat(scanner): parseFull full-file iteration + 3-field return (preserve last_message_preview)"
 ```
@@ -1177,17 +1177,17 @@ git commit -m "feat(scanner): parseFull full-file iteration + 3-field return (pr
 
 - [ ] **Step 1: 跑所有单元测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test`
+Run: `cd /Users/tester/Git/cc-linker && bun test`
 Expected: 全过。如有失败，必须修复后才能进入 staging。
 
 - [ ] **Step 2: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 3: 跑测试覆盖率**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test --coverage`
+Run: `cd /Users/tester/Git/cc-linker && bun test --coverage`
 Expected: registry.ts 和 scanner/jsonl.ts 覆盖率 ≥ 80%。
 
 - [ ] **Step 4: 手动 smoke test：v3 registry 升级（review 必改——路径修正）**
@@ -1225,7 +1225,7 @@ cat > $TEST_DIR/registry.json <<EOF
 EOF
 
 # 启动 daemon 观察（CC_LINKER_DIR 覆盖才能把 v3 放在我们指定的位置）
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 CC_LINKER_DIR=$TEST_DIR bun run dev start --no-sync
 # 检查 version
 head -3 $TEST_DIR/registry.json
@@ -1242,13 +1242,13 @@ head -3 $TEST_DIR/registry.json
 
 - [ ] **Step 1: 检查 git status**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && git status`
+Run: `cd /Users/tester/Git/cc-linker && git status`
 Expected: 干净（前面 8 个 commit 已经把改动都提交了）。
 
 - [ ] **Step 2: 推送到远端并创建 PR**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git push origin <branch-name>
 gh pr create --base master --title "feat(registry+scanner): schema v3→4 + user/assistant preview fields" --body "$(cat <<'EOF'
 ## 概述

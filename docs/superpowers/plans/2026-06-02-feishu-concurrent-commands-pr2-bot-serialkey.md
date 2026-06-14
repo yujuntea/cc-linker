@@ -34,7 +34,7 @@
 PR 2 弱依赖 PR 1 schema v4 字段（不读新字段，但 staging 验证需要 PR 1 提供的 `last_user_preview`）。执行前先确认：
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git log --oneline -1 master
 # 应包含 PR 1 的 merge commit（关键词 "schema v3 to v4" 或 "registry v4"）
 ```
@@ -46,7 +46,7 @@ git log --oneline -1 master
 新白名单 `/^[a-zA-Z0-9_-]+$/` 会拒绝所有含 `:` `/` 的 messageId。验证现有测试不会受影响：
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 grep -rE "message_id:\s*['\"][^'\"]*[:/][^'\"]*['\"]" tests/
 # 预期：无输出（现有测试 messageId 都是 msg-1 / msg-card-1 等）
 ```
@@ -196,13 +196,13 @@ describe('FeishuBot serialKey and messageId validation', () => {
 
 - [ ] **Step 2: 跑测试看它失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
 Expected: 4 个测试全失败——当前 bot.ts 没有 messageId 校验逻辑，所有消息都被接受。
 
 - [ ] **Step 3: Commit 失败测试**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/feishu/bot-serial-key.test.ts
 git commit -m "test(bot): add messageId validation + serialKey test suite (red)"
 ```
@@ -235,18 +235,18 @@ git commit -m "test(bot): add messageId validation + serialKey test suite (red)"
 
 - [ ] **Step 2: 跑测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
 Expected: 4 个 messageId 校验测试全过。
 
 - [ ] **Step 3: 跑现有 bot.test.ts 确保不破坏**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts`
 Expected: 全过。现有测试的 messageId 形如 `'msg-1'` / `'msg-card-1'` / `'msg-list-1'` 都是合法字符。
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/feishu/bot.ts
 git commit -m "feat(bot): validate messageId against /^[a-zA-Z0-9_-]+$/ whitelist"
 ```
@@ -376,13 +376,13 @@ git commit -m "feat(bot): validate messageId against /^[a-zA-Z0-9_-]+$/ whitelis
 
 - [ ] **Step 2: 跑测试看它失败**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
 Expected: 5 个 serialKey 测试全失败——当前代码用 `target.type === 'session' ? sessionUuid : new:openId`，command 也会落入 `new:openId` 分支，文件名是 `new:ou_user1:om_msg_001.json` 而非 `cmd:ou_user1:om_msg_001:om_msg_001.json`。
 
 - [ ] **Step 3: Commit 失败测试**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/feishu/bot-serial-key.test.ts
 git commit -m "test(bot): add cmd: serialKey behavior tests (red)"
 ```
@@ -418,12 +418,12 @@ git commit -m "test(bot): add cmd: serialKey behavior tests (red)"
 
 - [ ] **Step 2: 跑测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot-serial-key.test.ts`
 Expected: 9 个测试（4 messageId 校验 + 5 serialKey 行为）全过。
 
 - [ ] **Step 3: 跑现有 bot.test.ts 确保不破坏**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/bot.test.ts`
 Expected: 全过。现有测试中 command 消息的 serialKey 之前是 `new:openId`，**不会**触发任何断言失败（现有测试主要测 textReplies / cardReplies 内容，不测文件名）。
 
 **但要警惕**：现有测试如果 dispatch 跑到了 `claimNext` 检查 processing 目录，新代码下 command 走 `cmd:` 路径，**可能改变 dispatch 行为**。如果发现现有测试失败，**修复该测试**（不是改新代码）——新行为是正确的，测试需要适配。
@@ -431,7 +431,7 @@ Expected: 全过。现有测试中 command 消息的 serialKey 之前是 `new:op
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/feishu/bot.ts
 git commit -m "feat(bot): command messages use independent cmd:openId:msgId serialKey"
 ```
@@ -457,18 +457,18 @@ function esc(text: string): string {
 
 - [ ] **Step 2: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 3: 跑所有相关测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/feishu/`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/feishu/`
 Expected: bot.test.ts + bot-serial-key.test.ts + card-updater.test.ts + mapping.test.ts + activity.test.ts + image.test.ts 全过。
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add src/feishu/bot.ts
 git commit -m "feat(bot): add local esc() helper for markdown escape"
 ```
@@ -482,17 +482,17 @@ git commit -m "feat(bot): add local esc() helper for markdown escape"
 
 - [ ] **Step 1: 跑全量单元测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test`
+Run: `cd /Users/tester/Git/cc-linker && bun test`
 Expected: 全过。如有失败，定位是 PR 2 引起的，修复。
 
 - [ ] **Step 2: 跑 typecheck**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun run typecheck`
+Run: `cd /Users/tester/Git/cc-linker && bun run typecheck`
 Expected: 通过。
 
 - [ ] **Step 3: 跑测试覆盖率**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test --coverage`
+Run: `cd /Users/tester/Git/cc-linker && bun test --coverage`
 Expected 覆盖目标：
 - `bot.ts:onMessage` 入口校验段（line 132-149）覆盖率 ≥ 90%（messageId 校验、validateOwner、hasReceipt 全覆盖）
 - `bot.ts:onMessage` serialKey 计算段（line 215-222）覆盖率 ≥ 90%（isCommand / target / 三个 serialKey 分支全覆盖）
@@ -504,7 +504,7 @@ Expected 覆盖目标：
 
 启动 daemon:
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 bun run dev start
 ```
 
@@ -640,18 +640,18 @@ describe('SpoolQueue concurrency with cmd: serialKey (PR 2 pain point A core gua
 
 - [ ] **Step 2: 跑集成测试**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test tests/unit/queue/spool-concurrency.test.ts`
+Run: `cd /Users/tester/Git/cc-linker && bun test tests/unit/queue/spool-concurrency.test.ts`
 Expected: 5 个测试全过。**这 5 个测试不依赖 PR 2 的 bot.ts 改动**——它们直接验证 SpoolQueue 在 `cmd:` / `sessionUuid` / `new:openId` 三种 serialKey 下的并发语义，确保 Task 4 的 serialKey 改造**有真实并发支撑**（不只是字符串拼接对）。
 
 - [ ] **Step 3: 跑全量测试再确认**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && bun test`
+Run: `cd /Users/tester/Git/cc-linker && bun test`
 Expected: 全过。集成测试 + 单元测试 + 现有测试一起跑，确认无破坏。
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git add tests/unit/queue/spool-concurrency.test.ts
 git commit -m "test(spool): add concurrency tests for cmd:/sessionUuid/new: serialKey"
 ```
@@ -662,13 +662,13 @@ git commit -m "test(spool): add concurrency tests for cmd:/sessionUuid/new: seri
 
 - [ ] **Step 1: 检查 git status**
 
-Run: `cd /Users/wuyujun/Git/cc-linker && git status`
+Run: `cd /Users/tester/Git/cc-linker && git status`
 Expected: 干净。
 
 - [ ] **Step 2: 推送到远端并创建 PR**
 
 ```bash
-cd /Users/wuyujun/Git/cc-linker
+cd /Users/tester/Git/cc-linker
 git checkout -b feat/pr2-cmd-serial-key
 git push -u origin feat/pr2-cmd-serial-key
 gh pr create --base master --title "feat(feishu): command messages use independent cmd: serialKey" --body "$(cat <<'EOF'

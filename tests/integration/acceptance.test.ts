@@ -54,7 +54,7 @@ describe('Acceptance Tests', () => {
   function run(args: string): { stdout: string; exitCode: number } {
     try {
       const stdout = execSync(`bun run src/index.ts ${args}`, {
-        cwd: '/Users/wuyujun/Git/cc-linker',
+        cwd: '/Users/tester/Git/cc-linker',
         env,
         encoding: 'utf8',
       });

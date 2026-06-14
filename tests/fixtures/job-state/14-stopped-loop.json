@@ -10,20 +10,20 @@
   "output": null,
   "children": null,
   "linkScanOffset": 166101,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/dcb2ec25-2233-49ef-bb51-3a652036e651.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester/dcb2ec25-2233-49ef-bb51-3a652036e651.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--reply-on-resume",
     "--settings",
-    "/Users/wuyujun/.claude/providers/bailian-qwen3.6.json",
+    "/Users/tester/.claude/providers/provider-c.json",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "qwen3.7-plus[1m]"
+    "provider-c-model[1m]"
   ],
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "qwen3.7-plus[1m]"
+    "ANTHROPIC_MODEL": "provider-c-model[1m]"
   },
   "intent": "请每 5 秒 date 打印当前时间，循环 10 次",
   "name": "bash loop script",
@@ -32,7 +32,7 @@
   "resumeSessionId": "dcb2ec25-2233-49ef-bb51-3a652036e651",
   "daemonShort": "dcb2ec25",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun",
+  "cwd": "/Users/tester",
   "createdAt": "2026-06-08T07:28:06.901Z",
   "updatedAt": "2026-06-09T17:16:49.144Z",
   "firstTerminalAt": "2026-06-08T07:30:22.906Z",

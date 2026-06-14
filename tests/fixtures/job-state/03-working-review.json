@@ -8,15 +8,15 @@
   "template": "bg",
   "respawnFlags": [
     "--add-dir",
-    "/Users/wuyujun/Git/quality-insurance",
+    "/Users/tester/Git/quality-insurance",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "MiniMax-M3[1m]"
+    "claude-default[1m]"
   ],
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+    "ANTHROPIC_MODEL": "claude-default[1m]"
   },
   "intent": "OK， 请你先仔细检查确认下 建议进行 方案修复的问题，是否正确，如果没问题，请你完成执行计划修正",
   "name": "Review cursor memory optimization design",
@@ -24,7 +24,7 @@
   "sessionId": "5ba1baff-108d-4f9c-8480-789e42e21752",
   "resumeSessionId": "5ba1baff-108d-4f9c-8480-789e42e21752",
   "daemonShort": "5ba1baff",
-  "cwd": "/Users/wuyujun/Git/trae-data",
+  "cwd": "/Users/tester/Git/sample-project",
   "createdAt": "2026-06-09T06:07:52.740Z",
   "updatedAt": "2026-06-09T06:07:52.918Z",
   "firstTerminalAt": null,

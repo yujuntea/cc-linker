@@ -53,7 +53,7 @@ describe('readRoster', () => {
         '92664deb': {
           pid: 33341,
           sessionId: '92664deb-f4b6-48d3-9cdd-85cf8eea6dfc',
-          cwd: '/Users/wuyujun/Git/cc-linker',
+          cwd: '/Users/tester/Git/cc-linker',
           startedAt: 1780728420798,
           dispatch: { source: 'slash' },
         },

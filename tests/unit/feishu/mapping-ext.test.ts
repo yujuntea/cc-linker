@@ -23,7 +23,7 @@ describe('MappingEntryType extension (Agent View)', () => {
       type: 'pending_agent_reply',
       sessionUuid: '92664deb-f4b6-48d3-9cdd-85cf8eea6dfc',
       createdAt: '2026-06-06T00:00:00.000Z',
-      cwd: '/Users/wuyujun/Git/cc-linker',
+      cwd: '/Users/tester/Git/cc-linker',
       shortId: '92664deb',
       startedAt: '2026-06-06T00:00:00.000Z',
       timeoutMs: 300000,

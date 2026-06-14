@@ -12,20 +12,20 @@
   },
   "children": null,
   "linkScanOffset": 58013,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/d78c8339-18b0-4f53-8452-d4228d30f51f.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester/d78c8339-18b0-4f53-8452-d4228d30f51f.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--reply-on-resume",
     "--settings",
-    "/Users/wuyujun/.claude/providers/bailian-qwen3.6.json",
+    "/Users/tester/.claude/providers/provider-c.json",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "qwen3.6-plus[1m]"
+    "provider-c-model-lite[1m]"
   ],
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "qwen3.6-plus[1m]"
+    "ANTHROPIC_MODEL": "provider-c-model-lite[1m]"
   },
   "intent": "sleep 30 && echo done",
   "name": "Print date every five seconds",
@@ -34,7 +34,7 @@
   "resumeSessionId": "d78c8339-18b0-4f53-8452-d4228d30f51f",
   "daemonShort": "d78c8339",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun",
+  "cwd": "/Users/tester",
   "createdAt": "2026-06-06T11:18:52.651Z",
   "updatedAt": "2026-06-09T02:57:36.264Z",
   "firstTerminalAt": "2026-06-07T14:28:14.850Z",

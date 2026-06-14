@@ -10,13 +10,13 @@
   "output": null,
   "children": null,
   "linkScanOffset": 52252,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun-Git-cc-linker/92664deb-f4b6-48d3-9cdd-85cf8eea6dfc.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester-Git-cc-linker/92664deb-f4b6-48d3-9cdd-85cf8eea6dfc.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "MiniMax-M3[1m]"
+    "claude-default[1m]"
   ],
   "intent": "OK",
   "name": "Design cross-model AI review tool",
@@ -25,10 +25,10 @@
   "resumeSessionId": "92664deb-f4b6-48d3-9cdd-85cf8eea6dfc",
   "daemonShort": "92664deb",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun/Git/cc-linker",
+  "cwd": "/Users/tester/Git/cc-linker",
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "MiniMax-M3[1m]"
+    "ANTHROPIC_MODEL": "claude-default[1m]"
   },
   "backend": "daemon",
   "createdAt": "2026-06-06T06:47:00.129Z",

@@ -138,7 +138,7 @@ Agent View 在这个版本完成两次大改造:
 #### Fix
 
 从 JSONL 路径反推 cwd。CLI 编码规则:`cwd.split('/').join('-')`,
-例 `/Users/wuyujun` → `-Users-wuyujun`。`~/.claude/projects/<encoded>/<uuid>.jsonl`
+例 `/Users/tester` → `-Users-tester`。`~/.claude/projects/<encoded>/<uuid>.jsonl`
 的 `<encoded>` 段反向 decode(naive `-` → `/`)拿回 best-effort cwd,
 Peek 按钮 value 完整,guard 通过。Peek 内容读取走 `JsonlIndex.lookup(shortId)`
 不依赖 cwd,所以即使 decode 有损(原路径含 hyphen 时丢 hyphen)也不影响 Peek 功能。
@@ -150,7 +150,7 @@ Peek 按钮 value 完整,guard 通过。Peek 内容读取走 `JsonlIndex.lookup(
 
 #### Tests
 - `tests/unit/agent-view/snapshot-fetcher.test.ts`:3 个新 case
-  - single-segment decode(`/Users/wuyujun`)
+  - single-segment decode(`/Users/tester`)
   - multi-segment lossy decode(`/Git/cc-linker` → `/Git/cc/linker`)
   - JSONL 缺失时 cwd 仍为 `''`(graceful fallback)
 

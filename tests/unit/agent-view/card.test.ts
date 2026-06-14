@@ -449,7 +449,7 @@ describe('buildAttachedCard', () => {
     status: 'busy' as const,
     shortId: 'abc12345',
     sessionId: 'abc12345-9be0-4d5e-8b3f-1234567890ab',
-    cwd: '/Users/wuyujun/Git/trae-data',
+    cwd: '/Users/tester/Git/sample-project',
     recentOutput: '执行 sleep 30 中',
     outputFormat: 'markdown' as const,
     lastWatchedAt: '12:34:56',
@@ -470,7 +470,7 @@ describe('buildAttachedCard', () => {
       .map((e: any) => e.content)
       .join('\n');
     expect(markdownTexts).toContain('Status: 处理中 (busy)');
-    expect(markdownTexts).toContain('CWD: ~/Git/trae-data');
+    expect(markdownTexts).toContain('CWD: /Users/tester/Git/sample-project');
     // 不应包含 Peek 卡的 PID / Started 字样
     expect(markdownTexts).not.toContain('PID:');
     expect(markdownTexts).not.toContain('Started');

@@ -130,7 +130,7 @@ export function buildAttachedCard(opts: {
 - 必须用 `...TEMPLATE_HEADER`（含 `update_multi: true`，同 buildPeekCard）
 - header title：`📡 Watching · \`${name}\``
 - header template：`blue`
-- 状态字段行：`Status: 处理中 (busy)\n等待原因: ...\nCWD: ~/Git/trae-data`（waitingFor 非空才显示）
+- 状态字段行：`Status: 处理中 (busy)\n等待原因: ...\nCWD: ~/Git/sample-project`（waitingFor 非空才显示）
 - Recent output 块：与 Peek 同 markdown / terminal 分流（`outputFormat === 'terminal'` 时包 code-block + "原始终端片段"警示）
 - 末尾："Last watched 12:34:56"
 - 按钮（4 个）：[🔄 Refresh] [Stop Watching] [Reply] [Stop session]

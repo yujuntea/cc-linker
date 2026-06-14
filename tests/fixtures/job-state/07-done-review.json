@@ -12,15 +12,15 @@
   },
   "children": null,
   "linkScanOffset": 7393381,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun-Git-trae-data/82a57c55-5cba-47bd-910d-113006998ece.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester-Git-sample-project/82a57c55-5cba-47bd-910d-113006998ece.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--settings",
-    "/Users/wuyujun/.claude/providers/bailian-qwen3.6.json",
+    "/Users/tester/.claude/providers/provider-c.json",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "qwen3.7-plus[1m]"
+    "provider-c-model[1m]"
   ],
   "intent": "同意，请你完成计划文件修正",
   "name": "Review enrichment and attribution engine fixes",
@@ -29,10 +29,10 @@
   "resumeSessionId": "82a57c55-5cba-47bd-910d-113006998ece",
   "daemonShort": "82a57c55",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun/Git/trae-data",
+  "cwd": "/Users/tester/Git/sample-project",
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "qwen3.7-plus[1m]"
+    "ANTHROPIC_MODEL": "provider-c-model[1m]"
   },
   "backend": "daemon",
   "createdAt": "2026-06-08T15:57:55.837Z",

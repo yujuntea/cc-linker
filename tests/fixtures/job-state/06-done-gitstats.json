@@ -1,6 +1,6 @@
 {
   "state": "done",
-  "detail": "wuyujun 7天Git统计：总变更55,719行，154个commits，主力项目qa_test/trae-data占73.6%",
+  "detail": "tester 7天Git统计：总变更 12,345 行，42 个 commits，主力项目 sample-a 占 60.0%",
   "tempo": "idle",
   "inFlight": {
     "tasks": 0,
@@ -8,32 +8,32 @@
     "kinds": []
   },
   "output": {
-    "result": "wuyujun近7天代码变更分析完成：总行数55,719，Commits 154"
+    "result": "tester近7天代码变更分析完成：总行数 12,345，Commits 42"
   },
   "children": null,
   "linkScanOffset": 73525,
-  "linkScanPath": "/Users/wuyujun/.claude/projects/-Users-wuyujun/25a52919-7073-4ee1-b4d3-540620f823af.jsonl",
+  "linkScanPath": "/Users/tester/.claude/projects/-Users-tester/25a52919-7073-4ee1-b4d3-540620f823af.jsonl",
   "template": "bg",
   "respawnFlags": [
     "--settings",
-    "/Users/wuyujun/.claude/providers/bailian-qwen3.6.json",
+    "/Users/tester/.claude/providers/provider-c.json",
     "--permission-mode",
     "acceptEdits",
     "--model",
-    "qwen3.7-plus[1m]"
+    "provider-c-model[1m]"
   ],
   "bgIsolation": "none",
   "providerEnv": {
-    "ANTHROPIC_MODEL": "qwen3.7-plus[1m]"
+    "ANTHROPIC_MODEL": "provider-c-model[1m]"
   },
-  "intent": "分析下 wuyujun 最近7天内的 Git 代码提交行数",
-  "name": "wuyujun git stats",
+  "intent": "分析下 tester 最近 7 天内的 Git 代码提交行数",
+  "name": "tester git stats",
   "nameSource": "auto",
   "sessionId": "25a52919-7073-4ee1-b4d3-540620f823af",
   "resumeSessionId": "25a52919-7073-4ee1-b4d3-540620f823af",
   "daemonShort": "25a52919",
   "cliVersion": "2.1.163",
-  "cwd": "/Users/wuyujun",
+  "cwd": "/Users/tester",
   "createdAt": "2026-06-09T04:35:02.972Z",
   "updatedAt": "2026-06-09T09:58:06.999Z",
   "firstTerminalAt": "2026-06-09T05:04:08.483Z",

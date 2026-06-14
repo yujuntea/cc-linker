@@ -8,9 +8,9 @@
     "type": "git",
     "url": "git+https://github.com/yujuntea/cc-linker.git"
   },
-  "homepage": "https://github.com/yujuntea/cc-linker#readme",
+  "homepage": "https://github.com/zwyin/cc-linker#readme",
   "bugs": {
-    "url": "https://github.com/yujuntea/cc-linker/issues"
+    "url": "https://github.com/zwyin/cc-linker/issues"
   },
   "keywords": [
     "claude-code",

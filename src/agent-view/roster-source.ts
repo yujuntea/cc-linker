@@ -65,7 +65,7 @@ export function buildRosterSourceMap(
  * 文本作为 Peek 内容。
  *
  * dispatch.launch.sessionId 形如:
- *   /Users/wuyujun/.claude/projects/-Users-wuyujun-Git-cc-linker/57872373-....jsonl
+ *   /Users/<user>/.claude/projects/-Users-<user>-Git-<repo>/<8-char-hash>-....jsonl
  * 直接是 path,不是 UUID。读不到/格式不符返回 null,调用方退化下一级。
  */
 export function lookupResumeFromPath(

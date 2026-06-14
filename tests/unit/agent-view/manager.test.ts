@@ -1665,7 +1665,7 @@ describe('handleAttach — v2.2.15 short↔full guard compatibility', () => {
       sessions: [
         {
           pid: 0,
-          cwd: '/Users/wuyujun',
+          cwd: '/Users/tester',
           kind: 'background',
           startedAt: Date.now() - 1_000_000,
           sessionId: fullUuid,
@@ -1676,7 +1676,7 @@ describe('handleAttach — v2.2.15 short↔full guard compatibility', () => {
       ],
     }));
     // user clicks Attach with the short hash (matches the live card)
-    await mgr.handleAttach('ou_attach_short2full', '098639ad', '098639ad', 'sleep 30 && echo done', '/Users/wuyujun');
+    await mgr.handleAttach('ou_attach_short2full', '098639ad', '098639ad', 'sleep 30 && echo done', '/Users/tester');
 
     // UserManager entry must be the full UUID (SDK 拒 short)
     const entry = userManager.getEntry('ou_attach_short2full');
@@ -1739,7 +1739,7 @@ describe('handleStopAndSend (v2.2.18 fire-and-forget card callback)', () => {
       'ou_stop_send_1',
       'aaaaaaaa',
       'aaaaaaaa-0000-0000-0000-000000000000',
-      '/Users/wuyujun',
+      '/Users/tester',
       'hi',
       'parent-uuid-xxxx-xxxx',
       true,
