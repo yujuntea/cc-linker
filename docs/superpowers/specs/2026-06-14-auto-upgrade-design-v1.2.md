@@ -154,8 +154,8 @@ check({ force: true })  (强制不走缓存)
   ↓
 case status:
   up_to_date        → print "已是最新", exit 0
-  update_available  → 
-    ├── --to <version>: 
+  update_available  →
+    ├── --to <version>:
     │   ├─ 打印 warning: "确定要从 v0.6.3 降级/跳到 v0.5.0 吗?"
     │   ├─ 二次 confirm (除非 --yes)
     │   └─ execFileSync('npm', ['install', '-g', `cc-linker@${version}`])
@@ -164,12 +164,24 @@ case status:
         ├─ confirmPrompt "升级到 v{latest}?" (除非 --yes)
         └─ execFileSync('npm', ['install', '-g', 'cc-linker@latest'])
   ↓
-  (npm 触发 scripts/postinstall.js)
-  postinstall 看到 daemon 在跑 → 调 `cc-linker restart`
-  (沿用现有 restart.ts 行为)
+  // R1 修复: 主动 idempotent restart, 不依赖 postinstall
+  // (postinstall 可能被用户 .npmrc ignore-scripts 关掉, 也可能 fire 多次)
   ↓
-print "✅ 升级完成, daemon 已自动重启", exit 0
+  (a) postinstall 触发 cc-linker restart  (best effort, 可能跑可能不跑)
+  (b) 我们自己再调一次 cc-linker restart  (兜底, 幂等)
+  ↓
+  if (restart 成功):
+    print "✅ 升级完成, daemon 已自动重启", exit 0
+  else:
+    print "✅ 升级完成, 但 daemon 自动 restart 失败"
+    print "   请手动跑: cc-linker restart"
+    exit 0  (升级成功, restart 失败不报错)
 ```
+
+**R1 关键不变量**:
+- `npm i -g` 调用方是**用户主动**的 CLI, 我们**自己负责** daemon restart
+- postinstall 是 best effort (用户 `.npmrc` 可能 `ignore-scripts=true`, bun `add -g` 行为也不同)
+- 双重 restart 是幂等的: 第一次杀老 daemon 启新 daemon, 第二次发现 daemon 已是新 binary, 快速 no-op
 
 ### 4.3 `cc-linker upgrade` 状态检查
 
@@ -194,6 +206,38 @@ if (daemonRunning) {
   print "⚠️  升级会重启 daemon, 进行中的对话会中断"
 }
 ```
+
+#### 4.4.1 R2 修复: `cc-linker restart` 在 launchd 下走 unload/load
+
+**问题**: 现有 `src/cli/commands/restart.ts` 直接 kill + spawn, 在 launchd 环境下不够:
+- launchd 在 plist load 时解析 `ProgramArguments` 里的 symlink 一次
+- symlink 替换 (npm install 改了 `/usr/local/bin/cc-linker`) 不影响 launchd 缓存
+- launchd 拉起新 daemon 时用**旧 binary path** (即使 symlink 改了)
+
+**修法**: 改 `restart.ts`, 在 macOS launchd 环境下走 `launchctl unload && launchctl load`:
+
+```ts
+// src/cli/commands/restart.ts  改造点
+async function restart() {
+  if (isMacOS && existsSync(launchdPlistPath)) {
+    // 走 launchctl unload/load 强制重新解析 symlink
+    execFileSync('launchctl', ['unload', launchdPlistPath], { stdio: 'inherit' });
+    // wait for old daemon to exit (spin 15s)
+    await waitDaemonExit(15000);
+    execFileSync('launchctl', ['load', launchdPlistPath], { stdio: 'inherit' });
+    // wait for new daemon to start (spin 15s)
+    await waitDaemonReady(15000);
+  } else {
+    // 纯 --daemon 模式 或 Linux, 走原 stop+start
+    await stop();
+    await start({ daemon: true });
+  }
+}
+```
+
+**R2 是已有 bug 修, 不是 v1.2 引入的**. 借这次升级 feature 顺手修。deploy-local.js 已有完整 launchctl 逻辑可复用。
+
+**关键不变量**: `cc-linker restart` 跟 `cc-linker upgrade` 调 `cc-linker restart` 走同一份代码, 都用 launchctl unload/load (macOS launchd 环境)。
 
 ---
 
@@ -220,23 +264,95 @@ t=X+30s  send Feishu card (only if update_available, setTimeout 可被 clearTime
 - 每次触发后 setTimeout 下一次（24h 后）
 - daemon 优雅退出时 clearTimeout
 
-### 5.3 通知卡片（**静态**，无 action 按钮）
+### 5.3 通知卡片（**静态**，无 action 按钮 — R3 修复：根据 install mode 定制内容）
 
+**detectInstallMode 决定卡片内容**：
+
+```ts
+async function buildCardPayload(targetVersion: string) {
+  const mode = await detectInstallMode();
+  const changelogUrl = `https://github.com/yujuntea/cc-linker/releases/tag/v${targetVersion}`;
+
+  switch (mode) {
+    case 'npm_global':
+      return {
+        header: '🆕 cc-linker 有新版本',
+        body: [
+          `当前 v{PKG_VERSION} → v${targetVersion}`,
+          '',
+          '升级命令:',
+          '```',
+          'cc-linker upgrade',
+          '```',
+        ].join('\n'),
+        actions: [
+          { type: 'url', text: 'View changelog', url: changelogUrl },
+          { type: 'button', text: 'Skip 30 天', value: { action: 'skip', version: targetVersion } },
+        ],
+      };
+
+    case 'standalone_binary':
+      return {
+        header: '🆕 cc-linker 有新版本',
+        body: [
+          `当前 v{PKG_VERSION} → v${targetVersion}`,
+          '',
+          '你是 standalone binary 安装, 自动升级不支持',
+          '请下载新 binary:',
+          changelogUrl,
+        ].join('\n'),
+        actions: [
+          { type: 'url', text: 'Download v' + targetVersion, url: changelogUrl },
+          { type: 'button', text: 'Skip 30 天', value: { action: 'skip', version: targetVersion } },
+        ],
+      };
+
+    case 'dev':
+      return {
+        header: '🆕 cc-linker 有新版本',
+        body: [
+          `当前 v{PKG_VERSION} → v${targetVersion}`,
+          '',
+          '你是 dev mode, 升级用:',
+          '```',
+          'bun run deploy',
+          '```',
+        ].join('\n'),
+        actions: [
+          { type: 'url', text: 'View changelog', url: changelogUrl },
+          { type: 'button', text: 'Skip 30 天', value: { action: 'skip', version: targetVersion } },
+        ],
+      };
+  }
+}
+```
+
+**视觉示例**（npm global 用户）：
 ```
 ┌─────────────────────────────────────┐
-│  🆕 cc-linker 有新版本              │  ← header
+│  🆕 cc-linker 有新版本              │
 ├─────────────────────────────────────┤
 │ 当前 v0.6.3 → v0.6.4                │
 │                                     │
 │ 升级命令:                            │
+│ cc-linker upgrade                   │
 │                                     │
-│   cc-linker upgrade                 │
+│ [View changelog] [Skip 30 天]      │
+└─────────────────────────────────────┘
+```
+
+**视觉示例**（standalone binary 用户）：
+```
+┌─────────────────────────────────────┐
+│  🆕 cc-linker 有新版本              │
+├─────────────────────────────────────┤
+│ 当前 v0.6.3 → v0.6.4                │
 │                                     │
-│ 或手动:                              │
+│ 你是 standalone binary 安装        │
+│ 自动升级不支持, 请下载新 binary:    │
+│ github.com/.../releases/tag/v0.6.4  │
 │                                     │
-│   npm i -g cc-linker@latest         │
-│                                     │
-│ [View changelog] [Skip 30 天]      │  ← 唯二按钮
+│ [Download v0.6.4] [Skip 30 天]     │
 └─────────────────────────────────────┘
 ```
 
@@ -481,20 +597,26 @@ async function resolveRegistryUrl(): Promise<string> {
 
 ---
 
-## 12. 时间线 + LOC 估算（v1.2 简化版）
+## 12. 时间线 + LOC 估算（v1.2 收尾版）
 
 | 时段 | 内容 | LOC |
 |------|------|-----|
 | Day 1 上午 | `src/updater/{check,types,notify,lifecycle}.ts` + 单测 | ~250 + ~250 |
-| Day 1 下午 | `src/cli/commands/upgrade.ts` + status async banner + 单测 | ~180 + ~140 |
-| Day 1 晚+ | `src/feishu/updater-card.ts`（静态卡片 builder）+ Skip handler + 单测 | ~150 + ~100 |
+| Day 1 下午 | `src/cli/commands/upgrade.ts` + status async banner + **R1 idempotent restart** + 单测 | ~190 + ~150 |
+| Day 1 晚+ | `src/feishu/updater-card.ts`（**R3 install mode 分支**）+ Skip handler + 单测 | ~180 + ~120 |
 | Day 2 上午 | `src/runtime/updater-tick.ts` + 启动 hook + 单测 | ~100 + ~80 |
+| Day 2 上午+ | **`src/cli/commands/restart.ts` R2 改 launchd unload/load** + 单测 | ~50 + ~40 |
 | Day 2 下午 | `src/utils/paths.ts` + `src/utils/config.ts` + `package.json`（+ semver dep） | ~30 |
 | Day 2 晚+ | e2e 升级走通（fake registry + 真 daemon） | ~80 |
-| **合计** | | **~1360 LOC（含测试）** |
+| **合计** | | **~1520 LOC（含测试）** |
 
-**v1.1 → v1.2 砍掉 ~490 LOC**：
-- 砍: `src/upgrader/{runner,patch-card,state}.ts` (~250) + PID 守卫单测 (~100) + 跨重启 race 单测 (~80) + pending_upgrade.json 相关 (~60)
+**v1.2 初版 → 收尾 +R1+R2+R3 +160 LOC**:
+- R1: +10 (idempotent restart)
+- R2: +90 (launchd unload/load 改造, 含单测)
+- R3: +50 (install mode 卡片分支, 含单测)
+- 测试: 各 +10
+
+**vs v1.1 (1850 LOC)**: 仍省 -18%, 但 v1.2 收尾后**功能更完整** (R2 修了已有 bug, R3 修了 standalone binary 体验)。
 
 ---
 
