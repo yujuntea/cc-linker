@@ -98,7 +98,13 @@ src/review/
 ├── pipeline-state.ts    # engine 层面的 in-memory active pipeline Map（key: pipelineId, value: { record, abortController, watchClientSet }）
 ├── profile.ts           # ReviewProfile TOML 加载 + per-phase 深度 merge + provider 校验
 ├── phase-detect.ts      # 启发式：file path → git ref → 关键词 → 文件后缀/行号（启发式 4）→ PhaseUnknownError
-├── adapter.ts           # v2.1 重写：ClaudeBGAdapter 包装 `claude --bg` + `RendezvousClient.injectReply` + `claude stop` + `claude logs`
+├── adapter.ts           # v2.1 重写：ClaudeBGAdapter 暴露 4 个 API：
+                                  #   - startSession({role, provider, prompt, cwd, resumeSessionId?}) → {shortId, sessionId}
+                                  #   - resumeWorkSession({sessionId, prompt, provider, cwd}) → newShortId (sessionId 不变)
+                                  #   - injectReply({shortId, text, timeoutMs, signal?}) → {ok, verdict, output} (走 RendezvousClient)
+                                  #   - poll(shortId, timeoutMs, signal?) → JobStateFile (走 readJobState, 500ms tick)
+                                  #   - stop(shortId) → void (走 claude stop)
+                                  #   所有 API 接受 AbortSignal 用于 cancel 时的打断
 ├── cli-watch.ts         # v2.1 替换 v2 的 ide-server.ts：CLI `--watch` 模式，rich terminal UI（chalk + ANSI 进度条 + 状态条）
 ├── review-doctor.ts     # v2.1 新增：`cc-linker review doctor` 命令，profile / provider / CLI 版本 / daemon 健康检查
 └── reconciler.ts        # 启动扫描 running/ + human_pending/ 恢复 in-memory active set + pane 丢失检测（→ PANE_LOST）
@@ -337,6 +343,35 @@ type ReviewState =
   | { kind: 'DONE';              pipelineId; round: number; totalCostUsd; issueTrail }
   | { kind: 'FAILED';            pipelineId; round: number; reason; totalCostUsd }
   | { kind: 'ABORTED';           pipelineId; round: number; reason; abortedBefore };
+```
+
+**辅助类型（v2.1 新增 DecisionContext，替代 v2 的 ArbitrationContext）**：
+
+```typescript
+// v2.1 HUMAN_DECIDE 待决策的上下文
+interface DecisionContext {
+  // 触发原因（v2.1 变更 18：仅有 reject，不再有 partial）
+  trigger: 'verdict_reject';            // JUDGE_BY_WORK verdict=reject 触发
+
+  // P0/P1 rejection ratio 详情（用户做决策时需要看）
+  rejectionSummary: {
+    p0p1Total: number;
+    p0p1Rejected: number;
+    ratio: number;                       // e.g. 0.45
+    threshold: number;                   // e.g. 0.30 (from profile.guards)
+  };
+
+  // 所有外部 review 的 issue（按 severity 排序）
+  issues: Array<{
+    id: string;                          // e.g. 'review-A-1'
+    source: 'review-A' | 'review-B' | ...;
+    severity: 'P0' | 'P1' | 'P2' | 'P3';
+    location: string;
+    description: string;
+    suggestion: string;
+    workDecision: 'accept' | 'reject' | 'partial';   // work session 的判定
+  }>;
+}
 ```
 
 **v2.1 相对 v2 的 6 个关键调整**：
@@ -923,6 +958,41 @@ async function transition(pipeline: PipelineRecord, event: EngineEvent): Promise
 2. State machine 转换函数本身幂等：纯函数，相同 input 永远相同 output
 3. Polling 间隔去重：adapter.poll 500ms 一次，但只在 state 变化时 emit 事件
 
+**v2.1 变更 19 新增：FIXING source-aware 幂等性**：
+```typescript
+// FIXING 状态的幂等性检查要考虑 source 字段
+function isSameFixingTarget(pending: ReviewState, last: HistoryEvent): boolean {
+  if (pending.kind !== 'FIXING') return false;
+  if (last.toState !== 'FIXING') return false;
+  // FIXING 必须 source + inputIssues 都匹配才算幂等
+  return last.fixingSource === pending.source
+      && last.inputIssuesDigest === digest(pending.inputIssues);
+}
+```
+
+**v2.1 HUMAN_DECIDE → FIXING 期间 work session 状态**：
+- HUMAN_DECIDE 期间：work session 保持 `running` 状态（不被 stop），daemon 仍在；用户决策到达后立即 injectReply
+- 如果 HUMAN_DECIDE 期间 pane 消失：走 PANE_LOST 路径（而非 ABORTED），用户重连后可以决策 + 重新 spawn
+- 1h 超时触发 ABORTED 时：先 `claude stop` work session（防止 leak），再移到 `aborted/`
+
+**v2.1 AbortController 注入路径**：
+```typescript
+// engine.ts 创建 pipeline 时创建 AbortController
+const abortController = new AbortController();
+pipelineState.set(pipelineId, { record, abortController, watchClientSet });
+
+// 注入到所有 adapter 调用
+await adapter.poll(shortId, timeoutMs, abortController.signal);
+await adapter.injectReply({ shortId, text, timeoutMs, signal: abortController.signal });
+
+// 用户 cancel 时
+function cancelPipeline(pipelineId: string): void {
+  const state = pipelineState.get(pipelineId);
+  state.abortController.abort();  // 立即打断所有 polling 循环
+  // 然后调 cleanup
+}
+```
+
 ### 6.4 Reconciler（v2.1 改保守策略）
 
 ```typescript
@@ -985,14 +1055,60 @@ export async function reconcile(): Promise<void> {
 ⚠️ Pipeline 01HXYZK9... PANE_LOST
   Lost pane: review-A (shortId: abc12345)
   其他 pane: work (def67890, alive), review-B (ghi11111, alive)
-  
+
   选项:
     retry → cc-linker review status <id> 然后选 retry（重启该 pane）
     abort → cc-linker review abort <id>
     skip  → cc-linker review status <id> 然后选 skip（用 0 opinions 推进）
-  
+
   默认: 24h 后自动 ABORTED（reason: pane_lost_timeout）
 ```
+
+**PANE_LOST retry 实现细节**（v2.1 完整化）：
+
+```typescript
+async function retryPANE_LOST(pipelineId: string): Promise<void> {
+  const record = await pipelineStore.readRunning(pipelineId);
+  if (record.state.kind !== 'PANE_LOST') throw new Error('not in PANE_LOST');
+
+  const { lostPane, lostShortId, retryTarget } = record.state;
+
+  // 1. 清理旧 pane 的 state（如果还在）
+  try { await adapter.stop(lostShortId); } catch { /* 已被 daemon reap */ }
+
+  // 2. 重新 spawn lost pane（用 retryTarget 决定启动方式）
+  if (retryTarget === 'EXTERNAL_REVIEW') {
+    // review pane：找到原 provider + prompt template，重新 `--bg` spawn
+    const originalPane = record.panes.reviews.find(r => r.role === lostPane);
+    if (!originalPane) throw new Error('pane info lost');
+    const newShortId = await adapter.startSession({
+      role: 'review',
+      provider: originalPane.provider,
+      prompt: buildReviewPrompt(record),
+      cwd: record.input.cwd,
+    });
+    record.panes.reviews = record.panes.reviews.map(r =>
+      r.role === lostPane ? { ...r, shortId: newShortId } : r
+    );
+  } else if (retryTarget === 'FIXING' && lostPane === 'work') {
+    // work pane：复杂，需要重新 spawn work session（sessionId 已死）
+    // 注意：v2.1 设计是"work session 死了就全 pipeline 重新跑 R1"，
+    // 因为没有原始 work session context 可以恢复
+    logger.warn(`[reconciler] work pane lost in FIXING，pipeline ${pipelineId} 需重新从 R1 开始`);
+    record.panes.work = await spawnFreshWork(record);
+    record.state = { kind: 'SELF_REVIEW_R1', round: record.state.round, cycle: record.panes.work.cycle, pane: 'work' };
+  } else {
+    throw new Error(`retry not supported for retryTarget=${retryTarget} lostPane=${lostPane}`);
+  }
+
+  // 3. 回到 retryTarget 状态继续
+  record.state = buildStateFor(retryTarget, record);
+  await pipelineStore.saveRunning(record);
+  engine.continuePipeline(record);
+}
+```
+
+**为什么 work pane 死了要重新跑**：因为 work sessionId 是 bg session 的核心身份，session 死了 → 没有"上下文"可以 resume，state.json 中的 resumeSessionId 指向一个不存在的 session。强制 FAILED 会浪费之前所有进度；折中是"回到 R1 重新 self-review"，保留 history 但重新触发新 work session。
 
 ### 6.5 并发控制（v2.1 与 v2 一致）
 
@@ -1006,6 +1122,57 @@ async function acquirePipelineSlot(profile: ReviewProfile): Promise<boolean> {
 ```
 
 **默认 1 个 pipeline 同时跑**（避免 token 用量爆炸），profile 可配 `guards.max_concurrent_pipelines = 3`。
+
+### 6.6 Abort / Cleanup 流程（v2.1 新增）
+
+**触发场景**：
+- 用户 `cc-linker review cancel <id>`（主动取消）
+- 用户 `cc-linker review abort <id>`（max_rounds 触发）
+- HUMAN_DECIDE 1h 超时 → ABORTED
+- PANE_LOST 24h 超时 → ABORTED
+
+**Cleanup 步骤**（按顺序）：
+
+```typescript
+async function cleanupPipeline(pipelineId: string, reason: string): Promise<void> {
+  const record = await pipelineStore.readRunning(pipelineId);
+
+  // 1. 立即 abort 所有 polling 循环（打断 stuck 在 readJobState 的循环）
+  const state = pipelineState.get(pipelineId);
+  state?.abortController.abort();
+
+  // 2. 收集所有 active pane shortIds
+  const paneShortIds: string[] = [];
+  if (record.panes.work?.currentRoundShortId) {
+    paneShortIds.push(record.panes.work.currentRoundShortId);
+  }
+  for (const review of record.panes.reviews) {
+    paneShortIds.push(review.shortId);
+  }
+  // arbiter 已删（v2.1 变更 18）
+
+  // 3. 并行 claude stop 所有 pane（best-effort，不抛错）
+  const stopResults = await Promise.allSettled(
+    paneShortIds.map(shortId => adapter.stop(shortId))
+  );
+  // stop 失败也继续（daemon 可能已经 reap 了），仅 warn
+
+  // 4. 如果是 HUMAN_DECIDE 移到 aborted：保留 history 标记 decision timeout
+  // 否则直接移到 aborted/
+
+  // 5. 通知 cli-watch 客户端（如有连接）
+  state?.watchClientSet.forEach(client => client.send({ type: 'aborted', reason }));
+
+  // 6. 关闭文件锁 + 清理 in-memory state
+  pipelineState.delete(pipelineId);
+}
+```
+
+**关键设计点**：
+- `Promise.allSettled` 保证一个 stop 失败不影响其他
+- 步骤 1 abort 必须最先做（否则 step 3 的 stop 触发 daemon rendezvous 时 polling 还在跑）
+- HUMAN_DECIDE 超时 vs 用户主动 abort 走相同 cleanup 流程，只在 reason 字段区分
+- 1h/24h 超时由 Reconciler 在扫描时检测并触发 cleanup
 
 ## 7. ReviewProfile（v2.1 与 v2 一致）
 
@@ -1136,6 +1303,22 @@ guards.max_rounds = 8           # v2.1 改：Code phase 默认 8（v2 是 15）
 - 数组字段（providers）：phase 值完全替换 top-level 数组（不追加）
 - table 字段（prompts）：phase 的子表与 top-level 子表深度 merge
 
+**v2.1 重要**：phase_overrides 现在支持覆盖**所有 prompt 类型**，不仅是 `prompts.review.*`：
+
+```toml
+[phase_overrides.code]
+# 完全覆盖 work 类 prompt（spec phase 不需要 code-specific prompt）
+prompts.work.produce.system = """
+你是资深 TypeScript 工程师。{task}
+"""
+prompts.work.fixing.system = """
+verify-first：每个 issue 必须先判断是 real 还是 hallucination，对 real 才修改。
+"""
+# 也可以 per-phase 覆盖 review providers（v2 行为保留）
+review.providers = ["kimi-for-coding", "bailian-qwen3.6", "xiaomi-mimo"]
+guards.max_rounds = 8
+```
+
 ### 7.4 Provider 字段 → settingsPath 映射（v2.1 强化 fail fast）
 
 ```typescript
@@ -1220,7 +1403,10 @@ review 跑期间：
 - 用户**不能**通过飞书聊天发消息到 work session（被 engine 占用）
 - 飞书端收到 `[🤖 Review Engine] Pipeline 01HXYZK9... 正在使用当前 session，飞书聊天暂时禁用。review 完成后会自动恢复。`
 - review 完成后飞书聊天自动恢复
-- 用户可以 `/cancel review <id>` 中止（v2.1 新增）
+- **Phase 1**：通过 `cc-linker review cancel <id>` CLI 中止
+- **Phase 2（v2.1 计划）**：飞书 `/cancel review <id>` 中止（FeishuBot 解析 slash command → 调用本地 cc-linker daemon → cc-linker review cancel）
+
+**两边都实现时共享同一路径**：CLI/Feishu 都最终调用 `cleanupPipeline()`（见 §6.6），保证一致行为。
 
 ### 8.4 review 产物（v2.1 明确：不改源文件）
 
@@ -1301,6 +1487,7 @@ cc-linker review run "..."                # 自动识别失败抛 PhaseUnknownEr
 | **pane 丢失超时** | PANE_LOST 24h 未决策（v2.1 新增） | 自动 ABORTED `pane_lost_timeout` |
 | **max_rounds 达到** | 计数器到上限 | 自动 ABORTED `max_rounds_exceeded` |
 | **CLI watch 客户端断连** | 用户 Ctrl-C | engine 继续在后台跑，pipeline 不中断（v2.1 设计目标） |
+| **AbortController 触发**（v2.1 新增） | 用户 `cc-linker review cancel` 或 pipeline 超时未响应 | adapter.poll / injectReply 收到 abort signal，立即抛 `AbortError`；engine catch 后调 cleanup（见 §6.4 PANE_LOST retry 中的 cancel 路径） |
 
 ### 10.2 Graceful degradation vs fail fast（v2.1 与 v2 一致）
 
