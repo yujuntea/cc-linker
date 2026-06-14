@@ -652,6 +652,11 @@ stateDiagram-v2
 | **HUMAN_DECIDE** | 1h timeout | ABORTED | 同上 | — |
 | **FIXING (source=JUDGE)** | work bg done, verify+fix complete | SELF_REVIEW_R1 | cycle=`postfix`，**round += 1**（在 R1 entry 处） | work (injectReply) |
 | **FIXING (source=HUMAN)** | work bg done, verify+fix complete | SELF_REVIEW_R1 | cycle=`postfix`，**round += 1**（在 R1 entry 处） | work (injectReply) |
+
+**v2.1 简化**：上面 4 行 FIXING 转换可合并为通用规则——
+- **FIXING(source=X)** 完成 → 下一状态由 source 决定：`R1 → R2`、`R2 → EXTERNAL_REVIEW`、`JUDGE/HUMAN → R1(postfix)`
+- **FIXING 完成条件**：`work bg state=done` + output.result 含 `{per_issue, all_real_fixed, remaining_real_unfixed_count}`
+- **round += 1** 仅在 FIXING→R1(postfix) 时发生（其他 source 不增加 round）
 | **任意状态 X** | bg session 消失 (Reconciler) | PANE_LOST | 记录 `lostPane` + `lostShortId` + `detectedAt` | lost pane | 不变 |
 | **任意状态 X** | user: `review cancel` | ABORTED | `claude stop` × pane 数 + 移到 `aborted/` | — | 不变 |
 | **R1 entry** | round ≥ max_rounds | ABORTED | reason=`max_rounds_exceeded` | — | 超过阈值 |
@@ -1330,7 +1335,7 @@ async function resolveSettingsPath(provider: string): Promise<string> {
     throw new ProfileError({
       code: 'PROVIDER_NOT_FOUND',
       message: `provider '${provider}' 不在 ~/.claude/providers/`,
-      remediation: `放置 ~/.claude/providers/${provider}.json (格式参考其他 provider) 或运行 'cc-linker review doctor' 看详细诊断`,
+      remediation: `放置 ~/.cc-linker/providers/${provider}.json (格式参考其他 provider)，或运行 'cc-linker review doctor' 查完整诊断报告`,
     });
   }
   return path;
@@ -1388,7 +1393,7 @@ cc-linker review run "..." --no-watch
 
 | 错误 | 终端输出 |
 |------|---------|
-| Provider 找不到（doctor 阶段） | ❌ `provider 'kimi-2.6' 不在 ~/.claude/providers/` + `remediation: 放置 ~/.claude/providers/kimi-2.6.json 或运行 'cc-linker review doctor'` |
+| Provider 找不到（doctor 阶段） | ❌ `provider 'kimi-2.6' 不在 ~/.claude/providers/` + `remediation: 放置 ~/.cc-linker/providers/kimi-2.6.json，或运行 'cc-linker review doctor' 查完整诊断报告` |
 | CLI 版本过低（doctor 阶段） | ❌ `Claude CLI 2.1.139 不支持 --bg，需要 ≥ 2.1.163` + `remediation: claude update` |
 | daemon crash（运行时） | ⚠️ `daemon unhealthy (roster.json missing or stale)`, Pipeline 进入 PANE_LOST |
 | bg session 启动失败 | ❌ `work session 启动失败: <err>` + 标记 FAILED |
@@ -1565,6 +1570,11 @@ cc-linker review doctor
 ```
 
 **v2.1 必加**：避免运行时才发现配置错误。`cc-linker review run` 内部先调 doctor 再启动 engine。
+
+**退出码（v2.1 明确）**：
+- `0`：所有 check 通过
+- `1`：至少一个 check 失败（provider 缺失 / CLI 版本过低 / daemon 不健康 / profile 加载失败 / 配置缺失）
+- 失败时 stdout 输出 `❌` 标记的失败项 + remediation 提示；用户可据此修复
 
 ## 11. 测试策略（v2.1 补全）
 
