@@ -11,6 +11,7 @@ import {
   isDaemonRunning,
   loadExistingConfig,
   saveConfig,
+  maskSecret,
 } from './init-feishu';
 
 /** Check if Claude Code hook is already installed */
@@ -103,7 +104,8 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
 
     if (existingAppId && existingAppSecret) {
       console.log(chalk.gray('  检测到已有飞书配置:'));
-      console.log(chalk.gray(`    App ID: ${existingAppId.slice(0, 6)}****`));
+      console.log(chalk.gray(`    App ID:     ${existingAppId.slice(0, 6)}****`));
+      console.log(chalk.gray(`    App Secret: ${maskSecret(existingAppSecret)}`));
 
       const { reconfigure } = await inquirer.prompt([{
         type: 'confirm',
@@ -187,17 +189,25 @@ async function runFeishuWizard(existingAppId = '', existingAppSecret = ''): Prom
   }]);
 
   // Step 2: Get app_secret
+  // Note: `default` is intentionally omitted — @inquirer/password v5+ hardcodes
+  // useState('') and ignores config.default, so passing it would be misleading.
   const { appSecret } = await inquirer.prompt([{
-    type: 'input',
+    type: 'password',
     name: 'appSecret',
-    message: '飞书 App Secret:',
-    default: existingAppSecret || undefined,
-    validate: (v: string) => v.trim() ? true : 'App Secret 不能为空',
+    message: existingAppSecret
+      ? '飞书 App Secret（留空保持原值，或粘贴新值）:'
+      : '飞书 App Secret:',
+    mask: '*',
+    // 允许空输入（reconfigure 路径回车保留原值）；首次配置（existingAppSecret 为空）仍必须输入
+    validate: (v: string) =>
+      v.trim() || existingAppSecret ? true : 'App Secret 不能为空',
   }]);
+  // Reuse existing secret if user pressed Enter without typing a new one
+  const resolvedAppSecret = appSecret.trim() || existingAppSecret.trim();
 
   // Step 3: Verify credentials
   console.log(chalk.gray('  验证凭据...'));
-  const token = await getTenantToken(appId.trim(), appSecret.trim());
+  const token = await getTenantToken(appId.trim(), resolvedAppSecret);
   if (!token) {
     console.log(chalk.red('  ❌ 凭据无效，请检查 App ID 和 App Secret'));
     console.log(chalk.yellow('  请确认：'));
@@ -226,7 +236,7 @@ async function runFeishuWizard(existingAppId = '', existingAppSecret = ''): Prom
     console.log(chalk.gray('  （等待最多 120 秒）'));
 
     try {
-      openId = await captureOpenIdSdk(appId.trim(), appSecret.trim());
+      openId = await captureOpenIdSdk(appId.trim(), resolvedAppSecret);
     } catch (err) {
       console.log(chalk.yellow(`  ⚠️ 消息捕获失败: ${err}`));
     }
@@ -256,7 +266,7 @@ async function runFeishuWizard(existingAppId = '', existingAppSecret = ''): Prom
   const existing = loadExistingConfig();
   existing.feishu_bot = {
     app_id: appId.trim(),
-    app_secret: appSecret.trim(),
+    app_secret: resolvedAppSecret,
     ...(openId ? { owner_open_id: openId } : {}),
     ...(defaultCwd.trim() ? { default_cwd: defaultCwd.trim() } : {}),
   };
@@ -341,15 +351,21 @@ function printPermissionGuide(): void {
   console.log(chalk.gray('  访问飞书开放平台 https://open.feishu.cn/app → 你的应用'));
   console.log('');
   console.log(chalk.cyan('  必需权限（应用自建）:'));
-  console.log(chalk.green('    im:message:readonly        获取与发送单聊、群组消息'));
-  console.log(chalk.green('    im:message                 读取、发送、撤回用户消息'));
-  console.log(chalk.green('    im:message:send_as_bot     以应用身份发送消息'));
-  console.log(chalk.green('    im:chat:readonly           获取群组信息'));
-  console.log(chalk.green('    contact:user.base:readonly 获取通讯录用户基本信息'));
+  console.log(chalk.green('    im:message:readonly         获取消息详情（REST 主动读取）'));
+  console.log(chalk.green('    im:message.p2p_msg:readonly 接收用户发给 Bot 的单聊消息（事件推送，必装）'));
+  console.log(chalk.green('    im:message                  读取、发送、撤回用户消息'));
+  console.log(chalk.green('    im:message:send_as_bot      以应用身份发送消息'));
+  console.log(chalk.green('    im:resource                 下载用户发送的图片资源'));
   console.log('');
-  console.log(chalk.cyan('  必需事件订阅:'));
+  console.log(chalk.gray('  提示: im:message:readonly 是主动读取，不能触发 im.message.receive_v1 推送；'));
+  console.log(chalk.gray('  缺少 im:message.p2p_msg:readonly 会导致 setup 卡 120s 抓不到 open_id。'));
+  console.log('');
+  console.log(chalk.cyan('  必需事件订阅（事件配置）:'));
   console.log(chalk.green('    im.message.receive_v1      接收用户发给 Bot 的消息'));
   console.log(chalk.green('    im.chat.member.bot.added_v1  Bot 被邀请进群时触发（可选）'));
+  console.log('');
+  console.log(chalk.cyan('  必需事件订阅（回调配置）:'));
+  console.log(chalk.green('    card.action.trigger        接收卡片按钮点击（/list 切换会话、模型切换、SDK 权限确认等）'));
   console.log('');
   console.log(chalk.cyan('  必需配置:'));
   console.log(chalk.green('    ✅ 启用 Bot 能力（应用功能 → 机器人）'));

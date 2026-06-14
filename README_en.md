@@ -79,27 +79,47 @@ Have you ever found yourself in these situations:
 
 ## Quick Start
 
-### 1. Install
+### 1. Install Bun (Required Runtime)
 
-**Prerequisites**: `Bun >= 1.0` (required runtime). If you install via `npm install -g`, you also need `Node.js >= 20` to provide `npm`.
+cc-linker is built on Bun, so **Bun >= 1.0** is a hard prerequisite.
+
+**macOS / Linux:**
 
 ```bash
-# Option 1: install globally via npm
-# Node.js/npm is needed for installation, but cc-linker still runs on Bun
-npm install -g cc-linker
-
-# Option 2: install globally via Bun
-bun add -g cc-linker
-
-# Install Bun:
-# curl -fsSL https://bun.sh/install | bash
+curl -fsSL https://bun.sh/install | bash
 ```
 
-> **Note**: the current npm package entrypoint is built for Bun. If you want a runtime-free distribution, use the standalone binary artifact built from source.
->
+**macOS (Homebrew):**
+
+```bash
+brew tap oven-sh/bun && brew install bun
+```
+
+**Verify after install (open a new terminal first):**
+
+```bash
+bun --version   # should print >= 1.0.0
+```
+
+> **Not working?** Your PATH wasn't updated. Manually add `~/.bun/bin` to `PATH`, or simply restart the terminal.
+
+### 2. Install cc-linker
+
+**Option 1: Install globally via npm** (requires Node.js >= 20 to provide `npm`; cc-linker itself still needs Bun to run)
+
+```bash
+npm install -g cc-linker@latest
+```
+
+**Option 2: Install globally via Bun** (recommended)
+
+```bash
+bun add -g cc-linker
+```
+
 > **Update tip**: when running `npm install -g cc-linker@latest`, if the daemon is already running, it will automatically call `cc-linker restart` to upgrade to the new version — no manual restart needed.
 
-### 2. One-Step Setup
+### 3. One-Step Setup
 
 ```bash
 cc-linker setup
@@ -112,7 +132,7 @@ The interactive wizard guides you through:
 
 > **Need terminal-only features?** Run `cc-linker setup --skip-feishu` to skip chat app configuration.
 
-### 3. Start Using
+### 4. Start Using
 
 | Scenario | Action |
 |----------|--------|
@@ -342,10 +362,15 @@ Go to "Permission Management", search and enable:
 |------------|---------|
 | `im:message` | Read and send messages |
 | `im:message:send_as_bot` | Send messages as the app |
-| `im:message:readonly` | Get message details |
+| `im:message:readonly` | Get message details (REST active read) |
+| `im:message.p2p_msg:readonly` | Receive private messages sent to the Bot (**required for event push**) |
 | `im:resource` | Download image resources sent by users |
-| `im:chat:readonly` | Get chat info |
-| `contact:user.base:readonly` | Get basic user info |
+
+> **Trap warning**: `im:message.p2p_msg:readonly` is NOT the same as `im:message:readonly`.
+> The Feishu `im.message.receive_v1` event subscription page's "required permissions" list **only shows the former**.
+> If you only enable `im:message:readonly` (REST active read), the Bot will connect via WebSocket but will **NOT receive any private messages**.
+> cc-linker only handles `chat_type === 'p2p'` private messages, so this permission is required.
+> Missing it makes `cc-linker setup` hang for 120 seconds trying to capture `open_id`.
 
 ### Required Event Subscriptions
 

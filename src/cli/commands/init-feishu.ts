@@ -11,6 +11,18 @@ import { spawnSync } from 'child_process';
 const IS_MACOS = platform() === 'darwin';
 const IS_LINUX = platform() === 'linux';
 
+/**
+ * Mask a secret for terminal display: show first 3 + last 3 chars, middle as '*'.
+ * Returns '' for empty input and fully masks very short strings (≤6 chars).
+ */
+export function maskSecret(secret: string): string {
+  const s = secret ?? '';
+  if (s.length === 0) return '';
+  if (s.length <= 6) return '*'.repeat(s.length);
+  const middle = '*'.repeat(s.length - 6);
+  return `${s.slice(0, 3)}${middle}${s.slice(-3)}`;
+}
+
 function getMacOSPlistPath(): string {
   return join(homedir(), 'Library', 'LaunchAgents', 'com.cclinker.daemon.plist');
 }
@@ -238,17 +250,25 @@ export async function initFeishu(): Promise<void> {
   }]);
 
   // Step 2: Get app_secret
+  // Note: `default` is intentionally omitted — @inquirer/password v5+ hardcodes
+  // useState('') and ignores config.default, so passing it would be misleading.
   const { appSecret } = await inquirer.prompt([{
-    type: 'input',
+    type: 'password',
     name: 'appSecret',
-    message: '飞书 App Secret:',
-    default: feishu.app_secret || undefined,
-    validate: (v: string) => v.trim() ? true : 'App Secret 不能为空',
+    message: feishu.app_secret
+      ? '飞书 App Secret（留空保持原值，或粘贴新值）:'
+      : '飞书 App Secret:',
+    mask: '*',
+    // 允许空输入（有原值时回车保留）；首次配置仍必须输入
+    validate: (v: string) =>
+      v.trim() || feishu.app_secret ? true : 'App Secret 不能为空',
   }]);
+  // Reuse existing secret if user pressed Enter without typing a new one
+  const resolvedAppSecret = appSecret.trim() || feishu.app_secret?.trim() || '';
 
   // Step 3: Verify credentials and get bot name
   console.log(chalk.gray('\n验证凭据...'));
-  const token = await getTenantToken(appId.trim(), appSecret.trim());
+  const token = await getTenantToken(appId.trim(), resolvedAppSecret);
   if (!token) {
     console.log(chalk.red('❌ 凭据无效，请检查 App ID 和 App Secret'));
     process.exit(1);
@@ -277,7 +297,7 @@ export async function initFeishu(): Promise<void> {
     console.log(chalk.cyan('\n请在飞书中给 Bot 发一条任意消息...'));
     console.log(chalk.gray('（等待最多 120 秒）'));
 
-    openId = await captureOpenId(appId.trim(), appSecret.trim());
+    openId = await captureOpenId(appId.trim(), resolvedAppSecret);
 
     if (!openId) {
       console.log(chalk.yellow('\n⚠️ 未获取到 open_id'));
@@ -308,7 +328,7 @@ export async function initFeishu(): Promise<void> {
   // Step 6: Save config
   existing.feishu_bot = {
     app_id: appId.trim(),
-    app_secret: appSecret.trim(),
+    app_secret: resolvedAppSecret,
     ...(openId ? { owner_open_id: openId } : {}),
     ...(defaultCwd.trim() ? { default_cwd: defaultCwd.trim() } : {}),
   };
@@ -322,7 +342,7 @@ export async function initFeishu(): Promise<void> {
   console.log(chalk.green(`\n✅ 配置已保存到 ${CONFIG_PATH}`));
   console.log(chalk.cyan('\n配置内容:'));
   console.log(chalk.gray(`  app_id:          ${appId.trim()}`));
-  console.log(chalk.gray(`  app_secret:      ${appSecret.trim().slice(0, 4)}****`));
+  console.log(chalk.gray(`  app_secret:      ${maskSecret(resolvedAppSecret)}`));
   if (openId) {
     console.log(chalk.gray(`  owner_open_id:   ${openId}`));
   }
