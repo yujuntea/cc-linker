@@ -86,7 +86,7 @@ src/feishu/updater-card.ts    # Feishu 卡片构造
 | 触发点 | 频率 | 行为 | 失败处理 |
 |--------|------|------|---------|
 | CLI: `cc-linker upgrade --check` | 用户主动 | 查 registry（命中 24h 缓存就跳过），打印 banner 到 stdout | 静默 no-op |
-| CLI: `cc-linker status` | 用户主动 | 末尾追加 banner 行（命中缓存就跳过） | 静默 no-op |
+| CLI: `cc-linker status` | 用户主动 | **异步**触发 check（1s 软超时），主 status 输出后再打印 banner 行 | 超时静默，banner 不出现 |
 | CLI: `cc-linker start`（前台，非 daemon） | 用户主动 | 同步查一次（5s timeout），打印 banner 到 stdout 后再启 bot | 静默 no-op |
 | Daemon: `cc-linker start --daemon` 启动后 | 一次 | 同步查一次（5s timeout），新版本 → sleep 30s → 发 Feishu 卡片 | 跳过本次 |
 | Daemon 24h ticker | 每天 | 跟启动相同 | 静默 no-op |
@@ -155,7 +155,9 @@ exit 0 (banner-only, 不报错)
 #### `cc-linker upgrade`（无 `--check`，用户主动 apply）
 
 ```
-entry: cc-linker upgrade
+entry: cc-linker upgrade [--dry-run] [--to <version>]
+  ↓
+  ├── --dry-run: 强制不 apply, 只 print "would install X (current Y), no changes" + exit 0
   ↓
 check({ force: true }) (强制不走缓存, 走 fresh fetch)
   ↓
@@ -172,83 +174,157 @@ case status:
   disabled          → exit 0
 ```
 
-#### CLI 跟 daemon 协调
-- `cc-linker upgrade` 跑前读 `~/.cc-linker/owner.lock` 的 `upgrading` 字段
-- 若 `upgrading=true` → 拒绝（避免双重 apply）
-- 否则写 `upgrading=true` + `upgrade_started_at=now`，跑完恢复
-- 用 `@iarna/toml` 已有 dep 读写
+`--to <version>` 走 `npm i -g cc-linker@<version>` 精确版本（不走 latest），用于回退到旧版本。
+
+#### CLI 跟 daemon 协调（用独立锁文件，不污染 owner.lock）
+
+**为什么不用 owner.lock**：StateCoordinator 写 owner.lock（PID 字段），跟 upgrader 写 upgrading 字段会互相覆盖。**完全解耦**：
+
+```
+~/.cc-linker/.upgrading.lock
+{
+  pid = 12345
+  started_at = 1718...
+  target_version = "0.6.4"
+  source = "cli" | "card"  # 来源
+}
+```
+
+- **存在 + pid alive** = 升级中, 拒绝新的 apply（CLI / card 都查这个）
+- **存在 + pid dead** = 上一轮 crash, takeover
+- **不存在** = 可发起新升级
+- 退出时**必须**清理（正常路径用 `try/finally`，crash 后由新 bot 启动时清理）
+
+读取走 `readFileSync + parseInt + process.kill(pid, 0)`；写入走 `writeFileSync`（不需 atomic，丢失顶多重跑一次 apply）。
 
 ### 4.2 数据流 B：Daemon 启动检查
 
-#### 时序
+#### 时序（基于 post-init hook，不是 wall clock）
 
 ```
-t=0    start --daemon
-t=0~3s StateCoordinator.tryAcquire + WSClient connect + registry sync
-t=3s   ← 在这里调 checkAndNotify (不阻塞 bot ready)
-t=3s   checkAndNotify:
-         fetch (timeout 5s, 1 retry)
-         parse + semver compare
-         若 update_available:
-            sleep 30s (等 bot 完全 ready)
-            send Feishu card to owner
-            write notified_at = now() to .update-check.json
-         其它 status: 静默
-t=30s+ send Feishu card (only if update_available)
+t=0      start --daemon
+t=0~Xs   StateCoordinator.tryAcquire + WSClient.connect() + registry.sync() + startupReconcile()
+t=Xs     ←  bot 'ready' 事件触发 (post-init hook)
+            这里调 checkAndNotify (不阻塞其他 init)
+t=Xs     checkAndNotify:
+           fetch (timeout 5s, 1 retry)
+           parse + semver compare
+           若 update_available:
+              setTimeout(() => sendCard(), notify_delay_ms)  ← 来自 config
+              写 notified_at = now() 到 .update-check.json
+           其它 status: 静默
+t=X+30s  send Feishu card (only if update_available, setTimeout 可被 daemon shutdown clearTimeout)
 ```
 
-#### 为什么 sleep 30s
-- 启动后用户可能在 5s 内发消息（resume 旧 session），不希望 daemon 第一时间弹卡片
+#### 30s 缓冲的语义
+- **不是** wall clock，是 `bot ready` 事件后的延迟
+- 30s 给 bot 时间：warmup cache、active session 接管、spool reconcile
 - launchd 启动后用户没在看屏幕，30s 缓冲
+- 可配：`[updater] notify_delay_ms = 30000`（K 范围 0-300000）
+- 实现用 `setTimeout`，daemon 优雅退出时 `clearTimeout`（不留 dangling timer）
 
 #### 双发保护
 - 启动检查成功后写 `notified_at = now()` 到 cache
 - 24h ticker 看到 `notified_at` 在 24h 内就跳过（不重复发卡片，但 banner 仍可在 CLI 里看到）
 
-### 4.3 数据流 C：Feishu 卡片 + 用户点按钮
+### 4.3 数据流 C：Feishu 卡片 + 用户点按钮（v1.1 重构）
 
-#### 卡片样式
+#### 核心矛盾
+
+Bot 进程 = **即将被自己升级流程杀死的进程**。原 spec 让 Bot 既当"升级指挥官"又当"升级状态展示者"，但 Bot 会在 `cc-linker restart` 那一刻死亡，polling 永不结束 → 卡片永远卡在"升级中..."。
+
+#### 解决：upgrader 子进程模型
+
+状态管理权**完全**移交给独立 upgrader 子进程。Bot 只做"发卡片 + 写持久化状态 + spawn 子进程"，立刻返回。
+
+#### 持久化文件（3 个状态文件协同）
 
 ```
-┌─────────────────────────────────────┐
-│  🆕 cc-linker 有新版本              │  ← header
-├─────────────────────────────────────┤
-│ 当前 v0.6.3 → v0.6.4                │
-│                                     │
-│ 6 个 commits since v0.6.3           │  ← 暂不 parse, link 到 GitHub
-│                                     │
-│ [View changelog] [Skip] [Update]    │  ← action row
-└─────────────────────────────────────┘
+~/.cc-linker/pending_upgrade.json     # 卡片 → upgrader → 新 bot 的"事实交接点"
+{
+  "chat_id": "oc_xxx",
+  "message_id": "om_xxx",              # 原始卡片 message_id
+  "target_version": "0.6.4",
+  "started_at": "2026-06-14T...",
+  "patched_by_upgrader": false         # upgrader 完成 patch 后置 true
+}
+
+~/.cc-linker/.upgrading.lock          # 互斥锁 (跟 owner.lock 物理隔离)
+{
+  "pid": 12345,
+  "started_at": 1718...,
+  "target_version": "0.6.4",
+  "source": "card" | "cli"             # 来源
+}
+
+~/.cc-linker/.update-check.json       # 已存在, 复用 (status 字段追踪当前)
 ```
 
-#### Action callbacks
+#### 完整时序
+
+```
+T0      用户在飞书点 [Update]
+T0+0.1s Bot 收 card action callback (Feishu 3s ack timeout)
+T0+0.1s ├─ 写 pending_upgrade.json { message_id, chat_id, target_version, patched_by_upgrader: false }
+T0+0.1s ├─ 写 .upgrading.lock { pid: bot.pid, target_version, source: "card" }
+T0+0.1s ├─ 探测 .upgrading.lock 是否已存在 (上一轮 crash?)
+T0+0.1s │   └─ 已存在 + pid alive → 拒绝 (patch 卡片 "升级中, 请勿重复", ack Feishu 200)
+T0+0.1s │   └─ 已存在 + pid dead  → 接管, 覆盖 lock
+T0+0.2s ├─ patch 卡片 → "升级中..." (best-effort, 500ms timeout, 失败无所谓)
+T0+0.3s ├─ spawn: cc-linker upgrade --from-card --message-id=om_xxx --chat-id=oc_xxx --target-version=0.6.4
+T0+0.3s │   (detached: true, stdio: logFd, child.unref())
+T0+0.3s └─ ack Feishu 200, return
+                                  
+T0+0.3s Bot 返回其他工作, 之后会被 postinstall 杀 (见下)
+
+T+1s    Upgrader 进程启动
+         cc-linker 在 PATH 是 OLD 版本 (用户 spawn 时还没装新)
+         但 npm i -g 会替换, postinstall 时 PATH 已是 NEW
+T+3s    Upgrader 跑 `npm i -g cc-linker@latest` (stdio pipe 到 log)
+T+4s    npm install 主体完成
+         → postinstall.js 触发
+         → postinstall 调 `cc-linker restart` (PATH 里已是 NEW binary)
+         → restart 读 owner.lock 找 Bot PID
+         → kill Bot (Bot 正在跑老代码, 死亡)
+T+5s    Upgrader 看到 `npm install` exit code 0
+T+5.1s  Upgrader patch 卡片 → "✅ 已升级到 v0.6.4, daemon 重启中..."
+T+5.2s  Upgrader 写 pending_upgrade.json.patched_by_upgrader = true
+T+5.3s  Upgrader 删 .upgrading.lock
+T+5.4s  Upgrader exit 0
+                                  
+T+8s    新 Bot 启动 (跑 NEW binary)
+T+10s   新 Bot 读 pending_upgrade.json
+         ├─ patched_by_upgrader = true  → 删文件, 不动作 (upgrader 已搞定)
+         ├─ .upgrading.lock 仍存在 (PID 还活) → spin wait 30s 再检查
+         ├─ patched_by_upgrader = false (upgrader crash) → 兜底 patch 卡片 "❌ 状态未知, 请跑 cc-linker status 或手动 npm i -g cc-linker@latest"
+         └─ 文件不存在 → 不动作
+T+11s   新 Bot 正常 ready, 发用户消息
+```
+
+#### 关键 race 与裁决
+
+| Race | 谁赢 | 保证 |
+|------|------|------|
+| Bot patch 卡片 vs Bot 被杀 | 都无所谓 | Bot 用 500ms 超时, 失败无所谓, upgrader 会 patch |
+| npm i -g vs `cc-linker restart` 杀 Bot | **postinstall 杀 Bot** | npm lifecycle 顺序: install 主体 → postinstall (不可打断) |
+| Upgrader patch 卡片 vs Upgrader 被杀 | **新 Bot 兜底** | 新 Bot 看到 patched=false → 兜底 patch "❌ 状态未知" |
+| 新 Bot 启动 vs Upgrader 还在跑 | **新 Bot 等** | 新 Bot 看到 lock 存在 + PID 活 → spin wait 30s |
+| 用户点 [Update] 两次 | **第二次拒绝** | Bot handler 查 .upgrading.lock 已存在 → patch "升级中, 请勿重复" + ack 200 |
+| postinstall 跑 `cc-linker restart` 时 cc-linker 在 PATH 是新版 | OK | npm install 先 replace symlink 再跑 postinstall |
+
+#### 为什么不能用 bot poll cache 文件
+
+- Bot 进程会被杀，polling 终止 → 卡片永远卡住
+- 改用 **upgrader 直接 patch 卡片**，因为 upgrader 跟 postinstall 是**独立进程**，不被影响
+- 新 Bot 仅作 safety net，不参与正常流程
+
+#### Skip / Changelog 按钮
 
 | 按钮 | 行为 | 卡片演化 |
 |------|------|---------|
-| `Update` | `lark-cli invoke` → `applyCardAction` → fork exec `cc-linker upgrade --from-card` | patch "升级中..." → "✅ 已升级" / "❌ 失败" |
-| `Skip` | 写 `skipped_versions` 到 user-mapping.json（CAS），30 天内不再推 | patch "已忽略 v0.6.4, 30 天内不再提醒" |
+| `Update` | 见上文完整时序 | "升级中..." → "✅/❌" |
+| `Skip` | 写 `skipped_versions` 到 user-mapping.json（CAS retry × 1），patch 卡片 "已忽略 v0.6.4, 30 天内不再提醒" | 终态 |
 | `View changelog` | URL = `https://github.com/yujuntea/cc-linker/releases/tag/v0.6.4` | 卡片不变 |
-
-#### Apply 路径：fork exec（不在 bot 进程内）
-
-```ts
-// 卡片按钮 handler
-const child = spawn('cc-linker', ['upgrade', '--from-card'], {
-  detached: true,
-  stdio: ['ignore', logFd, logFd],
-});
-child.unref();
-return client.im.v1.message.patch({
-  message_id: originalMessageId,
-  content: JSON.stringify({ ...upgradeCard, state: 'upgrading' }),
-});
-// 后续 polling: child 退出后定时 poll .update-check.json
-// status 变 up_to_date 即视为升级成功 (60s 兜底 timeout)
-```
-
-**为什么 fork exec：**
-- bot 进程不能 `npm i -g cc-linker@latest` —— 它自己就是被升级的目标
-- fork 后 bot 仍跑旧 binary，`cc-linker restart` 触发 postinstall → 切到新 binary
 
 #### Skip 状态持久化
 
@@ -343,14 +419,19 @@ await rename(tmp, path);  // atomic on POSIX
 ### 5.6 端用户业务场景
 | # | 触发 | 期望 |
 |---|------|------|
-| B1 | 端用户点 Update | 卡片"升级中" → "✅ 已升级" |
+| B1 | 端用户点 Update | Bot 写状态 + spawn upgrader + ack; Upgrader 跑 npm i -g + patch 卡片 ✅/❌; 新 Bot 启动后清理 pending_upgrade.json |
 | B2 | 端用户 idle 时收到卡片 | 卡片躺着，飞书原生行为 |
 | B3 | Skip 后 30 天内又发版 | 卡片不发，CLI banner 仍显示 |
 | B4 | Skip 31 天后发版 | 卡片正常推 |
-| B5 | 升级失败 | 卡片"❌ 失败, 跑 npm i -g cc-linker@latest"，不重试 |
+| B5 | 升级失败（npm exit ≠ 0） | Upgrader patch "❌ 失败: {stderr snippet}"，不重试，不删 .upgrading.lock；新 Bot 看到 lock 存在但 PID 死 → 接管，patch 兜底 "❌ 状态未知, 请手动 npm i -g cc-linker@latest" |
 | B6 | 端用户没装飞书 | daemon 静默，CLI 仍可用 |
 | B7 | 端用户多台机器 | 每台独立（不跨设备协调） |
-| B8 | session 进行中升级 | postinstall graceful stop + startupReconcile 恢复 |
+| B8 | session 进行中升级 | postinstall graceful stop + startupReconcile 恢复（已有路径） |
+| B9 | 慢网络 `npm i -g` > 60s | Upgrader 仍在跑（postinstall 还没返回），新 Bot spin wait 30s；超时仍 patch "❌ 状态未知"，**实际升级可能仍在进行**（卡片 caveat） |
+| B10 | Upgrader 进程被 OOM 杀 | pending_upgrade.json.patched_by_upgrader 仍为 false；新 Bot 兜底 patch |
+| B11 | 用户点 Update 时 Bot 已被别的流程杀（race） | 飞书 3 次重试，新 Bot 收到 callback，照常处理 |
+| B12 | user-mapping.json 不存在（bot 没 init-feishu） | 启动检查静默 no-op；`notify_channel = none` 隐式 |
+| B13 | bun-only 用户没装 node | postinstall 失败 → 升级"成功"但 daemon 没 restart；Upgrader 检 postinstall 退出码 → patch "❌ postinstall 失败, 请手动 cc-linker restart" |
 
 ### 5.7 配置
 ```toml
@@ -359,9 +440,14 @@ enabled = true
 check_on_status = true
 check_on_start = true
 notify_channel = "feishu"   # feishu | cli | none
-registry_url = "https://registry.npmjs.org/cc-linker/latest"
+registry_url = "auto"        # "auto" = 读用户 .npmrc registry; 或写死 https://...
 check_interval_hours = 24
 skipped_ttl_days = 30
+notify_delay_ms = 30000      # daemon ready 后多久发卡片
+test_mode = false            # true = 卡片发到 test_openid 而非真实 owner
+test_openid = "ou_test"
+# priority: env > CLI flag > config
+# CC_LINKER_UPDATER_DISABLED=1  全局关
 ```
 
 | # | 触发 | 期望 |
@@ -370,7 +456,23 @@ skipped_ttl_days = 30
 | K2 | `notify_channel = "cli"` | daemon 启动 / tick 时**不**发 Feishu 卡片，改写 `~/.cc-linker/cc-linker.log`（用 `logger.info`）一行 banner；CLI `status` / `upgrade --check` 仍照常 |
 | K3 | `notify_channel = "none"` | daemon 侧完全静默, 跳过发卡片 + 不写 log；cache 仍写（CLI 用） |
 | K4 | 删 `.update-check.json` | 下次 fresh fetch |
-| K5 | section 不存在 | 用默认值 |
+| K5 | section 不存在 | 用默认值（enabled=true, check_interval_hours=24, skipped_ttl_days=30, notify_delay_ms=30000, test_mode=false） |
+
+#### Registry 解析（避免镜像延迟导致"假升级成功"）
+
+```ts
+async function resolveRegistryUrl(): Promise<string> {
+  const config = getConfig('updater.registry_url', 'auto');
+  if (config !== 'auto') return `${config}/cc-linker/latest`;
+  // auto: 读用户 .npmrc, 跟 npm i -g 用同一个 registry
+  const { stdout } = await execFileAsync('npm', ['config', 'get', 'registry'], { timeout: 3000 })
+    .catch(() => ({ stdout: 'https://registry.npmjs.org/' }));
+  const base = stdout.trim().replace(/\/$/, '');
+  return `${base}/cc-linker/latest`;
+}
+```
+
+**关键不变量：check 的 registry 跟 apply (`npm i -g`) 的 registry 一定一致**。否则用户看到 "v0.6.4 available" 但 apply 装到 v0.6.3（镜像延迟）。
 
 **优先级：env > CLI flag > config**
 
@@ -388,12 +490,27 @@ skipped_ttl_days = 30
 | `tests/unit/updater/lifecycle.test.ts` | ~120 | 6 | Skip CAS / 过期 |
 
 ### 6.2 集成测试
+
+#### CLI 路径
 | 场景 | 操作 | 期望 |
 |------|------|------|
 | `fake-registry → CLI banner` | 起 mock server, 跑 `upgrade --check` | banner 正确 |
 | `CLI upgrade apply` | mock 200 + tgz, 跑 `upgrade` | 调 `npm install`（mock 不真装） |
-| `daemon check on start` | 启 daemon, wait 30s | fetch 1 次 + 卡片 1 次 |
-| `24h ticker` | mock Date.now() 推进 25h | ticker 触发 + 写 cache |
+| `CLI upgrade --dry-run` | 跑 `upgrade --dry-run` | 打印 "would install X", 不调 npm |
+| `CLI upgrade --to 0.6.2` | 跑 `upgrade --to 0.6.2` | 调 `npm i -g cc-linker@0.6.2` |
+| `status async banner` | mock 1.5s 慢 fetch, 跑 `status` | 主 status 立即输出, banner 1s 后追加 |
+
+#### 卡片路径（upgrader 子进程模型，**新增**）
+| 场景 | 操作 | 期望 |
+|------|------|------|
+| `card Update happy path` | mock Feishu action, mock npm install 成功, mock postinstall 成功 | Bot 写 pending + lock + spawn; Upgrader patch ✅; 新 Bot 清理文件 |
+| `card Update double click` | 1s 内点 2 次 Update | 第一次正常, 第二次 patch "升级中, 请勿重复" |
+| `card Update + slow npm` | mock `npm install` 跑 90s | Upgrader 仍在跑 → patch 兜底超时; 实际升级可能成功（B9 caveat） |
+| `card Update + upgrader crash` | mock Upgrader 进程被 SIGKILL 在 patch 前 | pending.patched=false; 新 Bot 兜底 patch "❌ 状态未知" |
+| `card Update + new bot spins` | mock 新 Bot 启动时 Upgrader 还在跑 | 新 Bot spin wait 30s, 看到 patched=true 后清理 |
+| `card Update + test_mode` | `[updater] test_mode=true, test_openid=ou_test` | 卡片发到 test_openid 而非 owner |
+| `card Skip + CAS conflict` | mock UserManager.casUpdate 失败 1 次 | retry 1 次, 仍失败 patch "状态冲突, 请重试" |
+| `card Skip + expired entries` | mock user-mapping 含 35 天前 skip | getActiveSkips 过滤, 新版本正常推 |
 
 ### 6.3 α 阶段真实走通 checklist
 - [ ] `bun run dev upgrade --check` 在 fake registry 下跑通
@@ -460,17 +577,21 @@ skipped_ttl_days = 30
 
 ---
 
-## 10. 时间线 + LOC 估算
+## 10. 时间线 + LOC 估算（v1.1 修订）
+
+> v1.1 比 v1.0 多 ~250 LOC，主要是 upgrader 子进程模型 + 持久化文件 + 安全网。
 
 | 时段 | 内容 | LOC |
 |------|------|-----|
 | Day 1 上午 | `src/updater/{check,types,notify,lifecycle}.ts` + 单测 | ~250 + ~250 |
-| Day 1 下午 | `src/cli/commands/upgrade.ts` + status banner + 单测 | ~150 + ~120 |
-| Day 1 晚上 | `src/feishu/updater-card.ts` + 卡片 action handler | ~120 |
-| Day 2 上午 | `src/runtime/updater-tick.ts` + 启动 hook + 单测 | ~100 + ~80 |
-| Day 2 下午 | `src/utils/paths.ts` + `src/utils/config.ts` + `package.json`（+ semver dep） | ~30 |
-| Day 2 晚上 | e2e 升级走通（fake registry + 真 daemon） | ~80 |
-| **合计** | | **~1180 LOC（含测试）** |
+| Day 1 下午 | `src/cli/commands/upgrade.ts` + status async banner + 单测 | ~180 + ~140 |
+| Day 1 晚上 | `src/feishu/updater-card.ts` + 卡片 action handler | ~140 |
+| Day 1 晚+ | **`src/upgrader/{runner,patch-card,state}.ts` + pending_upgrade.json + .upgrading.lock + 单测** | ~250 + ~200 |
+| Day 2 上午 | `src/runtime/updater-tick.ts` + 启动 hook + **新 Bot 兜底逻辑** + 单测 | ~140 + ~100 |
+| Day 2 下午 | `src/utils/paths.ts` + `src/utils/config.ts` + `package.json`（+ semver dep） | ~40 |
+| Day 2 晚上 | **改 `scripts/postinstall.js` 加 bun fallback**（I1 修） | ~10 |
+| Day 2 晚+ | e2e 升级走通（fake registry + 真 daemon + 真实卡片） | ~120 |
+| **合计** | | **~1820 LOC（含测试）** |
 
 ---
 
@@ -482,7 +603,11 @@ skipped_ttl_days = 30
 - ❌ `min_version` 黑名单强制升级
 - ❌ 开发者侧 `bun run deploy` 整合进 `cc-linker upgrade`
 - ❌ Auto-update `cc-linker` binary（不走 npm 时）
-- ❌ 改 `scripts/postinstall.js` / `bun run deploy` / `daemon.ts` / `package.json` bin
+
+### 11.1 本次**必须改**的现有文件（不是 Out of Scope）
+
+- ✅ **`scripts/postinstall.js`**：加 bun fallback shebang（I1 修复）。原本 spec 写"不改 postinstall.js"是错的——bun-only 用户场景需要这个修。改动 ≤ 10 行，幂等性不变。
+- ❌ 不改 `bun run deploy` / `daemon.ts` / `package.json` bin
 
 ---
 
