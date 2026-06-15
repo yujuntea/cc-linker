@@ -602,6 +602,8 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
 
   console.log = (...args: any[]) => log('INFO', args.join(' '));
   console.error = (...args: any[]) => log('ERROR', args.join(' '));
+  console.warn = (...args: any[]) => log('WARN', args.join(' '));
+  console.debug = (...args: any[]) => log('DEBUG', args.join(' '));
 
   log('INFO', `Daemon child started (PID: ${pid})`);
   process.on('SIGHUP', () => {});

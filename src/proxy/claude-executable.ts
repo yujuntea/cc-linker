@@ -152,7 +152,7 @@ export function resolveClaudeExecutable(
     if (fallbackWarned) {
       logger.info(
         `[claude-resolver] 继续走 fallback → ${generalResolved} ` +
-        `(bundled 缺失;首次警告见 bot 启动早期日志,设置 [sdk] claude_executable 可消除)`,
+        `(bundled 缺失;首次警告见上方日志,设置 [sdk] claude_executable 可消除)`,
       );
     } else {
       logger.warn(
