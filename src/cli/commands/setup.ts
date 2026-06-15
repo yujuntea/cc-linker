@@ -372,8 +372,8 @@ function printPermissionGuide(): void {
   console.log(chalk.green('    ✅ 开启 WebSocket 模式（事件订阅 → 配置订阅方式）'));
   console.log(chalk.green('    ✅ 发布应用版本（版本管理与发布 → 创建版本）'));
   console.log('');
-  console.log(chalk.gray('  提示: 配置完成后，记得在「版本管理与发布」中'));
-  console.log(chalk.gray('  创建并上线一个新版本，否则权限不会生效。'));
+  console.log(chalk.yellow.bold('  ⚠️  关键提示: 配置完成后，必须在「版本管理与发布」中'));
+  console.log(chalk.yellow.bold('     创建并上线一个新版本，否则所有权限都不会生效!'));
   console.log('');
 }
 
