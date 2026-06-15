@@ -363,13 +363,15 @@ function printPermissionGuide(): void {
   console.log(chalk.cyan('  必需事件订阅（事件配置）:'));
   console.log(chalk.green('    im.message.receive_v1      接收用户发给 Bot 的消息'));
   console.log(chalk.green('    im.chat.member.bot.added_v1  Bot 被邀请进群时触发（可选）'));
+  console.log(chalk.yellow('    → 订阅方式: 选择「使用 长连接 接收事件」（推荐）'));
   console.log('');
   console.log(chalk.cyan('  必需事件订阅（回调配置）:'));
   console.log(chalk.green('    card.action.trigger        接收卡片按钮点击（/list 切换会话、模型切换、SDK 权限确认等）'));
+  console.log(chalk.yellow('    → 订阅方式: 选择「使用 长连接 接收回调」（推荐）'));
   console.log('');
   console.log(chalk.cyan('  必需配置:'));
   console.log(chalk.green('    ✅ 启用 Bot 能力（应用功能 → 机器人）'));
-  console.log(chalk.green('    ✅ 开启 WebSocket 模式（事件订阅 → 配置订阅方式）'));
+  console.log(chalk.green('    ✅ 开启 WebSocket 长连接（事件订阅 + 回调配置 两个 tab 都要选「长连接」）'));
   console.log(chalk.green('    ✅ 发布应用版本（版本管理与发布 → 创建版本）'));
   console.log('');
   console.log(chalk.yellow.bold('  ⚠️  关键提示: 配置完成后，必须在「版本管理与发布」中'));
