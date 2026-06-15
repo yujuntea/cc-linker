@@ -458,6 +458,8 @@ permission_mode = "acceptEdits"
 
 **注意：** SDK 模式需要系统已安装 `claude` 命令行工具（`npm install -g @anthropic-ai/claude-code`）。如需自定义可执行文件路径，可使用 `general.claude_bin` 或 `sdk.claude_executable`。
 
+> cc-linker 默认使用 SDK 自带的 claude 二进制（保证版本兼容）。若该二进制在 npm install 时被 omit（如 `--omit=optional`、`NODE_ENV=production`），cc-linker 会自动 fallback 到 `general.claude_bin`（通常是系统 PATH 中的 `claude`），并在日志中输出 WARN。如遇版本不兼容，可显式设置 `sdk.claude_executable` 指向兼容版本。
+
 **补充：** SDK 权限确认卡片如果发送失败，或用户在超时时间内未确认，当前实现会自动拒绝该次工具调用。
 
 **环境变量覆盖**：

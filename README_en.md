@@ -448,6 +448,8 @@ permission_mode = "acceptEdits"
 
 **Note**: SDK mode requires the `claude` CLI to be installed on the system (`npm install -g @anthropic-ai/claude-code`). You can override the executable path with `general.claude_bin` or `sdk.claude_executable`.
 
+> cc-linker defaults to the SDK-bundled `claude` binary (guaranteed version compatibility). If that binary is omitted during install (e.g. `--omit=optional`, `NODE_ENV=production`), cc-linker automatically falls back to `general.claude_bin` (typically system PATH `claude`) and emits a WARN log. If you hit version-incompatibility issues, set `sdk.claude_executable` explicitly to a compatible path.
+
 **Additional note**: if the permission card cannot be delivered, or the user does not respond before timeout, the current implementation automatically denies that tool request.
 
 **Environment Variable Overrides**:
