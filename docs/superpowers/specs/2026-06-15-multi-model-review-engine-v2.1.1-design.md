@@ -291,7 +291,7 @@ T47   Engine                      写 PipelineRecord 到 done/，CLI 输出 stat
 | 并发维度 | 谁决定 | 怎么控 |
 |---------|--------|--------|
 | Pipeline 之间 | PipelineStore 的 `running/` 目录 | 默认 1 个同时跑（profile 可配 `guards.max_concurrent_pipelines`） |
-| Pipeline 内的 pane | 状态机驱动 | R1/R2 串行（同 work session resume）；EXTERNAL_REVIEW 轮次内 review-A/B Promise.all 并行；FIXING 串行在 EXTERNAL/JUDGE 之后 |
+| Pipeline 内的 pane | 状态机驱动 | R1/R2 串行（同 work session resume）；**EXTERNAL_REVIEW 单一 review session 串行**（v2.1.1 变更 1：删 N 个 review 并行）；FIXING 串行在 EXTERNAL/JUDGE 之后 |
 | bg session 并发 | Claude CLI daemon | 实测 3+ 并行 OK；review engine 1 个 pipeline 最多 1+N 个 bg session（work + N reviews，无 arbiter） |
 | Polling 频率 | adapter 内部 | 500ms 一次 |
 
@@ -1064,11 +1064,13 @@ export async function reconcile(): Promise<void> {
 
     if (deadPanes.length > 0) {
       // v2.1 改：进入 PANE_LOST，不直接 FAILED
+      // v2.1.1 变更 1：deadPanes[0] 即可（单一 review 模型后通常只 1 pane 丢）
       logger.warn(`[reconciler] pipeline ${record.pipelineId} 有 ${deadPanes.length} 个 pane 已消失: ${deadPanes.join(', ')}`);
+      const first = deadPanes[0];
       record.state = {
         kind: 'PANE_LOST',
         round: record.state.round,
-        lostPanes: deadPanes.map(d => ({ role: d.role, shortId: d.shortId })),  // v2.1 修正：支持多 pane 同时丢失
+        lostPane: { role: first.role, shortId: first.shortId },  // v2.1.1：单数
         detectedAt: new Date().toISOString(),
       };
       await store.saveRunning(record);
@@ -1243,7 +1245,7 @@ provider = "claude-sonnet-4"   # 直接映射到 ~/.claude/providers/<name>.json
 
 [review]
 mode = "parallel"
-providers = ["kimi-for-coding", "bailian-qwen3.6"]   # 数组决定 EXTERNAL_REVIEW 几个 pane
+provider = "kimi-for-coding"   # v2.1.1 变更 1：单数（之前是 providers[] 数组）
 
 [guards]
 max_rounds = 6                       # v2.1 改：默认 6
@@ -1350,7 +1352,7 @@ template = """
 """
 
 [phase_overrides.code]
-review.providers = ["kimi-for-coding", "bailian-qwen3.6", "xiaomi-mimo"]   # 完全替换
+review.provider = "kimi-for-coding"   # v2.1.1 变更 1：单数（之前是 providers[] 数组）
 guards.max_rounds = 8           # v2.1 改：Code phase 默认 8（v2 是 15）
 ```
 
