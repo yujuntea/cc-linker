@@ -2379,6 +2379,16 @@ export class FeishuBot {
       );
       currentHandler = handler;
 
+      // I-1 fix: if SDK short-circuited (e.g. E_SDK_NO_CLAUDE), render an error card
+      // instead of a green success card. The sessionId is truthy (resume UUID) so we
+      // can't rely on `!result.sessionId` like the new-session path does.
+      if (result.sessionStatus === 'degraded' && cardUpdater) {
+        await cardUpdater.error(result.error ?? result.response);
+        cardMessageId = cardUpdater.getCardMessageId();
+        cardUpdater.dispose();
+        return { result, handler, cardMessageId, rendezvousHandled: false };
+      }
+
       // Defensive: if streaming text is empty but result.response has content,
       // fall back to result.response (e.g. when SDK partial messages are not emitted).
       const finalText = text || result.response || '(空回复)';

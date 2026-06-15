@@ -181,10 +181,10 @@ export function resolveClaudeExecutable(
 修法(任选一种):
 
   1) 重装 cc-linker, 保留 optional deps:
-     \`npm install -g cc-linker@latest --include=optional\`
+     npm install -g cc-linker@latest --include=optional
 
   2) 安装 Claude Code CLI:
-     \`npm install -g @anthropic-ai/claude-code\`
+     npm install -g @anthropic-ai/claude-code
      (完成后会自带 system 'claude',会被 resolver 自动 fallback 捕获)
 
   3) 在 config.toml 显式指定二进制路径:
