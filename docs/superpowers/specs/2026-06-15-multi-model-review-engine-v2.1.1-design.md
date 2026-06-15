@@ -907,14 +907,15 @@ interface PaneRegistry {
     startedAt: string;
     roundShortIds: string[];    // v2.1 新增：每轮 shortId 数组（诊断用）
   };
-  reviews: {
-    role: 'review-A' | 'review-B' | ...;
+  // v2.1.1 变更 1：单数 review（v2.1 是 reviews[]，单一 review 模型后改 review）
+  review?: {
+    role: 'review';
     shortId: string;
     sessionId: string;
     provider: string;
     round: number;
     cycle: 'initial' | 'postfix';
-  }[];
+  };
   // v2.1 变更 18：删 arbiter 字段（无 arbiter 状态）
 }
 
