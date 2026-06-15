@@ -1,14 +1,37 @@
-# Multi-Model Review Engine v2.1 Implementation Plan
+# Multi-Model Review Engine v2.1.1 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship a CLI-driven multi-model review pipeline that orchestrates work sessions across multiple Claude providers, fixes issues with verify-first discipline, and produces Markdown reports — all without modifying user source files automatically.
+**Goal:** Ship a CLI-driven multi-model review pipeline that orchestrates work sessions across multiple Claude providers, fixes issues with verify-first discipline + git checkpoint rollback, and produces Markdown reports — all without modifying user source files automatically.
 
-**Architecture:** 9-state state machine (PRODUCING → SELF_REVIEW_R1 → FIXING → SELF_REVIEW_R2 → FIXING → EXTERNAL_REVIEW → JUDGE_BY_WORK → FIXING → HUMAN_DECIDE → ...) drives a `claude --bg` based bg session per pane. State persisted to `~/.cc-linker/review-pipelines/running/<id>.json`. CLI subcommand group `cc-linker review {run,status,abort,report,decide,cancel,doctor,profiles}`.
+**Architecture:** 9-state state machine (PRODUCING → SELF_REVIEW_R1 → FIXING → SELF_REVIEW_R2 → FIXING → EXTERNAL_REVIEW → JUDGE_BY_WORK → FIXING → HUMAN_DECIDE → ...) drives a `claude --bg` based bg session per pane (1 work + 1 review). State persisted to `~/.cc-linker/review-pipelines/running/<id>.json`. CLI subcommand group `cc-linker review {run,status,abort,report,decide,cancel,doctor,profiles}`.
 
 **Tech Stack:** Bun + TypeScript (strict), Zod (Output Contract parsing), TOML via `@iarna/toml`, `commander` (CLI), `chalk` (terminal colors), no new HTTP framework (CLI `--watch` mode replaces v2's Bun.serve IDE).
 
-**Spec:** `docs/superpowers/specs/2026-06-14-multi-model-review-engine-v2.1-design.md` (~2000 lines)
+**Spec:** `docs/superpowers/specs/2026-06-15-multi-model-review-engine-v2.1.1-patch.md` (v2.1.1 patch 文档，6 项变更)
+
+**Base plan:** `docs/superpowers/plans/2026-06-14-multi-model-review-engine-v2.1-plan.md` (本文件，原 v2.1 计划基础上做了 v2.1.1 增量修改)
+
+---
+
+## v2.1.1 Patch Notes（相对 v2.1 的增量变更）
+
+本计划在 v2.1 计划基础上应用了 v2.1.1 patch（见 spec patch 文档）的 6 项变更。**原 v2.1 任务的 TDD 步骤大部分保留不变**，只在以下任务中应用了 v2.1.1 修改：
+
+| v2.1.1 变更 | 影响的本计划章节 | 修改性质 |
+|------------|-----------------|---------|
+| **1. 单一 Review 模型**（`review.providers[]` → `review.provider`） | T1.1, T1.2, T1.3, T2.2, T5.3, T7 | rename + 简化 |
+| **2. commit 前置指令** | T1.1 (新增 `prompts.work.fixing.preamble` 字段), T1.2 (preamble enabled 默认 true), T5.3 (FIXING 状态启动前注入 preamble) | 新增 |
+| **3. JSON parse 失败不静默**（`parseBgOutput` → `parseBgOutputWithRetry`） | T1.1 (新增 `parseDegraded[]` 字段), T5.1 (新增 `parseBgOutputWithRetry` 函数), T5.3 (调用方改用 parseWithRetry + 记录 degraded 事件) | 重写 |
+| **4. Context Overflow 三策略**（reset / review_fix / abort） | T1.1 (新增 `context_overflow_*` guards + `context_limits` + `contextResets[]`), T1.3 (doctor 新增检查), T5.3 (EXTERNAL_REVIEW 完成后插入 context 检查节点), **T10 (新增) Context Overflow Strategy 实现** | **新增 T10** |
+| **5. `getContextUsage` API** | T1.1 (新增 `KNOWN_CONTEXT_LIMITS` 表说明), T4.1 (新增 `getContextUsage` 方法), T4.2 (新增集成测试) | 新增 |
+| **6. review_fix 自然单 session 串行** | T5.3 (spec 显式说明), T6.1 (cleanup 流程无需变化) | 仅文档说明 |
+
+**未变更任务**：T3 (PhaseDetector), T7 (CLI), T8 (CLI watch) — 这三个任务与 v2.1.1 变更完全无关。
+
+**Phase 1 排期影响**：
+- v2.1: 5-6 周
+- v2.1.1: 6-7 周（+1 周，含新增 T10 + T1/T4/T5.1 的修改时间）
 
 ---
 
@@ -22,12 +45,13 @@ src/review/
 ├── phase-detect.ts              # 5 个启发式 + PhaseUnknownError
 ├── pipeline-store.ts            # 5 目录原子写 + moveToTerminal
 ├── pipeline-state.ts            # in-memory active pipeline Map + AbortController
-├── adapter.ts                   # ClaudeBGAdapter (claude --bg + RendezvousClient.injectReply + claude stop)
-├── engine.ts                    # 状态机驱动 (9 active states)
+├── adapter.ts                   # ClaudeBGAdapter (claude --bg + RendezvousClient.injectReply + claude stop + getContextUsage)
+├── engine.ts                    # 状态机驱动 (9 active states + 3 terminal)
 ├── reconciler.ts                # 启动扫描 + pane 丢失检测
 ├── review-doctor.ts             # cc-linker review doctor 健康检查
 ├── cli-watch.ts                 # CLI --watch 模式 (rich terminal)
-├── output-contract.ts           # Zod schemas + JSON 提取 + parse 降级
+├── output-contract.ts           # Zod schemas + JSON 提取 + parseBgOutputWithRetry (v2.1.1)
+├── context-overflow.ts          # v2.1.1 变更 4: checkContextOverflow + 三策略实现 (reset/review_fix/abort)
 ├── types.ts                     # ReviewState / PaneRegistry / PipelineRecord / HistoryEvent / DecisionContext
 └── abort-cleanup.ts             # cleanupPipeline() 6 步实现
 
@@ -45,11 +69,14 @@ tests/unit/review/
 ├── review-doctor.test.ts
 ├── cli-watch.test.ts
 ├── output-contract.test.ts
+├── context-overflow.test.ts            # v2.1.1 变更 4
+├── context-overflow-strategy.test.ts   # v2.1.1 变更 4 (T10.2)
 └── abort-cleanup.test.ts
 
 tests/integration/review/
 ├── adapter-bg-spawn.test.ts
 ├── adapter-inject-reply.test.ts
+├── adapter-get-context-usage.test.ts   # v2.1.1 变更 5 (T4.3 - 真实 jsonl 读取)
 ├── reconciler-recovery.test.ts
 └── e2e-mini-pipeline.test.ts
 
@@ -62,8 +89,9 @@ docs/superpowers/plans/
 - `src/index.ts` — register `review` subcommand group
 - `src/utils/paths.ts` — add `REVIEW_PIPELINES_DIR` + `REVIEW_PROFILES_DIR`
 - `src/utils/config.ts` — extend `ConfigData` with `review` section
-- `src/agent-view/job-state.ts` — extend `JobStateFile` interface with `output` field (or use local ExtendedJobStateFile per §7.5.6)
-- `package.json` — no new deps (use existing zod, chalk, toml)
+- `src/agent-view/job-state.ts` — **不修改**。按 spec §7.5.6 备选方案，Review Engine 内部用 `ExtendedJobStateFile = JobStateFile & { output?: string | null; children?: unknown; sessionId?: string; createdAt?: string; updatedAt?: string }` 扩展类型，不污染 Agent View
+- `src/agent-view/jsonl-last-assistant.ts` — **只读**。`readLastAssistantUsage` 已是公开导出函数，Review Engine 的 `adapter.getContextUsage` 复用它
+- `package.json` — no new deps (use existing zod, chalk, toml, @iarna/toml)
 
 ### Decomposition rationale
 
@@ -89,8 +117,8 @@ Create `tests/unit/review/types.test.ts`:
 import { describe, it, expect } from 'bun:test';
 import { ReviewProfileSchema, type ReviewProfile } from '../../src/review/types';
 
-describe('ReviewProfile', () => {
-  it('parses minimal valid profile', () => {
+describe('ReviewProfile (v2.1.1)', () => {
+  it('parses minimal valid profile (single review provider)', () => {
     const toml = `
 [meta]
 name = "default"
@@ -99,7 +127,7 @@ name = "default"
 provider = "claude-sonnet-4"
 
 [review]
-providers = ["kimi-for-coding"]
+provider = "kimi-for-coding"  # v2.1.1: 单数标量
 
 [guards]
 max_rounds = 6
@@ -107,7 +135,7 @@ max_rounds = 6
     const profile = ReviewProfileSchema.parse(toml);
     expect(profile.meta.name).toBe('default');
     expect(profile.work.provider).toBe('claude-sonnet-4');
-    expect(profile.review.providers).toEqual(['kimi-for-coding']);
+    expect(profile.review.provider).toBe('kimi-for-coding');  // v2.1.1
     expect(profile.guards.max_rounds).toBe(6);
   });
 
@@ -117,12 +145,12 @@ max_rounds = 6
 name = "bad"
 
 [review]
-providers = ["kimi"]
+provider = "kimi"
 `;
     expect(() => ReviewProfileSchema.parse(toml)).toThrow();
   });
 
-  it('applies default values for missing optional fields', () => {
+  it('applies default values for missing optional fields (incl. v2.1.1 context_overflow_*)', () => {
     const toml = `
 [meta]
 name = "minimal"
@@ -131,12 +159,66 @@ name = "minimal"
 provider = "sonnet"
 
 [review]
-providers = ["kimi"]
+provider = "kimi"
 `;
     const profile = ReviewProfileSchema.parse(toml);
     expect(profile.guards.max_concurrent_pipelines).toBe(1);
     expect(profile.guards.human_decide_timeout_ms).toBe(3_600_000);  // 1h
     expect(profile.guards.p0_p1_reject_threshold).toBe(0.30);
+    // v2.1.1 新增默认值
+    expect(profile.guards.context_overflow_threshold_1m).toBe(512_000);
+    expect(profile.guards.context_overflow_threshold_default).toBe(200_000);
+    expect(profile.guards.context_overflow_strategy).toBe('reset');
+  });
+
+  it('rejects invalid context_overflow_strategy (v2.1.1)', () => {
+    const toml = `
+[meta]
+name = "bad"
+[work]
+provider = "sonnet"
+[review]
+provider = "kimi"
+[guards]
+context_overflow_strategy = "invalid"
+`;
+    expect(() => ReviewProfileSchema.parse(toml)).toThrow();
+  });
+
+  it('parses context_limits override table (v2.1.1)', () => {
+    const toml = `
+[meta]
+name = "with-limits"
+[work]
+provider = "sonnet"
+[review]
+provider = "kimi"
+
+[context_limits]
+"claude-sonnet-4-5" = 1000000
+"kimi-for-coding" = 256000
+`;
+    const profile = ReviewProfileSchema.parse(toml);
+    expect(profile.context_limits['claude-sonnet-4-5']).toBe(1_000_000);
+    expect(profile.context_limits['kimi-for-coding']).toBe(256_000);
+  });
+
+  it('parses prompts.work.fixing.preamble (v2.1.1)', () => {
+    const toml = `
+[meta]
+name = "with-preamble"
+[work]
+provider = "sonnet"
+[review]
+provider = "kimi"
+
+[prompts.work.fixing.preamble]
+enabled = true
+template = "git commit first"
+`;
+    const profile = ReviewProfileSchema.parse(toml);
+    expect(profile.prompts['work.fixing.preamble']?.enabled).toBe(true);
+    expect(profile.prompts['work.fixing.preamble']?.template).toBe('git commit first');
   });
 });
 ```
@@ -162,55 +244,69 @@ export const ReviewProfileSchema = z.object({
     provider: z.string(),
   }),
   review: z.object({
-    mode: z.enum(['parallel', 'sequential']).default('parallel'),
-    providers: z.array(z.string()).min(1),
+    // v2.1.1 变更 1：单一 review 模型（从 v2.1 的 providers[] 改为 provider 标量）
+    provider: z.string(),
   }),
+  // v2.1 删 arbiter 后保留 optional 占位（向后兼容读取旧 profile）
   arbiter: z.object({
     provider: z.string(),
-    trigger_on: z.enum(['reject', 'disagree_significantly', 'low_acceptance']).default('disagree_significantly'),
-  }).optional(),  // v2.1 删 arbiter，保留 optional 向后兼容
+  }).optional(),
   guards: z.object({
     max_rounds: z.number().int().positive().default(6),
     max_concurrent_pipelines: z.number().int().positive().default(1),
     human_decide_timeout_ms: z.number().int().positive().default(3_600_000),
     p0_p1_reject_threshold: z.number().min(0).max(1).default(0.30),
+    // === v2.1.1 变更 4：context overflow 策略配置 ===
+    context_overflow_threshold_1m: z.number().int().positive().default(512_000),
+    context_overflow_threshold_default: z.number().int().positive().default(200_000),
+    context_overflow_strategy: z.enum(['reset', 'review_fix', 'abort']).default('reset'),
+    context_overflow_hysteresis_rounds: z.number().int().nonnegative().default(1),
   }).default({}),
   prompts: z.object({
     'work.produce': z.object({ system: z.string() }).optional(),
     'work.self_review': z.object({ system: z.string() }).optional(),
     'work.fixing': z.object({ system: z.string() }).optional(),
+    // v2.1.1 变更 2：commit preamble 配置
+    'work.fixing.preamble': z.object({
+      enabled: z.boolean().default(true),
+      template: z.string(),
+    }).optional(),
     'work.judge': z.object({ system: z.string() }).optional(),
     'review.code': z.object({ system: z.string() }).optional(),
     'review.plan': z.object({ system: z.string() }).optional(),
     'review.spec': z.object({ system: z.string() }).optional(),
   }).default({}),
   phase_overrides: z.record(z.string(), z.any()).default({}),
+  // v2.1.1 变更 4：模型 context 上限覆盖表
+  context_limits: z.record(z.string(), z.number().int().positive()).default({}),
 });
 
 export type ReviewProfile = z.infer<typeof ReviewProfileSchema>;
 
-// ReviewState enum (spec §5.1)
+// ReviewState enum (spec §5.1, v2.1.1 变更 1：单 review pane)
 export type ReviewState =
   | { kind: 'PRODUCING'; pipelineId: string; round: number; pane: 'work' }
-  | { kind: 'SELF_REVIEW_R1'; pipelineId: string; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
+  | { kind: 'SELF_REVIEW_R1'; pipelineId: string; round: number; cycle: 'initial' | 'postfix';
+      pane: 'work'; contextReset?: boolean /* v2.1.1: reset 标记 */ }
   | { kind: 'SELF_REVIEW_R2'; pipelineId: string; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
   | { kind: 'FIXING'; pipelineId: string; round: number; pane: 'work';
-      source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE';
+      source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE' | 'CONTEXT_OVERFLOW';  // v2.1.1: 新增 CONTEXT_OVERFLOW
       inputIssues: Issue[] }
   | { kind: 'EXTERNAL_REVIEW'; pipelineId: string; round: number; cycle: 'initial' | 'postfix';
-      panes: Array<{ role: string; shortId: string }> }
+      pane?: { role: 'review'; shortId: string } /* v2.1.1: 单数 */ }
   | { kind: 'JUDGE_BY_WORK'; pipelineId: string; round: number; pane: 'work' }
   | { kind: 'PANE_LOST'; pipelineId: string; round: number;
-      lostPanes: Array<{ role: string; shortId: string }>;
+      lostPane?: { role: 'work' | 'review'; shortId: string } /* v2.1.1: 单数 */;
       detectedAt: string;
       retryTarget: ReviewState['kind'] }
   | { kind: 'HUMAN_DECIDE'; pipelineId: string; round: number; pending: DecisionContext }
-  | { kind: 'DONE'; pipelineId: string; round: number; totalCostUsd: number; issueTrail: Issue[] }
+  | { kind: 'DONE'; pipelineId: string; round: number; totalCostUsd: number; issueTrail: Issue[];
+      contextOverflowApplied?: 'review_fix' /* v2.1.1: 标记 review_fix 模式 */ }
   | { kind: 'FAILED'; pipelineId: string; round: number; reason: string; totalCostUsd: number }
   | { kind: 'ABORTED'; pipelineId: string; round: number; reason: string; abortedBefore: ReviewState['kind'] };
 
 export interface Issue {
-  id: string;                  // e.g. "review-A-1"
+  id: string;                  // e.g. "review-1"（v2.1.1 变更 1: 单一 review 角色，id 简化为 "review-1"）
   severity: 'P0' | 'P1' | 'P2' | 'P3';
   location: string;
   description: string;
@@ -230,7 +326,7 @@ export interface DecisionContext {
   issues: Issue[];
 }
 
-// PipelineRecord (spec §6.1)
+// PipelineRecord (spec §6.1, v2.1.1 扩展)
 export interface PipelineRecord {
   pipelineId: string;
   createdAt: string;
@@ -240,14 +336,31 @@ export interface PipelineRecord {
   input: {
     rawInput: string;
     phase: 'spec' | 'plan' | 'code' | 'unknown';
-    profile: string;       // profile name
+    profile: string;
     maxRounds: number;
     cwd: string;
-    snapshotDir?: string;  // v2.1 review 修正: provider snapshot dir
+    snapshotDir?: string;
   };
   panes: PaneRegistry;
   history: HistoryEvent[];
   totalCostUsd: number;
+  // === v2.1.1 变更 3：parseDegraded 事件累计 ===
+  parseDegraded: Array<{
+    role: 'work' | 'review';
+    round: number;
+    state: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'EXTERNAL_REVIEW' | 'JUDGE_BY_WORK' | 'FIXING';
+    reason: string;
+    recoveredByRetry: boolean;  // true = retry 成功
+    ts: string;
+  }>;
+  // === v2.1.1 变更 4：context overflow 事件累计 ===
+  contextResets: Array<{
+    ts: string;
+    triggerRound: number;
+    usageBefore: { used: number; max: number; model: string };
+    strategy: 'reset' | 'review_fix' | 'abort';
+    checkpointSha: string | null;
+  }>;
 }
 
 export interface PaneRegistry {
@@ -258,14 +371,15 @@ export interface PaneRegistry {
     startedAt: string;
     roundShortIds: string[];
   };
-  reviews: Array<{
-    role: string;
+  // v2.1.1 变更 1：reviews[] → review?（单数）
+  review?: {
+    role: 'review';
     shortId: string;
     sessionId: string;
     provider: string;
     round: number;
     cycle: 'initial' | 'postfix';
-  }>;
+  };
 }
 
 export interface HistoryEvent {
@@ -277,20 +391,24 @@ export interface HistoryEvent {
   paneShortId?: string;
   paneSessionId?: string;
   providerAlias?: string;
-  inputDigest: string;       // sha256 前 16 字符
+  inputDigest: string;
   outputDigest: string;
   outputSizeBytes: number;
   costUsd: number;
   durationMs: number;
   issues?: Issue[];
-  verdict?: 'accept' | 'reject';  // v2.1 变更 18: 2 值
+  verdict?: 'accept' | 'reject';
+  // v2.1.1 变更 2：checkpoint SHA 记录（来自 FIXING 输出）
+  fixingCheckpointSha?: string | null;
+  // v2.1.1 变更 3：parse degraded 标记
+  parseDegraded?: { recoveredByRetry: boolean; reason: string };
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `bun test tests/unit/review/types.test.ts`
-Expected: 3 tests pass
+Expected: 6 tests pass (3 v2.1 基础 + 3 v2.1.1: context_overflow_strategy 校验 / context_limits 解析 / prompts.work.fixing.preamble 解析)
 
 - [ ] **Step 5: Commit**
 
@@ -316,7 +434,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadProfile, ProfileError } from '../../src/review/profile';
 
-describe('loadProfile', () => {
+describe('loadProfile (v2.1.1 single review provider)', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -324,7 +442,7 @@ describe('loadProfile', () => {
   });
   afterEach(() => rmSync(tmpDir, { recursive: true }));
 
-  it('loads valid profile with phase_overrides', async () => {
+  it('loads valid profile with phase_overrides (v2.1.1 single provider)', async () => {
     const path = join(tmpDir, 'default.toml');
     writeFileSync(path, `
 [meta]
@@ -334,32 +452,52 @@ name = "default"
 provider = "claude-sonnet-4"
 
 [review]
-providers = ["kimi-for-coding", "bailian-qwen3.6"]
+provider = "kimi-for-coding"  # v2.1.1: 单数标量
 
 [guards]
 max_rounds = 6
 
 [phase_overrides.code]
-review.providers = ["kimi", "qwen", "mimo"]
+review.provider = "bailian-qwen3.6"  # v2.1.1: 标量替换
 guards.max_rounds = 8
 
 [prompts.work.fixing.system]
 template = "verify-first: {{source}} issues"
+
+[prompts.work.fixing.preamble]  # v2.1.1: commit preamble
+enabled = true
+template = "git commit first"
 `);
     const profile = await loadProfile('default', 'code', path);
     expect(profile.guards.max_rounds).toBe(8);  // phase override
-    expect(profile.review.providers).toEqual(['kimi', 'qwen', 'mimo']);  // 完全替换
+    expect(profile.review.provider).toBe('bailian-qwen3.6');  // v2.1.1: 标量替换
     expect(profile.prompts['work.fixing']?.system).toContain('verify-first');
+    expect(profile.prompts['work.fixing.preamble']?.enabled).toBe(true);
   });
 
   it('throws ProfileError on missing file', async () => {
     try {
       await loadProfile('missing', 'code', '/nonexistent/path.toml');
-      expect(true).toBe(false);  // should have thrown
+      expect(true).toBe(false);
     } catch (err) {
       expect(err).toBeInstanceOf(ProfileError);
       expect((err as ProfileError).code).toBe('PROFILE_NOT_FOUND');
     }
+  });
+
+  it('v2.1.1: validates context_overflow_threshold_1m > 0', async () => {
+    const path = join(tmpDir, 'bad-threshold.toml');
+    writeFileSync(path, `
+[meta]
+name = "bad"
+[work]
+provider = "sonnet"
+[review]
+provider = "kimi"
+[guards]
+context_overflow_threshold_1m = 0
+`);
+    await expect(loadProfile('bad-threshold', 'code', path)).rejects.toThrow();
   });
 });
 ```
@@ -430,18 +568,27 @@ export async function loadProfile(
     throw new ProfileError(
       'PROFILE_INVALID',
       `profile '${name}' Zod 验证失败: ${(err as Error).message}`,
-      `检查 profile 字段是否齐全（meta.name / work.provider / review.providers）`,
+      `检查 profile 字段是否齐全（meta.name / work.provider / review.provider）`,
     );
   }
 
-  // Apply phase_overrides (deep merge per spec §7.3)
+  // Apply phase_overrides (deep merge per spec §7.3, v2.1.1 单 review provider)
   const phaseOverrides = profile.phase_overrides[phase];
   if (phaseOverrides && typeof phaseOverrides === 'object') {
     profile = deepMerge(profile, phaseOverrides as Partial<ReviewProfile>);
   }
 
-  // Validate provider files exist (spec §7.4 fail fast)
-  for (const providerName of [profile.work.provider, ...profile.review.providers]) {
+  // v2.1.1: validate context_overflow_threshold_1m > 0 (schema 已 default，但保留运行时校验做兜底)
+  if (profile.guards.context_overflow_threshold_1m <= 0) {
+    throw new ProfileError(
+      'PROFILE_INVALID',
+      `context_overflow_threshold_1m 必须 > 0，当前: ${profile.guards.context_overflow_threshold_1m}`,
+      `设置 [guards] context_overflow_threshold_1m = 512000（默认）`,
+    );
+  }
+
+  // Validate provider files exist (spec §7.4 fail fast, v2.1.1 单 review provider)
+  for (const providerName of [profile.work.provider, profile.review.provider]) {
     await validateProviderExists(providerName);
   }
 
@@ -504,7 +651,7 @@ export function existsProvider(name: string): boolean {
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `bun test tests/unit/review/profile.test.ts`
-Expected: 2 tests pass
+Expected: 3 tests pass (2 v2.1 基础 + 1 v2.1.1: context_overflow_threshold_1m 校验)
 
 - [ ] **Step 7: Commit**
 
@@ -545,7 +692,7 @@ name = "default"
 [work]
 provider = "test-sonnet"
 [review]
-providers = ["test-kimi"]
+provider = "test-kimi"  # v2.1.1: 单数标量
 `);
     const result = await runDoctor({ profilePath });
     expect(result.exitCode).toBe(0);
@@ -730,9 +877,11 @@ describe('PipelineStore', () => {
     updatedAt: '2026-06-14T00:00:00Z',
     state: { kind: 'PRODUCING', pipelineId: id, round: 0, pane: 'work' },
     input: { rawInput: 'test', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
-    panes: { reviews: [] },
+    panes: {},  // v2.1.1: 不初始化 reviews
     history: [],
     totalCostUsd: 0,
+    parseDegraded: [],  // v2.1.1
+    contextResets: [],  // v2.1.1
   });
 
   it('saves and reads running pipeline', async () => {
@@ -913,32 +1062,33 @@ describe('reconcile', () => {
       pipelineId: 'p1',
       createdAt: '', updatedAt: '',
       state: { kind: 'EXTERNAL_REVIEW', pipelineId: 'p1', round: 1, cycle: 'initial',
-               panes: [{ role: 'review-A', shortId: 'short-gone' }, { role: 'review-B', shortId: liveShortId }] },
+               pane: { role: 'review', shortId: 'short-gone' } /* v2.1.1: 单数 */ },
       input: { rawInput: 'x', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
-      panes: { reviews: [
-        { role: 'review-A', shortId: 'short-gone', sessionId: 'uuid-A', provider: 'kimi', round: 1, cycle: 'initial' },
-        { role: 'review-B', shortId: liveShortId, sessionId: 'uuid-B', provider: 'qwen', round: 1, cycle: 'initial' },
-      ] },
+      panes: {
+        review: { role: 'review', shortId: 'short-gone', sessionId: 'uuid-A', provider: 'kimi', round: 1, cycle: 'initial' },
+      },
       history: [],
       totalCostUsd: 0,
+      parseDegraded: [],
+      contextResets: [],
     };
     await store.saveRunning(record);
 
-    // Mock fetcher returns only liveShortId
-    const mockFetcher = async () => ({ sessions: [{ daemonShort: liveShortId, kind: 'background' }] });
+    // Mock fetcher returns nothing (review gone)
+    const mockFetcher = async () => ({ sessions: [] });
 
     await reconcile({ store, fetcher: mockFetcher as any, adapter: {} as any });
 
     const updated = await store.readRunning('p1');
     expect(updated?.state.kind).toBe('PANE_LOST');
     if (updated?.state.kind === 'PANE_LOST') {
-      expect(updated.state.lostPanes).toEqual([{ role: 'review-A', shortId: 'short-gone' }]);
+      expect(updated.state.lostPane).toEqual({ role: 'review', shortId: 'short-gone' });
       expect(updated.state.retryTarget).toBe('EXTERNAL_REVIEW');
     }
   });
 
-  it('transitions to PANE_LOST when ALL panes disappear (work + reviews)', async () => {
-    // 验证 spec §6.4：全 pane 丢失也走 PANE_LOST（不只是部分）
+  it('transitions to PANE_LOST when work pane disappears (v2.1.1 single lost pane)', async () => {
+    // 验证 spec §6.4：work pane 丢失也走 PANE_LOST（不只是 review）
     const record: PipelineRecord = {
       pipelineId: 'p2',
       createdAt: '', updatedAt: '',
@@ -947,25 +1097,25 @@ describe('reconcile', () => {
       input: { rawInput: 'x', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
       panes: {
         work: { sessionId: 'uuid-w', currentRoundShortId: 'short-w-gone', provider: 'sonnet', startedAt: '', roundShortIds: ['short-w-gone'] },
-        reviews: [
-          { role: 'review-A', shortId: 'short-a-gone', sessionId: 'uuid-a', provider: 'kimi', round: 1, cycle: 'initial' },
-        ],
+        review: { role: 'review', shortId: 'short-a', sessionId: 'uuid-a', provider: 'kimi', round: 1, cycle: 'initial' },
       },
       history: [],
       totalCostUsd: 0,
+      parseDegraded: [],
+      contextResets: [],
     };
     await store.saveRunning(record);
 
-    // Mock fetcher returns nothing (all dead)
-    const mockFetcher = async () => ({ sessions: [] });
+    // Mock fetcher returns only review (work gone)
+    const mockFetcher = async () => ({ sessions: [{ daemonShort: 'short-a', kind: 'background' }] });
 
     await reconcile({ store, fetcher: mockFetcher as any, adapter: {} as any });
 
     const updated = await store.readRunning('p2');
     expect(updated?.state.kind).toBe('PANE_LOST');
     if (updated?.state.kind === 'PANE_LOST') {
-      expect(updated.state.lostPanes).toHaveLength(2);  // work + review-A
-      expect(updated.state.lostPanes.map(p => p.role).sort()).toEqual(['review-A', 'work']);
+      // v2.1.1 单 review pane: lostPane 只记 work
+      expect(updated.state.lostPane).toEqual({ role: 'work', shortId: 'short-w-gone' });
     }
   });
 });
@@ -1017,11 +1167,14 @@ export async function reconcile({ store, fetcher, adapter: _adapter }: Reconcile
     const deadPanes = findDeadPanes(record.panes, liveShortIds);
     if (deadPanes.length > 0) {
       logger.warn(`[reconciler] pipeline ${record.pipelineId} has ${deadPanes.length} dead pane(s): ${deadPanes.map(p => `${p.role}@${p.shortId}`).join(', ')}`);
+      // v2.1.1: 单 review pane，deadPanes 通常只有 1 个 (work 或 review)
+      // 如有多个（理论上不会发生，单 review model），取第一个
+      const lostPane = deadPanes[0];
       record.state = {
         kind: 'PANE_LOST',
         pipelineId: record.pipelineId,
         round: record.state.round,
-        lostPanes: deadPanes,
+        lostPane,  // v2.1.1: 单数
         detectedAt: new Date().toISOString(),
         retryTarget: record.state.kind,
       };
@@ -1042,15 +1195,15 @@ export async function reconcile({ store, fetcher, adapter: _adapter }: Reconcile
 export function findDeadPanes(
   panes: PaneRegistry,
   liveShortIds: Set<string>,
-): Array<{ role: string; shortId: string }> {
-  const dead: Array<{ role: string; shortId: string }> = [];
+): Array<{ role: 'work' | 'review'; shortId: string }> {
+  const dead: Array<{ role: 'work' | 'review'; shortId: string }> = [];
   if (panes.work?.currentRoundShortId && !liveShortIds.has(panes.work.currentRoundShortId)) {
     dead.push({ role: 'work', shortId: panes.work.currentRoundShortId });
   }
-  for (const r of panes.reviews) {
-    if (!liveShortIds.has(r.shortId)) {
-      dead.push({ role: r.role, shortId: r.shortId });
-    }
+  // v2.1.1: 单 review pane（不再循环）
+  const review = panes.review;
+  if (review && !liveShortIds.has(review.shortId)) {
+    dead.push({ role: 'review', shortId: review.shortId });
   }
   return dead;
 }
@@ -1328,7 +1481,7 @@ Create `tests/unit/review/adapter.test.ts`:
 
 ```typescript
 import { describe, it, expect } from 'bun:test';
-import { parseBackgroundedOutput } from '../../src/review/adapter';
+import { parseBackgroundedOutput, parseModelFromProviderEnv, lookupContextLimit, KNOWN_CONTEXT_LIMITS } from '../../src/review/adapter';
 
 describe('parseBackgroundedOutput', () => {
   it('parses standard backgrounded output', () => {
@@ -1343,6 +1496,45 @@ backgrounded · 3f219846
 
   it('throws on unexpected output', () => {
     expect(() => parseBackgroundedOutput('error: something')).toThrow(/bg spawn failed/);
+  });
+});
+
+// v2.1.1 变更 5：getContextUsage 相关
+describe('parseModelFromProviderEnv (v2.1.1)', () => {
+  it('parses 1m suffix', () => {
+    expect(parseModelFromProviderEnv({ ANTHROPIC_MODEL: 'MiniMax-M3[1m]' }))
+      .toEqual({ name: 'MiniMax-M3', contextHint: 1_000_000 });
+  });
+
+  it('parses 256k suffix', () => {
+    expect(parseModelFromProviderEnv({ ANTHROPIC_MODEL: 'kimi-for-coding[256k]' }))
+      .toEqual({ name: 'kimi-for-coding', contextHint: 256_000 });
+  });
+
+  it('parses bare model name (no suffix)', () => {
+    expect(parseModelFromProviderEnv({ ANTHROPIC_MODEL: 'claude-sonnet-4' }))
+      .toEqual({ name: 'claude-sonnet-4', contextHint: null });
+  });
+
+  it('returns null on missing or empty', () => {
+    expect(parseModelFromProviderEnv(undefined)).toBeNull();
+    expect(parseModelFromProviderEnv({})).toBeNull();
+  });
+});
+
+describe('lookupContextLimit (v2.1.1)', () => {
+  it('returns known limit for known model', () => {
+    expect(lookupContextLimit('MiniMax-M3')).toBe(1_000_000);
+    expect(lookupContextLimit('kimi-for-coding')).toBe(256_000);
+  });
+
+  it('falls back to 200K for unknown model', () => {
+    expect(lookupContextLimit('unknown-model-xyz')).toBe(200_000);
+  });
+
+  it('KNOWN_CONTEXT_LIMITS has expected entries', () => {
+    expect(KNOWN_CONTEXT_LIMITS['claude-sonnet-4']).toBe(200_000);
+    expect(KNOWN_CONTEXT_LIMITS['claude-sonnet-4-5']).toBe(1_000_000);
   });
 });
 ```
@@ -1364,6 +1556,7 @@ import { join } from 'node:path';
 import { CLAUDE_JOBS_DIR } from '../utils/paths';
 import { readJobState, type JobStateFile } from '../agent-view/job-state';
 import { RendezvousClient, type RendezvousReplyResult } from '../agent-view/rendezvous-client';
+import { readLastAssistantUsage } from '../agent-view/jsonl-last-assistant';  // v2.1.1 变更 5
 import { logger } from '../utils/logger';
 import type { Issue } from './types';
 
@@ -1487,6 +1680,116 @@ export class ClaudeBGAdapter {
     }
     logger.info(`[adapter] snapshotted ${providers.length} providers → ${snapshotDir}`);
   }
+
+  /**
+   * v2.1.1 变更 5：读 work session 的当前 context 用量。
+   * 1. readJobState 拿 state.json
+   * 2. 解析 providerEnv.ANTHROPIC_MODEL 拿模型名 + context 上限
+   * 3. 读 linkScanPath 指向的 jsonl 末条
+   * 4. 调 readLastAssistantUsage 拿 usage
+   * 5. 返回 ContextUsage
+   */
+  async getContextUsage(shortId: string): Promise<ContextUsage | null> {
+    const state = await readJobState(shortId);
+    if (!state) return null;
+
+    const providerEnv = state.state.providerEnv as Record<string, string> | undefined;
+    const modelInfo = parseModelFromProviderEnv(providerEnv);
+    if (!modelInfo) {
+      return null;
+    }
+
+    const maxContext = lookupContextLimit(modelInfo.name);  // 兜底 200K
+
+    // 尝试读 jsonl 末条
+    const linkScanPath = state.state.linkScanPath;
+    if (!linkScanPath || !existsSync(linkScanPath)) {
+      return null;
+    }
+
+    try {
+      const usage = await readLastAssistantUsage(linkScanPath);
+      if (!usage) return null;
+
+      const used = (usage.input_tokens ?? 0)
+                 + (usage.cache_creation_input_tokens ?? 0)
+                 + (usage.cache_read_input_tokens ?? 0);
+      return {
+        used,
+        max: maxContext,
+        model: modelInfo.name,
+        percentUsed: used / maxContext,
+        source: 'jsonl',
+        breakdown: {
+          inputTokens: usage.input_tokens ?? 0,
+          cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+          cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+        },
+      };
+    } catch (err) {
+      logger.warn(`[adapter] getContextUsage(${shortId}) jsonl read failed: ${(err as Error).message}`);
+      return null;
+    }
+  }
+}
+
+// ============ v2.1.1 变更 5：模型 context 解析 ============
+
+export interface ContextUsage {
+  used: number;
+  max: number;
+  model: string;
+  percentUsed: number;
+  source: 'jsonl' | 'estimate' | 'unavailable';
+  breakdown?: {
+    inputTokens: number;
+    cacheCreationTokens: number;
+    cacheReadTokens: number;
+  };
+}
+
+export interface ModelInfo {
+  name: string;
+  contextHint: number | null;
+}
+
+/**
+ * 解析 ANTHROPIC_MODEL="MiniMax-M3[1m]" 格式：
+ *   "MiniMax-M3" → { name: "MiniMax-M3", contextHint: null }
+ *   "MiniMax-M3[1m]" → { name: "MiniMax-M3", contextHint: 1_000_000 }
+ *   "kimi-for-coding[256k]" → { name: "kimi-for-coding", contextHint: 256_000 }
+ */
+export function parseModelFromProviderEnv(env: Record<string, string> | undefined): ModelInfo | null {
+  if (!env) return null;
+  const raw = env.ANTHROPIC_MODEL;
+  if (!raw) return null;
+
+  const match = raw.match(/^(.+?)(?:\[(\d+)([km]?)\])?$/);
+  if (!match) return null;
+
+  const name = match[1];
+  const num = match[2] ? parseInt(match[2], 10) : null;
+  const unit = match[3] ?? '';
+  const contextHint = num ? (unit === 'm' ? num * 1_000_000 : num * (unit === 'k' ? 1_000 : 1)) : null;
+
+  return { name, contextHint };
+}
+
+// 内置已知模型 context 上限表
+export const KNOWN_CONTEXT_LIMITS: Record<string, number> = {
+  'MiniMax-M3': 1_000_000,
+  'MiniMax-M3.5': 1_000_000,
+  'claude-sonnet-4': 200_000,
+  'claude-sonnet-4-5': 1_000_000,
+  'claude-opus-4': 200_000,
+  'claude-haiku-4': 200_000,
+  'kimi-for-coding': 256_000,
+  'bailian-qwen3.6': 128_000,
+  'xiaomi-mimo': 128_000,
+};
+
+export function lookupContextLimit(modelName: string): number {
+  return KNOWN_CONTEXT_LIMITS[modelName] ?? 200_000;  // 兜底 200K
 }
 
 /**
@@ -1502,7 +1805,7 @@ export function parseBackgroundedOutput(stdout: string): string {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `bun test tests/unit/review/adapter.test.ts`
-Expected: 2 tests pass
+Expected: 8 tests pass (2 for parseBackgroundedOutput + 6 for v2.1.1 model parser)
 
 - [ ] **Step 5: Commit**
 
@@ -1599,7 +1902,7 @@ Create `tests/unit/review/output-contract.test.ts`:
 
 ```typescript
 import { describe, it, expect } from 'bun:test';
-import { extractJsonBlock, parseBgOutput, SelfReviewOutputSchema, FixingOutputSchema } from '../../src/review/output-contract';
+import { extractJsonBlock, parseBgOutput, parseBgOutputWithRetry, SelfReviewOutputSchema, FixingOutputSchema, ReviewFixOutputSchema } from '../../src/review/output-contract';
 
 describe('extractJsonBlock', () => {
   it('extracts from json fence', () => {
@@ -1617,7 +1920,7 @@ describe('extractJsonBlock', () => {
   });
 });
 
-describe('parseBgOutput', () => {
+describe('parseBgOutput (v2.1: deprecated, use parseBgOutputWithRetry)', () => {
   it('validates against SelfReview schema', () => {
     const output = '```json\n{"issues": [], "unfixed_count": 0}\n```';
     const result = parseBgOutput(output, SelfReviewOutputSchema);
@@ -1627,11 +1930,104 @@ describe('parseBgOutput', () => {
     }
   });
 
-  it('returns raw on parse failure (graceful degradation)', () => {
+  it('returns raw on parse failure (v2.1 行为)', () => {
     const output = 'no json anywhere';
     const result = parseBgOutput(output, FixingOutputSchema);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.raw).toBe('no json anywhere');
+  });
+});
+
+// v2.1.1 变更 3：parseBgOutputWithRetry（替换 v2.1 的 parseBgOutput）
+describe('parseBgOutputWithRetry (v2.1.1)', () => {
+  it('returns success on first try without invoking retry', async () => {
+    const mockBg = {
+      output: '```json\n{"issues": [], "unfixed_count": 0}\n```',
+      injectReply: async () => ({ ok: true }),
+      waitForState: async () => undefined,
+    };
+    const result = await parseBgOutputWithRetry(mockBg, SelfReviewOutputSchema, {
+      role: 'work', round: 1, maxRetries: 1,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data.issues).toEqual([]);
+      expect(result.retries).toBe(0);
+    }
+    expect(mockBg.injectReply).not.toHaveBeenCalled();  // 成功不重试
+  });
+
+  it('retries once on first failure, succeeds on retry', async () => {
+    let injectCount = 0;
+    const mockBg = {
+      get output() {
+        injectCount++;
+        return injectCount === 1
+          ? 'malformed json'  // 第 1 次：失败
+          : '```json\n{"issues": [], "unfixed_count": 0}\n```';  // 第 2 次：成功
+      },
+      injectReply: async () => ({ ok: true }),
+      waitForState: async () => undefined,
+    };
+    const result = await parseBgOutputWithRetry(mockBg, SelfReviewOutputSchema, {
+      role: 'review', round: 1, maxRetries: 1,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.retries).toBe(1);
+  });
+
+  it('returns parseDegraded when retry also fails', async () => {
+    const mockBg = {
+      output: 'still no json',
+      injectReply: async () => ({ ok: true }),
+      waitForState: async () => undefined,
+    };
+    const result = await parseBgOutputWithRetry(mockBg, SelfReviewOutputSchema, {
+      role: 'work', round: 1, maxRetries: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.parseDegraded).toBe(true);
+      expect(result.reason).toContain('after 1 retry');
+      expect(result.raw).toBe('still no json');
+    }
+  });
+
+  it('skips retry when maxRetries=0 (degraded immediately)', async () => {
+    const mockBg = {
+      output: 'no json',
+      injectReply: async () => ({ ok: true }),
+      waitForState: async () => undefined,
+    };
+    const result = await parseBgOutputWithRetry(mockBg, SelfReviewOutputSchema, {
+      role: 'work', round: 1, maxRetries: 0,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.parseDegraded).toBe(true);
+  });
+});
+
+describe('FixingOutputSchema (v2.1.1: 包含 checkpoint_sha)', () => {
+  it('accepts output with checkpoint_sha', () => {
+    const output = {
+      per_issue: [],
+      all_real_fixed: true,
+      remaining_real_unfixed_count: 0,
+      checkpoint_sha: 'abc1234',  // v2.1.1
+    };
+    expect(() => FixingOutputSchema.parse(output)).not.toThrow();
+  });
+});
+
+describe('ReviewFixOutputSchema (v2.1.1 变更 4: review_fix 模式)', () => {
+  it('parses review fix output with file_changes', () => {
+    const output = {
+      file_changes: [
+        { file: 'src/auth.ts', action: 'modify', old_text: 'foo', new_text: 'bar' },
+      ],
+      checkpoint_sha: 'def5678',
+    };
+    expect(() => ReviewFixOutputSchema.parse(output)).not.toThrow();
   });
 });
 ```
@@ -1664,7 +2060,7 @@ export function extractJsonBlock(output: string): unknown {
   return JSON.parse(output);
 }
 
-// ============ Zod Schemas (per spec §7.5.3) ============
+// ============ Zod Schemas (per spec §7.5.3, v2.1.1 扩展) ============
 
 export const IssueSchema = z.object({
   id: z.string().optional(),
@@ -1696,6 +2092,8 @@ export const FixingOutputSchema = z.object({
   })),
   all_real_fixed: z.boolean(),
   remaining_real_unfixed_count: z.number().int().min(0),
+  // v2.1.1 变更 2：checkpoint SHA 字段（可选，非 git 仓库时为 null）
+  checkpoint_sha: z.string().nullable().optional(),
 });
 
 export const JudgeOutputSchema = z.object({
@@ -1717,7 +2115,18 @@ export const ReviewOutputSchema = z.object({
   })),
 });
 
-// ============ Parse with Graceful Degradation ============
+// v2.1.1 变更 4：review_fix 模式输出 schema
+export const ReviewFixOutputSchema = z.object({
+  file_changes: z.array(z.object({
+    file: z.string(),
+    action: z.enum(['modify', 'create', 'delete']),
+    old_text: z.string().optional(),
+    new_text: z.string().optional(),
+  })),
+  checkpoint_sha: z.string().nullable().optional(),
+});
+
+// ============ Parse with v2.1 Graceful Degradation (kept for back-compat) ============
 
 export type ParseResult<T> = { ok: true; data: T } | { ok: false; raw: string };
 
@@ -1732,8 +2141,95 @@ export function parseBgOutput<T>(output: string, schema: z.ZodSchema<T>): ParseR
   }
 }
 
-// ============ issue_id 生成 (spec §5.4.7) ============
+// ============ v2.1.1 变更 3：parseBgOutputWithRetry ============
 
+/**
+ * v2.1.1 替换 v2.1 的 parseBgOutput：
+ *   1. 第 1 次正常 parse
+ *   2. 失败 → 注入 retry prompt 让 bg 重新生成（最多 maxRetries 次）
+ *   3. 仍失败 → 返 ok:false + parseDegraded:true，调用方按"排除/降级"处理
+ *
+ * 注意：parseBgOutputWithRetry 会改变 bg output（注入 retry prompt 后 bg 重新生成），
+ *       调用方应传入一个会读最新 output 的 handle。
+ */
+export interface BgOutputHandle {
+  /** 读最新 bg output（含 retry 后的新输出） */
+  readonly output: string;
+  /** 注入 reply 到 bg session */
+  injectReply(text: string, opts: { timeoutMs?: number }): Promise<{ ok: boolean }>;
+  /** 等 bg 进入指定 state */
+  waitForState(state: 'done', timeoutMs: number): Promise<void>;
+}
+
+export interface ParseRetryOptions {
+  role: 'work' | 'review';
+  round: number;
+  retryPrompt?: string;
+  maxRetries?: number;  // 默认 1
+}
+
+export type ParseRetrySuccess<T> = { ok: true; data: T; retries: number };
+export type ParseRetryFailure = { ok: false; parseDegraded: true; reason: string; raw: string };
+export type ParseRetryResult<T> = ParseRetrySuccess<T> | ParseRetryFailure;
+
+const DEFAULT_RETRY_PROMPT = `
+你的上一次输出无法被解析（JSON 提取失败或 schema 不匹配）。
+请严格按指定的 JSON schema 输出，只输出 \`\`\`json ... \`\`\`，不要添加自然语言前缀。
+`;
+
+export async function parseBgOutputWithRetry<T>(
+  bg: BgOutputHandle,
+  schema: z.ZodSchema<T>,
+  opts: ParseRetryOptions,
+): Promise<ParseRetryResult<T>> {
+  const maxRetries = opts.maxRetries ?? 1;
+  const retryPrompt = opts.retryPrompt ?? DEFAULT_RETRY_PROMPT;
+
+  // 第 1 次
+  const firstAttempt = tryParse(bg.output, schema);
+  if (firstAttempt.ok) return { ok: true, data: firstAttempt.data, retries: 0 };
+
+  if (maxRetries === 0) {
+    return {
+      ok: false, parseDegraded: true,
+      reason: firstAttempt.error,
+      raw: bg.output,
+    };
+  }
+
+  // Retry：注入让 bg 重新生成
+  logger.warn(`[output-contract] ${opts.role} round ${opts.round} parse failed, retrying: ${firstAttempt.error}`);
+  await bg.injectReply(retryPrompt, { timeoutMs: 30_000 });
+  await bg.waitForState('done', 30_000);
+
+  // 第 2 次
+  const secondAttempt = tryParse(bg.output, schema);
+  if (secondAttempt.ok) return { ok: true, data: secondAttempt.data, retries: 1 };
+
+  return {
+    ok: false, parseDegraded: true,
+    reason: `after 1 retry: ${firstAttempt.error} → ${secondAttempt.error}`,
+    raw: bg.output,
+  };
+}
+
+function tryParse<T>(output: string, schema: z.ZodSchema<T>): { ok: true; data: T } | { ok: false; error: string } {
+  try {
+    const json = extractJsonBlock(output);
+    const data = schema.parse(json);
+    return { ok: true, data };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// ============ issue_id 生成 (spec §5.4.7, v2.1.1 简化单 review 角色) ============
+
+/**
+ * v2.1.1 简化：单一 review 角色，id 形式从 "review-A-1" 改为 "review-1"。
+ * @param role 'review' (v2.1.1 单数)
+ * @param index 该 role 内的 issue 序号（从 1 开始）
+ */
 export function generateIssueId(role: string, index: number): string {
   return `${role}-${index}`;
 }
@@ -1742,7 +2238,7 @@ export function generateIssueId(role: string, index: number): string {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `bun test tests/unit/review/output-contract.test.ts`
-Expected: 5 tests pass
+Expected: 13 tests pass (3 extractJsonBlock + 2 parseBgOutput + 4 parseBgOutputWithRetry + 1 FixingOutputSchema + 1 ReviewFixOutputSchema + 2 others)
 
 - [ ] **Step 5: Commit**
 
@@ -1891,9 +2387,11 @@ const sampleRecord = (overrides: Partial<PipelineRecord> = {}): PipelineRecord =
   createdAt: '', updatedAt: '',
   state: { kind: 'PRODUCING', pipelineId: 'p1', round: 0, pane: 'work' },
   input: { rawInput: 'x', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
-  panes: { reviews: [] },
+  panes: {},  // v2.1.1: 不再初始化 reviews: []，按需填充
   history: [],
   totalCostUsd: 0,
+  parseDegraded: [],  // v2.1.1
+  contextResets: [],  // v2.1.1
   ...overrides,
 });
 
@@ -1965,7 +2463,7 @@ export type EngineEvent =
   | { type: 'JUDGE_VERDICT'; verdict: 'accept' | 'reject'; acceptedIssues: Issue[] }
   | { type: 'HUMAN_DECISION'; acceptedIssues: Issue[] }
   | { type: 'FIXING_DONE' }
-  | { type: 'PANE_LOST'; lostPanes: Array<{ role: string; shortId: string }>; nextStateAfter?: ReviewState }
+  | { type: 'PANE_LOST'; lostPane?: { role: 'work' | 'review'; shortId: string }; nextStateAfter?: ReviewState }  // v2.1.1: 单数
   | { type: 'USER_RETRY'; target: ReviewState['kind'] }
   | { type: 'USER_SKIP' }
   | { type: 'USER_ABORT'; reason: string }
@@ -1999,9 +2497,10 @@ export function computeNextState(state: ReviewState, event: EngineEvent): Review
       if (event.type === 'FIXING_DONE') {
         switch (state.source) {
           case 'SELF_REVIEW_R1': return { kind: 'SELF_REVIEW_R2', pipelineId: state.pipelineId, round: state.round, cycle: 'initial', pane: 'work' };
-          case 'SELF_REVIEW_R2': return { kind: 'EXTERNAL_REVIEW', pipelineId: state.pipelineId, round: state.round, cycle: 'initial', panes: [] };
+          case 'SELF_REVIEW_R2': return { kind: 'EXTERNAL_REVIEW', pipelineId: state.pipelineId, round: state.round, cycle: 'initial', pane: { role: 'review', shortId: 'pending' } /* v2.1.1 单数 */ };
           case 'JUDGE_BY_WORK':
           case 'HUMAN_DECIDE':
+          case 'CONTEXT_OVERFLOW':  // v2.1.1: 走 postfix 循环
             return { kind: 'SELF_REVIEW_R1', pipelineId: state.pipelineId, round: state.round + 1, cycle: 'postfix', pane: 'work' };
         }
       }
@@ -2050,9 +2549,11 @@ function computeNextStateAfter(target: ReviewState['kind'], pipelineId: string, 
       // FIXING 之后需要根据 source 决定下一步
       switch (fixingSource) {
         case 'SELF_REVIEW_R1': return { kind: 'SELF_REVIEW_R2', pipelineId, round, cycle: 'initial', pane: 'work' };
-        case 'SELF_REVIEW_R2': return { kind: 'EXTERNAL_REVIEW', pipelineId, round, cycle: 'initial', panes: [] };
+        case 'SELF_REVIEW_R2': return { kind: 'EXTERNAL_REVIEW', pipelineId, round, cycle: 'initial', pane: { role: 'review', shortId: 'pending' } /* v2.1.1 单数 */ };
         case 'JUDGE_BY_WORK':
-        case 'HUMAN_DECIDE': return { kind: 'SELF_REVIEW_R1', pipelineId, round, cycle: 'postfix', pane: 'work' };
+        case 'HUMAN_DECIDE':
+        case 'CONTEXT_OVERFLOW':  // v2.1.1
+          return { kind: 'SELF_REVIEW_R1', pipelineId, round, cycle: 'postfix', pane: 'work' };
         default: throw new Error(`FIXING skip requires fixingSource, got ${fixingSource}`);
       }
     case 'EXTERNAL_REVIEW': return { kind: 'JUDGE_BY_WORK', pipelineId, round, pane: 'work' };
@@ -2207,16 +2708,16 @@ describe('cleanupPipeline', () => {
   it('aborts controller, stops all panes, moves to aborted', async () => {
     const record: PipelineRecord = {
       pipelineId: 'p1', createdAt: '', updatedAt: '',
-      state: { kind: 'EXTERNAL_REVIEW', pipelineId: 'p1', round: 1, cycle: 'initial', panes: [] },
+      state: { kind: 'EXTERNAL_REVIEW', pipelineId: 'p1', round: 1, cycle: 'initial', pane: { role: 'review', shortId: 'short-a' } /* v2.1.1 单数 */ },
       input: { rawInput: 'x', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
       panes: {
         work: { sessionId: 'uuid-w', currentRoundShortId: 'short-w', provider: 'sonnet', startedAt: '', roundShortIds: ['short-w'] },
-        reviews: [
-          { role: 'review-A', shortId: 'short-a', sessionId: 'uuid-a', provider: 'kimi', round: 1, cycle: 'initial' },
-        ],
+        review: { role: 'review', shortId: 'short-a', sessionId: 'uuid-a', provider: 'kimi', round: 1, cycle: 'initial' },
       },
       history: [],
       totalCostUsd: 0,
+      parseDegraded: [],
+      contextResets: [],
     };
     await store.saveRunning(record);
 
@@ -2285,8 +2786,9 @@ export async function cleanupPipeline(
   if (record.panes.work?.currentRoundShortId) {
     paneShortIds.push(record.panes.work.currentRoundShortId);
   }
-  for (const review of record.panes.reviews) {
-    paneShortIds.push(review.shortId);
+  // v2.1.1: 单 review pane（不再循环）
+  if (record.panes.review?.shortId) {
+    paneShortIds.push(record.panes.review.shortId);
   }
 
   // Step 3: 并行 claude stop（best-effort，不抛错）
@@ -2387,7 +2889,7 @@ export async function reviewRun(task: string, opts: {
 
   console.log(`✓ Pipeline 启动: ${phase} phase, profile=${profileName}`);
   console.log(`✓ Work provider: ${profile.work.provider}`);
-  console.log(`✓ Review providers: ${profile.review.providers.join(', ')}`);
+  console.log(`✓ Review provider: ${profile.review.provider}`);  // v2.1.1: 单数
   console.log(`✓ Max rounds: ${profile.guards.max_rounds}`);
 
   // TODO: 实际启动 engine（Task 8 后才有）
@@ -2457,7 +2959,7 @@ export async function reviewProfiles() {
       }
     }
     if (loaded) {
-      console.log(`✓ ${name} (loaded phase=${loadedPhase}, work=${loaded.work.provider}, review=${loaded.review.providers.join(',')}, max_rounds=${loaded.guards.max_rounds})`);
+      console.log(`✓ ${name} (loaded phase=${loadedPhase}, work=${loaded.work.provider}, review=${loaded.review.provider}, max_rounds=${loaded.guards.max_rounds})`);  // v2.1.1
     } else {
       console.log(`❌ ${name}: ${lastErr?.message}`);
     }
@@ -2583,7 +3085,8 @@ describe('renderTerminal', () => {
       pipelineId: 'p1', createdAt: '', updatedAt: '',
       state: { kind: 'DONE', pipelineId: 'p1', round: 2, totalCostUsd: 1.23, issueTrail: [] },
       input: { rawInput: 'x', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
-      panes: { reviews: [] }, history: [], totalCostUsd: 1.23,
+      panes: {}, history: [], totalCostUsd: 1.23,  // v2.1.1
+      parseDegraded: [], contextResets: [],
     };
     const out = renderTerminal(record);
     expect(out).toContain('DONE');
@@ -2634,8 +3137,9 @@ export function renderLive(record: PipelineRecord): string {
   if (panes.work?.currentRoundShortId) {
     lines.push(`  🔧 work       ${panes.work.currentRoundShortId.slice(0, 8)} (${panes.work.provider})`);
   }
-  for (const r of panes.reviews) {
-    lines.push(`  👁 ${r.role.padEnd(10)} ${r.shortId.slice(0, 8)} (${r.provider})`);
+  // v2.1.1: 单 review pane（不再循环）
+  if (panes.review?.shortId) {
+    lines.push(`  👁 ${panes.review.role.padEnd(10)} ${panes.review.shortId.slice(0, 8)} (${panes.review.provider})`);
   }
   lines.push('');
 
@@ -2817,9 +3321,11 @@ describe('runPipeline', () => {
       pipelineId: 'p1', createdAt: new Date().toISOString(), updatedAt: '',
       state: { kind: 'PRODUCING', pipelineId: 'p1', round: 0, pane: 'work' },
       input: { rawInput: 'test', phase: 'code', profile: 'default', maxRounds: 6, cwd: '/tmp' },
-      panes: { reviews: [] },
+      panes: {},  // v2.1.1
       history: [],
       totalCostUsd: 0,
+      parseDegraded: [],  // v2.1.1
+      contextResets: [],  // v2.1.1
     };
     await store.saveRunning(record);
 
@@ -3091,27 +3597,22 @@ async function stepEXTERNAL_REVIEW(
   profile: ReviewProfile,
   opts: RunPipelineOpts,
 ): Promise<PipelineRecord> {
-  // Promise.all 启 N 个 review pane（每个 provider 一个）
+  // v2.1.1: 单一 review 模型，只 spawn 1 个 review pane
   const startedAt = Date.now();
-  const spawnPromises = profile.review.providers.map(async (provider, i) => {
-    const role = `review-${String.fromCharCode(65 + i)}`;  // A, B, C...
-    const { shortId, sessionId } = await opts.adapter.startSession({
-      role: 'review',
-      provider,
-      prompt: buildReviewPrompt(record, profile, role),
-      cwd: record.input.cwd,
-    });
-    return { role, shortId, sessionId, provider };
+  const { shortId, sessionId } = await opts.adapter.startSession({
+    role: 'review',
+    provider: profile.review.provider,  // v2.1.1: 单数
+    prompt: buildReviewPrompt(record, profile, 'review'),  // v2.1.1: 角色简化为 'review'
+    cwd: record.input.cwd,
   });
-  const newReviews = await Promise.all(spawnPromises);
-  record.panes.reviews = newReviews.map(r => ({
-    role: r.role,
-    shortId: r.shortId,
-    sessionId: r.sessionId,
-    provider: r.provider,
+  record.panes.review = {  // v2.1.1: 单数
+    role: 'review',
+    shortId,
+    sessionId,
+    provider: profile.review.provider,
     round: record.state.round,
     cycle: record.state.cycle,
-  }));
+  };
 
   // 等所有 review pane done
   await Promise.all(newReviews.map(r => opts.adapter.poll(r.shortId, 120_000, opts.signal)));
@@ -3130,11 +3631,13 @@ async function stepJUDGE_BY_WORK(
   profile: ReviewProfile,
   opts: RunPipelineOpts,
 ): Promise<PipelineRecord> {
-  // 把所有 review 的 issues 收集起来，injectReply 让 work session 评判
+  // v2.1.1: 单 review pane，直接读它的 issues
   const allIssues: Issue[] = [];
-  for (const review of record.panes.reviews) {
+  const review = record.panes.review;
+  if (review) {
     const stateJson = await readJobState(review.shortId);
     const outputText = (stateJson as any)?.output ?? '';
+    // v2.1.1 变更 3: 用 parseBgOutputWithRetry；这里为简化用 parseBgOutput（旧），T10.3 替换
     const parsed = parseBgOutput(outputText, parseBgOutputSimple());
     if (parsed.ok) {
       allIssues.push(...((parsed as any).data.issues.map((iss: any) => ({
@@ -3290,9 +3793,11 @@ export async function reviewRun(task: string, opts: {
     updatedAt: '',
     state: { kind: 'PRODUCING', pipelineId, round: 0, pane: 'work' },
     input: { rawInput: task, phase, profile: profileName, maxRounds, cwd },
-    panes: { reviews: [] },
+    panes: {},  // v2.1.1
     history: [],
     totalCostUsd: 0,
+    parseDegraded: [],  // v2.1.1
+    contextResets: [],  // v2.1.1
   };
 
   const store = new PipelineStore(REVIEW_PIPELINES_DIR);
@@ -3449,6 +3954,852 @@ git push origin feat/multi-model-review-engine-v2
 
 ---
 
+## Task 10 (v2.1.1, W6-W7): Context Overflow Strategy 引擎集成
+
+**v2.1.1 变更 4 新增**。Context overflow 是 work session 跨多轮注入的必然风险，T10 实现"检测 + 三策略执行 + 状态机集成"。
+
+### Task 10.1: ContextOverflow 模块（检测 + 三策略 dispatch）
+
+**Files:**
+- Create: `src/review/context-overflow.ts`
+- Create: `tests/unit/review/context-overflow.test.ts`
+
+- [ ] **Step 1: Write failing test for checkContextOverflow**
+
+Create `tests/unit/review/context-overflow.test.ts`:
+
+```typescript
+import { describe, it, expect } from 'bun:test';
+import { checkContextOverflow, selectOverflowStrategy } from '../../src/review/context-overflow';
+import type { ReviewProfile } from '../../src/review/types';
+
+describe('checkContextOverflow (v2.1.1)', () => {
+  const baseProfile: ReviewProfile = {
+    meta: { name: 'test' },
+    work: { provider: 'sonnet' },
+    review: { provider: 'kimi' },
+    guards: {
+      max_rounds: 6,
+      max_concurrent_pipelines: 1,
+      human_decide_timeout_ms: 3600000,
+      p0_p1_reject_threshold: 0.30,
+      context_overflow_threshold_1m: 512000,
+      context_overflow_threshold_default: 200000,
+      context_overflow_strategy: 'reset',
+      context_overflow_hysteresis_rounds: 1,
+    },
+    prompts: {},
+    phase_overrides: {},
+    context_limits: {},
+  } as ReviewProfile;
+
+  it('returns overflow=false when usage under threshold', async () => {
+    const mockAdapter = {
+      getContextUsage: async () => ({
+        used: 100_000, max: 200_000, model: 'kimi-for-coding',
+        percentUsed: 0.5, source: 'jsonl' as const,
+      }),
+    };
+    const result = await checkContextOverflow('short-1', baseProfile, mockAdapter as any);
+    expect(result.overflow).toBe(false);
+    expect(result.threshold).toBe(200_000);  // 非 1M 模型用 default
+  });
+
+  it('returns overflow=true when usage >= threshold (default model)', async () => {
+    const mockAdapter = {
+      getContextUsage: async () => ({
+        used: 200_000, max: 200_000, model: 'kimi-for-coding',
+        percentUsed: 1.0, source: 'jsonl' as const,
+      }),
+    };
+    const result = await checkContextOverflow('short-1', baseProfile, mockAdapter as any);
+    expect(result.overflow).toBe(true);
+  });
+
+  it('uses 1m threshold for 1M+ model', async () => {
+    const mockAdapter = {
+      getContextUsage: async () => ({
+        used: 600_000, max: 1_000_000, model: 'MiniMax-M3',
+        percentUsed: 0.6, source: 'jsonl' as const,
+      }),
+    };
+    const result = await checkContextOverflow('short-1', baseProfile, mockAdapter as any);
+    expect(result.overflow).toBe(true);
+    expect(result.threshold).toBe(512_000);
+  });
+
+  it('uses profile.context_limits override when present', async () => {
+    const profileWithOverride = { ...baseProfile, context_limits: { 'kimi-for-coding': 100_000 } };
+    const mockAdapter = {
+      getContextUsage: async () => ({
+        used: 150_000, max: 200_000, model: 'kimi-for-coding',
+        percentUsed: 0.75, source: 'jsonl' as const,
+      }),
+    };
+    const result = await checkContextOverflow('short-1', profileWithOverride, mockAdapter as any);
+    expect(result.usage?.max).toBe(100_000);  // override 生效
+    expect(result.overflow).toBe(true);
+  });
+
+  it('returns overflow=false on null usage (no data)', async () => {
+    const mockAdapter = { getContextUsage: async () => null };
+    const result = await checkContextOverflow('short-1', baseProfile, mockAdapter as any);
+    expect(result.overflow).toBe(false);
+    expect(result.reason).toBe('no_usage_data');
+  });
+});
+
+describe('selectOverflowStrategy (v2.1.1)', () => {
+  it('returns reset for default profile', () => {
+    expect(selectOverflowStrategy({ guards: { context_overflow_strategy: 'reset' } } as any))
+      .toBe('reset');
+  });
+
+  it('returns review_fix when configured', () => {
+    expect(selectOverflowStrategy({ guards: { context_overflow_strategy: 'review_fix' } } as any))
+      .toBe('review_fix');
+  });
+
+  it('returns abort when configured', () => {
+    expect(selectOverflowStrategy({ guards: { context_overflow_strategy: 'abort' } } as any))
+      .toBe('abort');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bun test tests/unit/review/context-overflow.test.ts`
+Expected: FAIL with "Cannot find module '../../src/review/context-overflow'"
+
+- [ ] **Step 3: Implement context-overflow.ts**
+
+Create `src/review/context-overflow.ts`:
+
+```typescript
+import { logger } from '../utils/logger';
+import type { ReviewProfile } from './types';
+import type { ClaudeBGAdapter, ContextUsage } from './adapter';
+
+export type OverflowStrategy = 'reset' | 'review_fix' | 'abort';
+
+export interface ContextCheckResult {
+  overflow: boolean;
+  reason?: 'no_usage_data' | 'threshold_exceeded';
+  usage: ContextUsage | null;
+  threshold: number;
+  model: string;
+}
+
+/**
+ * v2.1.1 变更 4：检查 work session 是否触发 context overflow。
+ *
+ * 阈值选择：
+ *   - 1M+ 模型（maxContext >= 1_000_000）→ 用 context_overflow_threshold_1m
+ *   - 其他 → 用 context_overflow_threshold_default
+ *   - profile.context_limits 覆盖 KNOWN_CONTEXT_LIMITS
+ *
+ * 返回 null usage → overflow:false（不阻塞，等下次检查）
+ */
+export async function checkContextOverflow(
+  workShortId: string,
+  profile: ReviewProfile,
+  adapter: Pick<ClaudeBGAdapter, 'getContextUsage'>,
+): Promise<ContextCheckResult> {
+  const usage = await adapter.getContextUsage(workShortId);
+  if (!usage) {
+    return { overflow: false, reason: 'no_usage_data', usage: null, threshold: 0, model: 'unknown' };
+  }
+
+  // profile 覆盖 > KNOWN_CONTEXT_LIMITS（adapter 内置）
+  const profileOverride = profile.context_limits[usage.model];
+  const maxContext = profileOverride ?? usage.max;
+
+  const threshold = maxContext >= 1_000_000
+    ? profile.guards.context_overflow_threshold_1m
+    : profile.guards.context_overflow_threshold_default;
+
+  return {
+    overflow: usage.used >= threshold,
+    reason: usage.used >= threshold ? 'threshold_exceeded' : undefined,
+    usage,
+    threshold,
+    model: usage.model,
+  };
+}
+
+export function selectOverflowStrategy(profile: ReviewProfile): OverflowStrategy {
+  return profile.guards.context_overflow_strategy;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `bun test tests/unit/review/context-overflow.test.ts`
+Expected: 8 tests pass (5 checkContextOverflow + 3 selectOverflowStrategy)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/review/context-overflow.ts tests/unit/review/context-overflow.test.ts
+git commit -m "feat(review): ContextOverflow check + strategy select (v2.1.1 T10.1)"
+```
+
+### Task 10.2: 三策略实现（reset / review_fix / abort）
+
+**Files:**
+- Modify: `src/review/context-overflow.ts`（追加 execute* 函数）
+- Create: `tests/unit/review/context-overflow-strategy.test.ts`
+
+- [ ] **Step 1: Write failing test for three strategies**
+
+Create `tests/unit/review/context-overflow-strategy.test.ts`:
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { executeContextReset, executeReviewFix, executeContextAbort } from '../../src/review/context-overflow';
+import { PipelineStore } from '../../src/review/pipeline-store';
+import { PipelineState } from '../../src/review/pipeline-state';
+import type { PipelineRecord, ReviewProfile } from '../../src/review/types';
+import { execSync } from 'node:child_process';
+
+describe('executeContextReset (v2.1.1)', () => {
+  let tmpDir: string;
+  let store: PipelineStore;
+  let state: PipelineState;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'reset-'));
+    // 初始化 git 仓库供 commit
+    execSync('git init', { cwd: tmpDir });
+    execSync('git config user.email "test@test.com"', { cwd: tmpDir });
+    execSync('git config user.name "test"', { cwd: tmpDir });
+    writeFileSync(join(tmpDir, 'init.txt'), 'init');
+    execSync('git add -A && git commit -m init', { cwd: tmpDir });
+    store = new PipelineStore(join(tmpDir, 'pipes'));
+    state = new PipelineState();
+  });
+  afterEach(() => rmSync(tmpDir, { recursive: true }));
+
+  it('kills work session, spawns new one, transitions to SELF_REVIEW_R1', async () => {
+    const mockAdapter = {
+      stop: async (shortId: string) => {},
+      startSession: async (opts: any) => ({ shortId: 'new-work', sessionId: 'new-uuid' }),
+      getContextUsage: async () => null,
+    };
+    const profile: ReviewProfile = {
+      meta: { name: 'test' },
+      work: { provider: 'sonnet' },
+      review: { provider: 'kimi' },
+      guards: { max_rounds: 6, max_concurrent_pipelines: 1, human_decide_timeout_ms: 3600000,
+                p0_p1_reject_threshold: 0.30, context_overflow_threshold_1m: 512000,
+                context_overflow_threshold_default: 200000, context_overflow_strategy: 'reset',
+                context_overflow_hysteresis_rounds: 1 },
+      prompts: {}, phase_overrides: {}, context_limits: {},
+    } as ReviewProfile;
+
+    const record: PipelineRecord = {
+      pipelineId: 'p1', createdAt: '', updatedAt: '',
+      state: { kind: 'EXTERNAL_REVIEW', pipelineId: 'p1', round: 1, cycle: 'initial' },
+      input: { rawInput: 'test', phase: 'code', profile: 'default', maxRounds: 6, cwd: tmpDir },
+      panes: {
+        work: { sessionId: 'old-uuid', currentRoundShortId: 'old-work', provider: 'sonnet', startedAt: '', roundShortIds: ['old-work'] },
+        review: { role: 'review', shortId: 'rev-1', sessionId: 'rev-uuid', provider: 'kimi', round: 1, cycle: 'initial' },
+      },
+      history: [], totalCostUsd: 0,
+      parseDegraded: [], contextResets: [],
+    };
+    await store.saveRunning(record);
+
+    const updated = await executeContextReset(record, profile, {
+      overflow: true, usage: { used: 600000, max: 1000000, model: 'MiniMax-M3', percentUsed: 0.6, source: 'jsonl' },
+      threshold: 512000, model: 'MiniMax-M3',
+    }, { store, state, adapter: mockAdapter as any });
+
+    // 验证：work pane 已切换到新 session
+    expect(updated.panes.work?.currentRoundShortId).toBe('new-work');
+    expect(updated.panes.work?.sessionId).toBe('new-uuid');
+    expect(updated.panes.work?.roundShortIds).toContain('new-work');
+    expect(updated.panes.work?.roundShortIds).toContain('old-work');
+
+    // 验证：状态转换到 SELF_REVIEW_R1 + contextReset:true
+    expect(updated.state.kind).toBe('SELF_REVIEW_R1');
+    if (updated.state.kind === 'SELF_REVIEW_R1') {
+      expect(updated.state.contextReset).toBe(true);
+    }
+
+    // 验证：contextResets 事件已记录
+    expect(updated.contextResets.length).toBe(1);
+    expect(updated.contextResets[0].strategy).toBe('reset');
+  });
+});
+
+describe('executeReviewFix (v2.1.1)', () => {
+  // 类似：mock adapter.injectReply 返 review fix output，
+  // 验证 transitions to DONE + contextOverflowApplied='review_fix'
+});
+
+describe('executeContextAbort (v2.1.1)', () => {
+  // 验证：移到 aborted/，reason=context_overflow
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bun test tests/unit/review/context-overflow-strategy.test.ts`
+Expected: FAIL
+
+- [ ] **Step 3: Implement three strategies**
+
+Append to `src/review/context-overflow.ts`:
+
+```typescript
+import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+/**
+ * v2.1.1 变更 4：策略 1 - Context Reset（默认，质量优先）
+ *
+ * 1. snapshot cwd（git commit "pre-context-reset"）
+ * 2. 生成 round summary
+ * 3. 杀掉 work session bg
+ * 4. spawn 新 work session with summary
+ * 5. 新 session 进入 SELF_REVIEW_R1 (round += 1, contextReset=true)
+ */
+export async function executeContextReset(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  contextCheck: ContextCheckResult,
+  ctx: { store: PipelineStore; state: PipelineState; adapter: ClaudeBGAdapter },
+): Promise<PipelineRecord> {
+  const workShortId = record.panes.work?.currentRoundShortId!;
+
+  // 1. snapshot cwd（如果 cwd 是 git 仓库）
+  let checkpointSha: string | null = null;
+  if (existsSync(join(record.input.cwd, '.git'))) {
+    try {
+      const msg = `pre-context-reset for pipeline ${record.pipelineId}`;
+      execSync(`git add -A && git commit -m "${msg}" --allow-empty`, { cwd: record.input.cwd });
+      checkpointSha = execSync('git rev-parse --short HEAD', { cwd: record.input.cwd }).toString().trim();
+    } catch (err) {
+      logger.warn(`[context-reset] git commit failed: ${(err as Error).message}`);
+    }
+  }
+
+  // 2. 生成 round summary
+  const summary = generateRoundSummary(record);
+
+  // 3. 杀掉 work session
+  await ctx.adapter.stop(workShortId).catch(() => {/* daemon may have already stopped */});
+
+  // 4. spawn 新 work session
+  const newWorkPrompt = `
+你的上一个 session 已被 reset（context 达到 ${contextCheck.usage?.used ?? '?'}/${contextCheck.usage?.max ?? '?'} tokens）。
+之前的 round summary：
+${summary}
+
+Checkpoint SHA: ${checkpointSha ?? 'N/A (non-git repo)'}
+
+请继续 review 当前 cwd 状态（从 git log 可以看到所有历史修改）。
+你处于 SELF_REVIEW_R1 round=${(record.state as any).round + 1}，请全面审查当前代码。
+`;
+  const newWork = await ctx.adapter.startSession({
+    role: 'work',
+    provider: profile.work.provider,
+    prompt: newWorkPrompt,
+    cwd: record.input.cwd,
+  });
+
+  // 5. 更新 record
+  const updated: PipelineRecord = {
+    ...record,
+    panes: {
+      ...record.panes,
+      work: {
+        ...record.panes.work!,
+        sessionId: newWork.sessionId,
+        currentRoundShortId: newWork.shortId,
+        roundShortIds: [...(record.panes.work?.roundShortIds ?? []), newWork.shortId],
+      },
+    },
+    state: {
+      kind: 'SELF_REVIEW_R1',
+      pipelineId: record.pipelineId,
+      round: ((record.state as any).round ?? 0) + 1,
+      cycle: 'initial',
+      pane: 'work',
+      contextReset: true,
+    },
+    contextResets: [
+      ...record.contextResets,
+      {
+        ts: new Date().toISOString(),
+        triggerRound: (record.state as any).round ?? 0,
+        usageBefore: {
+          used: contextCheck.usage?.used ?? 0,
+          max: contextCheck.usage?.max ?? 0,
+          model: contextCheck.model,
+        },
+        strategy: 'reset',
+        checkpointSha,
+      },
+    ],
+    updatedAt: new Date().toISOString(),
+  };
+
+  await ctx.store.saveRunning(updated);
+  logger.info(`[context-reset] pipeline ${record.pipelineId} reset to new work session ${newWork.shortId}`);
+  return updated;
+}
+
+/**
+ * v2.1.1 变更 4：策略 2 - Review Fix（速度优先）
+ *
+ * 1. injectReply 给 review model：按你提的 issues 应用修复
+ * 2. 解析 review_fix 输出（用 parseBgOutputWithRetry）
+ * 3. engine 顺序 apply file_changes
+ * 4. 跳过 R2/JUDGE，直接进 DONE，标记 contextOverflowApplied='review_fix'
+ */
+export async function executeReviewFix(
+  record: PipelineRecord,
+  profile: ReviewProfile,
+  contextCheck: ContextCheckResult,
+  ctx: { store: PipelineStore; state: PipelineState; adapter: ClaudeBGAdapter },
+): Promise<PipelineRecord> {
+  const reviewShortId = record.panes.review?.shortId!;
+
+  const fixPrompt = `
+你之前 review 提了 issues。Work session 因为 context 超限（${contextCheck.usage?.used ?? '?'}/${contextCheck.usage?.max ?? '?'}）无法继续处理。
+
+请按优先级应用你提的 issues 的修复：
+
+1. 先 \`git status\` 检查 + \`git commit\` 当前状态作为 checkpoint
+2. 对每个 issue 应用最小化修复（verify-first：先读代码确认是 real 才修）
+3. 输出 JSON: { file_changes: [{ file, action, old_text, new_text }], checkpoint_sha }
+
+⚠️ 一次只改一个文件，避免大爆炸修改。
+`;
+
+  // 注入 + 等 done
+  const result = await ctx.adapter.injectReply({
+    shortId: reviewShortId,
+    text: fixPrompt,
+    timeoutMs: 600_000,
+  });
+  if (!result.ok) {
+    logger.error(`[review-fix] injectReply failed: ${result.reason}, falling back to reset`);
+    return executeContextReset(record, profile, contextCheck, ctx);
+  }
+  // 轮询等 done
+  await ctx.adapter.poll(reviewShortId, 600_000);
+
+  // 解析 review_fix 输出
+  const bgHandle = {
+    output: await getLastBgOutput(reviewShortId),
+    injectReply: async (text: string, opts: any) => ctx.adapter.injectReply({ shortId: reviewShortId, text, timeoutMs: opts.timeoutMs ?? 30_000 }),
+    waitForState: async (state: 'done', timeoutMs: number) => {
+      await ctx.adapter.poll(reviewShortId, timeoutMs);
+    },
+  };
+  const fixOutput = await parseBgOutputWithRetry(bgHandle, ReviewFixOutputSchema, {
+    role: 'review', round: (record.state as any).round ?? 0, maxRetries: 1,
+  });
+
+  if (!fixOutput.ok) {
+    logger.error(`[review-fix] parse failed, falling back to reset`);
+    return executeContextReset(record, profile, contextCheck, ctx);
+  }
+
+  // 顺序 apply file_changes
+  for (const change of fixOutput.data.file_changes) {
+    await applyFileChange(record.input.cwd, change);
+  }
+
+  // 跳过后续 R2/JUDGE，直接 DONE
+  const updated: PipelineRecord = {
+    ...record,
+    state: {
+      kind: 'DONE',
+      pipelineId: record.pipelineId,
+      round: (record.state as any).round ?? 0,
+      totalCostUsd: record.totalCostUsd,
+      issueTrail: record.history.filter(e => e.issues).flatMap(e => e.issues ?? []),
+      contextOverflowApplied: 'review_fix',
+    },
+    contextResets: [
+      ...record.contextResets,
+      {
+        ts: new Date().toISOString(),
+        triggerRound: (record.state as any).round ?? 0,
+        usageBefore: {
+          used: contextCheck.usage?.used ?? 0,
+          max: contextCheck.usage?.max ?? 0,
+          model: contextCheck.model,
+        },
+        strategy: 'review_fix',
+        checkpointSha: fixOutput.data.checkpoint_sha ?? null,
+      },
+    ],
+    updatedAt: new Date().toISOString(),
+  };
+
+  await ctx.store.saveRunning(updated);
+  await ctx.store.moveToTerminal(updated);
+  logger.info(`[review-fix] pipeline ${record.pipelineId} DONE via review_fix`);
+  return updated;
+}
+
+/**
+ * v2.1.1 变更 4：策略 3 - Abort（保守）
+ */
+export async function executeContextAbort(
+  record: PipelineRecord,
+  contextCheck: ContextCheckResult,
+  ctx: { store: PipelineStore; state: PipelineState; adapter: ClaudeBGAdapter },
+): Promise<PipelineRecord> {
+  // cleanup 所有 pane
+  const paneShortIds: string[] = [];
+  if (record.panes.work?.currentRoundShortId) paneShortIds.push(record.panes.work.currentRoundShortId);
+  if (record.panes.review?.shortId) paneShortIds.push(record.panes.review.shortId);
+
+  for (const shortId of paneShortIds) {
+    await ctx.adapter.stop(shortId).catch(() => {});
+  }
+
+  const updated: PipelineRecord = {
+    ...record,
+    state: {
+      kind: 'ABORTED',
+      pipelineId: record.pipelineId,
+      round: (record.state as any).round ?? 0,
+      reason: `context_overflow: ${contextCheck.usage?.used ?? '?'}/${contextCheck.usage?.max ?? '?'} on ${contextCheck.model}`,
+      abortedBefore: 'JUDGE_BY_WORK',
+    },
+    contextResets: [
+      ...record.contextResets,
+      {
+        ts: new Date().toISOString(),
+        triggerRound: (record.state as any).round ?? 0,
+        usageBefore: {
+          used: contextCheck.usage?.used ?? 0,
+          max: contextCheck.usage?.max ?? 0,
+          model: contextCheck.model,
+        },
+        strategy: 'abort',
+        checkpointSha: null,
+      },
+    ],
+    updatedAt: new Date().toISOString(),
+  };
+
+  await ctx.store.saveRunning(updated);
+  await ctx.store.moveToTerminal(updated);
+  ctx.state.delete(record.pipelineId);
+  logger.warn(`[context-abort] pipeline ${record.pipelineId} aborted due to context overflow`);
+  return updated;
+}
+
+// ============ Helper functions ============
+
+function generateRoundSummary(record: PipelineRecord): string {
+  const rounds = record.history
+    .filter(e => e.toState === 'SELF_REVIEW_R1' || e.toState === 'FIXING')
+    .map(e => {
+      const issues = e.issues?.length ?? 0;
+      return `- Round ${e.round}: ${e.toState} via ${e.role} (${issues} issues)`;
+    })
+    .join('\n');
+  return rounds || 'No prior rounds (first reset)';
+}
+
+async function applyFileChange(cwd: string, change: { file: string; action: 'modify'|'create'|'delete'; old_text?: string; new_text?: string }): Promise<void> {
+  const { readFile, writeFile, unlink } = await import('node:fs/promises');
+  const path = join(cwd, change.file);
+  if (change.action === 'delete') {
+    await unlink(path).catch(() => {});
+  } else if (change.action === 'create') {
+    await writeFile(path, change.new_text ?? '', { mode: 0o644 });
+  } else {
+    // modify
+    const current = await readFile(path, 'utf-8').catch(() => '');
+    if (change.old_text && current.includes(change.old_text)) {
+      await writeFile(path, current.replace(change.old_text, change.new_text ?? ''), { mode: 0o644 });
+    } else {
+      // old_text 不匹配 → 跳过 + warn（避免覆盖未知内容）
+      logger.warn(`[review-fix] old_text not found in ${change.file}, skipping modification`);
+    }
+  }
+}
+
+async function getLastBgOutput(shortId: string): Promise<string> {
+  const { readJobState } = await import('../agent-view/job-state');
+  const state = await readJobState(shortId);
+  return (state?.state as any)?.output ?? '';
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `bun test tests/unit/review/context-overflow-strategy.test.ts`
+Expected: 3 tests pass (1 reset + 1 review_fix + 1 abort)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/review/context-overflow.ts tests/unit/review/context-overflow-strategy.test.ts
+git commit -m "feat(review): ContextOverflow 三策略实现 (v2.1.1 T10.2)"
+```
+
+### Task 10.3: Engine 集成 ContextOverflow（EXTERNAL_REVIEW → JUDGE 之间的检查节点）
+
+**Files:**
+- Modify: `src/review/engine.ts`（在 `stepEXTERNAL_REVIEW` 完成回调中插入 context 检查）
+- Modify: `tests/unit/review/engine.test.ts`（加 context overflow 集成测试）
+
+- [ ] **Step 1: Write failing test for engine integration**
+
+Append to `tests/unit/review/engine.test.ts`:
+
+```typescript
+describe('engine context overflow integration (v2.1.1)', () => {
+  it('triggers reset strategy when context overflows before JUDGE', async () => {
+    const mockAdapter = {
+      getContextUsage: async () => ({
+        used: 600_000, max: 1_000_000, model: 'MiniMax-M3',
+        percentUsed: 0.6, source: 'jsonl',
+      }),
+      stop: async () => {},
+      startSession: async (opts: any) => ({ shortId: 'new-work', sessionId: 'new-uuid' }),
+    };
+    // ... 构造 PipelineRecord at EXTERNAL_REVIEW state, profile.guards.context_overflow_strategy='reset'
+    // ... 调 engine.stepEXTERNAL_REVIEW (or runPipeline with mock that completes review)
+    // ... 验证：state 转 SELF_REVIEW_R1 + contextReset=true
+  });
+
+  it('triggers abort strategy when configured', async () => {
+    // 类似，但 profile.guards.context_overflow_strategy='abort'
+    // 验证：state 转 ABORTED + reason=context_overflow
+  });
+
+  it('skips context check when usage under threshold', async () => {
+    // 验证：正常进 JUDGE_BY_WORK（不触发 overflow 策略）
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bun test tests/unit/review/engine.test.ts`
+Expected: 3 new tests FAIL
+
+- [ ] **Step 3: Modify engine.ts to wire in context check**
+
+In `src/review/engine.ts`, locate the `stepEXTERNAL_REVIEW` function (defined in T5.3). After the function detects all reviews are done, **before** transitioning to JUDGE_BY_WORK, insert:
+
+```typescript
+// v2.1.1 变更 4：context overflow 检查（在 EXTERNAL_REVIEW → JUDGE_BY_WORK 之间）
+const contextCheck = await checkContextOverflow(
+  record.panes.work!.currentRoundShortId!,
+  profile,
+  opts.adapter,
+);
+if (contextCheck.overflow) {
+  logger.warn(`[engine] pipeline ${record.pipelineId} context overflow: ${contextCheck.usage?.used}/${contextCheck.usage?.max} (strategy=${profile.guards.context_overflow_strategy})`);
+
+  const strategy = selectOverflowStrategy(profile);
+  switch (strategy) {
+    case 'reset':
+      return await executeContextReset(record, profile, contextCheck, {
+        store: opts.store, state: opts.state, adapter: opts.adapter,
+      });
+    case 'review_fix':
+      return await executeReviewFix(record, profile, contextCheck, {
+        store: opts.store, state: opts.state, adapter: opts.adapter,
+      });
+    case 'abort':
+      return await executeContextAbort(record, contextCheck, {
+        store: opts.store, state: opts.state, adapter: opts.adapter,
+      });
+  }
+}
+
+// 正常：转 JUDGE_BY_WORK
+return await transitionTo(record, 'JUDGE_BY_WORK', /* ... */);
+```
+
+Import at top of `engine.ts`:
+```typescript
+import { checkContextOverflow, selectOverflowStrategy, executeContextReset, executeReviewFix, executeContextAbort } from './context-overflow';
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `bun test tests/unit/review/engine.test.ts`
+Expected: All tests pass (3 new + all existing)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/review/engine.ts tests/unit/review/engine.test.ts
+git commit -m "feat(review): engine wire in ContextOverflow check (v2.1.1 T10.3)"
+```
+
+### Task 10.4: doctor 检查 context overflow 配置
+
+**Files:**
+- Modify: `src/review/review-doctor.ts`（加 context_overflow_strategy / thresholds 检查）
+- Modify: `tests/unit/review/review-doctor.test.ts`（加 2 个测试）
+
+- [ ] **Step 1: Write failing test for doctor context checks**
+
+Append to `tests/unit/review/review-doctor.test.ts`:
+
+```typescript
+describe('review doctor context checks (v2.1.1)', () => {
+  it('passes when context_overflow_strategy is valid', async () => {
+    // profile with strategy='reset', thresholds > 0
+    // doctor output 应该 ✓
+  });
+
+  it('fails when context_overflow_threshold_1m <= 0', async () => {
+    // profile with threshold_1m = 0
+    // doctor output 应该 ❌ + remediation
+  });
+});
+```
+
+- [ ] **Step 2: Run test, expect FAIL**
+
+- [ ] **Step 3: Modify review-doctor.ts**
+
+Add new check function:
+
+```typescript
+function checkContextOverflowConfig(profile: ReviewProfile): DoctorCheck {
+  const issues: string[] = [];
+  if (profile.guards.context_overflow_threshold_1m <= 0) {
+    issues.push(`context_overflow_threshold_1m must be > 0 (current: ${profile.guards.context_overflow_threshold_1m})`);
+  }
+  if (profile.guards.context_overflow_threshold_default <= 0) {
+    issues.push(`context_overflow_threshold_default must be > 0`);
+  }
+  if (!['reset', 'review_fix', 'abort'].includes(profile.guards.context_overflow_strategy)) {
+    issues.push(`context_overflow_strategy must be reset/review_fix/abort`);
+  }
+  return {
+    name: 'Context overflow config',
+    ok: issues.length === 0,
+    issues,
+  };
+}
+```
+
+Wire into `runDoctor()`.
+
+- [ ] **Step 4: Run test, expect PASS**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/review/review-doctor.ts tests/unit/review/review-doctor.test.ts
+git commit -m "feat(review): doctor checks context_overflow config (v2.1.1 T10.4)"
+```
+
+### Task 10.5: cli-watch 显示 context overflow 事件
+
+**Files:**
+- Modify: `src/review/cli-watch.ts`（加 contextResets / parseDegraded 显示）
+- Modify: `tests/unit/review/cli-watch.test.ts`（加 2 个测试）
+
+- [ ] **Step 1: Write failing test for watch mode display**
+
+Append to `tests/unit/review/cli-watch.test.ts`:
+
+```typescript
+describe('cli-watch v2.1.1 display (v2.1.1)', () => {
+  it('displays parseDegraded events in timeline', () => {
+    // 构造 record with parseDegraded.length > 0
+    // 渲染输出应该包含 "⚠️ parse degraded" 字样
+  });
+
+  it('displays contextResets events in timeline', () => {
+    // 构造 record with contextResets.length > 0
+    // 渲染输出应该包含 "🔄 context reset" + strategy 名称
+  });
+});
+```
+
+- [ ] **Step 2-5: 实现 + commit**
+
+（参考 T8.1 的实现模式，renderTimeline() 加上 parseDegraded / contextResets 的渲染分支）
+
+```bash
+git commit -m "feat(review): cli-watch 显示 parseDegraded / contextResets (v2.1.1 T10.5)"
+```
+
+### Task 10.6: Engine T9.1 main loop 集成 commit preamble
+
+**v2.1.1 变更 2**：在 FIXING 状态启动前注入 commit preamble。
+
+**Files:**
+- Modify: `src/review/engine.ts`（在 `stepFIXING` 开头加 preamble 注入逻辑）
+- Modify: `tests/unit/review/engine-run.test.ts`（加 1 个测试验证 preamble 注入）
+
+- [ ] **Step 1: Write failing test**
+
+Append to `tests/unit/review/engine-run.test.ts`:
+
+```typescript
+describe('commit preamble injection (v2.1.1)', () => {
+  it('FIXING prepends commit preamble when enabled', async () => {
+    // profile.prompts['work.fixing.preamble'] = { enabled: true, template: '...' }
+    // mockAdapter.injectReply.calls[0][0].text 应包含 preamble 文本 + 后续 fix prompt
+  });
+
+  it('FIXING skips preamble when enabled=false', async () => {
+    // profile.prompts['work.fixing.preamble'] = { enabled: false, ... }
+    // injectReply calls 不应包含 preamble
+  });
+
+  it('FIXING skips preamble when field missing (backward compat)', async () => {
+    // profile.prompts 中无 'work.fixing.preamble'
+    // injectReply calls 不应包含 preamble
+  });
+});
+```
+
+- [ ] **Step 2-5: 实现 + commit**
+
+In `src/review/engine.ts`, `stepFIXING`:
+
+```typescript
+async function stepFIXING(record, profile, opts) {
+  const preamble = profile.prompts['work.fixing.preamble'];
+  const preambleText = preamble?.enabled ? renderTemplate(preamble.template, { pipelineId: record.pipelineId }) : '';
+  const basePrompt = renderFixingPrompt(record, /* ... */);
+  const finalPrompt = preambleText ? `${preambleText}\n\n---\n\n${basePrompt}` : basePrompt;
+
+  await opts.adapter.injectReply({
+    shortId: record.panes.work!.currentRoundShortId!,
+    text: finalPrompt,
+    timeoutMs: 300_000,
+  });
+  // ... 后续：poll + parseWithRetry + extract checkpoint_sha
+}
+```
+
+After parsing FIXING output, extract `checkpoint_sha` and store in `history.push({ ..., fixingCheckpointSha })`.
+
+```bash
+git commit -m "feat(review): FIXING state 注入 commit preamble (v2.1.1 T10.6)"
+```
+
+---
+
 ## Risk Monitoring During Implementation
 
 | Risk (from spec §14) | Watch for |
@@ -3461,8 +4812,11 @@ git push origin feat/multi-model-review-engine-v2
 | **Polling 500ms 抖动** | T8.1 watch mode has 500ms poll; acceptable per spec |
 | **Engine + Reconciler 抢同一个 pipeline** | reconciler has cleanupTmpFiles + saves state; engine has moveToTerminal after terminal |
 | **CLI Ctrl-C** | T8.1 watch SIGINT handler detached cleanly |
-| **Context window 膨胀** | Engine prompts are self-contained (artifact + issues explicit per §7.5.7); monitor at runtime |
+| **Context window 膨胀** | **v2.1.1**: T10.1-T10.3 三策略自动处理（reset / review_fix / abort）；profile.guards.context_overflow_* 可配 |
 | **JobStateFile `output` 字段** | T4.1 adapter assumes it's in JobStateFile; if not present in Agent View's TS type, use local ExtendedJobStateFile (per §7.5.6) |
+| **v2.1.1: JSON parse 失败** | T5.1 parseBgOutputWithRetry + parseDegraded 事件累计；raw output 存档到 `parse-failures/` |
+| **v2.1.1: commit preamble git 失败** | T10.6 兜底：preamble 失败不阻断，输出 `checkpoint_sha: null` 继续 |
+| **v2.1.1: review_fix 模式修改文件失败** | T10.2 applyFileChange 用 old_text 匹配避免覆盖；失败时降级到 reset 策略 |
 
 ---
 
@@ -3479,18 +4833,20 @@ git push origin feat/multi-model-review-engine-v2
 
 ---
 
-## Total Estimated Effort
+## Total Estimated Effort (v2.1.1)
 
-| Task | Estimated Time |
-|---|---|
-| T1 (Profile + Provider + Doctor) | 8h |
-| T2 (PipelineStore + Reconciler + pipeline-state) | 8h |
-| T3 (PhaseDetector) | 3h |
-| T4 (Adapter + integration test) | 8h |
-| T5 (Output Contract + Verdict + Engine core) | 12h |
-| T6 (Cleanup) | 4h |
-| T7 (CLI commands) | 6h |
-| T8 (cli-watch) | 8h |
-| **Total Phase 1** | **~57h ≈ 7 working days** |
+| Task | Estimated Time | v2.1.1 增量 |
+|---|---|---|
+| T1 (Profile + Provider + Doctor) | 8h + 1h (preamble/context config) | +1h |
+| T2 (PipelineStore + Reconciler + pipeline-state) | 8h | — |
+| T3 (PhaseDetector) | 3h | — |
+| T4 (Adapter + integration test) | 8h + 2h (getContextUsage) | +2h |
+| T5 (Output Contract + Verdict + Engine core) | 12h + 3h (parseWithRetry + commit preamble) | +3h |
+| T6 (Cleanup) | 4h | — |
+| T7 (CLI commands) | 6h | — |
+| T8 (cli-watch) | 8h + 1h (parseDegraded/contextResets 显示) | +1h |
+| T9 (Engine main loop) | 6h | — |
+| **T10 (ContextOverflow 新增)** | — | **+12h** |
+| **Total Phase 1 (v2.1.1)** | **~73h ≈ 9 working days** | **+19h** |
 
-Spec estimated 5-6 weeks (with spec writing + review iterations). Plan-level execution with TDD + frequent commits should hit the 5-week mark.
+Spec estimated 5-6 weeks (v2.1)。v2.1.1 增加 1 周（context overflow 策略化处理 + commit preamble + JSON parse retry），总排期 **6-7 周**。Plan-level execution with TDD + frequent commits should hit the 7-week mark.
