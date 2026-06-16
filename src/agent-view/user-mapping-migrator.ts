@@ -38,6 +38,15 @@ export async function migrateUserMappingSessions(
     try {
       const r = await resolveLiveSession(entry.sessionUuid, opts);
       if (r?.hasLiveFork && r.liveFork) {
+        // v2.6.1: 防御 — fork-resolver 的 v2.6.1 fallback 在 roster.sessionId 缺失时
+        // 用 chosen.short(8 字符)兜底。如果迁移写 8 字符到 user-mapping.sessionUuid,
+        // 下游 handleChat 的 short→full 展开会失败(SDK 拒 short)。跳过这种坏情况。
+        if (r.liveFork.fullUuid.length !== 36) {
+          logger.warn(
+            `user-mapping migrate: 跳过 ${openId.slice(0, 8)} — fork fullUuid 是 short 兜底(${r.liveFork.fullUuid}),不安全写入`,
+          );
+          continue;
+        }
         const newEntry: MappingEntry = { ...entry, sessionUuid: r.liveFork.fullUuid };
         // 同时更新 shortId 字段(pending_agent_reply 类型才有)
         if (entry.type === 'pending_agent_reply' && 'shortId' in entry) {

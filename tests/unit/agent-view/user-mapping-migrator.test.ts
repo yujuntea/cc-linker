@@ -151,7 +151,7 @@ describe('migrateUserMappingSessions', () => {
     setupStaleSession('ou_aaa', parentUuid1);
     setupForkJobAndRoster({
       forkShort: 'aaa00001',
-      forkSessionId: 'aaa00001-fork-uuid-1',
+      forkSessionId: 'aaa00001-1111-2222-3333-444444444444',  // 36 字符合法 UUID
       parentJsonl: parentJsonl1, parentUuid: parentUuid1,
       forkOffset: 1000, pid: 100,
     });
@@ -170,7 +170,7 @@ describe('migrateUserMappingSessions', () => {
     });
     expect(r.scanned).toBe(2);  // ou_aaa + ou_bbb
     expect(r.migrated).toBe(1);  // only ou_aaa
-    expect(userManager._entries.get('ou_aaa').sessionUuid).toBe('aaa00001-fork-uuid-1');
+    expect(userManager._entries.get('ou_aaa').sessionUuid).toBe('aaa00001-1111-2222-3333-444444444444');
     expect(userManager._entries.get('ou_bbb').sessionUuid).toBe('00000005-0000-0000-0000-000000000005');
     expect(userManager._entries.get('ou_ccc').sessionUuid).toBe('whatever');  // 不动
   });
@@ -181,7 +181,7 @@ describe('migrateUserMappingSessions', () => {
     setupStaleSession('ou_aaa', parentUuid);
     setupForkJobAndRoster({
       forkShort: 'cas00001',
-      forkSessionId: 'cas00001-fork-uuid',
+      forkSessionId: 'cas00001-aaaa-bbbb-cccc-dddddddddddd',  // 36 字符合法 UUID
       parentJsonl, parentUuid,
       forkOffset: 100, pid: 100,
     });

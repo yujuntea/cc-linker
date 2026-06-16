@@ -536,20 +536,9 @@ export class AgentViewManager {
     } else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sessionId)) {
       fullUuid = sessionId;
     }
-    // 0. 实时守卫(snapshot 里的 sessionId 可能是 short 或 full,都得认)
-    const result = await AgentSnapshotFetcher.fetch();
-    if (
-      !result.ok ||
-      !result.sessions.find(s => s.sessionId === sessionId || (fullUuid && s.sessionId === fullUuid))
-    ) {
-      await this.deps.replyFn('⚠️ 会话已不存在', { openId });
-      return null;
-    }
-    // 进入 CAS 阶段前,正式把 sessionId 替换成 full UUID,后续 UserManager
-    // 写入和 SDK 调用都走 full,免得 SDK 拒 short("Provided value ... is not a UUID")
     if (fullUuid) sessionId = fullUuid;
-    // v2.6: 翻译 stale sessionId → 活 fork
-    // 用户 attach 一个已死 session(被 fork 续接),直接 attach 到 fork
+    // v2.6.1: fork 解析在 snapshot 守卫 之前 — parent 可能已 dead 离开 jobs/,
+    // 但活 fork 还在。守卫直接用翻译后的 sessionId 查 fork,parent 不在也不会误报。
     try {
       const resolved = await resolveLiveSession(sessionId);
       if (resolved?.hasLiveFork && resolved.liveFork) {
@@ -558,10 +547,18 @@ export class AgentViewManager {
         );
         sessionId = resolved.liveFork.fullUuid;
         shortId = resolved.liveFork.short;
-        fullUuid = resolved.liveFork.fullUuid;
       }
     } catch (err: any) {
       logger.warn(`handleAttach: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
+    }
+    // 0. 实时守卫(用翻译后的 sessionId — parent 不在但 fork 在也 OK)
+    const result = await AgentSnapshotFetcher.fetch();
+    if (
+      !result.ok ||
+      !result.sessions.find(s => s.sessionId === sessionId)
+    ) {
+      await this.deps.replyFn('⚠️ 会话已不存在', { openId });
+      return null;
     }
     // v2.2.19 修正:expectedReply.clear 必须在 CAS 1 成功之后调用。
     // 旧逻辑(L415-418)在 CAS 1 之前就 clear — 如果 CAS 1 失败,用户的 pending reply
@@ -599,20 +596,8 @@ export class AgentViewManager {
       return null;
     }
     // 4. 发确认文本(busy/waiting 状态加提示)
-    // v2.6: fork 翻译后 sessionId 可能不在原 snapshot(刚被 fork),
-    // 不再 `!` 强断言,改成 defensive find + refetch fallback
-    let session = result.sessions.find(s => s.sessionId === sessionId);
-    if (!session) {
-      // 翻译到 fork 后,原 snapshot 没有它 — 重新拉一次(快照便宜)
-      const reResult = await AgentSnapshotFetcher.fetch();
-      if (reResult.ok) {
-        session = reResult.sessions.find(s => s.sessionId === sessionId);
-      }
-      if (!session) {
-        await this.deps.replyFn('⚠️ 会话已不存在或刚被 fork,请重试', { openId });
-        return null;
-      }
-    }
+    // v2.6.1: 守卫已通过(用翻译后的 sessionId 查到了 fork),session 必在 result 里
+    const session = result.sessions.find(s => s.sessionId === sessionId)!;
     const warning = session.status === 'busy' ? '\n⚠️ 该 session 正在处理中' : '';
     const waitingInfo =
       session.status === 'waiting' && session.waitingFor
@@ -977,22 +962,24 @@ export class AgentViewManager {
     }
     let session = result.sessions.find(s => s.sessionId === info.sessionId);
 
-    // v2.6: 找不到时尝试 fork 解析(用户点的是历史 card,bind 的 sessionId 可能已 stale)
-    // handleReplyRequest 已经翻译过一次,这里再翻译是防御性 — 也支持两层链式 fork
-    if (!session) {
-      try {
-        const resolved = await resolveLiveSession(info.sessionId);
-        if (resolved?.hasLiveFork && resolved.liveFork) {
-          logger.info(
-            `handleReply: 翻译 stale ${info.sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
-          );
-          info.sessionId = resolved.liveFork.fullUuid;
-          info.shortId = resolved.liveFork.short;
-          session = result.sessions.find(s => s.sessionId === resolved.liveFork!.fullUuid);
-        }
-      } catch (err: any) {
-        logger.warn(`handleReply: resolveLiveSession failed for ${info.sessionId}: ${err?.message ?? err}`);
+    // v2.6.1: fork 解析移到状态检查之前 — 修复 P0 bug:
+    // parent 还在 jobs/ 但 status='idle'/'done'(settled)时,find 成功但 status 检查
+    // fail,fork 解析没机会跑。改成无条件先 resolve → 再 find → 再 check status。
+    // handleReplyRequest 已经翻译过一次,这里再翻译是防御性 + 支持两层链式 fork。
+    try {
+      const resolved = await resolveLiveSession(info.sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handleReply: 翻译 stale ${info.sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        info.sessionId = resolved.liveFork.fullUuid;
+        info.shortId = resolved.liveFork.short;
+        // 重新在 snapshot 里找 fork(parent 还在时 fork 也可能不在 snapshot,要 defensive)
+        const found = result.sessions.find(s => s.sessionId === resolved.liveFork!.fullUuid);
+        if (found) session = found;
       }
+    } catch (err: any) {
+      logger.warn(`handleReply: resolveLiveSession failed for ${info.sessionId}: ${err?.message ?? err}`);
     }
 
     if (!session) {
