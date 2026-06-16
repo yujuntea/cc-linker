@@ -11,6 +11,7 @@ import type { AgentViewManager } from '../agent-view/manager';
 import { isAgentViewValue } from '../agent-view/action';
 import { buildBgConflictCard } from '../agent-view/card';
 import { checkRendezvousEligibility } from '../agent-view/rendezvous-fallback';
+import { resolveLiveSession } from '../agent-view/fork-resolver';
 import { RendezvousClient, type StatePatch } from '../agent-view/rendezvous-client';
 import { readLastAssistantTurn, waitForNewAssistantTurn, type LastAssistantTurn } from '../agent-view/jsonl-last-assistant';
 import { readJobState } from '../agent-view/job-state';
@@ -1532,7 +1533,21 @@ export class FeishuBot {
     bgAskedNewQuestion: boolean;
     cardMessageId: string | null;
   }> {
-    const { openId, sessionUuid, promptText, cwd, messageId } = params;
+    let { openId, sessionUuid, promptText, cwd, messageId } = params;
+    // v2.6: 翻译 stale sessionUuid → 活 fork
+    // 上游 handleReply/handleReplyRequest 已经翻译过,这里再翻译是底层兜底
+    try {
+      const resolved = await resolveLiveSession(sessionUuid);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `tryRendezvousReply: 翻译 ${sessionUuid.slice(0, 8)} → 活 fork ${resolved.liveFork.short} ` +
+          `(共享 JSONL: ${resolved.jsonlPath})`,
+        );
+        sessionUuid = resolved.liveFork.fullUuid;
+      }
+    } catch (err: any) {
+      logger.warn(`tryRendezvousReply: resolveLiveSession failed for ${sessionUuid}: ${err?.message ?? err}`);
+    }
     const short = sessionUuid.slice(0, 8);
     const eligibility = await checkRendezvousEligibility(short);
     if (!eligibility.canUse || !eligibility.rendezvousSock) {
