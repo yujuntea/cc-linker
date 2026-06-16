@@ -199,6 +199,8 @@ Send these in a Feishu private chat with the Bot:
 
 Agent View is cc-linker's "remote session takeover" capability: from Feishu, inspect live status of any background `claude` session running on your terminal, then Peek its log tail, Reply with text, Stop the process, or Attach it back into the main chat flow. The primary data source is `~/.claude/jobs/<short>/state.json` (the authoritative state machine maintained by Claude CLI). Requires Claude Code CLI >= 2.1.139 with the daemon running.
 
+> 💡 **Fork auto-continuation** (v2.6+): when a bg session is continued via `claude --resume --fork` to a new TUI (e.g., you switch between multiple TUIs), cc-linker automatically routes your reply to the latest live session. **No manual switching needed** — `/agents` list, [Peek], [Reply], and [Attach] all work against wherever the conversation is actually running. Clicking [Reply] on an old card also auto-jumps to the fork's TUI instead of erroring with "Claude Code process exited with code 1".
+
 ### Commands and Button Semantics
 
 | Entry | Behavior |
