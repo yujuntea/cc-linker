@@ -25,12 +25,17 @@ const MAX_COMPLETED_ITEMS = 5;
  * working 只剩 4 个,3 个被推到 ... N more 后面,跟 TUI 看到的 7 working
  * 不一致)。新策略:先 groupByStatus → 各 group 内按 startedAt 倒序 → waiting/busy
  * 全部进,completed 限额到 MAX_COMPLETED_ITEMS(5)。剩余 completed 计 hasMore。
+ *
+ * v2.6: fork 续接过滤 — 有 liveFork 的 session 自身已死,新 fork 已通过 jobs/
+ * 出现在列表里。隐藏原 session 避免重复展示。
  */
 function buildCappedCard(sessions: AgentSession[], totalSessions: number): {
   card: string;
   hasMore: number;
 } {
-  const groupsAll = groupByStatus(sessions);
+  // v2.6: 过滤被 fork 续接的 session(它本身已死,新 fork 在另一个 short 上)
+  const filteredSessions = sessions.filter(s => !s.liveFork);
+  const groupsAll = groupByStatus(filteredSessions);
   const sortByRecency = (arr: AgentSession[]) =>
     [...arr].sort((a, b) => b.startedAt - a.startedAt);
   const busySorted = sortByRecency(groupsAll.busy);
