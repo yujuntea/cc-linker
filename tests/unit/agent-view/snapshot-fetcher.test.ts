@@ -1,4 +1,7 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { writeFileSync, utimesSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { AgentSnapshotFetcher, _jobStateHooks } from '../../../src/agent-view/snapshot-fetcher';
 import { DaemonProbe } from '../../../src/agent-view/daemon-probe';
 
@@ -23,10 +26,14 @@ mock.module('node:child_process', () => {
 //    would pollute daemon-log-reader.test.ts via Bun's irrevocable module mocks) ──
 const readClaimedSourcesMock = mock((_h: number): Map<string, any> => new Map());
 
+// ── readRoster swap (v2.7: 让测试隔离真实 ~/.claude/daemon/roster.json) ──
+const readRosterMock = mock((): any => null);
+
 // ── Save / restore _jobStateHooks ──
 const origReadAll = _jobStateHooks.readAllJobStates;
 const origDerive = _jobStateHooks.deriveNameFromJsonl;
 const origReadClaimed = _jobStateHooks.readClaimedSources;
+const origReadRoster = _jobStateHooks.readRoster;
 const origDaemonCheck = DaemonProbe.check;
 
 beforeEach(() => {
@@ -41,6 +48,10 @@ beforeEach(() => {
   readClaimedSourcesMock.mockReset();
   readClaimedSourcesMock.mockImplementation(() => new Map());
   _jobStateHooks.readClaimedSources = readClaimedSourcesMock;
+  // v2.7: 默认 null — 防止真实 ~/.claude/daemon/roster.json 干扰已有 test
+  readRosterMock.mockReset();
+  readRosterMock.mockImplementation(() => null);
+  _jobStateHooks.readRoster = readRosterMock as any;
 
   // DaemonProbe defaults to true (roster.json exists). Tests override per case.
   (DaemonProbe as any).check = () => true;
@@ -50,6 +61,7 @@ afterEach(() => {
   _jobStateHooks.readAllJobStates = origReadAll;
   _jobStateHooks.deriveNameFromJsonl = origDerive;
   _jobStateHooks.readClaimedSources = origReadClaimed;
+  _jobStateHooks.readRoster = origReadRoster;
   (DaemonProbe as any).check = origDaemonCheck;
 });
 
@@ -60,8 +72,9 @@ function mockJobs(envs: any[]) {
 function makeEnv(stateOverride: any): any {
   // Derive short from the resumeSessionId's first 8 chars so the prefix-step's
   // `envs.find(e => e.short === s.sessionId.slice(0, 8))` matches.
+  // v2.7: 显式 short 覆盖 — bg slot reuse 场景下 short 与 resumeSessionId[:8] 不同
   const resumeId = stateOverride.resumeSessionId ?? 'aaaaaaaa-1111-1111-1111-111111111111';
-  const short = resumeId.slice(0, 8);
+  const short = stateOverride.short ?? resumeId.slice(0, 8);
   return {
     short,
     path: '/x',
@@ -317,5 +330,123 @@ describe('AgentSnapshotFetcher.fetch — cold-path name fallback', () => {
     _jobStateHooks.deriveNameFromJsonl = deriveSpy;
     await AgentSnapshotFetcher.fetch();
     expect(deriveSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ── Stale state.json detection (v2.7) ──
+//
+// 真实 bug case: bg slot (short=0abb6d98) 被 daemon 复用,新进程 resume 了
+// 482b3a60-...,但 state.json 没被覆盖(仍记录旧 incarnation 的 "done")。
+// claude agents --json 在 v2.1.163 把所有 background 都返 idle,失去真相源。
+// cc-linker snapshot-fetcher 直接信任 stale state.json → Feishu 错显示"已完成",
+// 而 TUI 用 JSONL mtime freshness 正确显示 "Working"。
+//
+// 修复:检测两个信号 → override 为 busy(贴合 TUI 行为)
+
+describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () => {
+  // tmp 目录存放测试 JSONL(用真实 statSync 测 mtime)
+  let tmpJsonlDir: string;
+  beforeEach(() => {
+    tmpJsonlDir = mkdtempSync(join(tmpdir(), 'agent-view-snapshot-'));
+  });
+
+  test('Signal 1: roster.sessionId ≠ state.sessionId → override busy with roster', async () => {
+    // 模拟 bg slot 0abb6d98 复用:roster 记录新进程 sessionId=482b3a60-...
+    // 但 state.json 还停留在旧 incarnation (sessionId=0abb6d98-...)
+    readRosterMock.mockImplementation(() => ({
+      workers: {
+        '0abb6d98': {
+          pid: 82144,
+          sessionId: '482b3a60-7ae0-4c8c-ba98-f462d08b3274',
+          cwd: '/Users/wuyujun/Git/trae-data-branch/trae-data',
+          startedAt: 1781573484361,
+          dispatch: { source: 'fleet' },
+        },
+      },
+      updatedAt: Date.now(),
+    }));
+    mockJobs([makeEnv({
+      short: '0abb6d98',  // 显式 short,模拟 bg slot 复用
+      state: 'done', name: 'Review AI coding lines attribution design',
+      sessionId: '0abb6d98-6bfc-4b95-b59f-52c493369986',  // 旧 incarnation
+      resumeSessionId: '667523a6-5c94-476c-8fe8-b52bd7fe1f08',
+      linkScanPath: null,
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    expect(r.sessions.length).toBe(1);
+    const s = r.sessions[0];
+    // 关键断言:override 后 status=busy,sessionId 用 roster 的
+    expect(s.status).toBe('busy');
+    expect(s.sessionId).toBe('482b3a60-7ae0-4c8c-ba98-f462d08b3274');
+    // ✅ prefix 被剥掉(无 prefix 表示仍在进行中)
+    expect(s.name).toBe('Review AI coding lines attribution design');
+    // 没有 completed 标志(只有 idle + completed=true 才进入"已完成"组)
+    expect(s.completed).toBeUndefined();
+  });
+
+  test('Signal 2: state.json says done but linkScanPath JSONL mtime < 5min → override busy', async () => {
+    // 模拟 TUI 使用的 fallback 信号:JSONL 最近被改 → bg 实际在写
+    readRosterMock.mockImplementation(() => null);  // roster 信息缺失
+    const freshJsonl = join(tmpJsonlDir, 'fresh.jsonl');
+    writeFileSync(freshJsonl, '[]');  // mtime = now
+    mockJobs([makeEnv({
+      state: 'done', name: 'fresh active session',
+      linkScanPath: freshJsonl,
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    expect(r.sessions.length).toBe(1);
+    const s = r.sessions[0];
+    expect(s.status).toBe('busy');  // overridden
+    expect(s.name).toBe('fresh active session');  // no ✅
+  });
+
+  test('Negative: 真正 done (no roster, JSONL stale) → 保持 idle + ✅', async () => {
+    // 防御:不该 override 真正完成的 session
+    readRosterMock.mockImplementation(() => null);
+    const staleJsonl = join(tmpJsonlDir, 'stale.jsonl');
+    writeFileSync(staleJsonl, '[]');
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
+    utimesSync(staleJsonl, tenMinAgo, tenMinAgo);  // mtime = 10 分钟前
+    mockJobs([makeEnv({
+      state: 'done', name: 'truly done',
+      linkScanPath: staleJsonl,
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    expect(r.sessions.length).toBe(1);
+    const s = r.sessions[0];
+    expect(s.status).toBe('idle');
+    expect(s.completed).toBe(true);
+    expect(s.name).toBe('✅ truly done');  // ✅ prefix 保留
+  });
+
+  test('Negative: roster.sessionId === state.sessionId (正常 bg session) → 不 override', async () => {
+    // 防御:正常 sessionId 匹配时,即使 status=idle 也不 override
+    // (避免误把合法 done 改回 busy)
+    readRosterMock.mockImplementation(() => ({
+      workers: {
+        'aaaaaaa1': {
+          pid: 3493, sessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+          cwd: '/x', startedAt: 0,
+          dispatch: { source: 'slash' },
+        },
+      },
+      updatedAt: Date.now(),
+    }));
+    mockJobs([makeEnv({
+      state: 'done', name: 'legit completed',
+      sessionId: 'aaaaaaa1-1111-1111-1111-111111111111',  // 与 roster 匹配
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+      linkScanPath: null,
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    expect(s.status).toBe('idle');
+    expect(s.name).toBe('✅ legit completed');
   });
 });

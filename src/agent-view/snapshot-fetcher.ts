@@ -22,6 +22,7 @@
 // linkScanPath,无需绕道还原。
 
 import { execFile } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { VersionGuard } from './version-guard';
 import { DaemonProbe } from './daemon-probe';
 import { attachRosterSources, filterUserDispatched } from './snapshot';
@@ -44,7 +45,15 @@ export const _jobStateHooks = {
   readAllJobStates,
   deriveNameFromJsonl,
   readClaimedSources,
+  // v2.7: 暴露 readRoster 给 staleness detection 测试
+  readRoster,
 };
+
+// v2.7: stale state.json 检测的 JSONL mtime 阈值。
+// 贴合 TUI 行为 — TUI 也用"JSONL 最近被改过"作为活进程信号。
+// 5 分钟阈值避免一次性 batch write 误判, 也足够覆盖正常 bg turn 时长
+// (典型 working turn 几秒到几分钟)。
+const STALE_JSONL_THRESHOLD_MS = 5 * 60 * 1000;
 
 export const AgentSnapshotFetcher = {
   async fetch(): Promise<FetchResult> {
@@ -65,10 +74,13 @@ export const AgentSnapshotFetcher = {
     }
 
     // 主数据:state.json。
-    // 合并 map + filter unknown + 加 emoji prefix 在一个循环里,确保 env ↔ session
+    // 合并 map + filter unknown + staleness 检测 + 加 emoji prefix 在一个循环里,确保 env ↔ session
     // 配对始终用同一份 env(不依赖 sessionId.slice(0,8) 与 env.short 的隐含一致性,
     // 防 fork-from-active session 的 resumeSessionId 是 parent UUID 导致 prefix 漏加)。
+    //
+    // v2.7: roster 提前读(原在后面),让 staleness 检测能用 — 否则 N 次磁盘读
     const envs = await _jobStateHooks.readAllJobStates();
+    const roster = _jobStateHooks.readRoster();
     let sessions: AgentSession[] = [];
     let droppedUnknown = 0;
     const droppedStates: Set<string> = new Set();
@@ -82,11 +94,78 @@ export const AgentSnapshotFetcher = {
         droppedStates.add(String(env.state.state));
         continue;
       }
-      let name = s.name;
-      if (env.state.state === 'stopped' && !name.startsWith('🛑')) name = `🛑 ${name}`;
-      else if (env.state.state === 'done' && !name.startsWith('✅')) name = `✅ ${name}`;
-      else if (env.state.state === 'failed' && !name.startsWith('❌')) name = `❌ ${name}`;
-      sessions.push(name === s.name ? s : { ...s, name });
+
+      // v2.7: stale state.json 检测 — bg slot 被 daemon 复用时,state.json
+      // 可能停留在旧 incarnation 的"done"状态(没有覆盖写),导致 cc-linker
+      // 错把活 session 展示在"已完成"组。TUI 用 JSONL mtime freshness 检测
+      // 这个问题,所以我们对齐 TUI 行为。
+      //
+      // 两个触发条件:
+      //   Signal 1 (主要): state.json.sessionId !== roster.workers[short].sessionId
+      //     → bg slot reuse 后,roster 记录新进程 sessionId,state.json 没更新
+      //     → 用 roster 的 sessionId + override 为 busy
+      //   Signal 2 (备份): state.json 说 idle 但 linkScanPath JSONL 最近被改
+      //     → 即使没有 roster 信息,JSONL 在被写 = bg 实际活着
+      //     → override 为 busy(不修改 sessionId,因为没有更权威的 source)
+      //
+      // 安全保证: 只 override `status === 'idle'`(done/stopped/failed 映射),
+      // busy/waiting/unknown 不动。
+      let overridden = false;
+      if (s.status === 'idle') {
+        const short = env.short;
+        const rosterWorker = roster?.workers?.[short];
+        const stateSessionId = env.state.sessionId ?? env.state.resumeSessionId;
+
+        // Signal 1: bg slot 被 reuse (roster.sessionId 不同于 state.json.sessionId)
+        if (
+          rosterWorker?.sessionId
+          && stateSessionId
+          && rosterWorker.sessionId !== stateSessionId
+        ) {
+          logger.warn(
+            `[agent-view] ${short}: state.json stale — ` +
+            `state.sessionId=${stateSessionId.slice(0, 8)} ` +
+            `vs roster.sessionId=${rosterWorker.sessionId.slice(0, 8)}; ` +
+            `bg slot reused, overriding to busy`,
+          );
+          s.sessionId = rosterWorker.sessionId;
+          s.status = 'busy';
+          s.name = s.name.replace(/^[✅🛑❌]\s*/, '');
+          s.completed = undefined;  // 清理 — 之前 idle+completed=true 是 settled 标志
+          overridden = true;
+        }
+        // Signal 2: JSONL 仍在被改(TUI 等价信号,防御 future roster 字段变化)
+        else if (env.state.linkScanPath) {
+          try {
+            const stat = statSync(env.state.linkScanPath);
+            const ageMs = Date.now() - stat.mtimeMs;
+            if (ageMs < STALE_JSONL_THRESHOLD_MS) {
+              logger.warn(
+                `[agent-view] ${short}: state.json says done but JSONL modified ` +
+                `${Math.round(ageMs / 1000)}s ago (<${STALE_JSONL_THRESHOLD_MS / 1000}s threshold); ` +
+                `bg actively working, overriding to busy`,
+              );
+              s.status = 'busy';
+              s.name = s.name.replace(/^[✅🛑❌]\s*/, '');
+              s.completed = undefined;  // 同上
+              overridden = true;
+            }
+          } catch {
+            // 文件不存在/读不了,graceful 跳过,保留 state.json 的 status
+          }
+        }
+      }
+
+      // 仅在 NOT overridden 时加 emoji prefix — 否则 ✅ 会被加再被剥
+      if (!overridden) {
+        let name = s.name;
+        if (env.state.state === 'stopped' && !name.startsWith('🛑')) name = `🛑 ${name}`;
+        else if (env.state.state === 'done' && !name.startsWith('✅')) name = `✅ ${name}`;
+        else if (env.state.state === 'failed' && !name.startsWith('❌')) name = `❌ ${name}`;
+        sessions.push(name === s.name ? s : { ...s, name });
+      } else {
+        sessions.push(s);
+      }
     }
     if (droppedUnknown > 0) {
       logger.warn(
@@ -98,7 +177,6 @@ export const AgentSnapshotFetcher = {
 
     // roster.json 给 source 标签(spare/slash/fleet);settled 后 roster 已清,
     // daemon.log claimedSources 兜底
-    const roster = readRoster();
     const rosterMap = buildRosterSourceMap(roster);
     const claimedSources = _jobStateHooks.readClaimedSources(24);
     sessions = sessions.map(s => {
