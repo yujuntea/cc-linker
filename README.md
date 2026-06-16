@@ -212,6 +212,8 @@ cc-linker status                    # 查看桥接状态
 
 Agent View 是 cc-linker 的"远端会话接管"能力：在飞书里查看终端后台 `claude` session 的实时状态，直接 Peek 日志、Reply 文字、Stop 进程或 Attach 回主对话流。主数据源是 `~/.claude/jobs/<short>/state.json`（Claude CLI 维护的权威状态机），需 Claude Code CLI ≥ 2.1.139 且 daemon 正在运行。
 
+> 💡 **Fork 自动续接**（v2.6+）: 当 bg session 被 `claude --resume --fork` 续接到新 TUI 时（例如你开了多个 TUI 切换），cc-linker 会自动用最新的活 session 接收你的 reply。**不需要手动指定** —— `/agents` 列表 / [Peek] / [Reply] / [Attach] 全部按"对话实际活跃位置"工作。旧 card 上点 [Reply] 也会自动跳到 fork 的 TUI，不会报 "Claude Code process exited with code 1"。
+
 ### 命令与按钮语义
 
 | 入口 | 行为 |
