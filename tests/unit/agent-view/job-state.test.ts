@@ -209,4 +209,49 @@ describe('jobStateToSession mapping', () => {
     expect(s!.status).toBe('busy');
     expect(s!.waitingFor).toBeUndefined();
   });
+
+  // v2.3.7: fork 场景 — child bg 的 state.json 同时有 sessionId(own UUID)
+  // 和 resumeSessionId(parent UUID)。handleReply 找 session 用的是
+  // fork-resolver 返回的 liveFork.fullUuid = own sessionId,所以这里必须
+  // 优先用 f.sessionId,否则 fork 的 child 永远 find 不到自己。
+  // 真实数据 ~/.claude/jobs/0abb6d98/state.json:
+  //   sessionId:        '0abb6d98-6bfc-4b95-b59f-52c493369986'
+  //   resumeSessionId:  '482b3a60-7ae0-4c8c-ba98-f462d08b3274'
+  test('jobStateToSession: 优先用 f.sessionId(对 fork 重要)', () => {
+    const env = {
+      short: '0abb6d98',
+      path: '/x/0abb6d98/state.json',
+      state: {
+        state: 'blocked',
+        sessionId: '0abb6d98-canonical-uuid',
+        resumeSessionId: '482b3a60-parent-uuid',
+        linkScanPath: '/x/482b3a60-parent-uuid.jsonl',
+      } as any,
+      mtimeMs: 0,
+      readAt: 0,
+    };
+    const session = jobStateToSession(env);
+    expect(session?.sessionId).toBe('0abb6d98-canonical-uuid');
+  });
+
+  // 旧字段兼容:没有 sessionId 时仍 fallback 到 resumeSessionId(原行为)
+  test('jobStateToSession: 没 sessionId 时 fallback 到 resumeSessionId', () => {
+    const s = jobStateToSession(makeEnv({
+      state: 'blocked',
+      resumeSessionId: 'parent-only-uuid',
+    }));
+    expect(s!.sessionId).toBe('parent-only-uuid');
+  });
+
+  // 都没有时退到 env.short — 跟没 fork 的非 fork session 走原路径
+  test('jobStateToSession: 都没时退到 short', () => {
+    const env = {
+      short: 'fallback0',
+      path: '/x',
+      state: { state: 'running' } as any,
+      mtimeMs: 0,
+      readAt: 0,
+    };
+    expect(jobStateToSession(env)!.sessionId).toBe('fallback0');
+  });
 });
