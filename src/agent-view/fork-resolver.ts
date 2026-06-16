@@ -13,9 +13,8 @@
  * 不写任何文件、不发任何网络、纯函数 + DI。
  */
 
-import { existsSync, readFileSync } from 'fs';
 import { join, basename } from 'path';
-import type { Roster } from './roster-source';
+import { readRosterFromPath, type Roster } from './roster-source';
 import type { JobStateEnvelope } from './job-state';
 import type { AgentSessionStatus } from './types';
 
@@ -131,10 +130,11 @@ export async function resolveLiveSession(
     // ★ CRITICAL: fullUuid 用 roster.sessionId(daemon 权威),不用 linkScanPath 派生
     // 真实数据 0abb6d98: linkScanPath = 482b3a60-...jsonl,basename 派生会得到 parent 的 UUID
     // 那样 handleReply 用 short='482b3a60' 找 sock 还是失败 — 必须用 fork 自己的 sessionId
+    // v2.6.1: 加 fallback,roster 缺 sessionId 时(罕见)用 short 兜底,避免下游 .slice() 抛 TypeError
     const liveRosterWorker = roster!.workers[chosen.short];
     liveFork = {
       short: chosen.short,
-      fullUuid: liveRosterWorker.sessionId,  // 一定是 fork 自己的 UUID
+      fullUuid: liveRosterWorker.sessionId || chosen.short,
       linkScanOffset: chosen.state.linkScanOffset ?? 0,
       status: jobStateToStatus(chosen),
       waitingFor: chosen.state.needs ?? undefined,
@@ -209,13 +209,6 @@ async function readRosterAndJobs(
     _cache = { ts: Date.now(), jobsDir, rosterPath, roster, jobs };
   }
   return { roster, jobs };
-}
-
-/** 直接读某路径(测试用) */
-function readRosterFromPath(p: string): Roster | null {
-  if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, 'utf8')) as Roster; }
-  catch { return null; }
 }
 
 /**

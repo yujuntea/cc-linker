@@ -102,12 +102,14 @@ export class ExpectedReplyState {
     if (!ok) {
       throw new Error(`Failed to set expectedReply for ${openId}: CAS failed on write`);
     }
-    // in-memory
+    // in-memory — v2.6.1: 用 effectiveInfo 保持 disk(user-mapping)和 memory 一致
+    // 之前用 info.* 导致 disk 写 fork UUID、memory 留 stale,get() 返新对象所以没炸,
+    // 但任何依赖 memory 状态的代码会读到旧值,易踩坑
     const internal: InternalEntry = {
-      shortId: info.shortId,
-      sessionId: info.sessionId,
-      cwd: info.cwd,
-      messageId: info.messageId,
+      shortId: effectiveInfo.shortId,
+      sessionId: effectiveInfo.sessionId,
+      cwd: effectiveInfo.cwd,
+      messageId: effectiveInfo.messageId,
       startedAt: now,
       timeoutMs: this.defaultTimeoutMs,
       casToken,

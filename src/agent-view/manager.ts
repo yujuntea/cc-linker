@@ -36,6 +36,9 @@ function buildCappedCard(sessions: AgentSession[], totalSessions: number): {
 } {
   // v2.6: 过滤被 fork 续接的 session(它本身已死,新 fork 在另一个 short 上)
   const filteredSessions = sessions.filter(s => !s.liveFork);
+  // v2.6.1: 修复 hasMore 计算 — fork 过滤掉的 session 不要再计入 "N more"
+  // 否则极端情况(全部 session 都被 fork 续接)会出现空卡 + "… 3 more" 死循环
+  const liveForkCount = sessions.length - filteredSessions.length;
   const groupsAll = groupByStatus(filteredSessions);
   const sortByRecency = (arr: AgentSession[]) =>
     [...arr].sort((a, b) => b.startedAt - a.startedAt);
@@ -51,7 +54,7 @@ function buildCappedCard(sessions: AgentSession[], totalSessions: number): {
   };
   const hasMore = Math.max(
     0,
-    totalSessions - busySorted.length - waitingSorted.length - groupsAll.idle.length - completedCapped.length,
+    totalSessions - liveForkCount - busySorted.length - waitingSorted.length - groupsAll.idle.length - completedCapped.length,
   );
   return {
     card: buildListCard(groups, new Date().toLocaleTimeString(), hasMore),
@@ -285,7 +288,7 @@ export class AgentViewManager {
     // 用户 Peek 一个已死 session(被 fork 续接),让 Peek 显示活 fork 的状态
     let effectiveSessionId = sessionId;
     let effectiveShortId = shortId;
-    let forkedFrom: { name: string; short: string } | undefined;
+    let forkedFrom: { short: string } | undefined;  // v2.6.1: 简化为只 short,name 字段未用
     try {
       const resolved = await resolveLiveSession(sessionId);
       if (resolved?.hasLiveFork && resolved.liveFork) {
@@ -294,7 +297,7 @@ export class AgentViewManager {
         );
         effectiveSessionId = resolved.liveFork.fullUuid;
         effectiveShortId = resolved.liveFork.short;
-        forkedFrom = { name: resolved.liveFork.short, short: resolved.liveFork.short };
+        forkedFrom = { short: resolved.liveFork.short };
       }
     } catch (err: any) {
       logger.warn(`handlePeek: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
@@ -596,7 +599,20 @@ export class AgentViewManager {
       return null;
     }
     // 4. 发确认文本(busy/waiting 状态加提示)
-    const session = result.sessions.find(s => s.sessionId === sessionId)!;
+    // v2.6: fork 翻译后 sessionId 可能不在原 snapshot(刚被 fork),
+    // 不再 `!` 强断言,改成 defensive find + refetch fallback
+    let session = result.sessions.find(s => s.sessionId === sessionId);
+    if (!session) {
+      // 翻译到 fork 后,原 snapshot 没有它 — 重新拉一次(快照便宜)
+      const reResult = await AgentSnapshotFetcher.fetch();
+      if (reResult.ok) {
+        session = reResult.sessions.find(s => s.sessionId === sessionId);
+      }
+      if (!session) {
+        await this.deps.replyFn('⚠️ 会话已不存在或刚被 fork,请重试', { openId });
+        return null;
+      }
+    }
     const warning = session.status === 'busy' ? '\n⚠️ 该 session 正在处理中' : '';
     const waitingInfo =
       session.status === 'waiting' && session.waitingFor

@@ -199,8 +199,8 @@ export function buildPeekCard(opts: {
   recentOutput: string;
   outputFormat?: 'markdown' | 'terminal';
   buttons: { peek: boolean; attach: boolean; reply: boolean; stop: boolean; refresh: boolean };
-  /** v2.6: 如果这个 session 已死但被 fork 续接,显示"已续接到 [新 short]"提示 */
-  forkedFrom?: { name: string; short: string };
+  /** v2.6: 如果这个 session 已死但被 fork 续接,显示"已续接到 [new short]"提示 */
+  forkedFrom?: { short: string };
 }): string {
   const statusLabel =
     opts.status === 'busy' ? '处理中'

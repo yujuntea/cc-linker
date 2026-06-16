@@ -40,6 +40,20 @@ export function readRoster(): Roster | null {
 }
 
 /**
+ * v2.6.1: 测试注入版 — 读指定路径的 roster.json。
+ * fork-resolver 等模块需要测试时注入 tmp 文件,所以暴露此 helper。
+ * 失败语义同 readRoster:返 null。
+ */
+export function readRosterFromPath(path: string): Roster | null {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as Roster;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 把 roster 压扁成 shortId → dispatch.source 的 Map。
  * 键用 short hash(8 字符),与 snapshot-fetcher / action 路由一致。
  * 失败/空 roster → 返回空 Map(此时所有 session 的 source 都会是 'unknown')。
