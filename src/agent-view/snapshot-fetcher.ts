@@ -101,7 +101,7 @@ export const AgentSnapshotFetcher = {
       // 这个问题,所以我们对齐 TUI 行为。
       //
       // 两个触发条件:
-      //   Signal 1 (主要): state.json.sessionId !== roster.workers[short].sessionId
+      //   Signal 1 (主要): s.sessionId !== roster.workers[short].sessionId
       //     → bg slot reuse 后,roster 记录新进程 sessionId,state.json 没更新
       //     → 用 roster 的 sessionId + override 为 busy
       //   Signal 2 (备份): state.json 说 idle 但 linkScanPath JSONL 最近被改
@@ -110,29 +110,38 @@ export const AgentSnapshotFetcher = {
       //
       // 安全保证: 只 override `status === 'idle'`(done/stopped/failed 映射),
       // busy/waiting/unknown 不动。
-      let overridden = false;
+      //
+      // 关于 s.sessionId: 直接用 jobStateToSession 算出的 canonical sessionId
+      // (它已经做了 sessionId → resumeSessionId → env.short 的 fallback),与
+      // sessionId.slice(0,8) 在下游(liveFork 解析、source attribution)用的字段一致。
+      // 之前用 env.state.sessionId ?? env.state.resumeSessionId 重复了 fallback 链,
+      // 既冗余又跟 s.sessionId 微妙不一致(empty string vs null 处理差异)。
+      let overriddenSession: AgentSession | null = null;
       if (s.status === 'idle') {
         const short = env.short;
         const rosterWorker = roster?.workers?.[short];
-        const stateSessionId = env.state.sessionId ?? env.state.resumeSessionId;
 
-        // Signal 1: bg slot 被 reuse (roster.sessionId 不同于 state.json.sessionId)
+        // Signal 1: bg slot 被 reuse (roster.sessionId 不同于 s.sessionId)
         if (
           rosterWorker?.sessionId
-          && stateSessionId
-          && rosterWorker.sessionId !== stateSessionId
+          && s.sessionId
+          && rosterWorker.sessionId !== s.sessionId
         ) {
           logger.warn(
             `[agent-view] ${short}: state.json stale — ` +
-            `state.sessionId=${stateSessionId.slice(0, 8)} ` +
+            `state.sessionId=${s.sessionId.slice(0, 8)} ` +
             `vs roster.sessionId=${rosterWorker.sessionId.slice(0, 8)}; ` +
             `bg slot reused, overriding to busy`,
           );
-          s.sessionId = rosterWorker.sessionId;
-          s.status = 'busy';
-          s.name = s.name.replace(/^[✅🛑❌]\s*/, '');
-          s.completed = undefined;  // 清理 — 之前 idle+completed=true 是 settled 标志
-          overridden = true;
+          // Immutable spread — 与文件其他地方({ ...s, name })风格一致,
+          // 避免就地修改 s 让 reviewer 困惑,也防止下游若拿到 s 引用被污染。
+          const { completed: _completed, ...rest } = s;
+          overriddenSession = {
+            ...rest,
+            sessionId: rosterWorker.sessionId,
+            status: 'busy',
+            name: s.name.replace(/^[✅🛑❌]\s*/, ''),
+          };
         }
         // Signal 2: JSONL 仍在被改(TUI 等价信号,防御 future roster 字段变化)
         else if (env.state.linkScanPath) {
@@ -145,10 +154,12 @@ export const AgentSnapshotFetcher = {
                 `${Math.round(ageMs / 1000)}s ago (<${STALE_JSONL_THRESHOLD_MS / 1000}s threshold); ` +
                 `bg actively working, overriding to busy`,
               );
-              s.status = 'busy';
-              s.name = s.name.replace(/^[✅🛑❌]\s*/, '');
-              s.completed = undefined;  // 同上
-              overridden = true;
+              const { completed: _completed, ...rest } = s;
+              overriddenSession = {
+                ...rest,
+                status: 'busy',
+                name: s.name.replace(/^[✅🛑❌]\s*/, ''),
+              };
             }
           } catch {
             // 文件不存在/读不了,graceful 跳过,保留 state.json 的 status
@@ -157,14 +168,14 @@ export const AgentSnapshotFetcher = {
       }
 
       // 仅在 NOT overridden 时加 emoji prefix — 否则 ✅ 会被加再被剥
-      if (!overridden) {
+      if (overriddenSession) {
+        sessions.push(overriddenSession);
+      } else {
         let name = s.name;
         if (env.state.state === 'stopped' && !name.startsWith('🛑')) name = `🛑 ${name}`;
         else if (env.state.state === 'done' && !name.startsWith('✅')) name = `✅ ${name}`;
         else if (env.state.state === 'failed' && !name.startsWith('❌')) name = `❌ ${name}`;
         sessions.push(name === s.name ? s : { ...s, name });
-      } else {
-        sessions.push(s);
       }
     }
     if (droppedUnknown > 0) {
