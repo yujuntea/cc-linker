@@ -987,13 +987,14 @@ export class AgentViewManager {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return;
     }
+    // v2.6.1: 移除 session.status !== 'waiting' 检查 — 用户在 reply mode,
+    // 即使 bg 状态变了(从 waiting → idle → working 都有可能)也应该允许继续发。
+    // 真正的 session 存在性检查是上面那行 `if (!session)`(snapshot.find 失败)。
+    // 这里只 log warn,不 bail。如果 bg 完全死了,runChatSDK 内部会报错。
     if (session.status !== 'waiting') {
-      await this.expectedReply.clear(openId);
-      await this.deps.replyFn(
-        `⚠️ Claude 已切换到 ${session.status},无法 reply`,
-        { openId },
+      logger.info(
+        `handleReply: bg 状态 ${session.status} 不是 waiting,但用户在 reply mode,继续 send (runChatSDK 会处理)`,
       );
-      return;
     }
 
     // M1 FIX (P0): T2 立即 markSent, 防双重 reply during the 60s wait
@@ -1007,8 +1008,11 @@ export class AgentViewManager {
     //      at the end of runChatSDK (P1-4 step, only if card init failed).
     //    In BOTH cases, the completion message is handled inside runChatSDK.
     //
-    // v2.4.x: 捕获 bgAskedNewQuestion + cardMessageId — 如果 bg 跑了并问新问题,
-    // finally clear 之后 re-set expectedReply 让用户可以直接在 chat 接着回。
+    // v2.6.1: 不管 bg 是否问新问题,reply 完成后都 re-set expectedReply。
+    // 这样用户可以连续发 reply(不强制每次点 [Reply]),符合用户对 reply
+    // "持续模式"的期望。bug 是:旧代码在 bgAskedNewQuestion=false 时
+    // 把 user-mapping 恢复成 type='session',下一次用户发文本走 chat 路径
+    // 触发 busy check,出现 "CLI 侧会话处理中" 误报。
     let bgAskedNewQuestion = false;
     let newCardMessageId: string | null = null;
     let sdkError: any = null;
@@ -1036,10 +1040,10 @@ export class AgentViewManager {
       return;
     }
 
-    // v2.4.x UX 改进: bg 跑了并问新问题 (new_needs), re-set expectedReply
-    // 让用户可以直接在 chat 接着回, 不用再点 [Reply]。新 messageId 是处理中卡
-    // transition 成等待卡的 messageId (runStreamingRendezvousReply 返的)。
-    if (bgAskedNewQuestion && newCardMessageId) {
+    // v2.6.1: ALWAYS re-set expectedReply(覆盖 markSent 的 clear),
+    // 让用户可以继续在 chat 接着 reply,不用再点 [Reply]。
+    // 退出方式:用户点 [❌ 取消等待] 按钮、/cancel、5min timeout。
+    if (newCardMessageId) {
       try {
         await this.expectedReply.set(openId, {
           shortId: info.shortId,
@@ -1048,42 +1052,12 @@ export class AgentViewManager {
           messageId: newCardMessageId,
         });
         logger.info(
-          `handleReply: bg 问新问题, re-set expectedReply with new waiting card ${newCardMessageId}`,
+          `handleReply: reply 完成,re-set expectedReply for follow-up (bgAskedNewQuestion=${bgAskedNewQuestion}, card=${newCardMessageId})`,
         );
       } catch (err: any) {
-        // re-set 失败不阻塞 reply 已完成, 记日志即可
         logger.warn(`handleReply: re-set expectedReply 失败: ${err?.message ?? err}`);
       }
-    } else {
-      // v2.5 fix: 正常完成 (bg 答完没问新问题) 时, markSent 已经把 user-mapping
-      // 从 pending_agent_reply 清成 null, 没有任何逻辑把它恢复成 plain session
-      // entry, 用户再发消息会被 resolveChatTarget 判 no_target → "当前没有
-      // 活跃会话" 错误 (pre-existing bug, v2.4.x 引入 rendezvous 后才暴露出来)。
-      //
-      // 修复: 这里把 user-mapping CAS 回 {type:'session', sessionUuid, cwd}
-      // 让用户能继续对话 (走 busy-check / 正常 chat 路径)。
-      // 不带 attachedAt — 这是 from-Reply 路径,不是 from-Attach 路径。
-      try {
-        const current = this.deps.userManager.getEntry(openId) ?? null;
-        const restored: MappingEntry = {
-          type: 'session' as const,
-          sessionUuid: info.sessionId,
-          cwd: info.cwd,
-          createdAt: new Date().toISOString(),
-        };
-        const ok = await this.deps.userManager.compareAndSwap(openId, current, restored);
-        if (ok) {
-          logger.info(`handleReply: 回复完成 (no new_needs), 恢复 user-mapping 为 session entry`);
-        } else {
-          logger.warn(`handleReply: restore user-mapping CAS 失败 (stale, 无害)`);
-        }
-      } catch (e: any) {
-        logger.warn(`handleReply: restore user-mapping 异常: ${e?.message ?? e}`);
-      }
     }
-
-    // v2.4: bot.ts 的 tryRendezvousReply 或 SDK P1-4 已发送 chat-text 回复,
-    // 这里不再发送旧的完成消息。
   }
 
   /**

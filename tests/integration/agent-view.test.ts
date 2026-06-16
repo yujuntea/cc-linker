@@ -126,7 +126,7 @@ function makeEnv() {
   const cardReplyFn = mock(async (_card: string, _opts: any) => 'om_card_001');
   const patchFn = mock(async (_messageId: string, _card: string) => null);
   const replyFn = mock(async (_text: string, _opts: any) => null);
-  const runChatSDK = mock(async () => ({ result: {}, handler: {}, cardMessageId: '' }));
+  const runChatSDK = mock(async () => ({ result: {}, handler: {}, cardMessageId: 'om_e2e_repatched' }));
   const mgr = new AgentViewManager({
     userManager,
     replyFn,
@@ -167,7 +167,7 @@ describe('Agent View end-to-end', () => {
     expect(mdContents).toContain('idle-task');
   });
 
-  test('reply happy path: waiting → reply text → runChatSDK invoked → expectedReply cleared', async () => {
+  test('v2.6.1: reply happy path: waiting → reply text → runChatSDK invoked → expectedReply re-set for follow-up', async () => {
     const { mgr, userManager, runChatSDK, replyFn, cardReplyFn } = makeEnv();
     const waiting = makeWaitingSession();
 
@@ -218,16 +218,18 @@ describe('Agent View end-to-end', () => {
     expect(callArg.sessionUuid).toBe(waiting.sessionId);
     expect(callArg.isNew).toBe(false);
 
-    // expectedReply 已被清除(try/finally 保证)
-    expect(mgr.expectedReply.get('ou_e2e_reply')).toBeUndefined();
-    // v2.5 fix: user-mapping 恢复成 plain session entry (无 new_needs 时),
-    // 让用户能继续对话。test 中 runChatSDK mock 没设 bgAskedNewQuestion (默认 undefined)
-    // → falsy → 走 plain session restore 分支。
+    // v2.6.1: 修复 Reply 持久性 — reply 完成后 expectedReply RE-SET(覆盖 markSent 的 clear),
+    // 让用户可以连续发 reply(不强制每次点 [Reply])。runChatSDK mock 返 cardMessageId
+    // (生产场景: patch 处理中卡 → 等待卡)→ handleReply 走 re-set 分支。
     const e2eRestored = userManager.getEntry('ou_e2e_reply');
     expect(e2eRestored).not.toBeNull();
     expect(e2eRestored).toEqual(expect.objectContaining({
-      type: 'session',
+      type: 'pending_agent_reply',
     }));
+    // expectedReply 应该被 re-set 回去(in-memory)
+    const reInfo = mgr.expectedReply.get('ou_e2e_reply');
+    expect(reInfo).toBeDefined();
+    expect(reInfo?.sessionId).toBe(waiting.sessionId);
   });
 
   test('reply rejected when status changed to busy (Step B re-guard)', async () => {
@@ -265,20 +267,22 @@ describe('Agent View end-to-end', () => {
     // expectedReply 已设置
     expect(mgr.expectedReply.get('ou_e2e_busy')).toBeDefined();
 
-    // Step B: 此时 session 已变成 busy,handleReply 应拒绝(Step B re-guard)
+    // Step B: 此时 session 已变成 busy,v2.6.1 取消状态检查 — handleReply 不再拒绝,
+    // 允许用户在 reply mode 持续 send(避免"CLI 侧会话处理中"误报)
     replyFn.mockClear();
     runChatSDK.mockClear();
     await mgr.handleReply('ou_e2e_busy', '迟到的回复');
 
-    // runChatSDK 不应被调用
-    expect(runChatSDK).not.toHaveBeenCalled();
-    // 应当回复"无法 reply"
-    expect(replyFn).toHaveBeenCalled();
-    expect(replyFn.mock.calls.some((c: any[]) => /已切换到 busy/.test(c[0]))).toBe(true);
+    // v2.6.1:runChatSDK 仍被调用 — 不管 bg 什么状态,runChatSDK 内部用 rendezvous 注入
+    expect(runChatSDK).toHaveBeenCalled();
+    // 不再发"无法 reply"警告
+    expect(replyFn.mock.calls.some((c: any[]) => /已切换到 busy/.test(c[0]))).toBe(false);
 
-    // expectedReply 仍被清理(try/finally)
-    expect(mgr.expectedReply.get('ou_e2e_busy')).toBeUndefined();
-    expect(userManager.getEntry('ou_e2e_busy')).toBeUndefined();
+    // expectedReply 仍被清理然后 re-set(因为 runChatSDK mock 没返 cardMessageId 所以 re-set 跳过)
+    // user-mapping 仍是 pending_agent_reply(没被改回 type='session' → 避免 busy check)
+    expect(userManager.getEntry('ou_e2e_busy')).toEqual(
+      expect.objectContaining({ type: 'pending_agent_reply' }),
+    );
   });
 
   test('v2.2.2 (v2.3 adapted): only sub-agents (spare) are filtered; slash and fleet are kept (TUI parity)', async () => {

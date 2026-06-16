@@ -766,10 +766,10 @@ describe('handleReply (Step B)', () => {
     expect(runSpy).not.toHaveBeenCalled();
   });
 
-  test('clears expectedReply when session no longer waiting (busy)', async () => {
+  test('v2.6.1: bg 状态变了(busy)handleReply 不再拒绝,继续 send (避免 busy check 误报)', async () => {
     const { mgr, userManager } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
-    // fetch 一次:Step B guard 看到 busy → throw "Claude 已切换到 busy,无法 reply" + clear
+    // fetch 一次:session 已切到 busy。v2.6.1 之前会 bail,现在只 log warn。
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
       ok: true,
       sessions: [{ ...waiting, status: 'busy' }],
@@ -779,15 +779,17 @@ describe('handleReply (Step B)', () => {
       sessionId: waiting.sessionId,
       cwd: waiting.cwd,
     });
-    const runSpy = mock(async () => ({ result: {}, handler: {}, cardMessageId: '' }));
+    // v2.6.1: runChatSDK 仍被调用(让 runChatSDK 内部用 rendezvous 处理)
+    const runSpy = mock(async () => ({ result: {}, handler: {}, cardMessageId: 'mid-busy' }));
     mgr.deps.runChatSDK = runSpy as any;
 
     await mgr.handleReply('ou_reply_ok', 'hello back');
 
-    // 守卫失败 → 不调 SDK + 清 expectedReply
-    expect(runSpy).not.toHaveBeenCalled();
-    expect(mgr.expectedReply.get('ou_reply_ok')).toBeUndefined();
-    expect(userManager.getEntry('ou_reply_ok')).toBeUndefined();
+    // v2.6.1:runChatSDK 被调用(不再 bail)
+    expect(runSpy).toHaveBeenCalled();
+    // 关键:user-mapping 没被改回 type='session' → 下次发消息不会触发 busy check
+    const entry = userManager.getEntry('ou_reply_ok');
+    expect(entry?.type).toBe('pending_agent_reply');
   });
 
   test('v2.3.4: clears expectedReply when runChatSDK throws (try/catch+reply)', async () => {
@@ -817,7 +819,7 @@ describe('handleReply (Step B)', () => {
     expect(errMsg).toContain('runChatSDK boom');
   });
 
-  test('v2.5: reply 完成后 user-mapping 恢复 plain session entry, 不再发旧完成消息 (bot.ts 负责 chat-text reply)', async () => {
+  test('v2.6.1: reply 完成后 user-mapping 保持 pending_agent_reply (让用户继续 reply,无需点 [Reply])', async () => {
     const { mgr, userManager, replyFn } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
@@ -829,23 +831,20 @@ describe('handleReply (Step B)', () => {
       sessionId: waiting.sessionId,
       cwd: waiting.cwd,
     });
-    // Mock returns valid result (rendezvousHandled: false = SDK path handled it)
-    mgr.deps.runChatSDK = mock(async () => ({ result: {}, handler: {}, cardMessageId: '', rendezvousHandled: false })) as any;
+    // v2.6.1: 返 cardMessageId,触发 expectedReply re-set
+    mgr.deps.runChatSDK = mock(async () => ({ result: {}, handler: {}, cardMessageId: 'mid-cont', rendezvousHandled: false })) as any;
     replyFn.mockClear();
 
     await mgr.handleReply('ou_reply_cont', '第一条');
 
-    // v2.5 行为: reply 完成后 user-mapping 恢复成 plain session entry (让用户
-    // 继续对话, 不必 /agents 重选)。expectedReply in-memory 仍 cleared。
-    expect(mgr.expectedReply.get('ou_reply_cont')).toBeUndefined();
-    // user-mapping 应被恢复成 plain session entry
-    const restored = userManager.getEntry('ou_reply_cont');
-    expect(restored).not.toBeNull();
-    expect(restored).toEqual(expect.objectContaining({
-      type: 'session', sessionUuid: waiting.sessionId, cwd: waiting.cwd,
-    }));
-    // v2.4: handleReply 不再发旧完成消息 — bot.ts 的 tryRendezvousReply 或 SDK P1-4 已发
-    // 所以 replyFn 不应被调用 (no error, no fallback)
+    // v2.6.1: expectedReply 被 re-set(不 cleared),用户可以继续 reply
+    const reInfo = mgr.expectedReply.get('ou_reply_cont');
+    expect(reInfo).toBeDefined();
+    expect(reInfo?.messageId).toBe('mid-cont');
+    // v2.6.1: user-mapping 仍是 pending_agent_reply(没被改回 type='session' → 避免 busy check)
+    const entry = userManager.getEntry('ou_reply_cont');
+    expect(entry?.type).toBe('pending_agent_reply');
+    // v2.4: handleReply 不再发旧完成消息
     const replyCalls = replyFn.mock.calls.filter(c => (c[0] as string).includes('已处理完'));
     expect(replyCalls.length).toBe(0);
   });
@@ -894,9 +893,10 @@ describe('handleReply (Step B)', () => {
   });
 
   /**
-   * v2.4.x: bg 跑完不回头 (done) → expectedReply stays cleared, 用户需 /agents
+   * v2.6.1: bg 跑完不回头 (done) → expectedReply 仍 re-set(用户可继续 reply),
+   * user-mapping 保持 pending_agent_reply(不会被改回 type='session' → 避免 busy check)
    */
-  test('v2.5: bg done → expectedReply cleared, user-mapping 恢复 plain session entry (用户能继续对话, 不必 /agents 重选)', async () => {
+  test('v2.6.1: bg done → expectedReply re-set (用户可继续 reply, 无需 /agents)', async () => {
     const { mgr, userManager } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
@@ -908,7 +908,7 @@ describe('handleReply (Step B)', () => {
       sessionId: waiting.sessionId,
       cwd: waiting.cwd,
     });
-    // Mock: bg 跑完不回头, 处理中卡变成"✅ 完成"卡
+    // Mock: bg 跑完不回头, runChatSDK 返 cardMessageId 触发 re-set
     mgr.deps.runChatSDK = mock(async () => ({
       result: {},
       handler: {},
@@ -919,14 +919,13 @@ describe('handleReply (Step B)', () => {
 
     await mgr.handleReply('ou_reply_done', '继续');
 
-    // expectedReply 应该是 cleared
-    expect(mgr.expectedReply.get('ou_reply_done')).toBeUndefined();
-    // v2.5: user-mapping 恢复成 plain session entry (no new_needs 时)
-    const restoredDone = userManager.getEntry('ou_reply_done');
-    expect(restoredDone).not.toBeNull();
-    expect(restoredDone).toEqual(expect.objectContaining({
-      type: 'session',
-    }));
+    // v2.6.1: expectedReply 被 re-set(覆盖 markSent clear),用户可继续 reply
+    const reInfo = mgr.expectedReply.get('ou_reply_done');
+    expect(reInfo).toBeDefined();
+    expect(reInfo?.messageId).toBe('om_done_card');
+    // user-mapping 保持 pending_agent_reply(不被改回 type='session')
+    const entry = userManager.getEntry('ou_reply_done');
+    expect(entry?.type).toBe('pending_agent_reply');
   });
 
   /**
@@ -955,10 +954,10 @@ describe('handleReply (Step B)', () => {
     expect(userManager.getEntry('ou_reply_throw')).toBeUndefined();
   });
 
-  test('v2.5 fix: normal completion (bg done, no new question) → restores user-mapping to session entry', async () => {
-    // 之前: markSent 把 user-mapping 清成 null, 没有任何逻辑恢复 → 用户再发消息
-    // 会被 resolveChatTarget 判 no_target 报 "当前没有活跃会话"
-    // 现在: 正常完成后 CAS 回 {type:'session', sessionUuid, cwd}
+  test('v2.6.1: normal completion (bg done, no new question) → 保持 pending_agent_reply,re-set expectedReply', async () => {
+    // 之前 v2.5 fix: 正常完成后 CAS 回 {type:'session', sessionUuid, cwd}
+    //   → 但下次用户发消息会触发 busy check,出现 "CLI 侧会话处理中" 误报
+    // 现在 v2.6.1: 不恢复 plain session,改为 re-set expectedReply(用户继续 reply)
     const { mgr, userManager } = makeMgrWithSpies();
     const waiting = makeWaitingSession();
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
@@ -973,7 +972,7 @@ describe('handleReply (Step B)', () => {
     });
     expect(userManager.getEntry('ou_restore')?.type).toBe('pending_agent_reply');
 
-    // runChatSDK 返回 bgAskedNewQuestion=false (bg 答完就结束)
+    // runChatSDK 返回 bgAskedNewQuestion=false (bg 答完就结束),但仍返 cardMessageId
     mgr.deps.runChatSDK = (async () => ({
       result: {}, handler: {}, cardMessageId: 'mid-done',
       rendezvousHandled: true, bgAskedNewQuestion: false,
@@ -981,15 +980,13 @@ describe('handleReply (Step B)', () => {
 
     await mgr.handleReply('ou_restore', '继续');
 
-    // expectedReply 已清
-    expect(mgr.expectedReply.get('ou_restore')).toBeUndefined();
-    // ⚠️ 关键: user-mapping 恢复成 plain session entry (没有 attachedAt)
-    const restored = userManager.getEntry('ou_restore');
-    expect(restored).not.toBeNull();
-    expect(restored).toEqual(expect.objectContaining({
-      type: 'session', sessionUuid: waiting.sessionId, cwd: '/p',
-    }));
-    expect(restored?.attachedAt).toBeUndefined();
+    // v2.6.1: expectedReply 被 re-set(让用户继续 reply)
+    const reInfo = mgr.expectedReply.get('ou_restore');
+    expect(reInfo).toBeDefined();
+    expect(reInfo?.messageId).toBe('mid-done');
+    // user-mapping 保持 pending_agent_reply(不被改回 type='session' → 避免 busy check)
+    const entry = userManager.getEntry('ou_restore');
+    expect(entry?.type).toBe('pending_agent_reply');
   });
 
   test('v2.5 fix: bg asked new question → re-sets expectedReply (NOT plain session restore)', async () => {
