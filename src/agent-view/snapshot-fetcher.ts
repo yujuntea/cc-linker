@@ -29,6 +29,7 @@ import { readRoster, buildRosterSourceMap } from './roster-source';
 import { readClaimedSources } from './daemon-log-reader';
 import { deriveNameFromJsonl } from './jsonl-name';
 import { readAllJobStates, jobStateToSession } from './job-state';
+import { resolveLiveSession } from './fork-resolver';
 import { logger } from '../utils/logger';
 import type { AgentSession, AgentSessionSource } from './types';
 
@@ -124,6 +125,22 @@ export const AgentSnapshotFetcher = {
       }
       return s;
     });
+
+    // v2.6: 透明 fork 解析 — 给每条 session 补 liveFork
+    // 如果一个 session 自身已死(TUI 关了)但有 live fork 续接,这里把 fork 摘要
+    // 挂到 session.liveFork 上,UI 据此渲染"已续接到 [新 short]"提示,
+    // handleList 据此过滤掉重复展示。
+    for (const s of sessions) {
+      if (!s.sessionId) continue;
+      try {
+        const r = await resolveLiveSession(s.sessionId);
+        if (r?.hasLiveFork && r.liveFork) {
+          s.liveFork = r.liveFork;
+        }
+      } catch (err: any) {
+        logger.warn(`snapshot-fetcher: resolveLiveSession failed for ${s.sessionId}: ${err?.message ?? err}`);
+      }
+    }
 
     sessions = filterUserDispatched(sessions);
     return { ok: true, sessions };
