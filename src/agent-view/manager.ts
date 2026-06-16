@@ -11,6 +11,7 @@ import { extractRecentAssistantText } from './jsonl-peek';
 import { JsonlIndex } from './jsonl-name';
 import { readRoster, lookupResumeFromPath } from './roster-source';
 import { readJobState } from './job-state';
+import { resolveLiveSession } from './fork-resolver';
 
 /** Maximum list-card byte size. 飞书 card 25KB 上限;超过走 text fallback。 */
 const MAX_CARD_BYTES = 25_000;
@@ -814,13 +815,32 @@ export class AgentViewManager {
     cwd: string,
     messageId?: string,
   ): Promise<void> {
+    // v2.6: 翻译 stale sessionId → 活 fork(如有)
+    // 用户点的 [Reply] 按钮可能是历史 card,bind 的 sessionId 可能已死
+    // (TUI 关了,但 claude --resume --fork 把对话续到新 TUI)
+    let effectiveSessionId = sessionId;
+    let effectiveShortId = _shortId;
+    try {
+      const resolved = await resolveLiveSession(sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handleReplyRequest: 翻译 ${sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short} ` +
+          `(共享 JSONL: ${resolved.jsonlPath})`,
+        );
+        effectiveSessionId = resolved.liveFork.fullUuid;
+        effectiveShortId = resolved.liveFork.short;
+      }
+    } catch (err: any) {
+      logger.warn(`handleReplyRequest: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
+    }
+
     // 1. 三重守卫
     const result = await AgentSnapshotFetcher.fetch();
     if (!result.ok) {
       await this.deps.replyFn(`❌ ${result.reason}`, { openId });
       return;
     }
-    const session = result.sessions.find(s => s.sessionId === sessionId);
+    const session = result.sessions.find(s => s.sessionId === effectiveSessionId);
     if (!session) {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return;
@@ -845,7 +865,7 @@ export class AgentViewManager {
     // adoptExistingCard 接管错卡, fallback 走 startProcessing 新发"处理中"卡,
     // 用户看到两张卡并存。
     const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
-    const peek = await this.resolvePeekContent(_shortId, peekMaxBytes);
+    const peek = await this.resolvePeekContent(effectiveShortId, peekMaxBytes);
     const card = buildWaitingCard({
       name: session.name,
       status: session.status,
@@ -868,7 +888,7 @@ export class AgentViewManager {
     // 其他类型(session 任意 / pending_new_session / transient)都自动清。
     try {
       await this.expectedReply.set(openId, {
-        shortId: _shortId, sessionId, cwd,
+        shortId: effectiveShortId, sessionId: effectiveSessionId, cwd,
         messageId: waitingCardMessageId ?? messageId,
       });
     } catch (err: any) {
