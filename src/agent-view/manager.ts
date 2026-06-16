@@ -545,6 +545,21 @@ export class AgentViewManager {
     // 进入 CAS 阶段前,正式把 sessionId 替换成 full UUID,后续 UserManager
     // 写入和 SDK 调用都走 full,免得 SDK 拒 short("Provided value ... is not a UUID")
     if (fullUuid) sessionId = fullUuid;
+    // v2.6: 翻译 stale sessionId → 活 fork
+    // 用户 attach 一个已死 session(被 fork 续接),直接 attach 到 fork
+    try {
+      const resolved = await resolveLiveSession(sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handleAttach: 翻译 ${sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        sessionId = resolved.liveFork.fullUuid;
+        shortId = resolved.liveFork.short;
+        fullUuid = resolved.liveFork.fullUuid;
+      }
+    } catch (err: any) {
+      logger.warn(`handleAttach: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
+    }
     // v2.2.19 修正:expectedReply.clear 必须在 CAS 1 成功之后调用。
     // 旧逻辑(L415-418)在 CAS 1 之前就 clear — 如果 CAS 1 失败,用户的 pending reply
     // 已经丢失且无法恢复。新逻辑:CAS 1 成功后再 clear(CAS 1 已 null 掉 entry,
