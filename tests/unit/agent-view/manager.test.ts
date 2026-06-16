@@ -936,6 +936,50 @@ describe('handleReply (Step B)', () => {
   });
 
   /**
+   * 2026-06-16 P0 bug: SDK fallback 路径下 (no_rendezvous_sock),runChatSDK 返
+   * { rendezvousHandled: false, cardMessageId: 'om_done' } — 旧逻辑检查
+   * `if (rendezvousHandled && newCardMessageId)` 会跳过 re-set,导致下次用户
+   * 发文本走 handleChat → "当前没有活跃会话"。
+   *
+   * 修复:只要 newCardMessageId 存在就 re-set(SDK fallback 也算成功)。
+   * 用户的连续 reply 是合理 UX,bg session 仍然存在,SDK resume 跑完一轮
+   * 后续可继续 reply。
+   */
+  test('2026-06-16 fix: SDK fallback 路径(rendezvousHandled=false)→ expectedReply 仍 re-set', async () => {
+    const { mgr, userManager } = makeMgrWithSpies();
+    const waiting = makeWaitingSession();
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [waiting],
+    }));
+    await mgr.expectedReply.set('ou_reply_sdk_fallback', {
+      shortId: waiting.sessionId.slice(0, 8),
+      sessionId: waiting.sessionId,
+      cwd: waiting.cwd,
+    });
+    // Mock: 模拟 SDK fallback 路径 — rendezvous 不可用(no_rendezvous_sock),
+    // SDK resume 成功跑完,返回 rendezvousHandled=false 但 cardMessageId 存在
+    mgr.deps.runChatSDK = mock(async () => ({
+      result: {},
+      handler: {},
+      cardMessageId: 'om_sdk_complete_card',
+      rendezvousHandled: false,        // ← 关键:SDK fallback 路径
+      bgAskedNewQuestion: false,
+    })) as any;
+
+    await mgr.handleReply('ou_reply_sdk_fallback', '继续');
+
+    // 关键断言:即使 rendezvousHandled=false,只要 cardMessageId 存在就 re-set
+    // (用户可以连续发 reply,不用每次点 [Reply])
+    const reInfo = mgr.expectedReply.get('ou_reply_sdk_fallback');
+    expect(reInfo).toBeDefined();
+    expect(reInfo?.messageId).toBe('om_sdk_complete_card');
+    // user-mapping 保持 pending_agent_reply,避免下次发消息撞 busy check
+    const entry = userManager.getEntry('ou_reply_sdk_fallback');
+    expect(entry?.type).toBe('pending_agent_reply');
+  });
+
+  /**
    * v2.4.x: runChatSDK 抛错时, 仍按 finally 行为清空 (不 re-set)
    */
   test('v2.4.x: runChatSDK throws → expectedReply cleared (no re-set)', async () => {

@@ -1057,9 +1057,19 @@ export class AgentViewManager {
     //     (不强制每次点 [Reply],符合用户对 Reply 持续模式的期望)
     //   - rendezvousHandled=false: SDK fallback,daemon 可能已死,re-set 没意义
     //     (下次 runChatSDK 还会失败),让用户 re-click [Reply] 触发新流程
-    // 不再要求 bgAskedNewQuestion — 用户的 bug case 是 bg 答完没问新问题
-    // 但用户想再发文本,这是合法的连续 reply,必须支持
-    if (rendezvousHandled && newCardMessageId) {
+    //
+    // 2026-06-16 修正: 移除 `rendezvousHandled` 限定条件。
+    // 真实 bug case: 用户的 bg session 没注册 rendezvous socket (`no_rendezvous_sock`),
+    // runChatSDK 走 SDK fallback (`claude --resume <uuid>`) 也能成功跑完 reply。
+    // 但旧逻辑跳过 re-set → 下次用户发文本走 handleChat → "当前没有活跃会话"。
+    //
+    // 修复: 只要 newCardMessageId 存在就 re-set。
+    //   - 这恢复了 v2.6.0 (commit 80209f6) 的行为
+    //   - 即使 bg 真死,handleReply 内的状态检查 (`session.completed` / `session` not found)
+    //     会给友好错误 "⚠️ Claude 已切换到 idle,无法 reply",不会误导用户
+    //   - `no_rendezvous_sock` ≠ daemon 死,只是这个 session 没起 rendezvous server。
+    //     SDK fallback 成功后 bg 仍然存在,用户继续 reply 完全合法
+    if (newCardMessageId) {
       try {
         await this.expectedReply.set(openId, {
           shortId: info.shortId,
