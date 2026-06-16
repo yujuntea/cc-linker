@@ -95,29 +95,32 @@ export const AgentSnapshotFetcher = {
         continue;
       }
 
-      // v2.7: stale state.json 检测 — bg slot 被 daemon 复用时,state.json
-      // 可能停留在旧 incarnation 的"done"状态(没有覆盖写),导致 cc-linker
-      // 错把活 session 展示在"已完成"组。TUI 用 JSONL mtime freshness 检测
-      // 这个问题,所以我们对齐 TUI 行为。
+      // v2.7+ (扩展): stale state.json 检测 — bg slot 被 daemon 复用时,
+      // state.json 可能停留在旧 incarnation 的"done/blocked"状态(没有覆盖写),
+      // 导致 cc-linker 错把活 session 展示在"已完成"或"等待输入"组。
+      // TUI 用 JSONL mtime freshness + pid liveness 检测这个问题,
+      // 所以我们对齐 TUI 行为。
       //
-      // 两个触发条件:
+      // 触发条件(应用范围: status !== 'busy'):
       //   Signal 1 (主要): s.sessionId !== roster.workers[short].sessionId
       //     → bg slot reuse 后,roster 记录新进程 sessionId,state.json 没更新
       //     → 用 roster 的 sessionId + override 为 busy
-      //   Signal 2 (备份): state.json 说 idle 但 linkScanPath JSONL 最近被改
+      //   Signal 2 (备份): linkScanPath JSONL 最近被改
       //     → 即使没有 roster 信息,JSONL 在被写 = bg 实际活着
       //     → override 为 busy(不修改 sessionId,因为没有更权威的 source)
       //
-      // 安全保证: 只 override `status === 'idle'`(done/stopped/failed 映射),
-      // busy/waiting/unknown 不动。
+      // 应用范围扩展(v2.7.1): 之前只检测 status='idle',但用户截图反馈
+      // state.json says blocked + JSONL fresh 也会误判为 waiting(2026-06-16 P0)。
+      // TUI 在两种情况都正确显示 busy/busy — 我们对齐。
+      //
+      // 安全保证: 只 override `status !== 'busy'`(idle + waiting 映射自
+      // done/stopped/failed/blocked),busy 状态保持不动 (已经正确)。
       //
       // 关于 s.sessionId: 直接用 jobStateToSession 算出的 canonical sessionId
       // (它已经做了 sessionId → resumeSessionId → env.short 的 fallback),与
       // sessionId.slice(0,8) 在下游(liveFork 解析、source attribution)用的字段一致。
-      // 之前用 env.state.sessionId ?? env.state.resumeSessionId 重复了 fallback 链,
-      // 既冗余又跟 s.sessionId 微妙不一致(empty string vs null 处理差异)。
       let overriddenSession: AgentSession | null = null;
-      if (s.status === 'idle') {
+      if (s.status !== 'busy') {
         const short = env.short;
         const rosterWorker = roster?.workers?.[short];
 
@@ -128,19 +131,20 @@ export const AgentSnapshotFetcher = {
           && rosterWorker.sessionId !== s.sessionId
         ) {
           logger.warn(
-            `[agent-view] ${short}: state.json stale — ` +
+            `[agent-view] ${short}: state.json stale (status=${s.status}) — ` +
             `state.sessionId=${s.sessionId.slice(0, 8)} ` +
             `vs roster.sessionId=${rosterWorker.sessionId.slice(0, 8)}; ` +
             `bg slot reused, overriding to busy`,
           );
           // Immutable spread — 与文件其他地方({ ...s, name })风格一致,
           // 避免就地修改 s 让 reviewer 困惑,也防止下游若拿到 s 引用被污染。
-          const { completed: _completed, ...rest } = s;
+          // waiting → busy 时还要清掉 waitingFor,否则 card.ts 会显示成 ❓ 等待原因
+          const { completed: _completed, waitingFor: _waitingFor, ...rest } = s;
           overriddenSession = {
             ...rest,
             sessionId: rosterWorker.sessionId,
             status: 'busy',
-            name: s.name.replace(/^[✅🛑❌]\s*/, ''),
+            name: s.name.replace(/^[✅🛑❌✋]\s*/, ''),  // ✋ = waiting emoji prefix
           };
         }
         // Signal 2: JSONL 仍在被改(TUI 等价信号,防御 future roster 字段变化)
@@ -150,15 +154,15 @@ export const AgentSnapshotFetcher = {
             const ageMs = Date.now() - stat.mtimeMs;
             if (ageMs < STALE_JSONL_THRESHOLD_MS) {
               logger.warn(
-                `[agent-view] ${short}: state.json says done but JSONL modified ` +
+                `[agent-view] ${short}: state.json says ${s.status} but JSONL modified ` +
                 `${Math.round(ageMs / 1000)}s ago (<${STALE_JSONL_THRESHOLD_MS / 1000}s threshold); ` +
                 `bg actively working, overriding to busy`,
               );
-              const { completed: _completed, ...rest } = s;
+              const { completed: _completed, waitingFor: _waitingFor, ...rest } = s;
               overriddenSession = {
                 ...rest,
                 status: 'busy',
-                name: s.name.replace(/^[✅🛑❌]\s*/, ''),
+                name: s.name.replace(/^[✅🛑❌✋]\s*/, ''),
               };
             }
           } catch {

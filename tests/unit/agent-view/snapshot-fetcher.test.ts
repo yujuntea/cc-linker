@@ -449,4 +449,79 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     expect(s.status).toBe('idle');
     expect(s.name).toBe('✅ legit completed');
   });
+
+  // 2026-06-16 P0 bug: state.json says blocked/waiting 但 bg 实际在跑
+  // (用户截图 21:25 时,48bbecc6 state=blocked, JSONL mtime 21:24,
+  //  bg pid alive — TUI 显示 Working,Feishu 显示等待输入)
+  // 修复:扩展 staleness 检测覆盖 waiting 状态。Signal 2 (JSONL fresh)
+  // 是关键信号 — 真 waiting session JSONL mtime 通常几小时前 stale。
+  test('Signal 2 on waiting: state.json says blocked but JSONL fresh → override to busy', async () => {
+    readRosterMock.mockImplementation(() => null);  // 无 roster 信息,纯靠 JSONL freshness
+    const freshJsonl = join(tmpJsonlDir, 'fresh-waiting.jsonl');
+    writeFileSync(freshJsonl, '[]');  // mtime = now
+    mockJobs([makeEnv({
+      state: 'blocked', needs: '请问我可以继续吗?',
+      name: 'bg actively working despite blocked state',
+      linkScanPath: freshJsonl,
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    expect(s.status).toBe('busy');  // overridden from waiting
+    expect(s.name).toBe('bg actively working despite blocked state');  // no ✋
+    // waitingFor 应被剥掉(busy 时不应有 waitingFor)
+    expect(s.waitingFor).toBeUndefined();
+  });
+
+  test('Negative waiting: 真在等用户输入 (JSONL stale) → 保持 waiting', async () => {
+    // 防御:用户问完问题,bg 等回 — JSONL 几小时前 stale,不应 override
+    readRosterMock.mockImplementation(() => null);
+    const staleJsonl = join(tmpJsonlDir, 'stale-waiting.jsonl');
+    writeFileSync(staleJsonl, '[]');
+    const hoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);  // 3h ago
+    utimesSync(staleJsonl, hoursAgo, hoursAgo);
+    mockJobs([makeEnv({
+      state: 'blocked', needs: '请问我可以继续吗?',
+      name: 'waiting for user',
+      linkScanPath: staleJsonl,
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    expect(s.status).toBe('waiting');  // 保持 waiting
+    expect(s.waitingFor).toBe('请问我可以继续吗?');
+  });
+
+  test('Signal 1 on waiting: bg slot 被 reuse (sessionId mismatch + blocked) → override to busy', async () => {
+    // 真实场景:0abb6d98 (no doc) 被 daemon 复用,roster.sessionId 是新进程,
+    // state.json 还停留在旧 incarnation 的 blocked 状态
+    readRosterMock.mockImplementation(() => ({
+      workers: {
+        '0abb6d98': {
+          pid: 82144,
+          sessionId: '482b3a60-7ae0-4c8c-ba98-f462d08b3274',
+          cwd: '/Users/wuyujun/Git/trae-data-branch/trae-data',
+          startedAt: 1781573484361,
+          dispatch: { source: 'fleet' },
+        },
+      },
+      updatedAt: Date.now(),
+    }));
+    mockJobs([makeEnv({
+      short: '0abb6d98',
+      state: 'blocked', needs: '需要我把修改整理成一个 patch 文件...',
+      name: 'Review AI coding lines attribution design',
+      sessionId: '0abb6d98-6bfc-4b95-b59f-52c493369986',  // 旧 incarnation
+      resumeSessionId: '667523a6-5c94-476c-8fe8-b52bd7fe1f08',
+      linkScanPath: null,
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    expect(s.status).toBe('busy');
+    expect(s.sessionId).toBe('482b3a60-7ae0-4c8c-ba98-f462d08b3274');
+    expect(s.waitingFor).toBeUndefined();  // 剥掉
+  });
 });
