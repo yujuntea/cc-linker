@@ -199,6 +199,8 @@ export function buildPeekCard(opts: {
   recentOutput: string;
   outputFormat?: 'markdown' | 'terminal';
   buttons: { peek: boolean; attach: boolean; reply: boolean; stop: boolean; refresh: boolean };
+  /** v2.6: 如果这个 session 已死但被 fork 续接,显示"已续接到 [新 short]"提示 */
+  forkedFrom?: { name: string; short: string };
 }): string {
   const statusLabel =
     opts.status === 'busy' ? '处理中'
@@ -220,6 +222,13 @@ export function buildPeekCard(opts: {
       content: recentBlock,
     },
   ];
+  // v2.6: fork 续接 annotation
+  if (opts.forkedFrom) {
+    elements.push({
+      tag: 'markdown',
+      content: `🔄 **已续接** — 对话在 TUI \`${opts.forkedFrom.short}\` 继续,原 TUI 已关闭`,
+    });
+  }
   // 按钮(根据 status 决定可见性)
   const actions: any[] = [];
   if (opts.buttons.refresh)

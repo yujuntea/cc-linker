@@ -281,13 +281,32 @@ export class AgentViewManager {
     sessionId: string,
     cwd: string,
   ): Promise<string | Record<string, unknown> | null> {
-    const session = await this.findSession(openId, sessionId);
+    // v2.6: 翻译 stale sessionId → 活 fork
+    // 用户 Peek 一个已死 session(被 fork 续接),让 Peek 显示活 fork 的状态
+    let effectiveSessionId = sessionId;
+    let effectiveShortId = shortId;
+    let forkedFrom: { name: string; short: string } | undefined;
+    try {
+      const resolved = await resolveLiveSession(sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handlePeek: 翻译 ${sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        effectiveSessionId = resolved.liveFork.fullUuid;
+        effectiveShortId = resolved.liveFork.short;
+        forkedFrom = { name: resolved.liveFork.short, short: resolved.liveFork.short };
+      }
+    } catch (err: any) {
+      logger.warn(`handlePeek: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
+    }
+
+    const session = await this.findSession(openId, effectiveSessionId);
     if (!session) {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return null;
     }
     const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
-    const peek = await this.resolvePeekContent(shortId, peekMaxBytes);
+    const peek = await this.resolvePeekContent(effectiveShortId, peekMaxBytes);
     const truncated = peek.text ?? '(无可用输出)';
     const buttons = {
       peek: true,
@@ -301,14 +320,15 @@ export class AgentViewManager {
       status: session.status,
       completed: session.completed,
       waitingFor: session.waitingFor,
-      shortId,
-      sessionId,
+      shortId: effectiveShortId,
+      sessionId: effectiveSessionId,
       cwd,
       pid: session.pid,
       startedAt: session.startedAt,
       recentOutput: truncated,
       outputFormat: peek.format,
       buttons,
+      ...(forkedFrom ? { forkedFrom } : {}),
     });
     return await this.sendOrFallback(
       card,
