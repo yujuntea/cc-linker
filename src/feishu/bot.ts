@@ -2129,14 +2129,29 @@ export class FeishuBot {
   }> {
     const { openId, sessionUuid: inputSessionUuid, cwd, settingsPath, promptText, serialKey, isNew = false, messageId, fromAgentViewReply = false, fromAttachedChat = false } = params;
 
+    // v2.6: 防御性 fork 解析(上游 handleReply/handleReplyRequest 已翻译,
+    // tryRendezvousReply 内部也翻译,这里再翻译一次防止上游漏掉)
+    let sessionUuid = inputSessionUuid;
+    try {
+      const resolved = await resolveLiveSession(inputSessionUuid);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `runChatSDK: 翻译 ${inputSessionUuid.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        sessionUuid = resolved.liveFork.fullUuid;
+      }
+    } catch (err: any) {
+      logger.warn(`runChatSDK: resolveLiveSession failed for ${inputSessionUuid}: ${err?.message ?? err}`);
+    }
+
     // v2.4 rendezvous-first: short-circuit for Agent View Reply OR Attach-chat
     if (
       (fromAgentViewReply || fromAttachedChat) &&
       config.get<boolean>('agent_view.rendezvous_enabled', false)
     ) {
       const rv = await this.tryRendezvousReply({
-        openId, sessionUuid: inputSessionUuid, promptText,
-        cwd,  // inputSessionUuid 解构里已含 cwd (bot.ts:1820)
+        openId, sessionUuid, promptText,
+        cwd,  // sessionUuid 解构里已含 cwd (bot.ts:1820)
         messageId,
       });
       if (rv.handled) {
@@ -2157,7 +2172,7 @@ export class FeishuBot {
     // 会被 SDK 拒(报 "Provided value ... is not a UUID")。handleAttach 已尝试
     // short→full 转换,但 runChatSDK 也可能被 Reply / 旧 UserManager entry
     // 直接调用,所以这里再做一次保险转换,顺便 CAS 回写 UserManager。
-    let sessionUuid = inputSessionUuid;
+    // (v2.6 fork 翻译已在上方完成,sessionUuid 已经是活 fork 的 canonical UUID)
     if (sessionUuid && /^[0-9a-f]{8}$/.test(sessionUuid)) {
       try {
         const { JsonlIndex } = await import('../agent-view/jsonl-name');
