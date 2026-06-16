@@ -924,7 +924,26 @@ export class AgentViewManager {
       await this.expectedReply.clear(openId);
       return;
     }
-    const session = result.sessions.find(s => s.sessionId === info.sessionId);
+    let session = result.sessions.find(s => s.sessionId === info.sessionId);
+
+    // v2.6: 找不到时尝试 fork 解析(用户点的是历史 card,bind 的 sessionId 可能已 stale)
+    // handleReplyRequest 已经翻译过一次,这里再翻译是防御性 — 也支持两层链式 fork
+    if (!session) {
+      try {
+        const resolved = await resolveLiveSession(info.sessionId);
+        if (resolved?.hasLiveFork && resolved.liveFork) {
+          logger.info(
+            `handleReply: 翻译 stale ${info.sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+          );
+          info.sessionId = resolved.liveFork.fullUuid;
+          info.shortId = resolved.liveFork.short;
+          session = result.sessions.find(s => s.sessionId === resolved.liveFork!.fullUuid);
+        }
+      } catch (err: any) {
+        logger.warn(`handleReply: resolveLiveSession failed for ${info.sessionId}: ${err?.message ?? err}`);
+      }
+    }
+
     if (!session) {
       await this.expectedReply.clear(openId);
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
