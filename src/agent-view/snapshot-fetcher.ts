@@ -126,19 +126,26 @@ export const AgentSnapshotFetcher = {
       return s;
     });
 
-    // v2.6: 透明 fork 解析 — 给每条 session 补 liveFork
-    // 如果一个 session 自身已死(TUI 关了)但有 live fork 续接,这里把 fork 摘要
-    // 挂到 session.liveFork 上,UI 据此渲染"已续接到 [新 short]"提示,
-    // handleList 据此过滤掉重复展示。
-    for (const s of sessions) {
-      if (!s.sessionId) continue;
-      try {
-        const r = await resolveLiveSession(s.sessionId);
-        if (r?.hasLiveFork && r.liveFork) {
-          s.liveFork = r.liveFork;
-        }
-      } catch (err: any) {
-        logger.warn(`snapshot-fetcher: resolveLiveSession failed for ${s.sessionId}: ${err?.message ?? err}`);
+    // v2.6.1: 透明 fork 解析 — 给每条 session 补 liveFork
+    // v2.6.1 优化: 用 Promise.all 并行 — 之前是 sequential await,N 个 session 要 N 次 cache lookup
+    // (虽然 1s cache 让 90% 命中,但 sequential 仍要 N 个 microtask 等待)
+    // 注意:resolveLiveSession 内部有 1s 缓存,所以并行不会导致 N 次磁盘读
+    const resolveResults = await Promise.all(
+      sessions
+        .filter(s => !!s.sessionId)
+        .map(async (s) => {
+          try {
+            const r = await resolveLiveSession(s.sessionId!);
+            return { session: s, resolved: r };
+          } catch (err: any) {
+            logger.warn(`snapshot-fetcher: resolveLiveSession failed for ${s.sessionId}: ${err?.message ?? err}`);
+            return { session: s, resolved: null };
+          }
+        }),
+    );
+    for (const { session: s, resolved: r } of resolveResults) {
+      if (r?.hasLiveFork && r.liveFork) {
+        s.liveFork = r.liveFork;
       }
     }
 

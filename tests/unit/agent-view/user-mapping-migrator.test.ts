@@ -198,4 +198,46 @@ describe('migrateUserMappingSessions', () => {
     expect(r.scanned).toBe(1);
     expect(r.migrated).toBe(0);
   });
+
+  test('1.6 fork 的 roster.sessionId 缺失(走 v2.6.1 fork-resolver 兜底) → migrator skip + warn,user-mapping 保留 stale', async () => {
+    // 场景:v2.6.1 fork-resolver 的兜底逻辑(roster.sessionId 缺失时用 chosen.short 当 fullUuid)
+    // 会让 fullUuid 是 8 字符而不是 36 字符。migrator 必须 skip 这种坏 fork,否则写入
+    // user-mapping.sessionUuid 是 8 字符,下游 handleChat 的 short→full 展开会失败。
+    const parentUuid = '00000007-0000-0000-0000-000000000007';
+    const parentJsonl = `/x/${parentUuid}.jsonl`;
+    setupStaleSession('ou_aaa', parentUuid);
+
+    // 关键:roster.workers[forkShort] 缺 sessionId 字段
+    const d = path.join(jobsDir, 'malformed77');
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'state.json'), JSON.stringify({
+      state: 'blocked',
+      tempo: 'active',
+      sessionId: undefined,  // 缺 canonical
+      resumeSessionId: parentUuid,
+      linkScanPath: parentJsonl,
+      linkScanOffset: 5000,
+      cwd: '/x',
+    }));
+    // 手动构造 roster:有 short 但没 sessionId
+    fs.writeFileSync(rosterPath, JSON.stringify({
+      workers: {
+        'malformed77': {
+          pid: 100,
+          cwd: '/x',
+          // 故意没 sessionId 字段
+        },
+      },
+    }));
+
+    const r = await migrateUserMappingSessions(userManager, {
+      jobsDir, rosterPath,
+    });
+    // skip 了,所以 migrated=0,scanned=1(进入 try 块就算 scanned)
+    expect(r.scanned).toBeGreaterThanOrEqual(1);
+    expect(r.migrated).toBe(0);
+    // 关键断言:user-mapping 保留 stale(没被坏 UUID 污染)
+    const entry = userManager._entries.get('ou_aaa');
+    expect(entry.sessionUuid).toBe(parentUuid);
+  });
 });
