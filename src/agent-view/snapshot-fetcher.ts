@@ -49,12 +49,6 @@ export const _jobStateHooks = {
   readRoster,
 };
 
-// v2.7: stale state.json 检测的 JSONL mtime 阈值。
-// 贴合 TUI 行为 — TUI 也用"JSONL 最近被改过"作为活进程信号。
-// 5 分钟阈值避免一次性 batch write 误判, 也足够覆盖正常 bg turn 时长
-// (典型 working turn 几秒到几分钟)。
-const STALE_JSONL_THRESHOLD_MS = 5 * 60 * 1000;
-
 export const AgentSnapshotFetcher = {
   async fetch(): Promise<FetchResult> {
     const ver = await VersionGuard.check();
@@ -98,29 +92,34 @@ export const AgentSnapshotFetcher = {
       // v2.7+ (扩展): stale state.json 检测 — bg slot 被 daemon 复用时,
       // state.json 可能停留在旧 incarnation 的"done/blocked"状态(没有覆盖写),
       // 导致 cc-linker 错把活 session 展示在"已完成"或"等待输入"组。
-      // TUI 用 JSONL mtime freshness + pid liveness 检测这个问题,
-      // 所以我们对齐 TUI 行为。
+      // TUI 用 JSONL mtime + pid liveness 检测这个问题,所以我们对齐 TUI 行为。
       //
-      // 触发条件(应用范围: status !== 'busy'):
+      // 触发条件(应用范围: status 不在 {busy, unknown}):
       //   Signal 1 (主要): s.sessionId !== roster.workers[short].sessionId
       //     → bg slot reuse 后,roster 记录新进程 sessionId,state.json 没更新
       //     → 用 roster 的 sessionId + override 为 busy
-      //   Signal 2 (备份): linkScanPath JSONL 最近被改
-      //     → 即使没有 roster 信息,JSONL 在被写 = bg 实际活着
+      //   Signal 2 (备份): JSONL mtime 比 state.json mtime 新
+      //     → bg 在 state.json 之后还在写 JSONL → state.json 已过时
       //     → override 为 busy(不修改 sessionId,因为没有更权威的 source)
       //
-      // 应用范围扩展(v2.7.1): 之前只检测 status='idle',但用户截图反馈
-      // state.json says blocked + JSONL fresh 也会误判为 waiting(2026-06-16 P0)。
-      // TUI 在两种情况都正确显示 busy/busy — 我们对齐。
+      // 关于 Signal 2 (v2.7.1): 之前用绝对 5 分钟阈值,会导致 bg 刚问完问题
+      // (state.json + JSONL 同时被改)的 5 分钟 false-positive 窗口。
+      // 改成 mtime 相对对比:Claude CLI 写顺序是
+      //   JSONL (assistant message) → state.json (state machine update)
+      // 所以 state.json 总是略新于 JSONL。"JSONL 比 state.json 新" 只在
+      // bg 写完 state.json 后还在继续写 JSONL 时成立 — 即 bg 实际在处理。
       //
-      // 安全保证: 只 override `status !== 'busy'`(idle + waiting 映射自
-      // done/stopped/failed/blocked),busy 状态保持不动 (已经正确)。
+      // 安全保证: 只 override status 不在 {busy, unknown},busy 已正确不重写,
+      // unknown 留给前端 graceful drop(避免我们猜测未知状态的语义)。
       //
       // 关于 s.sessionId: 直接用 jobStateToSession 算出的 canonical sessionId
       // (它已经做了 sessionId → resumeSessionId → env.short 的 fallback),与
       // sessionId.slice(0,8) 在下游(liveFork 解析、source attribution)用的字段一致。
       let overriddenSession: AgentSession | null = null;
-      if (s.status !== 'busy') {
+      // 用 explicit list 而非 `!== 'busy'` 避开 TS narrowing 警告(以及更明确意图)
+      // unknown 在 line ~91 已被 filter,这里只可能看到 idle / waiting / busy,
+      // 我们只 override idle + waiting(busy 已是最新,unknown 不在这里)。
+      if (s.status === 'idle' || s.status === 'waiting') {
         const short = env.short;
         const rosterWorker = roster?.workers?.[short];
 
@@ -144,25 +143,26 @@ export const AgentSnapshotFetcher = {
             ...rest,
             sessionId: rosterWorker.sessionId,
             status: 'busy',
-            name: s.name.replace(/^[✅🛑❌✋]\s*/, ''),  // ✋ = waiting emoji prefix
+            name: s.name.replace(/^[✅🛑❌]\s*/, ''),
           };
         }
-        // Signal 2: JSONL 仍在被改(TUI 等价信号,防御 future roster 字段变化)
+        // Signal 2: JSONL 比 state.json 新 — bg 在 state.json 写完后还在写
         else if (env.state.linkScanPath) {
           try {
             const stat = statSync(env.state.linkScanPath);
-            const ageMs = Date.now() - stat.mtimeMs;
-            if (ageMs < STALE_JSONL_THRESHOLD_MS) {
+            const jsonlAgeMs = Date.now() - stat.mtimeMs;
+            const stateAgeMs = Date.now() - env.mtimeMs;
+            if (jsonlAgeMs < stateAgeMs) {
               logger.warn(
-                `[agent-view] ${short}: state.json says ${s.status} but JSONL modified ` +
-                `${Math.round(ageMs / 1000)}s ago (<${STALE_JSONL_THRESHOLD_MS / 1000}s threshold); ` +
+                `[agent-view] ${short}: state.json says ${s.status} but JSONL ` +
+                `${Math.round((stateAgeMs - jsonlAgeMs) / 1000)}s newer than state.json; ` +
                 `bg actively working, overriding to busy`,
               );
               const { completed: _completed, waitingFor: _waitingFor, ...rest } = s;
               overriddenSession = {
                 ...rest,
                 status: 'busy',
-                name: s.name.replace(/^[✅🛑❌✋]\s*/, ''),
+                name: s.name.replace(/^[✅🛑❌]\s*/, ''),
               };
             }
           } catch {

@@ -73,12 +73,14 @@ function makeEnv(stateOverride: any): any {
   // Derive short from the resumeSessionId's first 8 chars so the prefix-step's
   // `envs.find(e => e.short === s.sessionId.slice(0, 8))` matches.
   // v2.7: 显式 short 覆盖 — bg slot reuse 场景下 short 与 resumeSessionId[:8] 不同
+  // v2.7.1: mtimeMs 默认 Date.now() — staleness 检测新逻辑用 mtime 对比,
+  // 测试需要 realistic mtimeMs(否则 stateAgeMs 巨大导致 JSONL 总是"更新")
   const resumeId = stateOverride.resumeSessionId ?? 'aaaaaaaa-1111-1111-1111-111111111111';
   const short = stateOverride.short ?? resumeId.slice(0, 8);
   return {
     short,
     path: '/x',
-    mtimeMs: 100,
+    mtimeMs: stateOverride.mtimeMs ?? Date.now(),
     readAt: 200,
     state: {
       state: 'running',
@@ -405,11 +407,17 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
 
   test('Negative: 真正 done (no roster, JSONL stale) → 保持 idle + ✅', async () => {
     // 防御:不该 override 真正完成的 session
+    // 真实场景:bg 10 分钟前完成(state.json + JSONL 同时被 Claude CLI 更新,
+    // state.json 略晚于 JSONL)。我的 Signal 2 检查 "JSONL 比 state.json 新",
+    // 这里 JSONL 比 state.json 旧 10 分钟 → 不 override ✓
     readRosterMock.mockImplementation(() => null);
     const staleJsonl = join(tmpJsonlDir, 'stale.jsonl');
     writeFileSync(staleJsonl, '[]');
-    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
-    utimesSync(staleJsonl, tenMinAgo, tenMinAgo);  // mtime = 10 分钟前
+    // utimesSync 用 seconds(epoch)。Date.now() 是 ms,除以 1000 转 seconds
+    const tenMinAgoSec = Math.floor((Date.now() - 10 * 60 * 1000) / 1000);
+    utimesSync(staleJsonl, tenMinAgoSec, tenMinAgoSec);  // JSONL mtime = 10min ago
+    // state.json 用 makeEnv 默认 mtimeMs = Date.now() (刚刚)
+    // → JSONL mtime < state.json mtime → Signal 2 不触发 ✓
     mockJobs([makeEnv({
       state: 'done', name: 'truly done',
       linkScanPath: staleJsonl,
@@ -476,15 +484,21 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
 
   test('Negative waiting: 真在等用户输入 (JSONL stale) → 保持 waiting', async () => {
     // 防御:用户问完问题,bg 等回 — JSONL 几小时前 stale,不应 override
+    // 真实场景:bg 3 小时前问完(state.json + JSONL 同时被更新),
+    // 之后没人写 JSONL。state.json mtime ≈ JSONL mtime,
+    // Signal 2 "JSONL 比 state.json 新" 不触发 → status 保持 waiting ✓
     readRosterMock.mockImplementation(() => null);
     const staleJsonl = join(tmpJsonlDir, 'stale-waiting.jsonl');
     writeFileSync(staleJsonl, '[]');
-    const hoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);  // 3h ago
-    utimesSync(staleJsonl, hoursAgo, hoursAgo);
+    const threeHoursAgoSec = Math.floor((Date.now() - 3 * 60 * 60 * 1000) / 1000);
+    utimesSync(staleJsonl, threeHoursAgoSec, threeHoursAgoSec);
     mockJobs([makeEnv({
       state: 'blocked', needs: '请问我可以继续吗?',
       name: 'waiting for user',
       linkScanPath: staleJsonl,
+      // state.json mtime 与 JSONL mtime 几乎同时(state.json 略晚于 JSONL,
+      // 模拟 Claude CLI 的 "先写 JSONL 后写 state.json" 写入顺序)
+      mtimeMs: threeHoursAgoSec * 1000 + 50,
       resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
     })]);
     const r = await AgentSnapshotFetcher.fetch();
@@ -492,6 +506,63 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     const s = r.sessions[0];
     expect(s.status).toBe('waiting');  // 保持 waiting
     expect(s.waitingFor).toBe('请问我可以继续吗?');
+  });
+
+  // v2.7.1 修复验证:bg 刚问完问题 (state.json 比 JSONL 略新),不 false-positive override
+  // 这是用户决定去掉 5 分钟窗口后的关键 case — 之前的逻辑会有 5 分钟误判窗口
+  test('v2.7.1: bg 刚问完 (state.json 比 JSONL 略新) → 保持 waiting', async () => {
+    // 真实场景:bg 刚 ask 问题。Claude CLI 写入顺序:
+    //   1. JSONL 写 assistant message(含 question text)
+    //   2. state.json 更新到 blocked + needs
+    // 所以 state.json 总是略新于 JSONL。Signal 2 检查 "JSONL 比 state.json 新"
+    // 不触发 → 保持 waiting ✓
+    readRosterMock.mockImplementation(() => null);
+    const justAskedJsonl = join(tmpJsonlDir, 'just-asked.jsonl');
+    writeFileSync(justAskedJsonl, '[]');  // mtime = now
+    const now = Date.now();
+    mockJobs([makeEnv({
+      state: 'blocked', needs: '需要我把修改整理成一个 patch 文件...',
+      name: 'just asked question',
+      linkScanPath: justAskedJsonl,
+      // state.json 比 JSONL 略新 100ms(模拟 CLI 写入顺序)
+      mtimeMs: now + 100,
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    // 关键:不 override,保留 [Reply] 按钮
+    expect(s.status).toBe('waiting');
+    expect(s.waitingFor).toBe('需要我把修改整理成一个 patch 文件...');
+    expect(s.completed).toBeUndefined();
+  });
+
+  // v2.7.1 关键 case:用户的原始 bug (48bbecc6 autonomous continuation)
+  // state.json stale (1h 前 update),JSONL fresh (1min 前 update) — bg 在处理新 turn
+  test('v2.7.1: 用户的原始 bug — state.json stale + JSONL fresh → override busy', async () => {
+    // 真实场景:48bbecc6 在用户截图 21:25 时
+    //   state.json mtime = 20:01 (1.5h 前,bg 问问题时)
+    //   JSONL mtime = 21:24 (1min 前,bg 在自主继续处理)
+    //   pid 82144 alive in roster (这里简化为无 roster)
+    readRosterMock.mockImplementation(() => null);
+    const freshJsonl = join(tmpJsonlDir, 'autonomous-fresh.jsonl');
+    writeFileSync(freshJsonl, '[]');  // mtime = now
+    const now = Date.now();
+    // state.json 1.5 小时前 (1.5h = 5400s = 5400000ms)
+    const stateJsonStaleMs = now - 5400 * 1000;
+    mockJobs([makeEnv({
+      state: 'blocked', needs: '需要我把修改整理成一个 patch 文件...',
+      name: 'bg autonomously continuing',
+      linkScanPath: freshJsonl,
+      mtimeMs: stateJsonStaleMs,
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    // 关键:JSONL 比 state.json 新很多 → override to busy
+    expect(s.status).toBe('busy');
+    expect(s.waitingFor).toBeUndefined();  // 剥掉
   });
 
   test('Signal 1 on waiting: bg slot 被 reuse (sessionId mismatch + blocked) → override to busy', async () => {
