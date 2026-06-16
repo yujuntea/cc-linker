@@ -126,7 +126,10 @@ function makeEnv() {
   const cardReplyFn = mock(async (_card: string, _opts: any) => 'om_card_001');
   const patchFn = mock(async (_messageId: string, _card: string) => null);
   const replyFn = mock(async (_text: string, _opts: any) => null);
-  const runChatSDK = mock(async () => ({ result: {}, handler: {}, cardMessageId: 'om_e2e_repatched' }));
+  const runChatSDK = mock(async () => ({
+    result: {}, handler: {}, cardMessageId: 'om_e2e_repatched',
+    rendezvousHandled: true, bgAskedNewQuestion: true,
+  }));
   const mgr = new AgentViewManager({
     userManager,
     replyFn,

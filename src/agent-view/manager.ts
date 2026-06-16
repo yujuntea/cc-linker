@@ -987,10 +987,18 @@ export class AgentViewManager {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return;
     }
-    // v2.6.1: 移除 session.status !== 'waiting' 检查 — 用户在 reply mode,
-    // 即使 bg 状态变了(从 waiting → idle → working 都有可能)也应该允许继续发。
-    // 真正的 session 存在性检查是上面那行 `if (!session)`(snapshot.find 失败)。
-    // 这里只 log warn,不 bail。如果 bg 完全死了,runChatSDK 内部会报错。
+    // v2.6.1: status 检查软化
+    // - session.completed: bg 已 settle (done/stopped/failed),无法 reply,bail 给友好错误
+    // - session.status !== 'waiting': bg 还在跑(只是不在 waiting 状态),用户既然在 reply mode
+    //   应当允许 send,runChatSDK 内部用 rendezvous 注入,daemon 处理
+    if (session.completed) {
+      await this.expectedReply.clear(openId);
+      await this.deps.replyFn(
+        `⚠️ Claude 已切换到 idle,无法 reply`,
+        { openId },
+      );
+      return;
+    }
     if (session.status !== 'waiting') {
       logger.info(
         `handleReply: bg 状态 ${session.status} 不是 waiting,但用户在 reply mode,继续 send (runChatSDK 会处理)`,
@@ -1008,11 +1016,14 @@ export class AgentViewManager {
     //      at the end of runChatSDK (P1-4 step, only if card init failed).
     //    In BOTH cases, the completion message is handled inside runChatSDK.
     //
-    // v2.6.1: 不管 bg 是否问新问题,reply 完成后都 re-set expectedReply。
-    // 这样用户可以连续发 reply(不强制每次点 [Reply]),符合用户对 reply
-    // "持续模式"的期望。bug 是:旧代码在 bgAskedNewQuestion=false 时
-    // 把 user-mapping 恢复成 type='session',下一次用户发文本走 chat 路径
-    // 触发 busy check,出现 "CLI 侧会话处理中" 误报。
+    // v2.6.1: 只在 rendezvous 路径下 re-set expectedReply
+    //   - rendezvousHandled=true: bg 还活着,daemon 没死,re-set 让用户继续 reply
+    //   - rendezvousHandled=false: SDK fallback,daemon 可能已死,re-set 没意义
+    //     (下次 runChatSDK 还会失败),让用户 re-click [Reply] 触发新流程
+    //   同时只在 bgAskedNewQuestion=true 时 re-set — cardMessageId 是新 waiting 卡
+    //   (bg 答完问新问题);bg done 时 cardMessageId 是 terminal "处理完成" 卡
+    //   → 不能当 waiting 卡用
+    let rendezvousHandled = false;
     let bgAskedNewQuestion = false;
     let newCardMessageId: string | null = null;
     let sdkError: any = null;
@@ -1027,6 +1038,7 @@ export class AgentViewManager {
         isNew: false,
         fromAgentViewReply: true,
       });
+      rendezvousHandled = result.rendezvousHandled ?? false;
       bgAskedNewQuestion = result.bgAskedNewQuestion ?? false;
       newCardMessageId = result.cardMessageId ?? null;
     } catch (err: any) {
@@ -1040,10 +1052,14 @@ export class AgentViewManager {
       return;
     }
 
-    // v2.6.1: ALWAYS re-set expectedReply(覆盖 markSent 的 clear),
-    // 让用户可以继续在 chat 接着 reply,不用再点 [Reply]。
-    // 退出方式:用户点 [❌ 取消等待] 按钮、/cancel、5min timeout。
-    if (newCardMessageId) {
+    // v2.6.1: 只在 rendezvous 路径下 re-set expectedReply
+    //   - rendezvousHandled=true: bg 还活着,daemon 没死,re-set 让用户继续 reply
+    //     (不强制每次点 [Reply],符合用户对 Reply 持续模式的期望)
+    //   - rendezvousHandled=false: SDK fallback,daemon 可能已死,re-set 没意义
+    //     (下次 runChatSDK 还会失败),让用户 re-click [Reply] 触发新流程
+    // 不再要求 bgAskedNewQuestion — 用户的 bug case 是 bg 答完没问新问题
+    // 但用户想再发文本,这是合法的连续 reply,必须支持
+    if (rendezvousHandled && newCardMessageId) {
       try {
         await this.expectedReply.set(openId, {
           shortId: info.shortId,
@@ -1052,7 +1068,7 @@ export class AgentViewManager {
           messageId: newCardMessageId,
         });
         logger.info(
-          `handleReply: reply 完成,re-set expectedReply for follow-up (bgAskedNewQuestion=${bgAskedNewQuestion}, card=${newCardMessageId})`,
+          `handleReply: rendezvous 路径,re-set expectedReply for follow-up (card=${newCardMessageId}, bgAskedNewQuestion=${bgAskedNewQuestion})`,
         );
       } catch (err: any) {
         logger.warn(`handleReply: re-set expectedReply 失败: ${err?.message ?? err}`);

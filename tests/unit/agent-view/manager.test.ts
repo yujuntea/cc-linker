@@ -780,7 +780,11 @@ describe('handleReply (Step B)', () => {
       cwd: waiting.cwd,
     });
     // v2.6.1: runChatSDK 仍被调用(让 runChatSDK 内部用 rendezvous 处理)
-    const runSpy = mock(async () => ({ result: {}, handler: {}, cardMessageId: 'mid-busy' }));
+    // 返 rendezvousHandled=true + cardMessageId → expectedReply 会 re-set
+    const runSpy = mock(async () => ({
+      result: {}, handler: {}, cardMessageId: 'mid-busy',
+      rendezvousHandled: true, bgAskedNewQuestion: false,
+    }));
     mgr.deps.runChatSDK = runSpy as any;
 
     await mgr.handleReply('ou_reply_ok', 'hello back');
@@ -832,7 +836,10 @@ describe('handleReply (Step B)', () => {
       cwd: waiting.cwd,
     });
     // v2.6.1: 返 cardMessageId,触发 expectedReply re-set
-    mgr.deps.runChatSDK = mock(async () => ({ result: {}, handler: {}, cardMessageId: 'mid-cont', rendezvousHandled: false })) as any;
+    mgr.deps.runChatSDK = mock(async () => ({
+      result: {}, handler: {}, cardMessageId: 'mid-cont',
+      rendezvousHandled: true, bgAskedNewQuestion: true,
+    })) as any;
     replyFn.mockClear();
 
     await mgr.handleReply('ou_reply_cont', '第一条');
