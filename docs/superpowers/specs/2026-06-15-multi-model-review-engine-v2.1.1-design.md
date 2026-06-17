@@ -106,10 +106,14 @@ src/review/
 ├── adapter.ts           # v2.1 重写 + v2.1.1 加 1 个 API：ClaudeBGAdapter 暴露 6 个 API：
                                   #   - startSession({role, provider, prompt, cwd, resumeSessionId?}) → {shortId, sessionId}
                                   #   - resumeWorkSession({sessionId, prompt, provider, cwd}) → newShortId (sessionId 不变)
-                                  #   - injectReply({shortId, text, timeoutMs, signal?}) → RendezvousReplyResult
+                                  #   - injectReply({shortId, text, timeoutMs}) → RendezvousReplyResult
                                   #     内部构造 stateJsonPath = join(CLAUDE_JOBS_DIR, shortId, 'state.json')
                                   #     调 RendezvousClient.injectReply({short, text, rendezvousSock, stateJsonPath})
                                   #     走 v2.4.x 新协议：daemon socket submit + state.json 轮询（非 legacy 长连接）
+                                  #   **v2.1.1 限制**：底层 RendezvousClient.injectReply 暂无 signal 支持（v2.4.x 协议自己轮询），
+                                  #     cancel 不会中途打断 injectReply，会跑满 timeoutMs（默认 60s）。
+                                  #     短期方案：cancel 走 Promise.race（injectReply + sleep）实现伪中断。
+                                  #     长期方案：给 RendezvousClient.injectReply 加 signal 参数（需 PR 到 agent-view）。
                                   #   - poll(shortId, timeoutMs, signal?) → JobStateEnvelope (走 readJobState, 500ms tick)
                                   #   - stop(shortId) → void (走 claude stop)
                                   #   - getContextUsage(shortId) → ContextUsage | null  # v2.1.1 变更 5 新增
@@ -157,14 +161,17 @@ class ClaudeBGAdapter {
    *   1. readJobState 拿 state.json
    *   2. 解析 providerEnv.ANTHROPIC_MODEL 拿模型名 + context 上限（从后缀 [1m]/[256k]）
    *   3. 读 linkScanPath 指向的 jsonl 末条
-   *   4. 调 jsonl-last-assistant.ts 的 readLastAssistantUsage 拿 usage
+   *   4. 调 jsonl-last-assistant.ts 的 readLastAssistantTurn 拿 usage（turn.usage）
    *   5. 返回 ContextUsage
    *
-   * 失败处理：
-   *   - session 不存在 → null
-   *   - state.json 缺 linkScanPath → estimate（按累计 output chars / 4 估算）
-   *   - jsonl 读失败 → estimate
-   *   - 都失败 → unavailable
+   * 返回值（v2.1.1）：
+   *   - session 不存在 → null（调用方按 unavailable 处理）
+   *   - state.json 缺 modelInfo → { source: 'unavailable', ... }（model 字段为 'unknown'）
+   *   - 读 jsonl 成功 → { source: 'jsonl', ... }
+   *   - 缺 linkScanPath 或 jsonl 读失败 → null（调用方按 unavailable 处理）
+   *
+   * 注意：v2.1.1 当前**没有** estimate 分支（按累计 chars 估算）；如果想做，参见
+   * §13.4 v2.1.1 评审项"context overflow 三策略"的扩展空间。
    */
   async getContextUsage(shortId: string): Promise<ContextUsage | null> {
     const state = await readJobState(shortId);
@@ -180,7 +187,8 @@ class ClaudeBGAdapter {
     // 尝试读 jsonl 末条
     const linkScanPath = state.state.linkScanPath;
     if (linkScanPath && existsSync(linkScanPath)) {
-      const usage = await readLastAssistantUsage(linkScanPath);  // 复用已有
+      const turn = await readLastAssistantTurn(linkScanPath);  // 复用已有，返回 LastAssistantTurn | null
+      const usage = turn?.usage;
       if (usage) {
         const used = (usage.input_tokens ?? 0)
                    + (usage.cache_creation_input_tokens ?? 0)
@@ -232,7 +240,10 @@ function parseModelFromProviderEnv(env: Record<string, string> | undefined): Mod
   const name = match[1];
   const num = match[2] ? parseInt(match[2], 10) : null;
   const unit = match[3] ?? '';
-  const contextHint = num ? (unit === 'm' ? num * 1_000_000 : num * (unit === 'k' ? num * 1_000 : 1)) : null;
+  // 单位换算：m → ×1_000_000；k → ×1_000；无单位 → ×1（按原样）
+  const contextHint = num ? (unit === 'm' ? num * 1_000_000
+                                   : unit === 'k' ? num * 1_000
+                                   : num) : null;
 
   return { name, contextHint };
 }
@@ -262,7 +273,7 @@ function lookupContextLimit(modelName: string, profileOverrides?: Record<string,
 | 复用 | 位置 | 用法 |
 |------|------|------|
 | `readJobState` | `src/agent-view/job-state.ts` | 读 state.json |
-| `readLastAssistantUsage` | `src/agent-view/jsonl-last-assistant.ts` | 解析 jsonl 末条 usage（已存在） |
+| `readLastAssistantTurn` | `src/agent-view/jsonl-last-assistant.ts` (`readLastAssistantTurn`) | 解析 jsonl 末条 assistant turn（已存在，turn.usage 含 token 统计） |
 | `CLAUDE_JOBS_DIR` | `src/utils/paths.ts` | 默认 jobs dir |
 
 ### 3.3 CLI 入口（v2.1 改 subcommand group）
@@ -472,9 +483,10 @@ type ReviewState =
   | { kind: 'SELF_REVIEW_R1';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work';
                                   contextReset?: boolean }  // v2.1.1 变更 4：context reset 后进 R1 时标记
   | { kind: 'SELF_REVIEW_R2';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
-  // === 修复节点（v2.1 变更 19：从 R1/R2/JUDGE/HUMAN 4 个调用点统一进入）===
-  | { kind: 'FIXING';            pipelineId; round: number; pane: 'work';
-                                  source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE';
+  // === 修复节点（v2.1 变更 19：从 R1/R2/JUDGE/HUMAN 4 个调用点统一进入；v2.1.1 变更 4 加 CONTEXT_CHECK）===
+  | { kind: 'FIXING';            pipelineId; round: number;
+                                  pane: 'work' | 'review';  // v2.1.1 变更 4：CONTEXT_CHECK→review_fix 时是 review
+                                  source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE' | 'CONTEXT_CHECK';
                                   inputIssues: Issue[] }
   // === 外审（可能并行 N 个 pane）===
   | { kind: 'EXTERNAL_REVIEW';   pipelineId; round: number; cycle: 'initial' | 'postfix';
@@ -517,8 +529,8 @@ interface DecisionContext {
 
   // 所有外部 review 的 issue（按 severity 排序）
   issues: Array<{
-    id: string;                          // e.g. 'review-A-1'
-    source: 'review-A' | 'review-B' | ...;
+    id: string;                          // v2.1.1 单 review：e.g. 'review-1'
+    source: 'review';                    // v2.1.1 固定（v2.1 是 'review-A' | 'review-B' | ...）
     severity: 'P0' | 'P1' | 'P2' | 'P3';
     location: string;
     description: string;
@@ -812,7 +824,7 @@ stateDiagram-v2
 | **EXTERNAL_REVIEW** | all N reviews state=`done` | CONTEXT_CHECK | 收集 N 条 opinions | reviews (×N) |
 | **CONTEXT_CHECK** | work session context < threshold | JUDGE_BY_WORK | 正常路径 | work (短轮询) | 不变 |
 | **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`reset` | SELF_REVIEW_R1 | 杀 work + spawn 新 + **round += 1**，**cycle=initial** | work (新 session) | +1 |
-| **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`review_fix` | FIXING (source=HUMAN/REVIEW_FIX) | 让 review model fix；parse 失败则回退 reset | review (injectReply) | 不变 |
+| **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`review_fix` | FIXING (source=CONTEXT_CHECK) | 让 review model fix；parse 失败则回退 reset | review (injectReply) | 不变 |
 | **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`abort` | ABORTED | reason=`context_overflow` | — | 不变 |
 | **JUDGE_BY_WORK** | work bg done, verdict=`accept` (P0/P1 rejection ratio < 30%) | FIXING (source=JUDGE) | 记录 accepted issues 作为 `inputIssues` | work (injectReply) |
 | **JUDGE_BY_WORK** | work bg done, verdict=`reject` (P0/P1 rejection ratio ≥ 30%) | HUMAN_DECIDE | 移到 `human_pending/` | work (injectReply) |
@@ -856,7 +868,7 @@ stateDiagram-v2
 | 80+ | SELF_REVIEW_R2 | 1 | work=busy | `--bg "review again after fix..." --resume <sessionId1>` | new short3 |
 | 105 | SELF_REVIEW_R2 → FIXING (source=R2) | 1 | work=done, work=busy | R2 发现 1 new issue → FIXING source=R2 | new short4 |
 | 130 | FIXING → EXTERNAL_REVIEW | 1 | work=done | FIXING 完成（1 real fixed）→ 进 EXTERNAL_REVIEW | source=R2→EXTERNAL_REVIEW |
-| 130+ | EXTERNAL_REVIEW | 1 | work=done, reviews=busy×2 | `Promise.all([--bg "review" kimi, --bg "review" qwen])` | new short5, short6 |
+| 130+ | EXTERNAL_REVIEW | 1 | work=done, review=busy×1（v2.1.1 单 review 模型） | `--bg "review X..." --settings kimi-for-coding` | new short5 |
 | 170 | JUDGE_BY_WORK | 1 | work=busy (injectReply) | 收集 opinions → injectReply("judge these opinions...") | work sessionId1 |
 | 185 | JUDGE_BY_WORK | 1 | work=done | 解析 per-issue accept/reject → engine 计算 P0/P1 rejection ratio | ratio=0.10 < 30% |
 | 200 | FIXING (source=JUDGE) | 1 | work=busy (injectReply) | verdict=`accept` → injectReply("apply accepted fixes") | new short7 |
@@ -877,11 +889,11 @@ stateDiagram-v2
 
 | t | 状态 | 事件 |
 |---|------|------|
-| 105 | EXTERNAL_REVIEW | reviews=busy×2 |
-| 130 | PANE_LOST | review-A bg session 消失（daemon crash） |
-| 130+ | PANE_LOST | watch mode 显示：`⚠️ review-A (short3) 消失。其他 pane: work=busy, review-B=busy。倒计时 24h。` |
+| 105 | EXTERNAL_REVIEW | review=busy×1（v2.1.1 单 review 模型） |
+| 130 | PANE_LOST | review bg session 消失（daemon crash） |
+| 130+ | PANE_LOST | watch mode 显示：`⚠️ review (short3) 消失。其他 pane: work=busy。倒计时 24h。` |
 | 用户决策 | → resume EXTERNAL_REVIEW | adapter 重新 `--bg "review" kimi` → new short5 |
-| ... | EXTERNAL_REVIEW | review-A + review-B 都 done → JUDGE_BY_WORK 继续 |
+| ... | EXTERNAL_REVIEW | review done → CONTEXT_CHECK → JUDGE_BY_WORK 继续 |
 
 **用户主动取消路径**：
 
@@ -904,7 +916,7 @@ stateDiagram-v2
 |---|------|------|
 | 130 | EXTERNAL_REVIEW | reviews=busy×1（v2.1.1 单 review pane） |
 | 170 | CONTEXT_CHECK | work session context 超阈值，strategy=`review_fix` |
-| 170+ | FIXING (source=REVIEW_FIX) | engine injectReply 给 review pane 修复 prompt（10min timeout） |
+| 170+ | FIXING (source=CONTEXT_CHECK) | engine injectReply 给 review pane 修复 prompt（10min timeout） |
 | ... | review pane 处理修复请求 | 单 session 串行执行，**无并发写冲突**（v2.1.1 简化点） |
 | 280+ | review pane parse 失败 | 兜底回退到 `executeContextReset`（杀 work + spawn 新 + round+=1） |
 | 280 | 成功 parse file_changes | engine 顺序 apply file_changes（一次只改一个文件） |
@@ -917,8 +929,8 @@ v2.1 删除 ARBITRATION 后，`JUDGE_BY_WORK` 的 verdict 由 **P0/P1 rejection 
 #### 5.4.1 输入
 
 ```
-- reviews: Array<{
-    role: 'review-A' | 'review-B' | ...,
+- reviews: Array<{                            // v2.1.1 单一 review 模型：通常 1 个元素
+    role: 'review',                          // v2.1 是 'review-A' | 'review-B' | ...
     issues: Array<{
       id: string,
       severity: 'P0' | 'P1' | 'P2' | 'P3',
@@ -1011,8 +1023,8 @@ p0_p1_reject_threshold = 0.30   # 默认 30%（v2.1）
 输出 JSON:
 {
   "per_issue": [
-    {"issue_id": "review-A-1", "decision": "accept", "reason": "..."},
-    {"issue_id": "review-A-2", "decision": "reject", "reason": "..."}
+    {"issue_id": "review-1", "decision": "accept", "reason": "..."},  // v2.1.1 单 review 模型
+    {"issue_id": "review-2", "decision": "reject", "reason": "..."}
   ],
   "reasoning": "总体判断说明"
 }
@@ -1026,14 +1038,15 @@ Engine 在生成 `reviews_json_for_each_role` 时**必须**按以下规则生成
 
 ```typescript
 function generateIssueId(role: string, index: number): string {
-  // role = 'review-A' | 'review-B' | 'work' (FIXING input)
+  // v2.1.1 单 review 模型：role 固定为 'review'
+  // v2.1 是 'review-A' | 'review-B' | 'work' (FIXING input)
   // index = 该 role 内的 issue 序号（从 1 开始）
   return `${role}-${index}`;
 }
 
-// 示例：
-// review-A-1 = review-A pane 的第 1 个 issue
-// review-B-3 = review-B pane 的第 3 个 issue
+// 示例（v2.1.1 单 review）：
+// review-1 = review pane 的第 1 个 issue
+// review-3 = review pane 的第 3 个 issue
 // work-2 = work pane self_review 的第 2 个 issue（FIXING 输入）
 ```
 
@@ -1076,10 +1089,14 @@ interface PaneRegistry {
     roundShortIds: string[];    // v2.1 新增：每轮 shortId 数组（诊断用）
   };
   // v2.1.1 变更 1：单数 review（v2.1 是 reviews[]，单一 review 模型后改 review）
+  // v2.1.1 生命周期：
+  //   - EXTERNAL_REVIEW 进入时设置：adapter.startSession({ role: 'review', ... }) 后写入
+  //   - EXTERNAL_REVIEW 离开时清除（CONTEXT_CHECK / JUDGE_BY_WORK / DONE / FAILED 时 delete pipeline.panes.review）
+  //   - round/cycle 字段与当前 state 的 round/cycle 同步（review 是 per-round spawn）
   review?: {
     role: 'review';
     shortId: string;
-    sessionId: string;
+    sessionId: string;     // 一次性（每轮新 spawn，sessionId 不会跨轮保留）
     provider: string;
     round: number;
     cycle: 'initial' | 'postfix';
@@ -1213,7 +1230,9 @@ pipelineState.set(pipelineId, { record, abortController, watchClientSet });
 
 // 注入到所有 adapter 调用
 await adapter.poll(shortId, timeoutMs, abortController.signal);
-await adapter.injectReply({ shortId, text, timeoutMs, signal: abortController.signal });
+await adapter.injectReply({ shortId, text, timeoutMs });
+// 注意：底层 RendezvousClient.injectReply 暂无 signal 支持（v2.1.1 限制），cancel 不会中途打断，会跑满 timeoutMs。
+// adapter.poll 支持 signal（readJobState 内部轮询 + signal 监听），cancel poll 立即生效。
 
 // 用户 cancel 时
 function cancelPipeline(pipelineId: string): void {
@@ -1247,7 +1266,28 @@ export async function reconcile(): Promise<void> {
     // v2.1.1 单 review 模型后通常 0 或 1 个（最多 2 个：work + 1 review）
     // - role: 'work' | 'review'（v2.1.1 单 review 模型）
     // - shortId: 已消失的 pane shortId
-    // findDeadPanes 函数实现见 §6.4 下方
+    //
+    // findDeadPanes 实现（v2.1.1）：
+    //   对比 PaneRegistry 里所有 pane 的 shortId 集合 vs liveShortIds 集合
+    //   不在 liveShortIds 里的 = dead
+    function findDeadPanes(
+      panes: PaneRegistry,
+      live: string[],
+    ): Array<{ role: 'work' | 'review'; shortId: string }> {
+      const liveSet = new Set(live);
+      const dead: Array<{ role: 'work' | 'review'; shortId: string }> = [];
+
+      // work pane（每轮 shortId 数组里任一不在 live → dead 整 work pane）
+      if (panes.work?.currentRoundShortId && !liveSet.has(panes.work.currentRoundShortId)) {
+        dead.push({ role: 'work', shortId: panes.work.currentRoundShortId });
+      }
+      // review pane（只在 EXTERNAL_REVIEW 阶段存在）
+      if (panes.review?.shortId && !liveSet.has(panes.review.shortId)) {
+        dead.push({ role: 'review', shortId: panes.review.shortId });
+      }
+
+      return dead;
+    }
 
     if (deadPanes.length > 0) {
       // v2.1 改：进入 PANE_LOST，不直接 FAILED
@@ -1289,8 +1329,8 @@ export async function reconcile(): Promise<void> {
 **PANE_LOST 用户决策**（v2.1 新增交互）：
 ```
 ⚠️ Pipeline 01HXYZK9... PANE_LOST
-  Lost panes: review-A (shortId: abc12345)
-  其他 pane: work (def67890, alive), review-B (ghi11111, alive)
+  Lost panes: review (shortId: abc12345)
+  其他 pane: work (def67890, alive)  # v2.1.1 单一 review 模型后通常只 1 个 lost pane
 
   选项:
     retry → cc-linker review status <id> 然后选 retry（重启所有丢失 pane）
@@ -1328,11 +1368,32 @@ async function retryPANE_LOST(pipelineId: string): Promise<void> {
     record.panes.review = { ...originalPane, shortId: newShortId };  // v2.1.1 单数
   } else if (retryTarget === 'FIXING' && lostPane?.role === 'work') {
     // work pane：复杂，需要重新 spawn work session（sessionId 已死）
-    // 注意：v2.1 设计是"work session 死了就全 pipeline 重新跑 R1"，
-    // 因为没有原始 work session context 可以恢复
-    logger.warn(`[reconciler] work pane lost in FIXING，pipeline ${pipelineId} 需重新从 R1 开始`);
-    record.panes.work = await spawnFreshWork(record);
-    record.state = { kind: 'SELF_REVIEW_R1', round: record.state.round, cycle: record.panes.work.cycle, pane: 'work' };
+    // v2.1.1 明确：spawn 新 work session + 回到 R1 entry
+    //   - cycle: 保留原 cycle（initial 或 postfix），不重置
+    //   - round: **不** +1（在 R1 entry 处自然 +1，与 §5.2 规则一致）
+    //   - 新 work session 的 prompt 必须包含 history summary（避免 R1 重新发现已修 issue）
+    //   - 检查 max_rounds：若 round+1 > max_rounds → 直接 ABORTED（不浪费 round 计数）
+    //   - 若新 work session 找不到任何 fix-after-checkpoint anchor → 视为"重置失败"，ABORTED reason=`work_session_unrecoverable`
+    logger.warn(`[reconciler] work pane lost in FIXING，pipeline ${pipelineId} 需重新从 R1 开始（round=${record.state.round + 1}，cycle=${record.state.cycle ?? 'initial'}）`);
+    if (record.state.round + 1 > (await profile.load(record.input.profile)).guards.max_rounds) {
+      // 超过 max_rounds，直接 ABORTED（v2.1.1 修复：避免 round 计数浪费）
+      record.state = {
+        kind: 'ABORTED',
+        pipelineId: record.pipelineId,
+        round: record.state.round,
+        reason: 'work_session_lost_exceeds_max_rounds',
+        abortedBefore: 'SELF_REVIEW_R1',
+      };
+      return;
+    }
+    record.panes.work = await spawnFreshWork(record);  // prompt 内自动注入 history summary
+    record.state = {
+      kind: 'SELF_REVIEW_R1',
+      pipelineId: record.pipelineId,
+      round: record.state.round,  // round 在 R1 entry 处自然 +1
+      cycle: record.state.cycle ?? 'initial',
+      pane: 'work',
+    };
   } else {
     throw new Error(`retry not supported for retryTarget=${retryTarget} lostPane=${lostPane?.role ?? 'none'}`);
   }
@@ -1649,7 +1710,7 @@ async function resolveSettingsPath(provider: string): Promise<string> {
 
 #### 7.5.1 数据来源
 
-bg session 的输出通过 `state.json.output` 获取（engine 需要扩展 `JobStateFile` 接口加 `output` 字段）。`output` 的格式取决于 `claude --bg` 的写入方式——实测是 session 最后一条 assistant message 的文本内容（string 类型）。
+bg session 的输出通过 `state.json.output` 获取（engine 需要扩展 `JobStateFile` 接口加 `output` 字段）。**实测**：`output` 是结构化对象 `{ result: string }`（不是裸 string），文本在 `.result` 字段里。访问统一写 `state.output?.result ?? ''`。
 
 #### 7.5.2 JSON 提取策略
 
@@ -1825,11 +1886,11 @@ function extractJsonBlock(output: string): unknown {
 interface JobStateFile {
   // ... 现有字段保持不变 ...
   // v2.1 Review Engine 前置：新增 output 字段
-  output?: string | null;      // bg session 的最终输出文本（done 状态时填充）
-  children?: unknown;           // bg session 的子任务（暂不使用）
-  sessionId?: string;           // 与 resumeSessionId 相同（向前兼容）
-  createdAt?: string;           // session 创建时间
-  updatedAt?: string;           // 最后更新时间
+  output?: { result: string } | null;  // bg session 的最终输出（实测是结构化对象，文本在 .result）
+  children?: unknown;                  // bg session 的子任务（暂不使用）
+  sessionId?: string;                  // 与 resumeSessionId 相同（向前兼容）
+  createdAt?: string;                  // session 创建时间
+  updatedAt?: string;                  // 最后更新时间
 }
 ```
 
@@ -1839,24 +1900,59 @@ interface JobStateFile {
 - Review Engine 与 Agent View **共享 `src/agent-view/job-state.ts`** 的 TS interface
 - 扩展 `JobStateFile` 接口需要 **Agent View 维护者 review + merge 1 个纯 type-only PR**（0 行业务逻辑，纯 declaration）
 - 协调时间预估：1 个工作日（PR + review + merge）
-- 如果 Agent View 维护者不便 merge，备选方案：在 Review Engine 内部声明一个 `ExtendedJobStateFile` 类型，通过 type intersection 扩展（不污染 Agent View）：
+
+**v2.1.1 决策（拍板）**：
+
+**Phase 1 走备选方案** —— Review Engine 内部声明 `ExtendedJobStateFile`，通过 type intersection 扩展（**不**污染 Agent View）。理由：
+- 避免跨 repo PR 协调（不阻塞 review engine implementation）
+- 适配器边界自然（adapter 内部封装 unwrap `output.result` 逻辑，caller 拿到 string）
+- 维护成本可控（5 个字段，重命名 / 删除概率低）
+
+**Phase 3（待 Agent View v2.5 升级时）**：把 `ExtendedJobStateFile` 的 5 个字段 merge 到 Agent View 的 `JobStateFile`，Review Engine 改回直接用 `JobStateFile`。
+
   ```typescript
-  // 在 src/review/adapter.ts 内部
+  // 在 src/review/types-extensions.ts（v2.1.1 Phase 1）
   type ExtendedJobStateFile = JobStateFile & {
-    output?: string | null;
+    output?: { result: string } | null;
     children?: unknown;
     sessionId?: string;
     createdAt?: string;
     updatedAt?: string;
   };
   ```
-  这种方案不需要 Agent View PR，但增加了类型重复维护成本
+
+  Phase 1 内部使用：`readJobState(shortId): Promise<JobStateEnvelope<ExtendedJobStateFile>>`（在 review 包内封装一层 generic）。
 
 #### 7.5.7 Context Window 策略化处理（v2.1.1 变更 4 替换原"风险+缓解"段）
 
 **v2.1 原问题**：work session 跨 8 轮 ~48 次注入可能超 200k tokens。缓解策略（prompt 自包含 + 显式 issues 传递）只解决信息传递问题，没解决"模型注意力稀释导致 R1 漏掉真问题"——R1 在第 5 轮可能已"忘了"第 1 轮修了什么，恶性假收敛。
 
 **v2.1.1 方案**：检测 work session context 用量，在 EXTERNAL_REVIEW → JUDGE_BY_WORK 转换前触发三种可配策略（`reset` / `review_fix` / `abort`）。
+
+##### 7.5.7.0 共享类型与辅助函数（v2.1.1 变更 4 新增）
+
+```typescript
+// src/review/context-overflow.ts（v2.1.1 新增）
+
+import type { ReviewProfile } from './profile';
+
+/** context overflow 检测结果 */
+interface ContextCheckResult {
+  overflow: boolean;
+  reason: 'no_usage_data' | 'usage_above_threshold';
+  usage: { used: number; max: number; model: string } | null;
+  threshold: number;
+  model: string;
+  /** 触发本次检测前累计的 cost（用于 DONE 时总成本累加 + review_fix 注入产生的 cost） */
+  costIncurred: number;
+}
+
+/** 从 review session 的 state.json.output 读最终输出文本（unwrapping { result: string }） */
+async function readReviewOutput(shortId: string): Promise<string> {
+  const state = await readJobState(shortId);
+  return state?.state.output?.result ?? '';
+}
+```
 
 ##### 7.5.7.1 触发点
 
@@ -1867,7 +1963,7 @@ interface JobStateFile {
 async function onExternalReviewComplete(pipeline: PipelineRecord): Promise<void> {
   const profile = await profile.load(pipeline.input.profile);
   const workShortId = pipeline.panes.work!.currentRoundShortId!;
-  const contextCheck = await checkContextOverflow(workShortId, profile);
+  const contextCheck = await checkContextOverflow(workShortId, profile, pipeline.totalCostUsd);
 
   if (!contextCheck.overflow) {
     // 正常路径：进入 JUDGE_BY_WORK
@@ -1880,10 +1976,10 @@ async function onExternalReviewComplete(pipeline: PipelineRecord): Promise<void>
 
   switch (profile.guards.context_overflow_strategy) {
     case 'reset':
-      await executeContextReset(pipeline, contextCheck);
+      await executeContextReset(pipeline, contextCheck, profile);
       break;
     case 'review_fix':
-      await executeReviewFix(pipeline, contextCheck);
+      await executeReviewFix(pipeline, contextCheck, profile);
       break;
     case 'abort':
       await executeContextAbort(pipeline, contextCheck);
@@ -1898,10 +1994,18 @@ async function onExternalReviewComplete(pipeline: PipelineRecord): Promise<void>
 async function checkContextOverflow(
   workShortId: string,
   profile: ReviewProfile,
+  currentCostUsd: number,  // 触发本次检测前累计的 cost
 ): Promise<ContextCheckResult> {
   const usage = await adapter.getContextUsage(workShortId);
   if (!usage) {
-    return { overflow: false, reason: 'no_usage_data', usage: null, threshold: 0, model: 'unknown' };
+    return {
+      overflow: false,
+      reason: 'no_usage_data',
+      usage: null,
+      threshold: 0,
+      model: 'unknown',
+      costIncurred: 0,
+    };
   }
 
   const profileLimit = profile.contextLimits?.[usage.model];
@@ -1912,11 +2016,14 @@ async function checkContextOverflow(
     ? profile.guards.context_overflow_threshold_1m ?? 512_000
     : profile.guards.context_overflow_threshold_default ?? 200_000;
 
+  const overflow = usage.used >= threshold;
   return {
-    overflow: usage.used >= threshold,
+    overflow,
+    reason: overflow ? 'usage_above_threshold' : 'no_usage_data',
     usage,
     threshold,
     model: usage.model,
+    costIncurred: currentCostUsd,  // 触发本次检测前已累计的 cost
   };
 }
 ```
@@ -1927,6 +2034,7 @@ async function checkContextOverflow(
 async function executeContextReset(
   pipeline: PipelineRecord,
   contextCheck: ContextCheckResult,
+  profile: ReviewProfile,  // v2.1.1 修复：profile 必须显式传入（onExternalReviewComplete 已加载）
 ): Promise<void> {
   const workShortId = pipeline.panes.work!.currentRoundShortId!;
 
@@ -1996,6 +2104,7 @@ Checkpoint SHA: ${checkpointSha ?? 'N/A (non-git repo)'}
 async function executeReviewFix(
   pipeline: PipelineRecord,
   contextCheck: ContextCheckResult,
+  profile: ReviewProfile,
 ): Promise<void> {
   const reviewShortId = pipeline.panes.review!.shortId;
 
@@ -2018,7 +2127,10 @@ async function executeReviewFix(
     timeoutMs: 600_000,  // 10min
   });
 
-  // 2. 解析 review model 的 fix 输出
+  // 2. 读 review session 实际 output（state.json.output.result）作为 parse 输入
+  const reviewOutput = await readReviewOutput(reviewShortId);
+
+  // 3. 解析 review model 的 fix 输出
   const fixOutput = await parseBgOutputWithRetry(
     { output: reviewOutput, injectReply: adapter.injectReply.bind(adapter), waitForState: adapter.waitForState.bind(adapter) },
     ReviewFixOutputSchema,
@@ -2026,7 +2138,7 @@ async function executeReviewFix(
   );
   if (!fixOutput.ok) {
     logger.error(`[engine] review_fix parse failed, falling back to context_reset`);
-    await executeContextReset(pipeline, contextCheck);  // 兜底
+    await executeContextReset(pipeline, contextCheck, profile);  // 兜底
     return;
   }
 
@@ -2104,8 +2216,7 @@ cc-linker review run "帮我修 NPE in auth.ts" --phase code --profile default
 #
 # Pane Status:
 #   🔧 work       short2 (claude-sonnet-4)  done       $0.10  8.2s
-#   👁 review-A   short3 (kimi-for-coding)  busy       $0.05  4.2s
-#   👁 review-B   short4 (bailian-qwen3.6)  busy       $0.07  4.0s
+#   👁 review     short3 (kimi-for-coding)  busy       $0.05  4.2s   # v2.1.1：单 review pane
 #
 # Timeline:
 #   [12:30] ✓ PRODUCING (short1, sonnet)         $0.012  2.3s
@@ -2264,7 +2375,7 @@ cc-linker review run "..."                # 自动识别失败抛 PhaseUnknownEr
 | **pane 丢失超时** | PANE_LOST 24h 未决策（v2.1 新增） | 自动 ABORTED `pane_lost_timeout` |
 | **max_rounds 达到** | 计数器到上限 | 自动 ABORTED `max_rounds_exceeded` |
 | **CLI watch 客户端断连** | 用户 Ctrl-C | engine 继续在后台跑，pipeline 不中断（v2.1 设计目标） |
-| **AbortController 触发**（v2.1 新增） | 用户 `cc-linker review cancel` 或 pipeline 超时未响应 | adapter.poll / injectReply 收到 abort signal，立即抛 `AbortError`；engine catch 后调 cleanup（见 §6.4 PANE_LOST retry 中的 cancel 路径） |
+| **AbortController 触发**（v2.1 新增） | 用户 `cc-linker review cancel` 或 pipeline 超时未响应 | `adapter.poll` 收到 abort signal 立即抛 `AbortError`；`adapter.injectReply` 当前 v2.1.1 不支持 signal，会跑满 timeoutMs（默认 60s）。engine catch 后调 cleanup（见 §6.4 PANE_LOST retry 中的 cancel 路径） |
 | **Context window 超限**（v2.1.1 变更 4 新增） | work session 跨多轮后 context 用量达到 profile.guards 阈值 | 在 EXTERNAL_REVIEW → JUDGE_BY_WORK 转换前触发 `checkContextOverflow` → 按 `context_overflow_strategy` 走 reset / review_fix / abort 三策略（详见 §7.5.7）。**注意**：默认 `reset` 策略需要重新 spawn work session（增加 ~60-90s + round 计数 +1） |
 
 ### 10.2 Graceful degradation vs fail fast（v2.1 与 v2 一致）
@@ -2343,8 +2454,7 @@ cc-linker review doctor
 # ✓ Daemon: healthy (roster.json mtime < 5min)
 # ✓ Profile 'default' loaded
 # ✓ Provider 'claude-sonnet-4' (work): ~/.claude/providers/claude-sonnet-4.json exists
-# ✓ Provider 'kimi-for-coding' (review-A): ~/.claude/providers/kimi-for-coding.json exists
-# ✓ Provider 'bailian-qwen3.6' (review-B): ~/.claude/providers/bailian-qwen3.6.json exists
+# ✓ Provider 'kimi-for-coding' (review): ~/.claude/providers/kimi-for-coding.json exists  # v2.1.1：单 review provider
 # ✓ Pipeline dir: ~/.cc-linker/review-pipelines/ writable
 # ✓ Config [review] section present
 #
@@ -2621,8 +2731,8 @@ T4 Adapter ──────────┘        ↓
 - `src/cli/commands/review.ts` —— doctor 检查 context + preamble 配置
 
 **兼容性与回滚**：
-- **profile 文件**：v2.1 用户的 `review.providers = ["x", "y"]` 配置在 v2.1.1 启动时检测到数组形式 → warn + 取第一个元素 + 继续（向后兼容）。v2.1.1 完整功能需要新配置
-- **PipelineRecord**：在 reading 旧 v2.1 record 时检测到 `reviews[]` 数组 → 兼容转换为单数 `review`（仅读，写新格式）
+- **profile 文件**：v2.1.1 是 v2.1 的 patch 版本（同 cc-linker 二进制升级），不存在"v2.1 还在跑"的情况。v2.1.1 启动时若读到 `review.providers = ["x", "y"]` 数组形式 → warn + 取第一个元素 + 继续（兼容老 profile 文件），但建议用户手工改为 `review.provider = "x"`。
+- **PipelineRecord**：v2.1.1 启动时若 reconciler 扫到 v2.1 残留的 `reviews[]` 格式 record（理论上不应该存在，但保险起见）→ 兼容转换为单数 `review`（仅读，不修改磁盘文件）。v2.1.1 写新 record 一律单数格式。
 - **回滚**：v2.1.1 引入的 parseWithRetry 在解析失败时 retry 1 次（比 v2.1 慢约 30s 但更安全），回滚到 v2.1 即放弃 retry 能力
 
 ## 15. 文档链接
