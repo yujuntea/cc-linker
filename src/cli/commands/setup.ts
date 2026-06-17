@@ -452,10 +452,15 @@ function printSummary(sessionCount: number, hookInstalled: boolean, feishu: Feis
   if (feishu.configured) {
     console.log(chalk.cyan('  飞书端可用命令:'));
     console.log(chalk.white('    /list                — 列出会话'));
+    console.log(chalk.white('    /listDir             — 浏览目录'));
     console.log(chalk.white('    /new [路径] -- 提示  — 创建新会话'));
-    console.log(chalk.white('    /switch <序号>       — 切换会话'));
-    console.log(chalk.white('    /model               — 管理模型'));
-    console.log(chalk.white('    /status              — 查看状态'));
+    console.log(chalk.white('    /model               — 查看/管理模型'));
+    console.log(chalk.white('    /stop                — 停止当前会话处理'));
+    console.log(chalk.white('    /agents              — 查看 Agent 列表'));
+    console.log('');
+    console.log(chalk.gray('  完整命令列表：在飞书给 Bot 发 /help'));
+    console.log(chalk.gray('  💡 提示：可在飞书开放平台 → 机器人 → 自定义菜单，'));
+    console.log(chalk.gray('     把 /list、/new、/agents、/help 绑到菜单上，手机端点选更方便'));
     console.log('');
   }
 }
