@@ -458,28 +458,35 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     expect(s.name).toBe('✅ legit completed');
   });
 
-  // 2026-06-16 P0 bug: state.json says blocked/waiting 但 bg 实际在跑
-  // (用户截图 21:25 时,48bbecc6 state=blocked, JSONL mtime 21:24,
-  //  bg pid alive — TUI 显示 Working,Feishu 显示等待输入)
-  // 修复:扩展 staleness 检测覆盖 waiting 状态。Signal 2 (JSONL fresh)
-  // 是关键信号 — 真 waiting session JSONL mtime 通常几小时前 stale。
-  test('Signal 2 on waiting: state.json says blocked but JSONL fresh → override to busy', async () => {
-    readRosterMock.mockImplementation(() => null);  // 无 roster 信息,纯靠 JSONL freshness
-    const freshJsonl = join(tmpJsonlDir, 'fresh-waiting.jsonl');
-    writeFileSync(freshJsonl, '[]');  // mtime = now
+  // 2026-06-17 P0 regression 防御:state=blocked + needs + JSONL mtime newer
+  // than state.json + no roster mismatch → status 必须保持 waiting,
+  // NOT 被 override 成 busy。这是真实生产环境数据触发的修复 —
+  // 之前 b049f26+5381b40 把 Signal 2 扩展到 waiting 状态,
+  // 错误 override 了几乎所有 settled session (5 个 waiting + 多个 done
+  // 被错误 promote 成 busy,Feishu 等待输入空)。
+  //
+  // 注意:这个测试和上面的 "Negative waiting" 是同向的(都期望保持 waiting),
+  // 但场景不同:这里 JSONL 比 state.json 新(模拟 daemon settle 触摸的 mtime 模式),
+  // 上面是 JSONL 比 state.json 旧。两个 case 都不能 override waiting。
+  test('2026-06-17 防御: blocked + JSONL mtime newer than state.json + no roster → keep waiting', async () => {
+    readRosterMock.mockImplementation(() => null);  // 无 Signal 1 roster mismatch
+    const daemonTouchedJsonl = join(tmpJsonlDir, 'daemon-touched-waiting.jsonl');
+    writeFileSync(daemonTouchedJsonl, '[]');  // mtime = now (daemon settle 触摸)
+    const now = Date.now();
     mockJobs([makeEnv({
       state: 'blocked', needs: '请问我可以继续吗?',
-      name: 'bg actively working despite blocked state',
-      linkScanPath: freshJsonl,
+      name: 'bg settled, daemon touched JSONL after settle',
+      linkScanPath: daemonTouchedJsonl,
+      mtimeMs: now - 60 * 60 * 1000,  // state.json 1h 前被写
       resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
     })]);
     const r = await AgentSnapshotFetcher.fetch();
     expect(r.ok).toBe(true); if (!r.ok) return;
     const s = r.sessions[0];
-    expect(s.status).toBe('busy');  // overridden from waiting
-    expect(s.name).toBe('bg actively working despite blocked state');  // no ✋
-    // waitingFor 应被剥掉(busy 时不应有 waitingFor)
-    expect(s.waitingFor).toBeUndefined();
+    // 关键:即使 JSONL mtime 比 state.json 新,waiting 状态也不该 override
+    expect(s.status).toBe('waiting');
+    expect(s.waitingFor).toBe('请问我可以继续吗?');
+    expect(s.name).toBe('bg settled, daemon touched JSONL after settle');  // 无 emoji prefix
   });
 
   test('Negative waiting: 真在等用户输入 (JSONL stale) → 保持 waiting', async () => {
@@ -537,22 +544,25 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     expect(s.completed).toBeUndefined();
   });
 
-  // v2.7.1 关键 case:用户的原始 bug (48bbecc6 autonomous continuation)
-  // state.json stale (1h 前 update),JSONL fresh (1min 前 update) — bg 在处理新 turn
-  test('v2.7.1: 用户的原始 bug — state.json stale + JSONL fresh → override busy', async () => {
-    // 真实场景:48bbecc6 在用户截图 21:25 时
-    //   state.json mtime = 20:01 (1.5h 前,bg 问问题时)
-    //   JSONL mtime = 21:24 (1min 前,bg 在自主继续处理)
-    //   pid 82144 alive in roster (这里简化为无 roster)
+  // v2.7.1 → v2.7.2:Signal 2 之前以为能检测 "bg autonomously continuing" 案例
+  // (state.json stale + JSONL fresh + state=blocked),但生产环境数据证明这个信号
+  // 不可靠 — JSONL mtime 是 daemon settle 触摸的,不是 bg write 触摸的。
+  // 现在这种 case 不再通过 Signal 2 override (waiting 状态完全不动)。
+  //
+  // 如果要检测 "bg autonomously continuing",得用别的信号(如进程 liveness / pid alive),
+  // 留给后续架构讨论。当前选择保守:不 override waiting — 错把活的 waiting
+  // 显示成 busy 是更糟的 UX (用户失去 Reply 按钮)。
+  test('v2.7.2: blocked + stale state.json + fresh JSONL + no roster → keep waiting (no false override)', async () => {
+    // 之前这个 case 被 override 成 busy,生产环境看是 false positive
+    // (用户 2026-06-17 截图 13 个 session 11 个被错误 override)
     readRosterMock.mockImplementation(() => null);
     const freshJsonl = join(tmpJsonlDir, 'autonomous-fresh.jsonl');
     writeFileSync(freshJsonl, '[]');  // mtime = now
     const now = Date.now();
-    // state.json 1.5 小时前 (1.5h = 5400s = 5400000ms)
     const stateJsonStaleMs = now - 5400 * 1000;
     mockJobs([makeEnv({
       state: 'blocked', needs: '需要我把修改整理成一个 patch 文件...',
-      name: 'bg autonomously continuing',
+      name: 'bg autonomously continuing (v2.7.2: no longer falsely override)',
       linkScanPath: freshJsonl,
       mtimeMs: stateJsonStaleMs,
       resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
@@ -560,9 +570,9 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     const r = await AgentSnapshotFetcher.fetch();
     expect(r.ok).toBe(true); if (!r.ok) return;
     const s = r.sessions[0];
-    // 关键:JSONL 比 state.json 新很多 → override to busy
-    expect(s.status).toBe('busy');
-    expect(s.waitingFor).toBeUndefined();  // 剥掉
+    // v2.7.2: waiting 不再被 override
+    expect(s.status).toBe('waiting');
+    expect(s.waitingFor).toBe('需要我把修改整理成一个 patch 文件...');
   });
 
   test('Signal 1 on waiting: bg slot 被 reuse (sessionId mismatch + blocked) → override to busy', async () => {
@@ -594,5 +604,48 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     expect(s.status).toBe('busy');
     expect(s.sessionId).toBe('482b3a60-7ae0-4c8c-ba98-f462d08b3274');
     expect(s.waitingFor).toBeUndefined();  // 剥掉
+  });
+
+  // 2026-06-17 P0 bug: snapshot-fetcher Signal 2 (JSONL mtime 比 state.json 新)
+  // 被扩展到 waiting 状态后,几乎所有 settled session 都被错误 override 成 busy。
+  // 真实数据(用户 ~/.claude/jobs/*/state.json 共 13 个 session,11 个被错误 override):
+  //   - 5 个 waiting sessions: state.json 1h 前 blocked,
+  //     JSONL mtime 被 daemon settle event 触摸过 → 触发 Signal 2 → override busy
+  //   - 多个 done sessions: 同样的 mtime pattern,也被错误 override
+  //
+  // 根因:JSONL 文件 mtime 不是 assistant write 时间,而是 daemon settle 时间。
+  // state.json mtime 是 state machine transition 时间(可能更早)。
+  // 两者相对顺序对"bg 是否在跑"没有意义 — 真实环境下两者可能相差 1h+,
+  // 但 bg 完全没在动(d等待回用户,d等待 daemon settle)。
+  //
+  // 修复:Signal 2 只适用于 idle (终态:done/stopped/failed),
+  // 因为终态可以被 bg slot reuse 污染。
+  // waiting/blocked 是实时的 state machine 状态 — bg 在等用户输入,
+  // 不是 stale。Signal 1 (roster.sessionId mismatch) 已能覆盖 waiting 状态下的
+  // bg slot reuse 误判。
+  test('P0 regression: blocked + JSONL mtime newer than state.json + no roster → keep waiting', async () => {
+    // 真实数据模式(2026-06-17 用户截图):
+    //   state.json: blocked + needs, mtime 1h 前
+    //   JSONL: mtime 1min 前(被 daemon settle 触摸,不是 bg write)
+    //   roster: null(没有 Signal 1 信号)
+    //   期望: status=waiting(signal 2 不应在 waiting 上 fire)
+    readRosterMock.mockImplementation(() => null);
+    const daemonTouchedJsonl = join(tmpJsonlDir, 'daemon-touched.jsonl');
+    writeFileSync(daemonTouchedJsonl, '[]');  // mtime = now (just touched by daemon settle)
+    const now = Date.now();
+    const oneHourAgoMs = now - 60 * 60 * 1000;
+    mockJobs([makeEnv({
+      state: 'blocked', needs: '需要我把修改整理成一个 patch 文件,或者帮你做更细致的二次验证吗?',
+      name: 'Review AI coding lines attribution design',
+      linkScanPath: daemonTouchedJsonl,
+      mtimeMs: oneHourAgoMs,  // state.json 1h 前被写 (bg ask 时)
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    // 关键:Signal 2 不应在 waiting 状态上 fire
+    expect(s.status).toBe('waiting');
+    expect(s.waitingFor).toBe('需要我把修改整理成一个 patch 文件,或者帮你做更细致的二次验证吗?');
   });
 });
