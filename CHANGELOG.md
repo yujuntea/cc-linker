@@ -4,6 +4,60 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-06-17
+
+### Added
+
+- **setup 向导新增 Step 2 权限模式选择** (`src/cli/commands/setup.ts`) —
+  `cc-linker setup` 流程中新增 Claude Code `permission_mode` 交互式选择
+  (6 个合法值: `acceptEdits` / `bypassPermissions` / `auto` / `default`
+  / `dontAsk` / `plan`),默认 `acceptEdits`。背景说明: 飞书端无法完成
+  终端式交互确认,推荐自动接受文件编辑。结果同步写入 `[claude].permission_mode`
+  和 `[sdk].permission_mode` 两段,`[sdk].enabled` 字段不被改动,
+  其它自定义字段(`allowed_tools` / `claude_executable` 等)完整保留。
+- **`savePermissionMode(mode, configPath?)` 导出函数** (`src/cli/commands/setup.ts`) —
+  把权限模式同步写入 `~/.cc-linker/config.toml` 的 helper。接受可选
+  `configPath` 参数,便于单元测试写 tmp 目录。
+
+### Changed
+
+- **setup 向导 step 编号重排** (`src/cli/commands/setup.ts`) — 现有
+  步骤 1/2/3 重排为 1/2/3/4 (新增的权限模式是 Step 2,hook 变 Step 3,
+  飞书变 Step 4)。`totalSteps` 同步调整为 `opts.skipFeishu ? 3 : 4`。
+- **printSummary 飞书端可用命令列表更新** (`src/cli/commands/setup.ts`) —
+  从 5 个命令升级为 6 个高频命令 (`/list` / `/listDir` / `/new` / `/model`
+  / `/stop` / `/agents`),并新增 `/help` 引导和"飞书后台 → 机器人 →
+  自定义菜单"轻量推荐(把 `/list` `/new` `/agents` `/help` 绑到菜单,
+  手机端点选更方便)。`bot.ts` 的 `helpText` 保持 12 个唯一命令,
+  未受影响。
+
+### Fixed
+
+- **`saveConfig` section 输出顺序** (`src/cli/commands/init-feishu.ts`) —
+  之前 `[claude]` / `[sdk]` 段会落到"剩余 sections"块底部,跟
+  `[feishu_bot]` 视觉上分开。现在固定顺序包含 `claude` / `sdk` 在
+  `feishu_bot` 之后、`queue` 之前,与 `config.ts` DEFAULTS 的相对
+  位置一致。
+
+### Refactored
+
+- **`loadExistingConfig` / `saveConfig` 接受可选 `configPath` 参数**
+  (`src/cli/commands/init-feishu.ts`) — 两个 helper 末尾新增可选参数,
+  默认仍走 `CONFIG_PATH` 全局常量。production 代码调用点全部不传
+  `configPath` (行为不变),测试通过显式 `configPath` 写 tmp 目录,
+  绕开 `bun:test` 模块缓存问题,**避免使用 `mock.module`** (代码库
+  在 `tests/unit/feishu/bot-runsdk.test.ts:7` 明确警告 `mock.module`
+  跨文件不可撤销)。
+
+### Tests
+
+- 新增 `tests/unit/cli/setup.test.ts` — 4 个用例覆盖 `savePermissionMode`:
+  空配置创建、字段同步 + 其它字段保留、`[sdk].enabled` 不被改、空
+  配置文件新增 `[claude]`/`[sdk]` 不影响 `[feishu_bot]`。
+- `tests/unit/cli/init-feishu.test.ts` 新增 2 个用例 — `saveConfig` section
+  顺序 + `[sdk].enabled` 保留。section-bounded regex (`/\[sdk\][\s\S]*?(?=\n\[|$)/`)
+  防御 greedy 误匹配。
+
 ## [0.7.0] - 2026-06-15
 
 ### Added
