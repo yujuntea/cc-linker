@@ -1,8 +1,8 @@
 # cc-linker 飞书一键配置 Skill 设计规格
 
-> 版本: v1.0
+> 版本: v1.1
 > 日期: 2026-06-17
-> 状态: 已评审，待实现
+> 状态: v1.1 已修复 11 项 review 问题（架构分层、gstack spike、二维码、重构路径、域识别、多 bot 冲突、截图策略、CI 测试、估算、selector 维护、init-feishu 去留），待最终评审
 
 ---
 
@@ -99,69 +99,71 @@ cc-linker 当前通过 `init-feishu` / `setup` 命令引导用户配置飞书机
 
 ### 4.1 整体架构
 
+**三层架构：SKILL.md（Claude 读）→ helper 脚本（Claude 调）→ cc-linker CLI（helper 调）**
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Claude Code 客户端                                          │
 │                                                              │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │ /setup-feishu Skill (SKILL.md)                      │     │
-│  │  - 顶层 orchestration 提示                          │     │
-│  │  - 调用 Helper 脚本完成实际操作                      │     │
+│  │  - 自然语言步骤描述                                   │     │
+│  │  - 通过 Bash tool 调 helper 脚本                     │     │
+│  │  - 不直接执行 TypeScript 代码                         │     │
 │  └────────────────────┬───────────────────────────────┘     │
-│                       │ Bash tool                            │
+│                       │ Bash tool (Claude 自发调用)          │
 └───────────────────────┼──────────────────────────────────────┘
                         ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  Skill Helper 脚本 (TypeScript / Bun)                       │
+│  cc-linker-feishu-skill/helper/ (Bun 脚本)                   │
 │                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │ detect       │  │ gstack       │  │ playwright       │   │
-│  │ backend      │→ │ backend      │  │ backend          │   │
-│  │              │  │ (Bash 包装)  │  │ (driver.ts)      │   │
-│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘   │
-│         └─────────────────┴───────────────────┘             │
-│                          ↓                                   │
-│         ┌────────────────────────────────┐                  │
-│         │ BrowserBackend 接口             │                  │
-│         │ (launch/navigate/click/...)     │                  │
-│         └────────────┬───────────────────┘                  │
-│                      ↓                                       │
-│  ┌──────────────────────────────────────────────┐           │
-│  │ 业务编排层                                     │           │
-│  │  - login()                                    │           │
-│  │  - createApp()                                │           │
-│  │  - grantScopes()                              │           │
-│  │  - subscribeEvents()                          │           │
-│  │  - enableBotAndPublish()  [调 cc-linker CLI]  │           │
-│  │  - captureOwnerOpenId()                      │           │
-│  │  - saveConfig()         [调 cc-linker CLI]   │           │
-│  └──────────────────────────────────────────────┘           │
-│                          ↓                                   │
-│  ┌──────────────────────────────────────────────┐           │
-│  │ 状态管理                                       │           │
-│  │  ~/.cc-linker/setup-state.json (续跑)         │           │
-│  │  ~/.cc-linker/feishu-cookies.json (免登录)    │           │
-│  └──────────────────────────────────────────────┘           │
-└─────────────────────┬───────────────────────────────────────┘
-                      ↓
+│  ┌─────────────────────────────────────────────┐           │
+│  │ 入口: helper/setup.ts (CLI)                  │           │
+│  │  $ bun run helper setup --phase=login        │           │
+│  │  $ bun run helper setup --phase=create-app   │           │
+│  │  $ bun run helper setup --phase=...          │           │
+│  │  $ bun run helper state --show               │           │
+│  └────────────────┬────────────────────────────┘           │
+│                   ↓                                           │
+│  ┌─────────────────────────────────────────────┐           │
+│  │ BrowserBackend 接口（仅 helper 内部使用）       │           │
+│  │ GStackBackend | PlaywrightBackend            │           │
+│  └────────────────┬────────────────────────────┘           │
+│                   ↓                                           │
+│  ┌─────────────────────────────────────────────┐           │
+│  │ 业务编排（每个 phase 一个函数）                  │           │
+│  │  login() / createApp() / grantScopes() / ...  │           │
+│  └────────────────┬────────────────────────────┘           │
+│                   ↓                                           │
+│  ┌─────────────────────────────────────────────┐           │
+│  │ 状态管理                                        │           │
+│  │  ~/.cc-linker/setup-state.json (续跑)          │           │
+│  │  ~/.cc-linker/feishu-cookies.json (免登录)     │           │
+│  └─────────────────────────────────────────────┘           │
+│                   ↓                                           │
+│  通过 child_process.spawn 调 cc-linker CLI                   │
+└───────────────────────┼──────────────────────────────────────┘
+                        ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  cc-linker CLI (既有代码 + 新增)                              │
+│  cc-linker CLI (既有 + 新增)                                  │
 │                                                              │
-│  ┌──────────────────────────────────┐                        │
-│  │ 新增 src/feishu/v7-ability.ts     │                        │
-│  │  - getAppAbility()                │                        │
-│  │  - enableBotCapability()          │                        │
-│  │  - publishNewVersion()            │                        │
-│  │  - approveAppVersion()            │                        │
-│  └──────────────────────────────────┘                        │
-│  ┌──────────────────────────────────┐                        │
-│  │ 新增 src/cli/commands/feishu/    │                        │
-│  │  - enable-bot                    │                        │
-│  │  - publish-version               │                        │
-│  │  - approve-version               │                        │
-│  │  - set-config                    │                        │
-│  └──────────────────────────────────┘                        │
-│  (复用 init-feishu.ts 中的 getTenantToken / captureOpenId)  │
+│  ┌──────────────────────────────────────────────┐            │
+│  │ 重构后 src/feishu/ 公共模块                     │            │
+│  │  - getTenantToken()   (从 init-feishu.ts 抽出) │            │
+│  │  - saveConfig()       (从 init-feishu.ts 抽出) │            │
+│  │  - captureOpenId()    (从 init-feishu.ts 抽出) │            │
+│  │  - v7-ability.ts (新增)                        │            │
+│  │    - getAppAbility / enableBotCapability / ... │            │
+│  └──────────────────────────────────────────────┘            │
+│  ┌──────────────────────────────────────────────┐            │
+│  │ 新增 src/cli/commands/feishu/                  │            │
+│  │  - enable-bot / publish-version / approve /    │            │
+│  │    set-config / feishu-stop-daemon (新增)      │            │
+│  └──────────────────────────────────────────────┘            │
+│  ┌──────────────────────────────────────────────┐            │
+│  │ 既有 src/runtime/state-coordinator.ts (复用)   │            │
+│  │  - isDaemonRunning() 用于检测多 bot 冲突       │            │
+│  └──────────────────────────────────────────────┘            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,8 +171,13 @@ cc-linker 当前通过 `init-feishu` / `setup` 命令引导用户配置飞书机
 
 | 仓库 | 范围 |
 |------|------|
-| `cc-linker`（既有） | v7 API 库、feishu 子命令族、getTenantToken 复用 |
-| `cc-linker-feishu-skill`（新建） | SKILL.md、Helper 脚本（detect backend、gstack 包装、Playwright driver、业务编排） |
+| `cc-linker`（既有） | 1. 重构 `init-feishu.ts` 内部函数到 `src/feishu/utils.ts`<br>2. 新增 v7 API 库（`src/feishu/v7-ability.ts`）<br>3. 新增 `cc-linker feishu <action>` 顶级子命令族<br>4. **保留** `cc-linker init-feishu`（手动模式，向后兼容无 skill 用户）<br>5. **保留** `cc-linker setup`（既有 setup wizard 流程，printPermissionGuide 升级为精确检测）|
+| `cc-linker-feishu-skill`（新建） | 1. `SKILL.md`（Claude 读的步骤化指令）<br>2. `helper/` Bun 脚本（含 BrowserBackend 抽象 + 业务编排 + 状态管理）<br>3. Playwright 浏览器 driver |
+
+**为什么保留 init-feishu**：
+- 无 Claude Code 的 cc-linker 用户仍需手动模式
+- init-feishu 现在升级为"半自动"：用 v7 API 做精确权限检测 + 调 v7 API 开 Bot + 发版本，但创建应用 + 开通权限 + 订阅事件仍手动
+- skill 和 init-feishu 共享 `src/feishu/utils.ts` 和 `src/feishu/v7-ability.ts`，**单一来源真相**
 
 ---
 
@@ -178,7 +185,7 @@ cc-linker 当前通过 `init-feishu` / `setup` 命令引导用户配置飞书机
 
 ### 5.1 cc-linker 侧 — `src/feishu/v7-ability.ts`
 
-封装飞书 v7 application API，独立可测。
+封装飞书 v7 application API，独立可测。**依赖**：import 既有 `getTenantToken`（从 `src/cli/commands/init-feishu.ts` 重构到 `src/feishu/utils.ts`，见 5.7）。
 
 ```typescript
 // 类型
@@ -241,10 +248,12 @@ cc-linker feishu set-config --key=app_id --value=cli_xxx
 - `3` = 审核中（建议等待后重试）
 - `1` = 其他错误
 
-### 5.3 Skill 侧 — BrowserBackend 接口
+### 5.3 Skill 侧 — helper 脚本的 BrowserBackend 接口
+
+**关键澄清**：`BrowserBackend` 接口**只在 helper 脚本内部使用**，不对外暴露。SKILL.md 不直接调用它，Claude 通过 Bash 调 `bun run helper setup --phase=<phase>`，helper 内部根据 phase 选择具体操作。
 
 ```typescript
-// skill-helper/src/backends/types.ts
+// helper/src/backends/types.ts (helper 脚本内部)
 export interface BrowserBackend {
   readonly name: 'gstack' | 'playwright';
   
@@ -276,26 +285,39 @@ export interface BrowserBackend {
   goBack(): Promise<void>;
   
   // 特殊
-  renderQrToTerminal(): Promise<void>;  // Playwright headless 用
+  saveCookies(path: string): Promise<void>;
+  loadCookies(path: string): Promise<void>;
 }
 ```
 
 ### 5.4 Skill 侧 — 后端实现
 
-**GStackBackend**（薄封装）：
-- 通过 `Bash` 工具调用 `gstack browse <subcommand>` CLI
-- 命令映射（**待 gstack CLI 文档确认具体语法**）：`navigate <url>` / `click <sel>` / `type <sel> <text>` / `text <sel>` 等
-- 实现时第一步：跑 `gstack browse --help` 确认实际命令格式，若语法不符则调整映射
-- 二维码在 headed 浏览器窗口显示，无需终端渲染
+**GStackBackend**（薄封装 — **spike-first**）：
+- **实现前必须先 spike**（0.5 天）：
+  - 跑 `gstack --version` 确认安装
+  - 跑 `gstack browse --help` 确认实际命令格式
+  - 跑一次 `gstack browse navigate https://example.com` 验证是否支持持久 session
+  - 跑一次 `gstack browse click <sel>` 验证命令格式
+- **三种可能结果及应对**：
+  - 情况 A：gstack 是 CLI 模式且支持 session → 按本设计走薄封装
+  - 情况 B：gstack 是 MCP server 模式（给 Claude 提供工具）→ 改用 mcp 协议调用
+  - 情况 C：CLI 命令格式不符合预期或无 session → 放弃 GStackBackend，只用 Playwright
+- **二维码处理**：gstack 默认 headed 模式，二维码在浏览器窗口显示，用户直接扫码
 
-**PlaywrightBackend**（重实现）：
+**PlaywrightBackend**（重实现 — **二维码处理修正**）：
 - `playwright-core` + 系统 Chrome 优先；无则 `bunx playwright install chromium`
 - cookie 持久化：`~/.cc-linker/feishu-cookies.json`
-- 二维码：`renderQrToTerminal()` 用 `qrcode-terminal` 包渲染
+- **二维码处理（修正版）**：
+  1. **首选**：用 headed 模式（默认），用户直接在浏览器窗口扫码 — **避免二维码解析问题**
+  2. **降级**（用户要求 headless）：截图保存到 `~/.cc-linker/setup-screenshots/qr-{timestamp}.png`，告诉用户"用手机扫码这张图"
+  3. **不采用**：`qrcode-terminal` 是从**字符串**渲染二维码，不能从浏览器**图片**还原 — 原 spec 这里写错了
+  4. **可选增强**（如未来需要）：用 `jsqr` 包解码图片 → 提取 URL → 用 `qrcode-terminal` 渲染到终端。但此方案脆弱，建议默认走前两条路径
 
-### 5.5 Skill 侧 — 业务编排
+### 5.5 Skill 侧 — 业务编排（helper 脚本内部）
 
-`skill-helper/src/flows/setup.ts` 串联 6 个 phase：
+**关键澄清**：以下代码是 **helper 脚本（`helper/src/flows/setup.ts`）的内部实现**，不是 skill 逻辑。SKILL.md 只告诉 Claude "run `bun run helper setup --phase=<phase>`"，Claude 通过 Bash 调用，helper 内部执行此代码。
+
+`helper/src/flows/setup.ts` 串联 7 个 phase：
 
 ```typescript
 export async function runSetup(opts: { 
@@ -303,35 +325,47 @@ export async function runSetup(opts: {
   state: SetupState; 
   resume?: boolean;
 }): Promise<SetupResult> {
-  // Phase 1: login (可 resume)
-  if (!opts.state.loggedIn) await login(opts.backend);
+  // Phase 0: detect domain (feishu.cn vs larksuite.com)
+  if (!opts.state.domain) {
+    opts.state.domain = await detectFeishuDomain();
+    saveState(opts.state);
+  }
+  
+  // Phase 1: ensure no daemon running (避免 WebSocket 冲突)
+  if (await isDaemonRunning()) {
+    log('检测到 daemon 在跑,临时停止以避免 WebSocket 冲突');
+    await execCcLinker(['stop']);
+  }
+  
+  // Phase 2: login (可 resume)
+  if (!opts.state.loggedIn) await login(opts.backend, opts.state.domain);
   opts.state.loggedIn = true; saveState(opts.state);
   
-  // Phase 2: createApp (可 resume)
+  // Phase 3: createApp (可 resume)
   if (!opts.state.appId) {
     const { appId, appSecret } = await createApp(opts.backend, 'cc-linker');
     opts.state.appId = appId; opts.state.appSecret = appSecret;
     saveState(opts.state);
   }
   
-  // Phase 3: grantScopes
+  // Phase 4: grantScopes
   if (!opts.state.scopesGranted) {
     await grantScopes(opts.backend, opts.state.appId, REQUIRED_SCOPES);
     opts.state.scopesGranted = true; saveState(opts.state);
   }
   
-  // Phase 4: subscribeEvents
+  // Phase 5: subscribeEvents
   if (!opts.state.eventsSubscribed) {
     const { verificationToken } = await subscribeEvents(opts.backend, opts.state.appId);
     opts.state.verificationToken = verificationToken;
     opts.state.eventsSubscribed = true; saveState(opts.state);
   }
   
-  // Phase 5: enableBot + publish (调 cc-linker CLI)
-  await enableBotAndPublish(opts.state.appId, opts.state.appSecret);
+  // Phase 6: enableBot + publish (调 cc-linker CLI)
+  await enableBotAndPublish(opts.state.appId, opts.state.appSecret, opts.state.domain);
   
-  // Phase 6: captureOwnerOpenId + saveConfig
-  await captureOwnerAndSave(opts.backend, opts.state);
+  // Phase 7: captureOwnerOpenId + saveConfig
+  await captureOwnerAndSave(opts.state.appId, opts.state.appSecret, opts.state.domain);
   
   return { success: true, appId: opts.state.appId };
 }
@@ -346,6 +380,8 @@ export async function runSetup(opts: {
   "startedAt": "2026-06-17T10:00:00Z",
   "lastUpdatedAt": "2026-06-17T10:05:00Z",
   "backend": "playwright",
+  "domain": "feishu.cn",          // 新增: 国内/海外域自动识别结果
+  "daemonStoppedAtStart": true,    // 新增: 进入流程前是否停了 daemon
   "loggedIn": true,
   "appId": "cli_a1b2c3d4",
   "appSecret": "***masked***",
@@ -358,6 +394,77 @@ export async function runSetup(opts: {
 ```
 
 **resume 机制**：用户跑 `/setup-feishu` 时检测到此文件存在且有未完成项，自动从断点续跑。
+
+**关键修复**：
+- `domain` 字段记录检测到的飞书域（`feishu.cn` / `larksuite.com`），所有 API 调用都用此域
+- `daemonStoppedAtStart` 字段记录：进入流程前停过 daemon → 完成后必须**自动重启 daemon**（不能丢）
+
+### 5.7 既有代码重构路径（必做，在 M1 之前）
+
+当前 `init-feishu.ts` 的几个函数是私有的，spec 5.1/5.2 假设复用但未明确路径。第一步重构（半天）：
+
+```
+src/cli/commands/init-feishu.ts (既有, 内部函数)
+  ├── getTenantToken()   ──┐
+  ├── saveConfig()       ──┼──→  src/feishu/utils.ts (新建, 公开 export)
+  ├── captureOpenId()    ──┘
+                              │
+src/feishu/v7-ability.ts (新) ┘ import 这些公共函数
+
+src/cli/commands/init-feishu.ts (重构后) → 改为 import + 复用
+src/cli/commands/setup.ts (既有 printPermissionGuide) → 改为用 v7-ability
+```
+
+**具体动作**：
+1. 创建 `src/feishu/utils.ts`，export `getTenantToken`、`saveConfig`、`captureOpenId`、`maskSecret`
+2. 改 `init-feishu.ts` 为 import 这些函数
+3. 改 `v7-ability.ts` import `getTenantToken` from `src/feishu/utils`
+4. helper 脚本的 `enableBotAndPublish`/`captureOwnerAndSave` 通过 `child_process.spawn` 调 `cc-linker feishu enable-bot` 等子命令（不直接 import TypeScript — 跨仓库边界）
+
+**验证标准**：`init-feishu.ts` 重构前后行为一致（手测一次完整 setup 流程）。
+
+### 5.8 飞书域自动识别
+
+海外用户用 `open.larksuite.com`，国内用 `open.feishu.cn`，两个域 token 不互通。helper 在 Phase 0 必须先识别：
+
+```typescript
+// helper/src/utils/domain.ts
+export type FeishuDomain = 'feishu.cn' | 'larksuite.com';
+
+export async function detectFeishuDomain(): Promise<FeishuDomain> {
+  // 并行探测两个域
+  const results = await Promise.allSettled([
+    fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: 'invalid', app_secret: 'invalid' }),
+      signal: AbortSignal.timeout(5000),
+    }),
+    fetch('https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: 'invalid', app_secret: 'invalid' }),
+      signal: AbortSignal.timeout(5000),
+    }),
+  ]);
+  
+  // 选连通且能返回 JSON 错误响应的域（不能仅看 TCP 通）
+  // 通常国内优先
+  if (results[0].status === 'fulfilled' && results[0].value.status < 500) {
+    return 'feishu.cn';
+  }
+  if (results[1].status === 'fulfilled' && results[1].value.status < 500) {
+    return 'larksuite.com';
+  }
+  throw new Error('无法连接飞书开放平台，请检查网络');
+}
+```
+
+**应用**：
+- 所有 v7 API 调用 base URL = `https://open.${domain === 'feishu.cn' ? 'feishu' : 'larksuite'}.cn/...` 实际 larksuite 是 `https://open.larksuite.com`
+- 浏览器 navigate URL 同样使用对应域
+- setup-state.json 持久化 domain
+- 错误信息中提示"你使用的是飞书国内版/海外版"
 
 ---
 
@@ -372,19 +479,30 @@ export async function runSetup(opts: {
    - 不存在 → 全新流程
    - 存在 + 全部完成 → 提示"已配置,是否重新配置?"
    - 存在 + 未完成 → 提示"上次中断在 X 阶段,是否续跑?"
+   - 存在 + daemonStoppedAtStart=true → 提示"上次中断时停了 daemon,先帮你重启"
 
-3. 后端检测:
+3. 域检测 (Phase 0):
+   - helper 并行探测 open.feishu.cn 和 open.larksuite.com
+   - 选定连通的域,记入 state
+
+4. 后端检测 (Bash: `bun run helper backend detect`):
    - spawn('gstack', ['--version']) → 成功则用 gstack
    - 失败则用 Playwright (首次提示安装)
    - **若两者都不可用**: 打印清晰的手动操作指南,引导用户按 6 步完成(回到当前 `init-feishu` 体验)
+   - **若用户已经在 daemon 上用 cc-linker**:
+     - 临时停 daemon (避免 WebSocket 冲突)
+     - 记录 state.daemonStoppedAtStart=true
+     - 流程结束后**自动重启 daemon**
 
-4. 浏览器登录:
-   - navigate('https://open.feishu.cn/app')
+5. 浏览器登录:
+   - navigate('https://open.${domain}/app')
    - 检测登录态 (cookie 有效)
-   - 未登录则点击 QR 登录,等待扫码
-   - 保存 cookies
+   - 未登录则点击 QR 登录
+   - **gstack headed 模式**: 用户在浏览器窗口扫码
+   - **Playwright headless 模式**: 截图保存,告诉用户"用手机扫码这张图"
+   - 等待登录成功,保存 cookies
 
-5. 创建应用 (UI 模拟):
+6. 创建应用 (UI 模拟):
    - click('create-app-btn')
    - fill('app-name', 'cc-linker')
    - fill('app-desc', 'cc-linker 飞书机器人')
@@ -392,11 +510,11 @@ export async function runSetup(opts: {
    - getText('app-id-display') → 抓 App ID
    - getText('app-secret-display') → 抓 App Secret
 
-6. 开通 5 个权限 (UI 模拟,串行):
+7. 开通 5 个权限 (UI 模拟,串行):
    - 对每个 scope: search → 找到 → click 申请
    - 处理可能的确认弹窗
 
-7. 订阅事件:
+8. 订阅事件:
    - navigate('/event')
    - click('mode-websocket')
    - click('add-event')
@@ -404,29 +522,28 @@ export async function runSetup(opts: {
    - click 确认
    - getText('verification-token') → 关键抓取
 
-8. 启用 Bot + 发布版本 (调 cc-linker CLI):
-   - exec('cc-linker feishu enable-bot ...')
-   - exec('cc-linker feishu publish-version ...')
-   - 尝试 exec('cc-linker feishu approve-version ...')
+9. 启用 Bot + 发布版本 (调 cc-linker CLI):
+   - exec('cc-linker feishu enable-bot --domain=${domain} ...')
+   - exec('cc-linker feishu publish-version --domain=${domain} ...')
+   - 尝试 exec('cc-linker feishu approve-version --domain=${domain} ...')
    - 若 approve 失败 (非 admin) → 打印管理员链接
 
-9. 抓 owner open_id:
+10. 抓 owner open_id:
    - exec('cc-linker start --daemon') 临时启动
    - 提示用户给 Bot 发消息
    - captureOpenId 复用既有逻辑 (120s 超时)
+   - 抓完立即 stop daemon (避免一直占着 WS)
 
-10. 写入 config:
-    - exec('cc-linker feishu set-config ...') 多次调用
-    - 或一次性写 ~/.cc-linker/config.toml
+11. 写入 config:
+   - exec('cc-linker feishu set-config ...') 多次调用
+   - 或一次性写 ~/.cc-linker/config.toml
 
-11. 验证:
-    - 重启 daemon
-    - 提示用户发消息测试
-    - 30s 后检查 bot 状态
-
-12. 完成:
-    - 清理 setup-state.json
-    - 输出使用文档
+12. 验证 + 收尾:
+   - 若 state.daemonStoppedAtStart=true: 重启 daemon
+   - 提示用户发消息测试
+   - 30s 后检查 bot 状态
+   - 清理 setup-state.json (保留 backup)
+   - 输出使用文档
 ```
 
 ### 6.2 失败流 — gstack 失败降级
@@ -476,13 +593,58 @@ exec('cc-linker feishu approve-version ...') 退出码 2
 打印:
   ⚠️  你不是该应用的 admin
   请把以下链接发给企业管理员,管理员点"同意发布"后回来按回车:
-    https://open.feishu.cn/app/{appId}/version
+    https://open.${domain}/app/{appId}/version
   ↓
 inquirer.prompt 等待用户回车
   ↓
 用户回车后,继续抓 owner open_id + 写 config
   ↓
 最终输出: "配置已写入,待管理员同意发布后即可使用"
+```
+
+### 6.5 失败流 — 多 bot 实例冲突
+
+```
+Phase 0 检测 isDaemonRunning() 返回 true
+  ↓
+输出: "检测到 cc-linker daemon 正在跑,需要临时停止避免 WebSocket 冲突"
+  ↓
+调用 cc-linker stop (复用既有逻辑)
+  ↓
+state.daemonStoppedAtStart = true
+  ↓
+继续主流程
+  ↓
+Phase 7 (验证收尾):
+  ├─ state.daemonStoppedAtStart === true → 自动重启 cc-linker start --daemon
+  └─ 否则 → 不动
+```
+
+**为什么重要**：飞书 WebSocket 同一 app_id 只能一个连接（MEMORY `feishu-p2p-permission-trap`）。如果用户之前 daemon 在跑，captureOpenId 不会收到任何事件（被占线）。
+
+### 6.6 失败流 — 全自动化失败回退到手动
+
+```
+gstack 失败 + Playwright 失败 + domain 都探测不到
+  ↓
+判定: 全自动流程无法继续
+  ↓
+输出: "自动化配置无法启动,以下是手动操作清单"
+  ↓
+打印:
+  ⚠️  请在浏览器中打开 https://open.${domain}/app
+  1. 创建企业自建应用 → 拿到 App ID/Secret
+  2. 权限管理 → 开通以下 5 个权限: [...]
+  3. 事件订阅 → 长连接模式 → 添加 im.message.receive_v1 → 复制 Verification Token
+  4. 回调配置 → 长连接模式 → 添加 card.action.trigger
+  5. 应用功能 → 机器人 → 启用
+  6. 版本管理与发布 → 创建新版本 → 提交
+
+  完成后运行: cc-linker init-feishu (手动配置向导)
+  ↓
+inquirer.prompt "是否需要我打印这个清单到本地文件?"
+  ↓
+保留 setup-state.json (标记 allFailed=true), 方便用户调 debug
 ```
 
 ---
@@ -512,13 +674,22 @@ inquirer.prompt 等待用户回车
 
 ### 8.1 敏感数据处理
 
-| 数据 | 存储位置 | 权限 | 日志输出 |
-|------|---------|------|---------|
-| App Secret | `~/.cc-linker/config.toml` | 0o600 | **绝不输出**（截图前 mask）|
-| Verification Token | `~/.cc-linker/config.toml` | 0o600 | 允许输出（与 Bot 公开行为一致）|
-| App ID | `~/.cc-linker/config.toml` | 0o600 | 允许输出（公开标识）|
-| Cookie | `~/.cc-linker/feishu-cookies.json` | 0o600 | **绝不输出** |
-| App Secret 截图 | mask 处理后保留 | 0o600 | — |
+| 数据 | 存储位置 | 权限 | 日志输出 | 截图策略 |
+|------|---------|------|---------|---------|
+| App Secret | `~/.cc-linker/config.toml` | 0o600 | **绝不输出** | **禁用截图**（创建成功页）|
+| Verification Token | `~/.cc-linker/config.toml` | 0o600 | 允许输出 | **禁用截图**（事件订阅页）|
+| App ID | `~/.cc-linker/config.toml` | 0o600 | 允许输出 | 允许截图（公开标识）|
+| Cookie | `~/.cc-linker/feishu-cookies.json` | 0o600 | **绝不输出** | **禁用截图**（登录页）|
+
+**截图策略（修正）**：
+- 三个敏感页面**完全禁用截图**（不靠"mask 后保留"，因为 mask 不可靠）
+  - 创建应用成功页（暴露 App Secret）
+  - 事件订阅页（暴露 Verification Token）
+  - 登录页（暴露 session cookie）
+- 其他页面正常截图用于 debug
+- helper 内部维护一个 `BLOCKED_SCREENSHOT_PATTERNS` 列表（URL 正则或 page.title() 包含关键字）
+- 截图保存到 `~/.cc-linker/setup-screenshots/`，权限 0o600
+- helper 退出时**默认清理**截图（除非用户传 `--keep-screenshots`）
 
 ### 8.2 网络请求
 
@@ -564,27 +735,40 @@ skill-helper/tests/unit/flows/setup.test.ts
 
 ### 9.3 集成测试（端到端）
 
-**前置条件**：需要一个飞书测试租户（开发者本人在该租户下是 admin）+ 一个"未配置的应用"。
+**关键澄清**：真实飞书租户 credentials **不能进 CI**（安全风险、租户管理成本高）。集成测试分两层：
 
-**测试租户来源**：
-- 短期：开发者本人的飞书测试租户（自建企业、自己管）
-- 长期：CI 上需注册专用 test tenant + test account，由项目维护者持有 credentials，注入到 GitHub Actions Secrets
-
+**Layer A: Playwright route mock（CI 跑）**
 ```
-tests/integration/auto-setup.test.ts
-  - 启动 helper 脚本
-  - 准备: 清除 cookies 和 state
-  - 跳过登录 phase (使用预存的 cookie)
-  - 跑 createApp + grantScopes + subscribeEvents
-  - 调 cc-linker v7 API 启用 Bot + 发版本
-  - 验证 setup-state.json 正确
-  - 清理: 删除测试创建的应用
+tests/integration/auto-setup-mock.test.ts
+  - 用 Playwright 的 page.route() mock 飞书域响应
+  - mock 数据准备: 静态 HTML 模拟飞书控制台各页面（创建应用、权限、事件）
+  - 不调真实 v7 API,用 msw (Mock Service Worker) mock fetch
+  - 跑 helper 全流程,验证:
+    - 各 phase 顺序正确
+    - state 持久化
+    - 退出码映射
+  - CI 上跑 (无需真实凭据)
 ```
 
-**CI 兼容性**：
-- GitHub Actions Linux runner + Xvfb
-- 用 Playwright 的 `headless: true` 模式
-- 跳过扫码登录（用测试 cookie）
+**Layer B: 真实飞书租户（仅本机）**
+```
+tests/integration/auto-setup-real.test.ts
+  - 前置: 开发者本机有飞书测试租户 + 已开 Bot 权限的应用
+  - 跑真实 createApp + grantScopes + subscribeEvents
+  - 不在 CI 跑,通过 npm script `test:integration:real` 手动触发
+  - 输出真实截图 + setup-state.json,人工 review
+  - 跑一次后清理(删除测试创建的应用)
+```
+
+**视觉回归测试**（layer A 的扩展）：
+- 静态 HTML mock 中嵌入"飞书历史版本"的截图（从真实租户导出）
+- 跑 helper 全流程,对比 mock HTML 截图 vs 历史截图
+- **不对比像素**（飞书会 A/B test），**只对比关键文本节点和 selector 命中**
+- 失败时人工 review 飞书控制台改了什么
+
+**测试租户管理**：
+- **短期**：开发者本机手测（不进入 CI）
+- **长期**（不承诺）：项目维护者注册专用 test tenant，凭据放本地 `.env.test`，不进 git
 
 ### 9.4 视觉回归测试
 
@@ -611,42 +795,94 @@ tests/integration/auto-setup.test.ts
 
 | 模块 | 工时 | 仓库 |
 |------|------|------|
+| **既有代码重构（getTenantToken/saveConfig/captureOpenId → src/feishu/utils）** | **0.5 天** | cc-linker |
 | v7 API 库（5 个函数 + 错误码映射） | 2 天 | cc-linker |
-| cc-linker feishu 子命令（4 个） | 1 天 | cc-linker |
+| cc-linker feishu 子命令（5 个: enable-bot / publish-version / approve-version / set-config / domain-info） | 1 天 | cc-linker |
 | cc-linker 单元测试 | 1 天 | cc-linker |
+| **gstack spike（验证 CLI/MCP 模式、session 支持）** | **0.5 天** | 新建 |
 | Skill 仓库搭建（`cc-linker-feishu-skill`） | 0.5 天 | 新建 |
 | SKILL.md 编写 | 1 天 | 新建 |
-| BrowserBackend 接口 + 类型 | 0.5 天 | 新建 |
+| helper 脚本入口（CLI 子命令分发） | 0.5 天 | 新建 |
+| BrowserBackend 接口 + 类型（helper 内部） | 0.5 天 | 新建 |
 | PlaywrightBackend 实现 | 2 天 | 新建 |
-| GStackBackend 实现（Bash 包装） | 1 天 | 新建 |
+| GStackBackend 实现（视 spike 结果） | 0.5-1 天 | 新建 |
 | 后端检测 + 降级逻辑 | 0.5 天 | 新建 |
-| 业务编排（login/createApp/grantScopes/subscribeEvents/...） | 2 天 | 新建 |
-| 状态管理 + resume | 1 天 | 新建 |
-| 错误处理 + 截图 + 降级 | 1 天 | 新建 |
+| 域检测（feishu.cn vs larksuite.com） | 0.5 天 | 新建 |
+| 业务编排（7 个 phase） | 2.5 天 | 新建 |
+| 状态管理 + resume + 多 bot 冲突 | 1 天 | 新建 |
+| 错误处理 + 截图策略 + 降级 | 1 天 | 新建 |
 | 单元测试（Skill 侧） | 1 天 | 新建 |
-| 集成测试（端到端 + 飞书测试租户） | 2 天 | 新建 |
-| 文档（README + 故障排查） | 1 天 | 新建 |
-| **合计** | **17.5 工作日 ≈ 3.5 周** | |
+| 集成测试（Playwright route mock + CI 可跑） | 2 天 | 新建 |
+| 真实租户本机集成测试（Layer B） | 1 天 | 新建 |
+| 视觉回归（selector 文本对比） | 1 天 | 新建 |
+| 文档（README + 故障排查 + 故障排查） | 1 天 | 新建 |
+| **合计** | **~22.5 工作日 ≈ 4.5 周** | |
+
+**vs 原 17.5 天估算**：+5 天 buffer（gstack spike + 真实租户测试 + selector 维护 + 截图策略细化 + 重构路径）
 
 ### 10.2 里程碑
 
-- **M1（Day 2）**：v7 API 库 + 单元测试 ✅（独立可用，CLI 用户受益）
-- **M2（Day 4）**：cc-linker feishu 子命令族 + 单元测试 ✅
-- **M3（Day 6）**：Skill 仓库 + SKILL.md + BrowserBackend 接口
-- **M4（Day 9）**：PlaywrightBackend + GStackBackend 可用
-- **M5（Day 12）**：业务编排 + 状态管理完成
-- **M6（Day 14）**：错误处理 + 降级 + resume 完整
-- **M7（Day 17.5）**：集成测试通过 + 文档完成
+- **M0.5（Day 0.5）**：既有代码重构 + gstack spike ✅（决定后续是否做 GStackBackend）
+- **M1（Day 3）**：v7 API 库 + 单元测试 ✅（独立可用，CLI 用户受益）
+- **M2（Day 4.5）**：cc-linker feishu 子命令族 + 单元测试 ✅
+- **M3（Day 6）**：Skill 仓库 + SKILL.md + helper 入口 + BrowserBackend 接口
+- **M4（Day 9）**：PlaywrightBackend + 域检测 + 后端检测
+- **M5（Day 12）**：业务编排 7 phase + 状态管理
+- **M6（Day 14.5）**：错误处理 + 截图策略 + 多 bot 冲突 + 全失败 fallback
+- **M7（Day 17）**：单元测试 + Playwright route mock 集成测试（CI 可跑）
+- **M8（Day 19）**：本机真实飞书租户集成测试（Layer B）
+- **M9（Day 22.5）**：视觉回归 + 文档完成
 
 ### 10.3 风险点与应对
 
 | 风险 | 概率 | 应对 |
 |------|------|------|
-| 飞书控制台改版导致 selector 失效 | 高 | 集中管理 selectors.ts + 视觉回归 |
+| 飞书控制台改版导致 selector 失效 | 高 | 集中管理 selectors.ts + 视觉回归（10.4 详述）|
 | Playwright 跨平台差异 | 中 | 主要在 macOS/Linux 验证,Windows 标注"尽力而为" |
-| gstack CLI 命令格式未稳定 | 中 | 后端抽象层屏蔽,允许快速重写 |
-| 飞书测试租户不可用 | 低 | 用用户自己的租户做 alpha 测试 |
-| Verification Token DOM 抓不到 | 中 | 截图 + 用户粘贴降级路径已设计 |
+| gstack 实际是 MCP 模式不是 CLI | 中 | spike-first 验证,失败时只用 Playwright |
+| gstack 无持久 session | 中 | helper 维护自己的 Playwright session 兜底 |
+| 飞书测试租户不可用 | 高 | Layer A mock 测试在 CI 跑,Layer B 真实测试只在本机 |
+| Verification Token DOM 抓不到 | 中 | 截图禁用 + 用户粘贴降级路径已设计 |
+| domain 探测误判（两个都通但内容不一致）| 低 | 探测时同时检查响应 JSON 的 `code` 字段（飞书返回 99991/99992 等）|
+| 多 bot WebSocket 冲突 | 中 | 6.5 流程已设计:进入前停 daemon,完成后重启 |
+
+### 10.4 Selector 维护流程
+
+**目录结构**：
+```
+helper/src/selectors/
+├── _meta.ts                    // last-verified 时间戳集中管理
+├── login.ts                    // 登录页 selector
+├── create-app.ts               // 创建应用 selector
+├── permissions.ts              // 权限管理 selector
+├── event-subscription.ts       // 事件订阅 selector
+└── callback.ts                 // 回调配置 selector
+```
+
+**每个 selector 文件格式**：
+```typescript
+// helper/src/selectors/login.ts
+export const LOGIN_SELECTORS = {
+  qrCodeButton: '[data-testid="qrcode-login"]',
+  // ...
+} as const;
+
+// last verified: 2026-06-17 by @wuyujun
+// 如果飞书改版,selector 失效,请:
+// 1. 在测试租户手动打开飞书控制台
+// 2. DevTools 找到新 selector
+// 3. 改这里 + 更新 last-verified 日期
+```
+
+**维护触发**：
+- 每次跑 helper 成功 → 自动更新 `_meta.ts` 的 `lastVerified`
+- 超过 **30 天**未验证的 selector → helper 启动时 warning（"飞书控制台可能已改版，建议手测一次"）
+- 跑 helper 失败时 → 截图 + 当前 selector → 提示"可能是 selector 失效，请检查 selectros/login.ts 是否需要更新"
+
+**CI 监控**（Layer A 视觉回归）：
+- helper 跑完后,对比 mock HTML vs 历史截图的 **selector 命中**（不对比像素）
+- 关键 selector 集合（5-10 个）需要全命中,否则 CI fail
+- selector 命中失败时,打印建议: "试试 `data-testid=create-app-v2`"
 
 ---
 
@@ -705,12 +941,16 @@ im:resource                  - 下载用户资源（图片等）
 - Bot info: https://open.feishu.cn/document/ukTMukTMukTM/uAjMxEjLwITMx4CMyETM
 - p2p 权限陷阱: MEMORY `feishu-p2p-permission-trap.md`
 
-### 12.4 既有代码复用点
+### 12.4 既有代码复用点（重构后）
 
-- `src/cli/commands/init-feishu.ts`:
-  - `getTenantToken(appId, appSecret)` → v7-ability.ts 复用
-  - `captureOpenId(appId, appSecret)` → skill helper 复用
-  - `saveConfig(config, path)` → feishu set-config 复用
+- `src/feishu/utils.ts`（**新建, 从 init-feishu.ts 抽出的公共函数**）:
+  - `getTenantToken(appId, appSecret)` → v7-ability.ts + helper 都 import
+  - `captureOpenId(appId, appSecret)` → helper 通过 `cc-linker feishu capture-open-id` 子命令调
+  - `saveConfig(config, path)` → feishu set-config 子命令调
+  - `maskSecret(secret)` → 日志/截图 mask
+- `src/cli/commands/init-feishu.ts`（**重构后**）: 改为 import from `src/feishu/utils`, 行为不变
+- `src/cli/commands/setup.ts`（**升级**）: `printPermissionGuide` 用 v7-ability 做精确检测
+- `src/runtime/state-coordinator.ts`: `isDaemonRunning()` → helper 检测多 bot 冲突
 - `src/utils/paths.ts`: `CONFIG_PATH`, `RUNTIME_PID_FILE` 路径常量
 - `src/utils/logger.ts`: 复用 logger 风格
 
