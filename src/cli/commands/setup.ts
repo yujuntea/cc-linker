@@ -14,9 +14,13 @@ import {
   maskSecret,
 } from './init-feishu';
 
-export function savePermissionMode(mode: string, _configPath?: string): void {
-  // placeholder — implemented in Task 4
-  void mode;
+export function savePermissionMode(mode: string, configPath?: string): void {
+  const existing = loadExistingConfig(configPath);
+  if (!existing.claude) existing.claude = {};
+  existing.claude.permission_mode = mode;
+  if (!existing.sdk) existing.sdk = {};
+  existing.sdk.permission_mode = mode;
+  saveConfig(existing, configPath);
 }
 
 /** Check if Claude Code hook is already installed */
