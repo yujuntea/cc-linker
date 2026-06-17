@@ -52,7 +52,7 @@ interface FeishuWizardResult {
 
 export async function setup(registry: RegistryManager, opts: SetupOptions = {}): Promise<void> {
   // Calculate total steps dynamically
-  const totalSteps = opts.skipFeishu ? 2 : 3;
+  const totalSteps = opts.skipFeishu ? 3 : 4;
 
   console.log(chalk.blue('═══════════════════════════════════════════'));
   console.log(chalk.blue('  cc-linker 一键配置向导'));
@@ -60,9 +60,10 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
 
   console.log(chalk.gray('本向导将引导你完成以下配置：'));
   console.log(chalk.gray('  1. 初始化会话注册表'));
-  console.log(chalk.gray('  2. 安装 Claude Code 自动注册钩子'));
+  console.log(chalk.gray('  2. 选择 Claude Code 权限模式'));
+  console.log(chalk.gray('  3. 安装 Claude Code 自动注册钩子'));
   if (!opts.skipFeishu) {
-    console.log(chalk.gray('  3. 配置飞书 Bot（App ID + App Secret + 开机自启）'));
+    console.log(chalk.gray('  4. 配置飞书 Bot（App ID + App Secret + 开机自启）'));
   }
   console.log('');
 
@@ -78,10 +79,45 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
   console.log(chalk.green(`  ✅ 已注册 ${sessionCount} 个会话`));
   console.log('');
 
-  // ===== Step 2: Install hook =====
+  // ===== Step 2: Claude Code 权限模式 =====
+  console.log(chalk.cyan(`── Step 2/${totalSteps} ── Claude Code 权限模式`));
+  console.log('');
+  console.log(chalk.gray('  ℹ  权限模式说明:'));
+  console.log(chalk.gray('    控制 Claude Code 执行操作时的交互确认行为。'));
+  console.log(chalk.gray('    由于飞书端无法完成终端式交互确认，默认自动接受文件编辑。'));
+  console.log('');
+  console.log(chalk.gray('  可选值:'));
+  console.log(chalk.gray('    acceptEdits          (推荐) 自动接受文件编辑，最适合飞书侧使用'));
+  console.log(chalk.gray('    bypassPermissions    跳过所有权限检查，慎用'));
+  console.log(chalk.gray('    auto                 智能判断'));
+  console.log(chalk.gray('    default              使用 Claude Code 默认（可能弹出确认）'));
+  console.log(chalk.gray('    dontAsk              不询问'));
+  console.log(chalk.gray('    plan                 强制进入 plan 模式'));
+  console.log('');
+
+  const { permissionMode } = await inquirer.prompt([{
+    type: 'list',
+    name: 'permissionMode',
+    message: '请选择 Claude Code 权限模式:',
+    default: 'acceptEdits',
+    choices: [
+      { name: 'acceptEdits          (推荐) 自动接受文件编辑，最适合飞书侧使用', value: 'acceptEdits' },
+      { name: 'bypassPermissions    跳过所有权限检查，慎用', value: 'bypassPermissions' },
+      { name: 'auto                 智能判断', value: 'auto' },
+      { name: 'default              使用 Claude Code 默认（可能弹出确认）', value: 'default' },
+      { name: 'dontAsk              不询问', value: 'dontAsk' },
+      { name: 'plan                 强制进入 plan 模式', value: 'plan' },
+    ],
+  }]);
+
+  savePermissionMode(permissionMode);
+  console.log(chalk.green(`  ✅ 权限模式已设置为: ${permissionMode}（已同步到 [claude] 和 [sdk]）`));
+  console.log('');
+
+  // ===== Step 3: Install hook =====
   let hookInstalled = false;
   if (!opts.skipHook) {
-    console.log(chalk.cyan(`── Step 2/${totalSteps} ── 安装 Claude Code 钩子`));
+    console.log(chalk.cyan(`── Step 3/${totalSteps} ── 安装 Claude Code 钩子`));
 
     if (isHookInstalled()) {
       console.log(chalk.green('  ✅ Hook 已安装，跳过'));
@@ -100,11 +136,11 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
     console.log('');
   }
 
-  // ===== Step 3: Feishu Bot setup (optional) =====
+  // ===== Step 4: Feishu Bot setup (optional) =====
   let feishuResult: FeishuWizardResult = { configured: false, appId: '', started: false, autoStart: false };
 
   if (!opts.skipFeishu) {
-    console.log(chalk.cyan(`── Step 3/${totalSteps} ── 配置飞书 Bot`));
+    console.log(chalk.cyan(`── Step 4/${totalSteps} ── 配置飞书 Bot`));
     console.log('');
 
     const existingConfig = loadExistingConfig();
