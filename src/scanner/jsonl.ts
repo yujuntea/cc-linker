@@ -259,27 +259,34 @@ export class JSONLScanner {
    * 返回 null,caller 跳过 cwd 修正(保守不破坏现有数据)。
    */
   private readFirstCwd(filePath: string): string | null {
-    const stat = statSync(filePath);
-    if (stat.size === 0) return null;
-    const readSize = Math.min(4096, stat.size);
-    const fd = openSync(filePath, 'r');
     try {
-      const buffer = Buffer.alloc(readSize);
-      readSync(fd, buffer, 0, readSize, 0);  // 从文件头读
-      const head = buffer.toString('utf8');
-      const lines = head.split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line);
-          if (entry.cwd) return entry.cwd;
-        } catch {
-          continue;  // 跳过 malformed 行
+      const stat = statSync(filePath);
+      if (stat.size === 0) return null;
+      const readSize = Math.min(4096, stat.size);
+      const fd = openSync(filePath, 'r');
+      try {
+        const buffer = Buffer.alloc(readSize);
+        readSync(fd, buffer, 0, readSize, 0);  // 从文件头读
+        const head = buffer.toString('utf8');
+        const lines = head.split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (entry.cwd) return entry.cwd;
+          } catch {
+            continue;  // 跳过 malformed 行
+          }
         }
+        return null;  // 头部 4KB 没找到 cwd
+      } finally {
+        closeSync(fd);
       }
-      return null;  // 头部 4KB 没找到 cwd
-    } finally {
-      closeSync(fd);
+    } catch (err) {
+      // 文件被删/权限错误等异常情况:保守返回 null,跳过 cwd 修正
+      // (现有 scan 流程也会在外层 catch 这个文件,所以这里只是 fail-soft)
+      logger.warn(`readFirstCwd 失败: ${filePath}: ${(err as Error).message}`);
+      return null;
     }
   }
 
