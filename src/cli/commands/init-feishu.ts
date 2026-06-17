@@ -167,7 +167,7 @@ export function saveConfig(config: Record<string, any>, configPath?: string): vo
   const lines: string[] = [];
 
   // Write known sections in order
-  for (const section of ['general', 'feishu_bot', 'queue', 'runtime', 'security', 'scanner', 'cli_proxy', 'hook']) {
+  for (const section of ['general', 'feishu_bot', 'claude', 'sdk', 'queue', 'runtime', 'security', 'scanner', 'cli_proxy', 'hook']) {
     const values = config[section];
     if (!values || typeof values !== 'object') continue;
     lines.push(`[${section}]`);

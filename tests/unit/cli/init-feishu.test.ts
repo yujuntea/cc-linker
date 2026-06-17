@@ -62,6 +62,54 @@ max_pending = 100
     });
   });
 
+  describe('saveConfig with explicit configPath', () => {
+    it('places [claude] and [sdk] right after [feishu_bot] in output order', () => {
+      const { saveConfig } = require('../../../src/cli/commands/init-feishu');
+      saveConfig(
+        {
+          general: { log_level: 'info' },
+          feishu_bot: { app_id: 'x' },
+          claude: { permission_mode: 'acceptEdits' },
+          sdk: { permission_mode: 'acceptEdits' },
+          queue: { max_pending: 100 },
+        },
+        configPath,
+      );
+      const raw = readFileSync(configPath, 'utf8');
+      const idxFeishu = raw.indexOf('[feishu_bot]');
+      const idxClaude = raw.indexOf('[claude]');
+      const idxSdk = raw.indexOf('[sdk]');
+      const idxQueue = raw.indexOf('[queue]');
+      expect(idxFeishu).toBeGreaterThan(-1);
+      expect(idxClaude).toBeGreaterThan(idxFeishu);
+      expect(idxSdk).toBeGreaterThan(idxClaude);
+      expect(idxQueue).toBeGreaterThan(idxSdk);
+    });
+
+    it('preserves [sdk].enabled when not modified', () => {
+      writeFileSync(configPath, `[claude]
+permission_mode = "default"
+allowed_tools = ["Read"]
+
+[sdk]
+enabled = false
+claude_executable = "/custom/path/claude"
+`);
+      const { saveConfig } = require('../../../src/cli/commands/init-feishu');
+      saveConfig(
+        {
+          claude: { permission_mode: 'bypassPermissions', allowed_tools: ['Read'] },
+          sdk: { permission_mode: 'bypassPermissions', enabled: false, claude_executable: '/custom/path/claude' },
+        },
+        configPath,
+      );
+      const raw = readFileSync(configPath, 'utf8');
+      expect(raw).toMatch(/\[sdk\][\s\S]*enabled\s*=\s*false/);
+      expect(raw).toContain('claude_executable');
+      expect(raw).toMatch(/\[claude\][\s\S]*allowed_tools/);
+    });
+  });
+
   describe('loadExistingConfig', () => {
     it('returns empty object for non-existent file', () => {
       const nonExistent = join(tmpDir, 'no-such-file.toml');
