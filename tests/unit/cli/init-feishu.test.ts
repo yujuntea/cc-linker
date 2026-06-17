@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { saveConfig } from '../../../src/cli/commands/init-feishu';
 
 // We test the pure helper functions by importing them indirectly
 // Since they're not exported, we test through the module's behavior
@@ -64,7 +65,6 @@ max_pending = 100
 
   describe('saveConfig with explicit configPath', () => {
     it('places [claude] and [sdk] right after [feishu_bot] in output order', () => {
-      const { saveConfig } = require('../../../src/cli/commands/init-feishu');
       saveConfig(
         {
           general: { log_level: 'info' },
@@ -95,7 +95,6 @@ allowed_tools = ["Read"]
 enabled = false
 claude_executable = "/custom/path/claude"
 `);
-      const { saveConfig } = require('../../../src/cli/commands/init-feishu');
       saveConfig(
         {
           claude: { permission_mode: 'bypassPermissions', allowed_tools: ['Read'] },
@@ -104,9 +103,11 @@ claude_executable = "/custom/path/claude"
         configPath,
       );
       const raw = readFileSync(configPath, 'utf8');
-      expect(raw).toMatch(/\[sdk\][\s\S]*enabled\s*=\s*false/);
+      const sdkBlock = raw.match(/\[sdk\][\s\S]*?(?=\n\[|$)/)?.[0] ?? '';
+      expect(sdkBlock).toMatch(/enabled\s*=\s*false/);
       expect(raw).toContain('claude_executable');
-      expect(raw).toMatch(/\[claude\][\s\S]*allowed_tools/);
+      const claudeBlock = raw.match(/\[claude\][\s\S]*?(?=\n\[|$)/)?.[0] ?? '';
+      expect(claudeBlock).toMatch(/allowed_tools/);
     });
   });
 
