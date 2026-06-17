@@ -98,13 +98,38 @@ export class JSONLScanner {
                 ...(existing?.status === 'corrupted' ? { status: 'active' } : {}),
               });
             } else {
-              // 已有元数据，只更新活跃信息
-              const meta = this.parseTail(filePath);
-              // 若此前因 JSONL 缺失被标记为 corrupted，现在文件恢复则自动重置
-              if (existing?.status === 'corrupted') {
-                (meta as any).status = 'active';
+              // v2.7+: cwd 修正检查 — reconciler 可能用 parent PWD 抢先创建 entry
+              // (session-start hook 拿不到 bg session 真实 cwd),registry.cwd 错的。
+              // 必须用 JSONL 的 first cwd (决定 project_dir) 修正,否则 /switch +
+              // resume 会用错 cwd → Claude CLI "No conversation found"。
+              //
+              // 关键:必须用 FIRST cwd,不是 latest。Claude CLI 的 project_dir 是从
+              // first cwd 算出来的,后续 cwd 变化不影响 project_dir。所以 resume 只在
+              // project_dir_first 能找到 session。
+              //
+              // 实现:读 JSONL 头 4KB 拿 first cwd (轻量,O(4KB))。
+              // 不一致时强制 parseFull 拿全部 metadata 重新填,避免部分字段 stale。
+              const jsonlFirstCwd = this.readFirstCwd(filePath);
+              if (jsonlFirstCwd && existing.cwd !== jsonlFirstCwd) {
+                logger.warn(
+                  `scanner: ${sessionId} registry.cwd=${existing.cwd} 与 JSONL first cwd=${jsonlFirstCwd} 不一致,` +
+                  `reconciler 抢先创建了 entry。force parseFull 修正`,
+                );
+                const meta = this.parseFull(filePath, sessionId);
+                this.registry.upsert(sessionId, {
+                  ...meta,
+                  jsonl_path: filePath,
+                  ...(existing?.status === 'corrupted' ? { status: 'active' } : {}),
+                });
+              } else {
+                // 已有元数据，只更新活跃信息
+                const meta = this.parseTail(filePath);
+                // 若此前因 JSONL 缺失被标记为 corrupted，现在文件恢复则自动重置
+                if (existing?.status === 'corrupted') {
+                  (meta as any).status = 'active';
+                }
+                this.registry.upsert(sessionId, meta);
               }
-              this.registry.upsert(sessionId, meta);
             }
           }
 
@@ -219,6 +244,43 @@ export class JSONLScanner {
       return truncated;
     }
     return null;
+  }
+
+  /**
+   * v2.7+: 读 JSONL 头部 4KB,提取第一个有 cwd 字段的 entry。
+   * 用作轻量的"cwd 验证"探针,避免每次 scan 都 parseFull 整个文件。
+   *
+   * 为什么用 first cwd 而不是 latest:Claude CLI 用 first cwd 算 project_dir,
+   * resume 只能在 project_dir_first 找到 session。如果 session 中途 `cd` 到别处,
+   * latest cwd ≠ first cwd,latest cwd 会让 resume 找不到 session。
+   *
+   * 4KB 头部通常足够装下几十个 entry (一行 cwd entry ~80 字节),覆盖 session
+   * 启动阶段的所有 cwd 写入。如果首条 cwd 在 4KB 之后 (极罕见,大 stub header),
+   * 返回 null,caller 跳过 cwd 修正(保守不破坏现有数据)。
+   */
+  private readFirstCwd(filePath: string): string | null {
+    const stat = statSync(filePath);
+    if (stat.size === 0) return null;
+    const readSize = Math.min(4096, stat.size);
+    const fd = openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.alloc(readSize);
+      readSync(fd, buffer, 0, readSize, 0);  // 从文件头读
+      const head = buffer.toString('utf8');
+      const lines = head.split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry.cwd) return entry.cwd;
+        } catch {
+          continue;  // 跳过 malformed 行
+        }
+      }
+      return null;  // 头部 4KB 没找到 cwd
+    } finally {
+      closeSync(fd);
+    }
   }
 
   private parseFull(filePath: string, sessionId: string): Partial<SessionEntry> {
