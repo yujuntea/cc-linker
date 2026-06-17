@@ -14,6 +14,15 @@ import {
   maskSecret,
 } from './init-feishu';
 
+export function savePermissionMode(mode: string, configPath?: string): void {
+  const existing = loadExistingConfig(configPath);
+  if (!existing.claude) existing.claude = {};
+  existing.claude.permission_mode = mode;
+  if (!existing.sdk) existing.sdk = {};
+  existing.sdk.permission_mode = mode;
+  saveConfig(existing, configPath);
+}
+
 /** Check if Claude Code hook is already installed */
 function isHookInstalled(): boolean {
   if (!existsSync(CLAUDE_SETTINGS_PATH)) return false;
@@ -43,7 +52,7 @@ interface FeishuWizardResult {
 
 export async function setup(registry: RegistryManager, opts: SetupOptions = {}): Promise<void> {
   // Calculate total steps dynamically
-  const totalSteps = opts.skipFeishu ? 2 : 3;
+  const totalSteps = opts.skipFeishu ? 3 : 4;
 
   console.log(chalk.blue('═══════════════════════════════════════════'));
   console.log(chalk.blue('  cc-linker 一键配置向导'));
@@ -51,9 +60,10 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
 
   console.log(chalk.gray('本向导将引导你完成以下配置：'));
   console.log(chalk.gray('  1. 初始化会话注册表'));
-  console.log(chalk.gray('  2. 安装 Claude Code 自动注册钩子'));
+  console.log(chalk.gray('  2. 选择 Claude Code 权限模式'));
+  console.log(chalk.gray('  3. 安装 Claude Code 自动注册钩子'));
   if (!opts.skipFeishu) {
-    console.log(chalk.gray('  3. 配置飞书 Bot（App ID + App Secret + 开机自启）'));
+    console.log(chalk.gray('  4. 配置飞书 Bot（App ID + App Secret + 开机自启）'));
   }
   console.log('');
 
@@ -69,10 +79,45 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
   console.log(chalk.green(`  ✅ 已注册 ${sessionCount} 个会话`));
   console.log('');
 
-  // ===== Step 2: Install hook =====
+  // ===== Step 2: Claude Code 权限模式 =====
+  console.log(chalk.cyan(`── Step 2/${totalSteps} ── Claude Code 权限模式`));
+  console.log('');
+  console.log(chalk.gray('  ℹ  权限模式说明:'));
+  console.log(chalk.gray('    控制 Claude Code 执行操作时的交互确认行为。'));
+  console.log(chalk.gray('    由于飞书端无法完成终端式交互确认，默认自动接受文件编辑。'));
+  console.log('');
+  console.log(chalk.gray('  可选值:'));
+  console.log(chalk.gray('    acceptEdits          (推荐) 自动接受文件编辑，最适合飞书侧使用'));
+  console.log(chalk.gray('    bypassPermissions    跳过所有权限检查，慎用'));
+  console.log(chalk.gray('    auto                 智能判断'));
+  console.log(chalk.gray('    default              使用 Claude Code 默认（可能弹出确认）'));
+  console.log(chalk.gray('    dontAsk              不询问'));
+  console.log(chalk.gray('    plan                 强制进入 plan 模式'));
+  console.log('');
+
+  const { permissionMode } = await inquirer.prompt([{
+    type: 'list',
+    name: 'permissionMode',
+    message: '请选择 Claude Code 权限模式:',
+    default: 'acceptEdits',
+    choices: [
+      { name: 'acceptEdits          (推荐) 自动接受文件编辑，最适合飞书侧使用', value: 'acceptEdits' },
+      { name: 'bypassPermissions    跳过所有权限检查，慎用', value: 'bypassPermissions' },
+      { name: 'auto                 智能判断', value: 'auto' },
+      { name: 'default              使用 Claude Code 默认（可能弹出确认）', value: 'default' },
+      { name: 'dontAsk              不询问', value: 'dontAsk' },
+      { name: 'plan                 强制进入 plan 模式', value: 'plan' },
+    ],
+  }]);
+
+  savePermissionMode(permissionMode);
+  console.log(chalk.green(`  ✅ 权限模式已设置为: ${permissionMode}（已同步到 [claude] 和 [sdk]）`));
+  console.log('');
+
+  // ===== Step 3: Install hook =====
   let hookInstalled = false;
   if (!opts.skipHook) {
-    console.log(chalk.cyan(`── Step 2/${totalSteps} ── 安装 Claude Code 钩子`));
+    console.log(chalk.cyan(`── Step 3/${totalSteps} ── 安装 Claude Code 钩子`));
 
     if (isHookInstalled()) {
       console.log(chalk.green('  ✅ Hook 已安装，跳过'));
@@ -91,11 +136,11 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
     console.log('');
   }
 
-  // ===== Step 3: Feishu Bot setup (optional) =====
+  // ===== Step 4: Feishu Bot setup (optional) =====
   let feishuResult: FeishuWizardResult = { configured: false, appId: '', started: false, autoStart: false };
 
   if (!opts.skipFeishu) {
-    console.log(chalk.cyan(`── Step 3/${totalSteps} ── 配置飞书 Bot`));
+    console.log(chalk.cyan(`── Step 4/${totalSteps} ── 配置飞书 Bot`));
     console.log('');
 
     const existingConfig = loadExistingConfig();
@@ -363,17 +408,19 @@ function printPermissionGuide(): void {
   console.log(chalk.cyan('  必需事件订阅（事件配置）:'));
   console.log(chalk.green('    im.message.receive_v1      接收用户发给 Bot 的消息'));
   console.log(chalk.green('    im.chat.member.bot.added_v1  Bot 被邀请进群时触发（可选）'));
+  console.log(chalk.yellow('    → 订阅方式: 选择「使用 长连接 接收事件」（推荐）'));
   console.log('');
   console.log(chalk.cyan('  必需事件订阅（回调配置）:'));
   console.log(chalk.green('    card.action.trigger        接收卡片按钮点击（/list 切换会话、模型切换、SDK 权限确认等）'));
+  console.log(chalk.yellow('    → 订阅方式: 选择「使用 长连接 接收回调」（推荐）'));
   console.log('');
   console.log(chalk.cyan('  必需配置:'));
   console.log(chalk.green('    ✅ 启用 Bot 能力（应用功能 → 机器人）'));
-  console.log(chalk.green('    ✅ 开启 WebSocket 模式（事件订阅 → 配置订阅方式）'));
+  console.log(chalk.green('    ✅ 开启 WebSocket 长连接（事件订阅 + 回调配置 两个 tab 都要选「长连接」）'));
   console.log(chalk.green('    ✅ 发布应用版本（版本管理与发布 → 创建版本）'));
   console.log('');
-  console.log(chalk.gray('  提示: 配置完成后，记得在「版本管理与发布」中'));
-  console.log(chalk.gray('  创建并上线一个新版本，否则权限不会生效。'));
+  console.log(chalk.yellow.bold('  ⚠️  关键提示: 配置完成后，必须在「版本管理与发布」中'));
+  console.log(chalk.yellow.bold('     创建并上线一个新版本，否则所有权限都不会生效!'));
   console.log('');
 }
 
@@ -405,10 +452,15 @@ function printSummary(sessionCount: number, hookInstalled: boolean, feishu: Feis
   if (feishu.configured) {
     console.log(chalk.cyan('  飞书端可用命令:'));
     console.log(chalk.white('    /list                — 列出会话'));
+    console.log(chalk.white('    /listDir             — 浏览目录'));
     console.log(chalk.white('    /new [路径] -- 提示  — 创建新会话'));
-    console.log(chalk.white('    /switch <序号>       — 切换会话'));
-    console.log(chalk.white('    /model               — 管理模型'));
-    console.log(chalk.white('    /status              — 查看状态'));
+    console.log(chalk.white('    /model               — 查看/管理模型'));
+    console.log(chalk.white('    /stop                — 停止当前会话处理'));
+    console.log(chalk.white('    /agents              — 查看 Agent 列表'));
+    console.log('');
+    console.log(chalk.gray('  完整命令列表：在飞书给 Bot 发 /help'));
+    console.log(chalk.gray('  💡 提示：可在飞书开放平台 → 机器人 → 自定义菜单，'));
+    console.log(chalk.gray('     把 /list、/new、/agents、/help 绑到菜单上，手机端点选更方便'));
     console.log('');
   }
 }

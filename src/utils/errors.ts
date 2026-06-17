@@ -29,6 +29,10 @@ export function handleError(err: unknown): never {
       'E011': ['会话仍在创建中，请稍后重试'],
       'E012': ['会话已损坏，请使用 /switch 切换到其他会话'],
       'E013': ['服务正在运行，请先执行 cc-linker stop 后再执行此命令'],
+      'E_SDK_NO_CLAUDE': [
+        '安装 Claude Code CLI: npm install -g @anthropic-ai/claude-code',
+        '或在 config.toml 的 [sdk] section 显式设置 claude_executable',
+      ],
     };
 
     if (suggestions[err.code]) {

@@ -1,5 +1,9 @@
 // src/agent-view/types.ts
 
+// v2.6: 透明 fork 解析
+// types-only import:运行时不构成循环依赖(fork-resolver 也会 import type ./types)
+import type { ResolvedForkSummary } from './fork-resolver';
+
 export type AgentSessionStatus = 'busy' | 'waiting' | 'idle' | 'unknown';
 
 // v2.2.1: 来源标识 — 由 ~/.claude/daemon/roster.json 的 dispatch.source 推断
@@ -30,6 +34,10 @@ export interface AgentSession {
   detail?: string;
   /** state.json.intent — 原始派发命令,detail 空时回退用 */
   intent?: string;
+  // v2.6: 透明 fork 解析
+  /** 如果这个 session 自身已死(TUI 关了)但有活 fork 在跑,这里填 fork 的摘要
+   *  UI 据此渲染 "🔄 已续接到 [new short]" 提示;handleList 据此过滤重复展示 */
+  liveFork?: ResolvedForkSummary;
 }
 
 export type AgentSessionGroup = {

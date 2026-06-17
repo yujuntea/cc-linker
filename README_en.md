@@ -199,6 +199,8 @@ Send these in a Feishu private chat with the Bot:
 
 Agent View is cc-linker's "remote session takeover" capability: from Feishu, inspect live status of any background `claude` session running on your terminal, then Peek its log tail, Reply with text, Stop the process, or Attach it back into the main chat flow. The primary data source is `~/.claude/jobs/<short>/state.json` (the authoritative state machine maintained by Claude CLI). Requires Claude Code CLI >= 2.1.139 with the daemon running.
 
+> 💡 **Fork auto-continuation** (v2.6+): when a bg session is continued via `claude --resume --fork` to a new TUI (e.g., you switch between multiple TUIs), cc-linker automatically routes your reply to the latest live session. **No manual switching needed** — `/agents` list, [Peek], [Reply], and [Attach] all work against wherever the conversation is actually running. Clicking [Reply] on an old card also auto-jumps to the fork's TUI instead of erroring with "Claude Code process exited with code 1".
+
 ### Commands and Button Semantics
 
 | Entry | Behavior |
@@ -447,6 +449,8 @@ permission_mode = "acceptEdits"
 ```
 
 **Note**: SDK mode requires the `claude` CLI to be installed on the system (`npm install -g @anthropic-ai/claude-code`). You can override the executable path with `general.claude_bin` or `sdk.claude_executable`.
+
+> cc-linker defaults to the SDK-bundled `claude` binary (guaranteed version compatibility). If that binary is omitted during install (e.g. `--omit=optional`, `NODE_ENV=production`), cc-linker automatically falls back to `general.claude_bin` (typically system PATH `claude`) and emits a WARN log. If you hit version-incompatibility issues, set `sdk.claude_executable` explicitly to a compatible path.
 
 **Additional note**: if the permission card cannot be delivered, or the user does not respond before timeout, the current implementation automatically denies that tool request.
 

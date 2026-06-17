@@ -11,6 +11,7 @@ import { extractRecentAssistantText } from './jsonl-peek';
 import { JsonlIndex } from './jsonl-name';
 import { readRoster, lookupResumeFromPath } from './roster-source';
 import { readJobState } from './job-state';
+import { resolveLiveSession } from './fork-resolver';
 
 /** Maximum list-card byte size. 飞书 card 25KB 上限;超过走 text fallback。 */
 const MAX_CARD_BYTES = 25_000;
@@ -25,12 +26,20 @@ const MAX_COMPLETED_ITEMS = 5;
  * working 只剩 4 个,3 个被推到 ... N more 后面,跟 TUI 看到的 7 working
  * 不一致)。新策略:先 groupByStatus → 各 group 内按 startedAt 倒序 → waiting/busy
  * 全部进,completed 限额到 MAX_COMPLETED_ITEMS(5)。剩余 completed 计 hasMore。
+ *
+ * v2.6: fork 续接过滤 — 有 liveFork 的 session 自身已死,新 fork 已通过 jobs/
+ * 出现在列表里。隐藏原 session 避免重复展示。
  */
 function buildCappedCard(sessions: AgentSession[], totalSessions: number): {
   card: string;
   hasMore: number;
 } {
-  const groupsAll = groupByStatus(sessions);
+  // v2.6: 过滤被 fork 续接的 session(它本身已死,新 fork 在另一个 short 上)
+  const filteredSessions = sessions.filter(s => !s.liveFork);
+  // v2.6.1: 修复 hasMore 计算 — fork 过滤掉的 session 不要再计入 "N more"
+  // 否则极端情况(全部 session 都被 fork 续接)会出现空卡 + "… 3 more" 死循环
+  const liveForkCount = sessions.length - filteredSessions.length;
+  const groupsAll = groupByStatus(filteredSessions);
   const sortByRecency = (arr: AgentSession[]) =>
     [...arr].sort((a, b) => b.startedAt - a.startedAt);
   const busySorted = sortByRecency(groupsAll.busy);
@@ -45,7 +54,7 @@ function buildCappedCard(sessions: AgentSession[], totalSessions: number): {
   };
   const hasMore = Math.max(
     0,
-    totalSessions - busySorted.length - waitingSorted.length - groupsAll.idle.length - completedCapped.length,
+    totalSessions - liveForkCount - busySorted.length - waitingSorted.length - groupsAll.idle.length - completedCapped.length,
   );
   return {
     card: buildListCard(groups, new Date().toLocaleTimeString(), hasMore),
@@ -275,18 +284,40 @@ export class AgentViewManager {
     sessionId: string,
     cwd: string,
   ): Promise<string | Record<string, unknown> | null> {
-    const session = await this.findSession(openId, sessionId);
+    // v2.6: 翻译 stale sessionId → 活 fork
+    // 用户 Peek 一个已死 session(被 fork 续接),让 Peek 显示活 fork 的状态
+    let effectiveSessionId = sessionId;
+    let effectiveShortId = shortId;
+    let forkedFrom: { short: string } | undefined;  // v2.6.1: 简化为只 short,name 字段未用
+    try {
+      const resolved = await resolveLiveSession(sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handlePeek: 翻译 ${sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        effectiveSessionId = resolved.liveFork.fullUuid;
+        effectiveShortId = resolved.liveFork.short;
+        forkedFrom = { short: resolved.liveFork.short };
+      }
+    } catch (err: any) {
+      logger.warn(`handlePeek: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
+    }
+
+    const session = await this.findSession(openId, effectiveSessionId);
     if (!session) {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return null;
     }
     const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
-    const peek = await this.resolvePeekContent(shortId, peekMaxBytes);
+    const peek = await this.resolvePeekContent(effectiveShortId, peekMaxBytes);
     const truncated = peek.text ?? '(无可用输出)';
     const buttons = {
       peek: true,
       attach: true,
-      reply: session.status === 'waiting',
+      // v2.7.4: Reply 在所有 status 都显示(对齐 TUI)。
+      // busy: rendezvous 排队;completed (idle): claude --resume 续对话。
+      // Stop 只在 busy 显示(dead session 无意义)。
+      reply: true,
       stop: session.status === 'busy',
       refresh: true,
     };
@@ -295,14 +326,15 @@ export class AgentViewManager {
       status: session.status,
       completed: session.completed,
       waitingFor: session.waitingFor,
-      shortId,
-      sessionId,
+      shortId: effectiveShortId,
+      sessionId: effectiveSessionId,
       cwd,
       pid: session.pid,
       startedAt: session.startedAt,
       recentOutput: truncated,
       outputFormat: peek.format,
       buttons,
+      ...(forkedFrom ? { forkedFrom } : {}),
     });
     return await this.sendOrFallback(
       card,
@@ -386,7 +418,8 @@ export class AgentViewManager {
       const buttons = {
         peek: true,
         attach: true,
-        reply: session.status === 'waiting',
+        // v2.7.4: Reply 在所有 status 都显示(对齐 TUI)。
+        reply: true,
         stop: session.status === 'busy',
         refresh: true,
       };
@@ -507,18 +540,30 @@ export class AgentViewManager {
     } else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sessionId)) {
       fullUuid = sessionId;
     }
-    // 0. 实时守卫(snapshot 里的 sessionId 可能是 short 或 full,都得认)
+    if (fullUuid) sessionId = fullUuid;
+    // v2.6.1: fork 解析在 snapshot 守卫 之前 — parent 可能已 dead 离开 jobs/,
+    // 但活 fork 还在。守卫直接用翻译后的 sessionId 查 fork,parent 不在也不会误报。
+    try {
+      const resolved = await resolveLiveSession(sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handleAttach: 翻译 ${sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        sessionId = resolved.liveFork.fullUuid;
+        shortId = resolved.liveFork.short;
+      }
+    } catch (err: any) {
+      logger.warn(`handleAttach: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
+    }
+    // 0. 实时守卫(用翻译后的 sessionId — parent 不在但 fork 在也 OK)
     const result = await AgentSnapshotFetcher.fetch();
     if (
       !result.ok ||
-      !result.sessions.find(s => s.sessionId === sessionId || (fullUuid && s.sessionId === fullUuid))
+      !result.sessions.find(s => s.sessionId === sessionId)
     ) {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return null;
     }
-    // 进入 CAS 阶段前,正式把 sessionId 替换成 full UUID,后续 UserManager
-    // 写入和 SDK 调用都走 full,免得 SDK 拒 short("Provided value ... is not a UUID")
-    if (fullUuid) sessionId = fullUuid;
     // v2.2.19 修正:expectedReply.clear 必须在 CAS 1 成功之后调用。
     // 旧逻辑(L415-418)在 CAS 1 之前就 clear — 如果 CAS 1 失败,用户的 pending reply
     // 已经丢失且无法恢复。新逻辑:CAS 1 成功后再 clear(CAS 1 已 null 掉 entry,
@@ -555,6 +600,7 @@ export class AgentViewManager {
       return null;
     }
     // 4. 发确认文本(busy/waiting 状态加提示)
+    // v2.6.1: 守卫已通过(用翻译后的 sessionId 查到了 fork),session 必在 result 里
     const session = result.sessions.find(s => s.sessionId === sessionId)!;
     const warning = session.status === 'busy' ? '\n⚠️ 该 session 正在处理中' : '';
     const waitingInfo =
@@ -809,24 +855,42 @@ export class AgentViewManager {
     cwd: string,
     messageId?: string,
   ): Promise<void> {
+    // v2.6: 翻译 stale sessionId → 活 fork(如有)
+    // 用户点的 [Reply] 按钮可能是历史 card,bind 的 sessionId 可能已死
+    // (TUI 关了,但 claude --resume --fork 把对话续到新 TUI)
+    let effectiveSessionId = sessionId;
+    let effectiveShortId = _shortId;
+    try {
+      const resolved = await resolveLiveSession(sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handleReplyRequest: 翻译 ${sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short} ` +
+          `(共享 JSONL: ${resolved.jsonlPath})`,
+        );
+        effectiveSessionId = resolved.liveFork.fullUuid;
+        effectiveShortId = resolved.liveFork.short;
+      }
+    } catch (err: any) {
+      logger.warn(`handleReplyRequest: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
+    }
+
     // 1. 三重守卫
     const result = await AgentSnapshotFetcher.fetch();
     if (!result.ok) {
       await this.deps.replyFn(`❌ ${result.reason}`, { openId });
       return;
     }
-    const session = result.sessions.find(s => s.sessionId === sessionId);
+    const session = result.sessions.find(s => s.sessionId === effectiveSessionId);
     if (!session) {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return;
     }
-    if (session.status !== 'waiting') {
-      await this.deps.replyFn(
-        `⚠️ 该 session 不是 waiting 状态(当前 ${session.status}),无法 reply`,
-        { openId },
-      );
-      return;
-    }
+    // v2.7.4: 移除 'status !== waiting' guard(之前在 if-block 里 bail)。
+    // Reply 在所有 status 下都允许(对齐 TUI 行为):
+    //   - busy → rendezvous 排队注入(在当前 turn 完后)
+    //   - completed (idle) → claude --resume <sessionId> 续对话,作为新 turn
+    //   - waiting → 跟之前一样直接发卡
+    // runChatSDK 内部负责跟 status 协调。
     // 2. 发交互卡 — header + 等待原因 + AI 最近输出 + [❌ 取消等待]
     //
     // v2.3.13:之前是纯文本 prompt(replyFn),用户看不到 AI 上一句问的是什么 —
@@ -840,7 +904,7 @@ export class AgentViewManager {
     // adoptExistingCard 接管错卡, fallback 走 startProcessing 新发"处理中"卡,
     // 用户看到两张卡并存。
     const peekMaxBytes = config.get<number>('agent_view.peek_max_bytes', 2048);
-    const peek = await this.resolvePeekContent(_shortId, peekMaxBytes);
+    const peek = await this.resolvePeekContent(effectiveShortId, peekMaxBytes);
     const card = buildWaitingCard({
       name: session.name,
       status: session.status,
@@ -863,7 +927,7 @@ export class AgentViewManager {
     // 其他类型(session 任意 / pending_new_session / transient)都自动清。
     try {
       await this.expectedReply.set(openId, {
-        shortId: _shortId, sessionId, cwd,
+        shortId: effectiveShortId, sessionId: effectiveSessionId, cwd,
         messageId: waitingCardMessageId ?? messageId,
       });
     } catch (err: any) {
@@ -899,19 +963,45 @@ export class AgentViewManager {
       await this.expectedReply.clear(openId);
       return;
     }
-    const session = result.sessions.find(s => s.sessionId === info.sessionId);
+    let session = result.sessions.find(s => s.sessionId === info.sessionId);
+
+    // v2.6.1: fork 解析移到状态检查之前 — 修复 P0 bug:
+    // parent 还在 jobs/ 但 status='idle'/'done'(settled)时,find 成功但 status 检查
+    // fail,fork 解析没机会跑。改成无条件先 resolve → 再 find → 再 check status。
+    // handleReplyRequest 已经翻译过一次,这里再翻译是防御性 + 支持两层链式 fork。
+    try {
+      const resolved = await resolveLiveSession(info.sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `handleReply: 翻译 stale ${info.sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        info.sessionId = resolved.liveFork.fullUuid;
+        info.shortId = resolved.liveFork.short;
+        // 重新在 snapshot 里找 fork(parent 还在时 fork 也可能不在 snapshot,要 defensive)
+        const found = result.sessions.find(s => s.sessionId === resolved.liveFork!.fullUuid);
+        if (found) session = found;
+      }
+    } catch (err: any) {
+      logger.warn(`handleReply: resolveLiveSession failed for ${info.sessionId}: ${err?.message ?? err}`);
+    }
+
     if (!session) {
       await this.expectedReply.clear(openId);
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return;
     }
+    // v2.7.4: 移除 session.completed hard bail (之前在 if-block 里 return)。
+    // Reply 在所有 status 都允许(对齐 TUI 行为):
+    //   - busy → runChatSDK 走 rendezvous 路径,在当前 turn 完后注入
+    //   - completed (idle) → runChatSDK 走 SDK fallback,claude --resume <sessionId>
+    //     续对话,作为新 turn
+    //   - waiting → 跟之前一样
+    // v2.6.1 已经软化了 'status !== waiting' 检查(只 log info,不 bail),
+    // 现在进一步把 'completed' 也软化 — 不 bail,让 runChatSDK 处理。
     if (session.status !== 'waiting') {
-      await this.expectedReply.clear(openId);
-      await this.deps.replyFn(
-        `⚠️ Claude 已切换到 ${session.status},无法 reply`,
-        { openId },
+      logger.info(
+        `handleReply: bg 状态 ${session.status} 不是 waiting,但用户在 reply mode,继续 send (runChatSDK 会处理)`,
       );
-      return;
     }
 
     // M1 FIX (P0): T2 立即 markSent, 防双重 reply during the 60s wait
@@ -925,8 +1015,14 @@ export class AgentViewManager {
     //      at the end of runChatSDK (P1-4 step, only if card init failed).
     //    In BOTH cases, the completion message is handled inside runChatSDK.
     //
-    // v2.4.x: 捕获 bgAskedNewQuestion + cardMessageId — 如果 bg 跑了并问新问题,
-    // finally clear 之后 re-set expectedReply 让用户可以直接在 chat 接着回。
+    // v2.6.1: 只在 rendezvous 路径下 re-set expectedReply
+    //   - rendezvousHandled=true: bg 还活着,daemon 没死,re-set 让用户继续 reply
+    //   - rendezvousHandled=false: SDK fallback,daemon 可能已死,re-set 没意义
+    //     (下次 runChatSDK 还会失败),让用户 re-click [Reply] 触发新流程
+    //   同时只在 bgAskedNewQuestion=true 时 re-set — cardMessageId 是新 waiting 卡
+    //   (bg 答完问新问题);bg done 时 cardMessageId 是 terminal "处理完成" 卡
+    //   → 不能当 waiting 卡用
+    let rendezvousHandled = false;
     let bgAskedNewQuestion = false;
     let newCardMessageId: string | null = null;
     let sdkError: any = null;
@@ -941,6 +1037,7 @@ export class AgentViewManager {
         isNew: false,
         fromAgentViewReply: true,
       });
+      rendezvousHandled = result.rendezvousHandled ?? false;
       bgAskedNewQuestion = result.bgAskedNewQuestion ?? false;
       newCardMessageId = result.cardMessageId ?? null;
     } catch (err: any) {
@@ -954,10 +1051,24 @@ export class AgentViewManager {
       return;
     }
 
-    // v2.4.x UX 改进: bg 跑了并问新问题 (new_needs), re-set expectedReply
-    // 让用户可以直接在 chat 接着回, 不用再点 [Reply]。新 messageId 是处理中卡
-    // transition 成等待卡的 messageId (runStreamingRendezvousReply 返的)。
-    if (bgAskedNewQuestion && newCardMessageId) {
+    // v2.6.1: 只在 rendezvous 路径下 re-set expectedReply
+    //   - rendezvousHandled=true: bg 还活着,daemon 没死,re-set 让用户继续 reply
+    //     (不强制每次点 [Reply],符合用户对 Reply 持续模式的期望)
+    //   - rendezvousHandled=false: SDK fallback,daemon 可能已死,re-set 没意义
+    //     (下次 runChatSDK 还会失败),让用户 re-click [Reply] 触发新流程
+    //
+    // 2026-06-16 修正: 移除 `rendezvousHandled` 限定条件。
+    // 真实 bug case: 用户的 bg session 没注册 rendezvous socket (`no_rendezvous_sock`),
+    // runChatSDK 走 SDK fallback (`claude --resume <uuid>`) 也能成功跑完 reply。
+    // 但旧逻辑跳过 re-set → 下次用户发文本走 handleChat → "当前没有活跃会话"。
+    //
+    // 修复: 只要 newCardMessageId 存在就 re-set。
+    //   - 这恢复了 v2.6.0 (commit 80209f6) 的行为
+    //   - 即使 bg 真死,handleReply 内的状态检查 (`session.completed` / `session` not found)
+    //     会给友好错误 "⚠️ Claude 已切换到 idle,无法 reply",不会误导用户
+    //   - `no_rendezvous_sock` ≠ daemon 死,只是这个 session 没起 rendezvous server。
+    //     SDK fallback 成功后 bg 仍然存在,用户继续 reply 完全合法
+    if (newCardMessageId) {
       try {
         await this.expectedReply.set(openId, {
           shortId: info.shortId,
@@ -966,42 +1077,12 @@ export class AgentViewManager {
           messageId: newCardMessageId,
         });
         logger.info(
-          `handleReply: bg 问新问题, re-set expectedReply with new waiting card ${newCardMessageId}`,
+          `handleReply: rendezvous 路径,re-set expectedReply for follow-up (card=${newCardMessageId}, bgAskedNewQuestion=${bgAskedNewQuestion})`,
         );
       } catch (err: any) {
-        // re-set 失败不阻塞 reply 已完成, 记日志即可
         logger.warn(`handleReply: re-set expectedReply 失败: ${err?.message ?? err}`);
       }
-    } else {
-      // v2.5 fix: 正常完成 (bg 答完没问新问题) 时, markSent 已经把 user-mapping
-      // 从 pending_agent_reply 清成 null, 没有任何逻辑把它恢复成 plain session
-      // entry, 用户再发消息会被 resolveChatTarget 判 no_target → "当前没有
-      // 活跃会话" 错误 (pre-existing bug, v2.4.x 引入 rendezvous 后才暴露出来)。
-      //
-      // 修复: 这里把 user-mapping CAS 回 {type:'session', sessionUuid, cwd}
-      // 让用户能继续对话 (走 busy-check / 正常 chat 路径)。
-      // 不带 attachedAt — 这是 from-Reply 路径,不是 from-Attach 路径。
-      try {
-        const current = this.deps.userManager.getEntry(openId) ?? null;
-        const restored: MappingEntry = {
-          type: 'session' as const,
-          sessionUuid: info.sessionId,
-          cwd: info.cwd,
-          createdAt: new Date().toISOString(),
-        };
-        const ok = await this.deps.userManager.compareAndSwap(openId, current, restored);
-        if (ok) {
-          logger.info(`handleReply: 回复完成 (no new_needs), 恢复 user-mapping 为 session entry`);
-        } else {
-          logger.warn(`handleReply: restore user-mapping CAS 失败 (stale, 无害)`);
-        }
-      } catch (e: any) {
-        logger.warn(`handleReply: restore user-mapping 异常: ${e?.message ?? e}`);
-      }
     }
-
-    // v2.4: bot.ts 的 tryRendezvousReply 或 SDK P1-4 已发送 chat-text 回复,
-    // 这里不再发送旧的完成消息。
   }
 
   /**

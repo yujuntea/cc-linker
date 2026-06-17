@@ -75,19 +75,20 @@ export function buildListCard(
           type: 'default',
         },
       ];
-      if (status === 'waiting') {
-        actions.push({
-          tag: 'button',
-          text: { tag: 'plain_text', content: 'Reply' },
-          value: {
-            tag: 'agent_view_reply_request',
-            shortId: s.sessionId.slice(0, 8),
-            sessionId: s.sessionId,
-            cwd: s.cwd,
-          },
-          type: 'primary',
-        });
-      }
+      // v2.7.4: Reply 在所有 status 下都显示(对齐 TUI 行为)
+      // 之前 status==='waiting' 才显示,busy / completed 用户无法 reply。
+      // 现在 busy: rendezvous 排队注入;completed: claude --resume 续对话。
+      actions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: 'Reply' },
+        value: {
+          tag: 'agent_view_reply_request',
+          shortId: s.sessionId.slice(0, 8),
+          sessionId: s.sessionId,
+          cwd: s.cwd,
+        },
+        type: 'primary',
+      });
       if (status === 'busy') {
         actions.push({
           tag: 'button',
@@ -199,6 +200,8 @@ export function buildPeekCard(opts: {
   recentOutput: string;
   outputFormat?: 'markdown' | 'terminal';
   buttons: { peek: boolean; attach: boolean; reply: boolean; stop: boolean; refresh: boolean };
+  /** v2.6: 如果这个 session 已死但被 fork 续接,显示"已续接到 [new short]"提示 */
+  forkedFrom?: { short: string };
 }): string {
   const statusLabel =
     opts.status === 'busy' ? '处理中'
@@ -220,6 +223,13 @@ export function buildPeekCard(opts: {
       content: recentBlock,
     },
   ];
+  // v2.6: fork 续接 annotation
+  if (opts.forkedFrom) {
+    elements.push({
+      tag: 'markdown',
+      content: `🔄 **已续接** — 对话在 TUI \`${opts.forkedFrom.short}\` 继续,原 TUI 已关闭`,
+    });
+  }
   // 按钮(根据 status 决定可见性)
   const actions: any[] = [];
   if (opts.buttons.refresh)
@@ -696,19 +706,19 @@ function renderAttachedCardJson(opts: {
       type: 'default',
     },
   ];
-  if (opts.status === 'waiting') {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: 'Reply' },
-      value: {
-        tag: 'agent_view_reply_request',
-        shortId: opts.shortId,
-        sessionId: opts.sessionId,
-        cwd: opts.cwd,
-      },
-      type: 'primary',
-    });
-  }
+  // v2.7.4: Reply 在所有 status 下都显示(对齐 TUI 行为)
+  // busy → rendezvous 排队注入,completed → claude --resume 续对话。
+  actions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: 'Reply' },
+    value: {
+      tag: 'agent_view_reply_request',
+      shortId: opts.shortId,
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+    },
+    type: 'primary',
+  });
   if (opts.status === 'busy') {
     actions.push({
       tag: 'button',

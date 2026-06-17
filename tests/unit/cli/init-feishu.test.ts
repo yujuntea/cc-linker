@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { saveConfig } from '../../../src/cli/commands/init-feishu';
 
 // We test the pure helper functions by importing them indirectly
 // Since they're not exported, we test through the module's behavior
@@ -59,6 +60,54 @@ max_pending = 100
       expect(raw).toContain('[general]');
       expect(raw).toContain('[feishu_bot]');
       expect(raw).toContain('[queue]');
+    });
+  });
+
+  describe('saveConfig with explicit configPath', () => {
+    it('places [claude] and [sdk] right after [feishu_bot] in output order', () => {
+      saveConfig(
+        {
+          general: { log_level: 'info' },
+          feishu_bot: { app_id: 'x' },
+          claude: { permission_mode: 'acceptEdits' },
+          sdk: { permission_mode: 'acceptEdits' },
+          queue: { max_pending: 100 },
+        },
+        configPath,
+      );
+      const raw = readFileSync(configPath, 'utf8');
+      const idxFeishu = raw.indexOf('[feishu_bot]');
+      const idxClaude = raw.indexOf('[claude]');
+      const idxSdk = raw.indexOf('[sdk]');
+      const idxQueue = raw.indexOf('[queue]');
+      expect(idxFeishu).toBeGreaterThan(-1);
+      expect(idxClaude).toBeGreaterThan(idxFeishu);
+      expect(idxSdk).toBeGreaterThan(idxClaude);
+      expect(idxQueue).toBeGreaterThan(idxSdk);
+    });
+
+    it('preserves [sdk].enabled when not modified', () => {
+      writeFileSync(configPath, `[claude]
+permission_mode = "default"
+allowed_tools = ["Read"]
+
+[sdk]
+enabled = false
+claude_executable = "/custom/path/claude"
+`);
+      saveConfig(
+        {
+          claude: { permission_mode: 'bypassPermissions', allowed_tools: ['Read'] },
+          sdk: { permission_mode: 'bypassPermissions', enabled: false, claude_executable: '/custom/path/claude' },
+        },
+        configPath,
+      );
+      const raw = readFileSync(configPath, 'utf8');
+      const sdkBlock = raw.match(/\[sdk\][\s\S]*?(?=\n\[|$)/)?.[0] ?? '';
+      expect(sdkBlock).toMatch(/enabled\s*=\s*false/);
+      expect(raw).toContain('claude_executable');
+      const claudeBlock = raw.match(/\[claude\][\s\S]*?(?=\n\[|$)/)?.[0] ?? '';
+      expect(claudeBlock).toMatch(/allowed_tools/);
     });
   });
 

@@ -5,6 +5,7 @@ import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { StreamParser, StreamChunk, ResultChunk } from './stream-parser';
 import { StreamAdapter, type SDKStreamChunk } from './stream-adapter';
+import { resolveClaudeExecutable, type ClaudeResolution } from './claude-executable';
 import { PermissionHandler, type PermissionPrompt } from './permission-handler';
 import { query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { writeActivityMarker, SessionActivityCache } from '../utils/session-activity';
@@ -746,7 +747,36 @@ export class ClaudeSessionManager {
       handler.onPermissionRequest = (prompt) => onPermissionRequest(prompt, handler);
 
       const permissionMode = config.get<string>('sdk.permission_mode', 'acceptEdits');
-      const claudeExecutable = config.get<string>('sdk.claude_executable', '');
+
+      // 优先级链解析 claude 二进制路径 (见 claude-executable.ts)。
+      // 抛 E_SDK_NO_CLAUDE 时 short-circuit 给出可操作消息 —— 不会进入 query(),
+      // 不会产生误导性的 "Claude SDK 执行失败"。
+      let claudeResolution: ClaudeResolution;
+      try {
+        // 适配 ConfigManager.get 的 `T | undefined` 实际返回到解析器期望的
+        // 严格 `T`(resolver 不允许 undefined 因为它在两个分支里都走 fallback)。
+        // 这里 cast 是类型层的、零运行时开销:ConfigManager.get 的实现里
+        // 总返回 `T`(有 fallback 时),TS 严格模式下把类方法返回推成 `T | undefined`。
+        claudeResolution = resolveClaudeExecutable(config as { get: <T>(key: string, fallback?: T) => T });
+      } catch (err: any) {
+        logger.error(`[sendSDKMessage] Claude binary 解析失败: ${err.message}`);
+        return {
+          result: {
+            response: `❌ ${err.message}`,
+            costUsd: 0,
+            durationMs: 0,
+            sessionId: sessionId ?? '',
+            jsonlPath: null,
+            sessionStatus: 'degraded',
+            error: err.message,
+          },
+          handler: new PermissionHandler({
+            allowedTools: config.get<string[]>('claude.allowed_tools', []),
+            disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
+            timeoutMs: config.get<number>('sdk.timeout_ms', 600_000),
+          }),
+        };
+      }
 
       let lastResult: any = null;
       let hasError = false;
@@ -759,9 +789,10 @@ export class ClaudeSessionManager {
       const hardTimeout = config.get<number>('runtime.hard_timeout_ms', 30 * 60 * 1000);
       let hardTimer: ReturnType<typeof setTimeout> | null = null;
 
-      // Build SDK options.  When claude_executable is empty (the default),
-      // omit pathToClaudeCodeExecutable so the SDK uses its own bundled
-      // binary that is guaranteed to be version-compatible.
+      // Build SDK options.  pathToClaudeCodeExecutable is always populated by
+      // resolveClaudeExecutable (sdk_bundled / sdk_configured / general_claude_bin /
+      // system_path), so the SDK no longer falls back to optional-dep auto-discovery
+      // (which can fail in --omit=optional / standalone-binary environments).
       const sdkOptions: Record<string, any> = {
         permissionMode: permissionMode as any,
         canUseTool: handler.canUseTool.bind(handler),
@@ -770,10 +801,8 @@ export class ClaudeSessionManager {
         disallowedTools: config.get<string[]>('claude.disallowed_tools', []),
         abortController,
         includePartialMessages: true,
+        pathToClaudeCodeExecutable: claudeResolution.path,
       };
-      if (claudeExecutable) {
-        sdkOptions.pathToClaudeCodeExecutable = claudeExecutable;
-      }
       if (sessionId && !isNew) {
         sdkOptions.resume = sessionId;
       }
@@ -782,9 +811,9 @@ export class ClaudeSessionManager {
       }
 
       // Diagnostic logging before spawning
-      const binarySource = claudeExecutable
-        ? `external (${claudeExecutable})`
-        : 'SDK-bundled (default)';
+      const binarySource = claudeResolution.fallback
+        ? `${claudeResolution.source} (fallback)`
+        : claudeResolution.source;
       logger.info(
         `SDK: spawning Claude — binary=${binarySource}, ` +
           `session=${sessionId ?? 'new'}, resume=${!isNew && !!sessionId}, ` +

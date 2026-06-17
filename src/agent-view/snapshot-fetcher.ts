@@ -29,6 +29,7 @@ import { readRoster, buildRosterSourceMap } from './roster-source';
 import { readClaimedSources } from './daemon-log-reader';
 import { deriveNameFromJsonl } from './jsonl-name';
 import { readAllJobStates, jobStateToSession } from './job-state';
+import { resolveLiveSession } from './fork-resolver';
 import { logger } from '../utils/logger';
 import type { AgentSession, AgentSessionSource } from './types';
 
@@ -43,6 +44,8 @@ export const _jobStateHooks = {
   readAllJobStates,
   deriveNameFromJsonl,
   readClaimedSources,
+  // v2.7: 暴露 readRoster 给 staleness detection 测试
+  readRoster,
 };
 
 export const AgentSnapshotFetcher = {
@@ -64,10 +67,13 @@ export const AgentSnapshotFetcher = {
     }
 
     // 主数据:state.json。
-    // 合并 map + filter unknown + 加 emoji prefix 在一个循环里,确保 env ↔ session
+    // 合并 map + filter unknown + staleness 检测 + 加 emoji prefix 在一个循环里,确保 env ↔ session
     // 配对始终用同一份 env(不依赖 sessionId.slice(0,8) 与 env.short 的隐含一致性,
     // 防 fork-from-active session 的 resumeSessionId 是 parent UUID 导致 prefix 漏加)。
+    //
+    // v2.7: roster 提前读(原在后面),让 staleness 检测能用 — 否则 N 次磁盘读
     const envs = await _jobStateHooks.readAllJobStates();
+    const roster = _jobStateHooks.readRoster();
     let sessions: AgentSession[] = [];
     let droppedUnknown = 0;
     const droppedStates: Set<string> = new Set();
@@ -81,11 +87,76 @@ export const AgentSnapshotFetcher = {
         droppedStates.add(String(env.state.state));
         continue;
       }
-      let name = s.name;
-      if (env.state.state === 'stopped' && !name.startsWith('🛑')) name = `🛑 ${name}`;
-      else if (env.state.state === 'done' && !name.startsWith('✅')) name = `✅ ${name}`;
-      else if (env.state.state === 'failed' && !name.startsWith('❌')) name = `❌ ${name}`;
-      sessions.push(name === s.name ? s : { ...s, name });
+
+      // v2.7+: stale state.json 检测 — bg slot 被 daemon 复用时,
+      // state.json 可能停留在旧 incarnation 的"done/blocked"状态(没有覆盖写),
+      // 导致 cc-linker 错把活 session 展示在"已完成"或"等待输入"组。
+      //
+      // 当前唯一信号 (v2.7.3 P0 修复):
+      //   Signal 1: s.sessionId !== roster.workers[short].sessionId
+      //     → bg slot reuse 后,roster 记录新进程 sessionId,state.json 没更新
+      //     → 用 roster 的 sessionId + override 为 busy
+      //
+      // Signal 2 (JSONL mtime vs state.json mtime 比较) 已在 v2.7.2/2.7.3 完全移除:
+      //   真实数据(2026-06-17 用户 ~/.claude/jobs/*/)显示 JSONL 文件 mtime 不是
+      //   bg assistant write 时间 — 它是 daemon settle event 触摸文件的时间。
+      //   state.json mtime 是 state machine transition 时间(bg ask 时 / settle 时)。
+      //   两者相对顺序对 'bg 是否在跑' 没有意义,生产环境几乎所有 settled session
+      //   都满足 'JSONL 比 state.json 新'。
+      //
+      //   之前用 5min 阈值(b049f26)有 false-positive 窗口,改用 mtime 对比(5381b40)
+      //   又把误判扩大 — round 1 错误 override 5/5 waiting,round 2 错误 override 4/5 done。
+      //   完全移除 Signal 2:Signal 1 (roster.sessionId mismatch) 已能覆盖合法的
+      //   bg slot reuse 误判场景(用户原始 P0:0abb6d98 stale blocked,roster 是新进程
+      //   sessionId)。
+      //
+      //   已知 trade-off:无法检测 "bg alive 但 state.json stale 且 roster 也没记录" 的
+      //   边角案例。这种 case 极少且会自我修正(bg 真在跑的话会 ask / settle,
+      //   state.json 也会更新)。等 Claude CLI 提供更权威的 liveness 信号再扩展。
+      //
+      // 关于 s.sessionId: 直接用 jobStateToSession 算出的 canonical sessionId
+      // (它已经做了 sessionId → resumeSessionId → env.short 的 fallback),与
+      // sessionId.slice(0,8) 在下游(liveFork 解析、source attribution)用的字段一致。
+      let overriddenSession: AgentSession | null = null;
+      // Signal 1: bg slot 被 reuse (roster.sessionId 不同于 s.sessionId)
+      // 适用于 idle 和 waiting — bg slot reuse 可能产生任意 stale state
+      const short = env.short;
+      const rosterWorker = roster?.workers?.[short];
+
+      if (
+        (s.status === 'idle' || s.status === 'waiting')
+        && rosterWorker?.sessionId
+        && s.sessionId
+        && rosterWorker.sessionId !== s.sessionId
+      ) {
+        logger.warn(
+          `[agent-view] ${short}: state.json stale (status=${s.status}) — ` +
+          `state.sessionId=${s.sessionId.slice(0, 8)} ` +
+          `vs roster.sessionId=${rosterWorker.sessionId.slice(0, 8)}; ` +
+          `bg slot reused, overriding to busy`,
+        );
+        // Immutable spread — 与文件其他地方({ ...s, name })风格一致,
+        // 避免就地修改 s 让 reviewer 困惑,也防止下游若拿到 s 引用被污染。
+        // waiting → busy 时还要清掉 waitingFor,否则 card.ts 会显示成 ❓ 等待原因
+        const { completed: _completed, waitingFor: _waitingFor, ...rest } = s;
+        overriddenSession = {
+          ...rest,
+          sessionId: rosterWorker.sessionId,
+          status: 'busy',
+          name: s.name.replace(/^[✅🛑❌]\s*/, ''),
+        };
+      }
+
+      // 仅在 NOT overridden 时加 emoji prefix — 否则 ✅ 会被加再被剥
+      if (overriddenSession) {
+        sessions.push(overriddenSession);
+      } else {
+        let name = s.name;
+        if (env.state.state === 'stopped' && !name.startsWith('🛑')) name = `🛑 ${name}`;
+        else if (env.state.state === 'done' && !name.startsWith('✅')) name = `✅ ${name}`;
+        else if (env.state.state === 'failed' && !name.startsWith('❌')) name = `❌ ${name}`;
+        sessions.push(name === s.name ? s : { ...s, name });
+      }
     }
     if (droppedUnknown > 0) {
       logger.warn(
@@ -97,7 +168,6 @@ export const AgentSnapshotFetcher = {
 
     // roster.json 给 source 标签(spare/slash/fleet);settled 后 roster 已清,
     // daemon.log claimedSources 兜底
-    const roster = readRoster();
     const rosterMap = buildRosterSourceMap(roster);
     const claimedSources = _jobStateHooks.readClaimedSources(24);
     sessions = sessions.map(s => {
@@ -124,6 +194,29 @@ export const AgentSnapshotFetcher = {
       }
       return s;
     });
+
+    // v2.6.1: 透明 fork 解析 — 给每条 session 补 liveFork
+    // v2.6.1 优化: 用 Promise.all 并行 — 之前是 sequential await,N 个 session 要 N 次 cache lookup
+    // (虽然 1s cache 让 90% 命中,但 sequential 仍要 N 个 microtask 等待)
+    // 注意:resolveLiveSession 内部有 1s 缓存,所以并行不会导致 N 次磁盘读
+    const resolveResults = await Promise.all(
+      sessions
+        .filter(s => !!s.sessionId)
+        .map(async (s) => {
+          try {
+            const r = await resolveLiveSession(s.sessionId!);
+            return { session: s, resolved: r };
+          } catch (err: any) {
+            logger.warn(`snapshot-fetcher: resolveLiveSession failed for ${s.sessionId}: ${err?.message ?? err}`);
+            return { session: s, resolved: null };
+          }
+        }),
+    );
+    for (const { session: s, resolved: r } of resolveResults) {
+      if (r?.hasLiveFork && r.liveFork) {
+        s.liveFork = r.liveFork;
+      }
+    }
 
     sessions = filterUserDispatched(sessions);
     return { ok: true, sessions };

@@ -292,6 +292,72 @@ describe('buildListCard v2.3 — group order waiting first', () => {
   });
 });
 
+// v2.7.4: Reply 按钮在所有状态下都显示(对齐 TUI 行为)
+// 之前 Reply 只在 status==='waiting' 显示。TUI (claude agents) 允许在任意
+// 状态下 reply — Feishu 也应该一致。
+describe('buildListCard — Reply on all statuses (v2.7.4)', () => {
+  function mkSession(overrides: Partial<AgentSession>): AgentSession {
+    return {
+      pid: 100, sessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+      shortId: 'aaaaaaa1', name: 'test session', cwd: '/x', status: 'busy',
+      source: 'unknown', startedAt: Date.now() - 1000,
+      ...overrides,
+    };
+  }
+
+  test('busy session: shows [Reply] button (aligning with TUI)', () => {
+    const groups: AgentSessionGroup = {
+      busy: [mkSession({ name: 'bg-active', status: 'busy' })],
+      waiting: [], idle: [], completed: [],
+    };
+    const card = JSON.parse(buildListCard(groups, 'now'));
+    const busyActionElements = card.elements.filter(
+      (e: any) => e.tag === 'action' && e.actions.some(
+        (a: any) => a.value?.tag === 'agent_view_reply_request'
+          && e.actions.some((a2: any) => a2.value?.sessionId?.startsWith('aaaaaaa1'))
+      ),
+    );
+    // 关键断言:busy session 必须有 Reply 按钮
+    expect(busyActionElements.length).toBeGreaterThan(0);
+  });
+
+  test('completed session: shows [Reply] button (claude --resume continues conversation)', () => {
+    const groups: AgentSessionGroup = {
+      busy: [], waiting: [], idle: [],
+      completed: [mkSession({
+        name: 'finished-task', status: 'idle', completed: true,
+        sessionId: 'bbbbbbb2-2222-2222-2222-222222222222',
+      })],
+    };
+    const card = JSON.parse(buildListCard(groups, 'now'));
+    // 找到 completed 组的 action block,验证包含 Reply
+    const allActions = card.elements
+      .filter((e: any) => e.tag === 'action')
+      .flatMap((e: any) => e.actions);
+    const replyBtn = allActions.find(
+      (a: any) => a.value?.tag === 'agent_view_reply_request'
+        && a.value?.sessionId === 'bbbbbbb2-2222-2222-2222-222222222222',
+    );
+    expect(replyBtn).toBeDefined();
+  });
+
+  test('waiting session (control): still shows [Reply] button', () => {
+    const groups: AgentSessionGroup = {
+      busy: [], waiting: [mkSession({
+        name: 'waiting-bg', status: 'waiting',
+        sessionId: 'ccccccc3-3333-3333-3333-333333333333',
+      })], idle: [], completed: [],
+    };
+    const card = JSON.parse(buildListCard(groups, 'now'));
+    const replyBtn = card.elements
+      .filter((e: any) => e.tag === 'action')
+      .flatMap((e: any) => e.actions)
+      .find((a: any) => a.value?.tag === 'agent_view_reply_request'
+        && a.value?.sessionId === 'ccccccc3-3333-3333-3333-333333333333');
+    expect(replyBtn).toBeDefined();
+  });
+});
+
 describe('buildPeekCard', () => {
   test('renders status + waitingFor + recentOutput', () => {
     const card = JSON.parse(
@@ -517,15 +583,16 @@ describe('buildAttachedCard', () => {
     expect(tags).not.toContain('agent_view_stop');
   });
 
-  test('idle status shows only refresh + stop_watching', () => {
+  // v2.7.4: idle status 也显示 Reply 按钮(对齐 TUI 行为 — claude --resume
+  // 续对话)。Stop 在 dead session 无意义,仍隐藏。
+  test('v2.7.4: idle status shows refresh + stop_watching + reply (no stop)', () => {
     const card = JSON.parse(buildAttachedCard({ ...baseOpts, status: 'idle' }));
     const actionEl = card.elements.find((e: any) => e.tag === 'action');
     const tags = actionEl.actions.map((a: any) => a.value.tag);
     expect(tags).toEqual(
-      expect.arrayContaining(['agent_view_refresh_peek', 'agent_view_stop_watching']),
+      expect.arrayContaining(['agent_view_refresh_peek', 'agent_view_stop_watching', 'agent_view_reply_request']),
     );
     expect(tags).not.toContain('agent_view_stop');
-    expect(tags).not.toContain('agent_view_reply_request');
   });
 
   test('shows Last watched timestamp at end', () => {

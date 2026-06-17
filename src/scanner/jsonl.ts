@@ -98,13 +98,38 @@ export class JSONLScanner {
                 ...(existing?.status === 'corrupted' ? { status: 'active' } : {}),
               });
             } else {
-              // 已有元数据，只更新活跃信息
-              const meta = this.parseTail(filePath);
-              // 若此前因 JSONL 缺失被标记为 corrupted，现在文件恢复则自动重置
-              if (existing?.status === 'corrupted') {
-                (meta as any).status = 'active';
+              // v2.7+: cwd 修正检查 — reconciler 可能用 parent PWD 抢先创建 entry
+              // (session-start hook 拿不到 bg session 真实 cwd),registry.cwd 错的。
+              // 必须用 JSONL 的 first cwd (决定 project_dir) 修正,否则 /switch +
+              // resume 会用错 cwd → Claude CLI "No conversation found"。
+              //
+              // 关键:必须用 FIRST cwd,不是 latest。Claude CLI 的 project_dir 是从
+              // first cwd 算出来的,后续 cwd 变化不影响 project_dir。所以 resume 只在
+              // project_dir_first 能找到 session。
+              //
+              // 实现:读 JSONL 头 4KB 拿 first cwd (轻量,O(4KB))。
+              // 不一致时强制 parseFull 拿全部 metadata 重新填,避免部分字段 stale。
+              const jsonlFirstCwd = this.readFirstCwd(filePath);
+              if (jsonlFirstCwd && existing.cwd !== jsonlFirstCwd) {
+                logger.warn(
+                  `scanner: ${sessionId} registry.cwd=${existing.cwd} 与 JSONL first cwd=${jsonlFirstCwd} 不一致,` +
+                  `reconciler 抢先创建了 entry。force parseFull 修正`,
+                );
+                const meta = this.parseFull(filePath, sessionId);
+                this.registry.upsert(sessionId, {
+                  ...meta,
+                  jsonl_path: filePath,
+                  ...(existing?.status === 'corrupted' ? { status: 'active' } : {}),
+                });
+              } else {
+                // 已有元数据，只更新活跃信息
+                const meta = this.parseTail(filePath);
+                // 若此前因 JSONL 缺失被标记为 corrupted，现在文件恢复则自动重置
+                if (existing?.status === 'corrupted') {
+                  (meta as any).status = 'active';
+                }
+                this.registry.upsert(sessionId, meta);
               }
-              this.registry.upsert(sessionId, meta);
             }
           }
 
@@ -219,6 +244,93 @@ export class JSONLScanner {
       return truncated;
     }
     return null;
+  }
+
+  /**
+   * v2.7+: 读 JSONL 头部,提取第一个有 cwd 字段的 entry。
+   * 用作轻量的"cwd 验证"探针,避免每次 scan 都 parseFull 整个文件。
+   *
+   * 为什么用 first cwd 而不是 latest:Claude CLI 用 first cwd 算 project_dir,
+   * resume 只能在 project_dir_first 找到 session。如果 session 中途 `cd` 到别处,
+   * latest cwd ≠ first cwd,latest cwd 会让 resume 找不到 session。
+   *
+   * 实现要点:
+   * - 读头部最多 1MB (覆盖绝大多数 session — cwd 通常在 user 消息的早期)
+   * - 用 balanced-brace counting + string awareness 找连续的 JSON objects 边界
+   *   (因为单行 JSONL 长度可达几百 KB — system prompt 等 hook content 巨大,
+   *    不能用 split('\n') 然后 JSON.parse(line),会因截断 parse 失败)
+   * - 迭代解析每个 object,找第一个有 cwd 字段的 (first object 可能是 ai-title
+   *   / agent-name 等 metadata,没有 cwd)
+   * - 超过 1MB 还没找到 → 返回 null,caller 跳过修正
+   *
+   * 真实案例 (用户 2026-06-17 截图):
+   *   48bbecc6 JSONL 5MB:
+   *     object 1 (line 1, 127B): ai-title, no cwd
+   *     object 2: agent-name, no cwd
+   *     ...
+   *     object N (line 18, ~15KB offset): user 消息, cwd=/Users/wuyujun/Git/...
+   *   旧 split('\n') + JSON.parse(line) 方案在 4KB 边界截断第一行 → parse 失败 → null
+   *   现在用 balanced-brace counting 跨过截断行 + 迭代 object 找第一个有 cwd 的。
+   */
+  private readFirstCwd(filePath: string): string | null {
+    try {
+      const stat = statSync(filePath);
+      if (stat.size === 0) return null;
+      const readSize = Math.min(1024 * 1024, stat.size);
+      const fd = openSync(filePath, 'r');
+      try {
+        const buffer = Buffer.alloc(readSize);
+        readSync(fd, buffer, 0, readSize, 0);
+        const head = buffer.toString('utf8');
+
+        // 迭代找连续的 JSON objects,直到找到第一个有 cwd 字段的
+        let pos = 0;
+        while (pos < head.length) {
+          // 跳过空白
+          while (pos < head.length && /\s/.test(head[pos])) pos++;
+          if (pos >= head.length || head[pos] !== '{') break;
+
+          // balanced-brace counting 找 object 结束位置
+          let depth = 0;
+          let inString = false;
+          let escaped = false;
+          let endIdx = -1;
+          for (let i = pos; i < head.length; i++) {
+            const ch = head[i];
+            if (inString) {
+              if (escaped) escaped = false;
+              else if (ch === '\\') escaped = true;
+              else if (ch === '"') inString = false;
+            } else {
+              if (ch === '"') inString = true;
+              else if (ch === '{') depth++;
+              else if (ch === '}') {
+                depth--;
+                if (depth === 0) { endIdx = i; break; }
+              }
+            }
+          }
+          if (endIdx === -1) {
+            // 当前 object 跨过 1MB 边界 → 读更多不划算,fallback 到 parseTail
+            return null;
+          }
+          try {
+            const entry = JSON.parse(head.slice(pos, endIdx + 1));
+            if (entry && typeof entry.cwd === 'string') return entry.cwd;
+          } catch {
+            // 罕见:balanced-brace 找到的边界 JSON 还是不合法。跳过这个 object
+            // (理论上不应该发生 — balanced-brace 跟 JSON 边界是等价的)
+          }
+          pos = endIdx + 1;  // 继续找下一个 object
+        }
+        return null;  // 头部 1MB 内没找到有 cwd 的 object
+      } finally {
+        closeSync(fd);
+      }
+    } catch (err) {
+      logger.warn(`readFirstCwd 失败: ${filePath}: ${(err as Error).message}`);
+      return null;
+    }
   }
 
   private parseFull(filePath: string, sessionId: string): Partial<SessionEntry> {

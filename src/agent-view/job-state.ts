@@ -34,6 +34,7 @@ export interface JobStateFile {
   nameSource?: 'auto' | 'user' | string;
   intent?: string;
   resumeSessionId?: string;
+  sessionId?: string;  // canonical own UUID(v2.3.7+);fork 的 child bg 用这个,resumeSessionId 是 parent 的
   daemonShort?: string;
   template?: 'bg' | 'interactive' | string;
   respawnFlags?: string[];
@@ -247,7 +248,7 @@ export function jobStateToSession(env: JobStateEnvelope): AgentSession | null {
     cwd: f.cwd ?? '',
     kind: 'background',
     startedAt: env.mtimeMs,  // 没有真启动时间;mtime 作 elapsed 近似
-    sessionId: f.resumeSessionId ?? env.short,
+    sessionId: f.sessionId ?? (f.resumeSessionId ?? env.short),
     name: f.name ?? env.short,
     status,
     source: 'unknown',

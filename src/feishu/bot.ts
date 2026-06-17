@@ -11,6 +11,7 @@ import type { AgentViewManager } from '../agent-view/manager';
 import { isAgentViewValue } from '../agent-view/action';
 import { buildBgConflictCard } from '../agent-view/card';
 import { checkRendezvousEligibility } from '../agent-view/rendezvous-fallback';
+import { resolveLiveSession } from '../agent-view/fork-resolver';
 import { RendezvousClient, type StatePatch } from '../agent-view/rendezvous-client';
 import { readLastAssistantTurn, waitForNewAssistantTurn, type LastAssistantTurn } from '../agent-view/jsonl-last-assistant';
 import { readJobState } from '../agent-view/job-state';
@@ -1532,7 +1533,21 @@ export class FeishuBot {
     bgAskedNewQuestion: boolean;
     cardMessageId: string | null;
   }> {
-    const { openId, sessionUuid, promptText, cwd, messageId } = params;
+    let { openId, sessionUuid, promptText, cwd, messageId } = params;
+    // v2.6: 翻译 stale sessionUuid → 活 fork
+    // 上游 handleReply/handleReplyRequest 已经翻译过,这里再翻译是底层兜底
+    try {
+      const resolved = await resolveLiveSession(sessionUuid);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `tryRendezvousReply: 翻译 ${sessionUuid.slice(0, 8)} → 活 fork ${resolved.liveFork.short} ` +
+          `(共享 JSONL: ${resolved.jsonlPath})`,
+        );
+        sessionUuid = resolved.liveFork.fullUuid;
+      }
+    } catch (err: any) {
+      logger.warn(`tryRendezvousReply: resolveLiveSession failed for ${sessionUuid}: ${err?.message ?? err}`);
+    }
     const short = sessionUuid.slice(0, 8);
     const eligibility = await checkRendezvousEligibility(short);
     if (!eligibility.canUse || !eligibility.rendezvousSock) {
@@ -2114,14 +2129,29 @@ export class FeishuBot {
   }> {
     const { openId, sessionUuid: inputSessionUuid, cwd, settingsPath, promptText, serialKey, isNew = false, messageId, fromAgentViewReply = false, fromAttachedChat = false } = params;
 
+    // v2.6: 防御性 fork 解析(上游 handleReply/handleReplyRequest 已翻译,
+    // tryRendezvousReply 内部也翻译,这里再翻译一次防止上游漏掉)
+    let sessionUuid = inputSessionUuid;
+    try {
+      const resolved = await resolveLiveSession(inputSessionUuid);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `runChatSDK: 翻译 ${inputSessionUuid.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        sessionUuid = resolved.liveFork.fullUuid;
+      }
+    } catch (err: any) {
+      logger.warn(`runChatSDK: resolveLiveSession failed for ${inputSessionUuid}: ${err?.message ?? err}`);
+    }
+
     // v2.4 rendezvous-first: short-circuit for Agent View Reply OR Attach-chat
     if (
       (fromAgentViewReply || fromAttachedChat) &&
       config.get<boolean>('agent_view.rendezvous_enabled', false)
     ) {
       const rv = await this.tryRendezvousReply({
-        openId, sessionUuid: inputSessionUuid, promptText,
-        cwd,  // inputSessionUuid 解构里已含 cwd (bot.ts:1820)
+        openId, sessionUuid, promptText,
+        cwd,  // sessionUuid 解构里已含 cwd (bot.ts:1820)
         messageId,
       });
       if (rv.handled) {
@@ -2142,7 +2172,7 @@ export class FeishuBot {
     // 会被 SDK 拒(报 "Provided value ... is not a UUID")。handleAttach 已尝试
     // short→full 转换,但 runChatSDK 也可能被 Reply / 旧 UserManager entry
     // 直接调用,所以这里再做一次保险转换,顺便 CAS 回写 UserManager。
-    let sessionUuid = inputSessionUuid;
+    // (v2.6 fork 翻译已在上方完成,sessionUuid 已经是活 fork 的 canonical UUID)
     if (sessionUuid && /^[0-9a-f]{8}$/.test(sessionUuid)) {
       try {
         const { JsonlIndex } = await import('../agent-view/jsonl-name');
@@ -2378,6 +2408,16 @@ export class FeishuBot {
         isNew, serialKey, settingsPath,
       );
       currentHandler = handler;
+
+      // I-1 fix: if SDK short-circuited (e.g. E_SDK_NO_CLAUDE), render an error card
+      // instead of a green success card. The sessionId is truthy (resume UUID) so we
+      // can't rely on `!result.sessionId` like the new-session path does.
+      if (result.sessionStatus === 'degraded' && cardUpdater) {
+        await cardUpdater.error(result.error ?? result.response);
+        cardMessageId = cardUpdater.getCardMessageId();
+        cardUpdater.dispose();
+        return { result, handler, cardMessageId, rendezvousHandled: false };
+      }
 
       // Defensive: if streaming text is empty but result.response has content,
       // fall back to result.response (e.g. when SDK partial messages are not emitted).

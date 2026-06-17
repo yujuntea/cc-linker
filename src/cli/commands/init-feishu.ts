@@ -139,10 +139,11 @@ export async function captureOpenId(appId: string, appSecret: string): Promise<s
   });
 }
 
-export function loadExistingConfig(): Record<string, any> {
-  if (!existsSync(CONFIG_PATH)) return {};
+export function loadExistingConfig(configPath?: string): Record<string, any> {
+  const path = configPath ?? CONFIG_PATH;
+  if (!existsSync(path)) return {};
   try {
-    return parse(readFileSync(CONFIG_PATH, 'utf8')) as Record<string, any>;
+    return parse(readFileSync(path, 'utf8')) as Record<string, any>;
   } catch {
     return {};
   }
@@ -158,14 +159,15 @@ function formatTomlValue(v: any): string {
   return JSON.stringify(v);
 }
 
-export function saveConfig(config: Record<string, any>): void {
-  const dir = dirname(CONFIG_PATH);
+export function saveConfig(config: Record<string, any>, configPath?: string): void {
+  const path = configPath ?? CONFIG_PATH;
+  const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
 
   const lines: string[] = [];
 
   // Write known sections in order
-  for (const section of ['general', 'feishu_bot', 'queue', 'runtime', 'security', 'scanner', 'cli_proxy', 'hook']) {
+  for (const section of ['general', 'feishu_bot', 'claude', 'sdk', 'queue', 'runtime', 'security', 'scanner', 'cli_proxy', 'hook']) {
     const values = config[section];
     if (!values || typeof values !== 'object') continue;
     lines.push(`[${section}]`);
@@ -174,7 +176,9 @@ export function saveConfig(config: Record<string, any>): void {
       lines.push(`${k} = ${formatTomlValue(v)}`);
     }
     lines.push('');
-    delete config[section]; // Mark as written
+
+    // Mark written
+    if (config[section]) delete config[section];
   }
 
   // Write any remaining sections
@@ -188,7 +192,7 @@ export function saveConfig(config: Record<string, any>): void {
     lines.push('');
   }
 
-  writeFileSync(CONFIG_PATH, lines.join('\n'), { mode: 0o600 });
+  writeFileSync(path, lines.join('\n'), { mode: 0o600 });
 }
 
 export async function initFeishu(): Promise<void> {

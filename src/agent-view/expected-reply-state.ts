@@ -1,4 +1,5 @@
 import type { UserManager, MappingEntry } from '../feishu/mapping';
+import { logger } from '../utils/logger';
 
 export interface ExpectedReplyInfo {
   shortId: string;
@@ -47,17 +48,37 @@ export class ExpectedReplyState {
    *     不能动的状态;清掉 SDK 收尾找不到目标 entry,sessionUuid 永远悬空。
    */
   async set(openId: string, info: ExpectedReplyInfo): Promise<void> {
+    // v2.6: fork 解析(防止 card 上是 stale sessionId,持久化前翻译)
+    // 调用方通常已翻译(handleReplyRequest/handleReply 都做了),这里是兜底
+    let effectiveInfo = info;
+    try {
+      const { resolveLiveSession } = await import('./fork-resolver');
+      const resolved = await resolveLiveSession(info.sessionId);
+      if (resolved?.hasLiveFork && resolved.liveFork) {
+        logger.info(
+          `ExpectedReply.set: 翻译 ${info.sessionId.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+        );
+        effectiveInfo = {
+          ...info,
+          sessionId: resolved.liveFork.fullUuid,
+          shortId: resolved.liveFork.short,
+        };
+      }
+    } catch (err: any) {
+      logger.warn(`ExpectedReply.set: resolveLiveSession failed for ${info.sessionId}: ${err?.message ?? err}`);
+    }
+
     const now = Date.now();
     const casToken = `${now}-${Math.random().toString(36).slice(2, 10)}`;
     const newEntry: MappingEntry = {
       type: 'pending_agent_reply',
-      sessionUuid: info.sessionId,
-      cwd: info.cwd,
+      sessionUuid: effectiveInfo.sessionId,
+      cwd: effectiveInfo.cwd,
       createdAt: new Date(now).toISOString(),
       startedAt: new Date(now).toISOString(),
       timeoutMs: this.defaultTimeoutMs,
-      shortId: info.shortId,
-      cardMessageId: info.messageId,  // v2.4: persist for crash recovery
+      shortId: effectiveInfo.shortId,
+      cardMessageId: effectiveInfo.messageId,  // v2.4: persist for crash recovery
       casToken,
     };
     // 智能 CAS:探测当前 entry
@@ -81,12 +102,14 @@ export class ExpectedReplyState {
     if (!ok) {
       throw new Error(`Failed to set expectedReply for ${openId}: CAS failed on write`);
     }
-    // in-memory
+    // in-memory — v2.6.1: 用 effectiveInfo 保持 disk(user-mapping)和 memory 一致
+    // 之前用 info.* 导致 disk 写 fork UUID、memory 留 stale,get() 返新对象所以没炸,
+    // 但任何依赖 memory 状态的代码会读到旧值,易踩坑
     const internal: InternalEntry = {
-      shortId: info.shortId,
-      sessionId: info.sessionId,
-      cwd: info.cwd,
-      messageId: info.messageId,
+      shortId: effectiveInfo.shortId,
+      sessionId: effectiveInfo.sessionId,
+      cwd: effectiveInfo.cwd,
+      messageId: effectiveInfo.messageId,
       startedAt: now,
       timeoutMs: this.defaultTimeoutMs,
       casToken,
@@ -182,10 +205,26 @@ export class ExpectedReplyState {
         // 已超时,静默删除
         await this.userManager.compareAndSwap(openId, entry, null);
       } else {
+        // v2.6: 翻译 stale sessionId → 活 fork(bot 重启续接)
+        let effectiveSessionId = entry.sessionUuid!;
+        let effectiveShortId = entry.shortId!;
+        try {
+          const { resolveLiveSession } = await import('./fork-resolver');
+          const resolved = await resolveLiveSession(entry.sessionUuid!);
+          if (resolved?.hasLiveFork && resolved.liveFork) {
+            logger.info(
+              `restoreExpectedReplyStates: 翻译 ${entry.sessionUuid!.slice(0, 8)} → 活 fork ${resolved.liveFork.short}`,
+            );
+            effectiveSessionId = resolved.liveFork.fullUuid;
+            effectiveShortId = resolved.liveFork.short;
+          }
+        } catch (err: any) {
+          logger.warn(`restoreExpectedReplyStates: resolveLiveSession failed for ${entry.sessionUuid!}: ${err?.message ?? err}`);
+        }
         // 未超时,重建
         const internal: InternalEntry = {
-          shortId: entry.shortId!,
-          sessionId: entry.sessionUuid!,
+          shortId: effectiveShortId,
+          sessionId: effectiveSessionId,
           cwd: entry.cwd || '',
           messageId: entry.cardMessageId,  // v2.4: restore from user-mapping
           startedAt,

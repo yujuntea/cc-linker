@@ -314,6 +314,11 @@ async function createBotRuntime(
     },
   });
   bot.setAgentView(agentView);
+  // v2.6: 启动迁移 user-mapping 中 stale session entries 到活 fork
+  // (在 restoreExpectedReplyStates 之前跑,这样恢复时拿到的就是翻译后的)
+  const { migrateUserMappingSessions } = await import('../../agent-view/user-mapping-migrator');
+  const migrationResult = await migrateUserMappingSessions(userManager);
+  log('INFO', `user-mapping 迁移: ${migrationResult.scanned} 扫描, ${migrationResult.migrated} 已翻译到活 fork`);
   // R8 启动恢复:从 user-mapping.json 恢复 pending_agent_reply slots
   // (清掉超时的,重建未超时的 in-memory + setTimeout)
   await agentView.restoreExpectedReplyStates();
@@ -602,6 +607,8 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
 
   console.log = (...args: any[]) => log('INFO', args.join(' '));
   console.error = (...args: any[]) => log('ERROR', args.join(' '));
+  console.warn = (...args: any[]) => log('WARN', args.join(' '));
+  console.debug = (...args: any[]) => log('DEBUG', args.join(' '));
 
   log('INFO', `Daemon child started (PID: ${pid})`);
   process.on('SIGHUP', () => {});

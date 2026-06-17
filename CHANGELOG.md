@@ -4,6 +4,115 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-06-17
+
+### Added
+
+- **setup 向导新增 Step 2 权限模式选择** (`src/cli/commands/setup.ts`) —
+  `cc-linker setup` 流程中新增 Claude Code `permission_mode` 交互式选择
+  (6 个合法值: `acceptEdits` / `bypassPermissions` / `auto` / `default`
+  / `dontAsk` / `plan`),默认 `acceptEdits`。背景说明: 飞书端无法完成
+  终端式交互确认,推荐自动接受文件编辑。结果同步写入 `[claude].permission_mode`
+  和 `[sdk].permission_mode` 两段,`[sdk].enabled` 字段不被改动,
+  其它自定义字段(`allowed_tools` / `claude_executable` 等)完整保留。
+- **`savePermissionMode(mode, configPath?)` 导出函数** (`src/cli/commands/setup.ts`) —
+  把权限模式同步写入 `~/.cc-linker/config.toml` 的 helper。接受可选
+  `configPath` 参数,便于单元测试写 tmp 目录。
+
+### Changed
+
+- **setup 向导 step 编号重排** (`src/cli/commands/setup.ts`) — 现有
+  步骤 1/2/3 重排为 1/2/3/4 (新增的权限模式是 Step 2,hook 变 Step 3,
+  飞书变 Step 4)。`totalSteps` 同步调整为 `opts.skipFeishu ? 3 : 4`。
+- **printSummary 飞书端可用命令列表更新** (`src/cli/commands/setup.ts`) —
+  从 5 个命令升级为 6 个高频命令 (`/list` / `/listDir` / `/new` / `/model`
+  / `/stop` / `/agents`),并新增 `/help` 引导和"飞书后台 → 机器人 →
+  自定义菜单"轻量推荐(把 `/list` `/new` `/agents` `/help` 绑到菜单,
+  手机端点选更方便)。`bot.ts` 的 `helpText` 保持 12 个唯一命令,
+  未受影响。
+
+### Fixed
+
+- **`saveConfig` section 输出顺序** (`src/cli/commands/init-feishu.ts`) —
+  之前 `[claude]` / `[sdk]` 段会落到"剩余 sections"块底部,跟
+  `[feishu_bot]` 视觉上分开。现在固定顺序包含 `claude` / `sdk` 在
+  `feishu_bot` 之后、`queue` 之前,与 `config.ts` DEFAULTS 的相对
+  位置一致。
+
+### Refactored
+
+- **`loadExistingConfig` / `saveConfig` 接受可选 `configPath` 参数**
+  (`src/cli/commands/init-feishu.ts`) — 两个 helper 末尾新增可选参数,
+  默认仍走 `CONFIG_PATH` 全局常量。production 代码调用点全部不传
+  `configPath` (行为不变),测试通过显式 `configPath` 写 tmp 目录,
+  绕开 `bun:test` 模块缓存问题,**避免使用 `mock.module`** (代码库
+  在 `tests/unit/feishu/bot-runsdk.test.ts:7` 明确警告 `mock.module`
+  跨文件不可撤销)。
+
+### Tests
+
+- 新增 `tests/unit/cli/setup.test.ts` — 4 个用例覆盖 `savePermissionMode`:
+  空配置创建、字段同步 + 其它字段保留、`[sdk].enabled` 不被改、空
+  配置文件新增 `[claude]`/`[sdk]` 不影响 `[feishu_bot]`。
+- `tests/unit/cli/init-feishu.test.ts` 新增 2 个用例 — `saveConfig` section
+  顺序 + `[sdk].enabled` 保留。section-bounded regex (`/\[sdk\][\s\S]*?(?=\n\[|$)/`)
+  防御 greedy 误匹配。
+
+## [0.7.0] - 2026-06-15
+
+### Added
+
+- **claude 二进制优先级链解析器** (`src/proxy/claude-executable.ts`) —
+  飞书机器人 SDK 路径在 `optional-dep` 二进制缺失时
+  (`--omit=optional` / `NODE_ENV=production` / `bun build --compile` standalone
+  binary),原本会抛 `Native CLI binary for {platform}-{arch} not found` →
+  含糊的 "Claude SDK 执行失败"。新增 `resolveClaudeExecutable(configLike, options)`
+  纯函数,4 级优先级链: `1) sdk.claude_executable → 2) SDK bundled → 3) general.claude_bin
+  → 4) throw E_SDK_NO_CLAUDE`,返回 `{ path, source, fallback }` 让运维可观测。
+  `sendSDKMessage` (`src/proxy/session.ts`) 接入后,**总是**给 SDK 传
+  `pathToClaudeCodeExecutable` (不再条件性省略),所有 4 级都产出可用路径。
+- **fallback one-shot WARN de-noise** — 模块级 `fallbackWarned` 标志,首次
+  降级打 WARN (含 3 种可操作修法),后续降级降为 INFO,避免 24/7 bot 每请求
+  一行 WARN。
+- **E_SDK_NO_CLAUDE 错误码** (`src/utils/errors.ts:32`) — 列入 `handleError`
+  suggestions 表,消息含 3 种修法 (`npm install -g cc-linker@latest
+  --include=optional` / `npm install -g @anthropic-ai/claude-code` /
+  `[sdk] claude_executable = "..."`),CLI 用户也能看到。
+- **postinstall 版本检查** (`scripts/postinstall.js`) — `npm install -g
+  cc-linker@latest` 后自动跑 `claude --version`,若 < 2.1.139 打 WARN
+  提示用户升级(Agent View 数据源 `~/.claude/jobs/<short>/state.json` 需要
+  2.1.139+)。**非阻塞**: 缺失 / 乱码 / 当前版本都静默退出。
+
+### Fixed
+
+- **bot 错误卡渲染:resume 路径** (`src/feishu/bot.ts:2385`) — 之前
+  `sendSDKMessage` 在 E_SDK_NO_CLAUDE 时无条件走 `cardUpdater.complete()` →
+  resume 用户看到绿色 "✅ 处理完成" 卡含错误文本(最差的 UX)。新增
+  `result.sessionStatus === 'degraded'` 检查,先打红色错误卡。I-1 修复。
+- **daemon console.warn/debug 路由** (`src/cli/commands/start.ts:605-606`) —
+  之前只重写 `console.log` (→INFO) 和 `console.error` (→ERROR),WARN / DEBUG
+  走默认 stderr,从未进 `cc-linker.log`。补全 2 行,首次 fallback WARN
+  现在对运维可见。
+- **WARN follow-up 消息文案** (`src/proxy/claude-executable.ts:155`) —
+  之前说"首次警告见 bot 启动早期日志"(实际 WARN 在首次 `sendSDKMessage`
+  时发出),改成"首次警告见上方日志",运维能 grep 找到。
+- **setup 脚本描述精确化** (`src/cli/commands/setup.ts`) —
+  "事件订阅 → 配置订阅方式" 太笼统,改成两个 section 各自明确
+  "→ 订阅方式: 选择「使用 长连接 接收事件/回调」（推荐）",
+  "必需配置" 那行也明确"事件订阅 + 回调配置 两个 tab 都要选「长连接」"。
+  避免用户只在一个 tab 选长连接导致静默 broken。
+- **关键提示高亮** (`src/cli/commands/setup.ts:375-376`) — "配置完成后必须
+  在版本管理与发布中创建并上线新版本,否则权限不生效" 从 `chalk.gray` 升级
+  到 `chalk.yellow.bold` + ⚠️ emoji,该 tip 是 silent-failure 的高发点。
+- **测试文件路径 import** (`tests/unit/proxy/claude-executable.test.ts`) —
+  `@/` 别名在项目里没配置(无 `bunfig.toml` / `package.json imports` /
+  `tsconfig paths`),改成相对路径,Task 1 实现后测试才能 load。
+
+### Test Coverage
+
+- 13 个 resolver 单元测试覆盖所有优先级分支、平台注入、错误消息内容、
+  one-shot de-noise 状态机。`bun test` 956/956 pass。
+
 ## [0.6.1] - 2026-06-13
 
 ### Fixed
