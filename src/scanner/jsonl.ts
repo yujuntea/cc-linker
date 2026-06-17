@@ -247,44 +247,87 @@ export class JSONLScanner {
   }
 
   /**
-   * v2.7+: 读 JSONL 头部 4KB,提取第一个有 cwd 字段的 entry。
+   * v2.7+: 读 JSONL 头部,提取第一个有 cwd 字段的 entry。
    * 用作轻量的"cwd 验证"探针,避免每次 scan 都 parseFull 整个文件。
    *
    * 为什么用 first cwd 而不是 latest:Claude CLI 用 first cwd 算 project_dir,
    * resume 只能在 project_dir_first 找到 session。如果 session 中途 `cd` 到别处,
    * latest cwd ≠ first cwd,latest cwd 会让 resume 找不到 session。
    *
-   * 4KB 头部通常足够装下几十个 entry (一行 cwd entry ~80 字节),覆盖 session
-   * 启动阶段的所有 cwd 写入。如果首条 cwd 在 4KB 之后 (极罕见,大 stub header),
-   * 返回 null,caller 跳过 cwd 修正(保守不破坏现有数据)。
+   * 实现要点:
+   * - 读头部最多 1MB (覆盖绝大多数 session — cwd 通常在 user 消息的早期)
+   * - 用 balanced-brace counting + string awareness 找连续的 JSON objects 边界
+   *   (因为单行 JSONL 长度可达几百 KB — system prompt 等 hook content 巨大,
+   *    不能用 split('\n') 然后 JSON.parse(line),会因截断 parse 失败)
+   * - 迭代解析每个 object,找第一个有 cwd 字段的 (first object 可能是 ai-title
+   *   / agent-name 等 metadata,没有 cwd)
+   * - 超过 1MB 还没找到 → 返回 null,caller 跳过修正
+   *
+   * 真实案例 (用户 2026-06-17 截图):
+   *   48bbecc6 JSONL 5MB:
+   *     object 1 (line 1, 127B): ai-title, no cwd
+   *     object 2: agent-name, no cwd
+   *     ...
+   *     object N (line 18, ~15KB offset): user 消息, cwd=/Users/wuyujun/Git/...
+   *   旧 split('\n') + JSON.parse(line) 方案在 4KB 边界截断第一行 → parse 失败 → null
+   *   现在用 balanced-brace counting 跨过截断行 + 迭代 object 找第一个有 cwd 的。
    */
   private readFirstCwd(filePath: string): string | null {
     try {
       const stat = statSync(filePath);
       if (stat.size === 0) return null;
-      const readSize = Math.min(4096, stat.size);
+      const readSize = Math.min(1024 * 1024, stat.size);
       const fd = openSync(filePath, 'r');
       try {
         const buffer = Buffer.alloc(readSize);
-        readSync(fd, buffer, 0, readSize, 0);  // 从文件头读
+        readSync(fd, buffer, 0, readSize, 0);
         const head = buffer.toString('utf8');
-        const lines = head.split('\n');
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const entry = JSON.parse(line);
-            if (entry.cwd) return entry.cwd;
-          } catch {
-            continue;  // 跳过 malformed 行
+
+        // 迭代找连续的 JSON objects,直到找到第一个有 cwd 字段的
+        let pos = 0;
+        while (pos < head.length) {
+          // 跳过空白
+          while (pos < head.length && /\s/.test(head[pos])) pos++;
+          if (pos >= head.length || head[pos] !== '{') break;
+
+          // balanced-brace counting 找 object 结束位置
+          let depth = 0;
+          let inString = false;
+          let escaped = false;
+          let endIdx = -1;
+          for (let i = pos; i < head.length; i++) {
+            const ch = head[i];
+            if (inString) {
+              if (escaped) escaped = false;
+              else if (ch === '\\') escaped = true;
+              else if (ch === '"') inString = false;
+            } else {
+              if (ch === '"') inString = true;
+              else if (ch === '{') depth++;
+              else if (ch === '}') {
+                depth--;
+                if (depth === 0) { endIdx = i; break; }
+              }
+            }
           }
+          if (endIdx === -1) {
+            // 当前 object 跨过 1MB 边界 → 读更多不划算,fallback 到 parseTail
+            return null;
+          }
+          try {
+            const entry = JSON.parse(head.slice(pos, endIdx + 1));
+            if (entry && typeof entry.cwd === 'string') return entry.cwd;
+          } catch {
+            // 罕见:balanced-brace 找到的边界 JSON 还是不合法。跳过这个 object
+            // (理论上不应该发生 — balanced-brace 跟 JSON 边界是等价的)
+          }
+          pos = endIdx + 1;  // 继续找下一个 object
         }
-        return null;  // 头部 4KB 没找到 cwd
+        return null;  // 头部 1MB 内没找到有 cwd 的 object
       } finally {
         closeSync(fd);
       }
     } catch (err) {
-      // 文件被删/权限错误等异常情况:保守返回 null,跳过 cwd 修正
-      // (现有 scan 流程也会在外层 catch 这个文件,所以这里只是 fail-soft)
       logger.warn(`readFirstCwd 失败: ${filePath}: ${(err as Error).message}`);
       return null;
     }

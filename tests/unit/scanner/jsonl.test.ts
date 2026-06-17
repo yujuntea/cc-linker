@@ -99,6 +99,51 @@ describe('JSONLScanner', () => {
     expect(entry?.cwd).toBe('/Users/test/project');
   });
 
+  it('reads cwd correctly when first user message is huge (cwd at >4KB offset)', async () => {
+    // 真实案例:48bbecc6 的 first cwd 在 line 18 (15KB) 处,因为前 14KB 是
+    // 巨大的 system prompt hook attachment。split('\n') + JSON.parse 会因为
+    // 第一行被截断而失败 — 必须用 balanced-brace counting 找 first object 边界。
+    const sessionId = 'huge-hook-test';
+    const projectDir = join(tmpDir, '.claude', 'projects', '-Users-test-huge');
+    mkdirSync(projectDir, { recursive: true });
+    const jsonlFile = join(projectDir, `${sessionId}.jsonl`);
+    // 模拟 huge hook output (~5KB) + 后面带 cwd 的 user 消息
+    const hugeHookContent = 'A'.repeat(5000);
+    const lines = [
+      JSON.stringify({
+        type: 'user',
+        attachment: { content: hugeHookContent },  // 巨大 system prompt
+        timestamp: '2026-06-17T00:00:00.000Z',
+      }),
+      JSON.stringify({
+        type: 'user',
+        cwd: '/Users/test/huge-session',  // 真正的 cwd 字段在 5KB+ 后
+        message: { content: 'start session' },
+        timestamp: '2026-06-17T00:00:01.000Z',
+      }),
+    ];
+    writeFileSync(jsonlFile, lines.join('\n'));
+
+    // Reconciler 抢先创建 entry 用错 cwd
+    registry.upsert(sessionId, {
+      origin: 'cli',
+      title: 'huge hook test',
+      cwd: '/Users/wrong',  // 错的
+      created_at: '2026-06-17T00:00:00.000Z',
+    });
+
+    const scanner = new JSONLScanner(
+      registry,
+      new Map(),
+      join(tmpDir, '.claude')
+    );
+    await scanner.scan();
+
+    const entry = registry.get(sessionId);
+    // 必须从 huge JSONL 里找到 cwd = '/Users/test/huge-session'
+    expect(entry?.cwd).toBe('/Users/test/huge-session');
+  });
+
   it('preserves first cwd when session changed cwd mid-session (project_dir is from first cwd)', async () => {
     // 真实场景:session 启动时 cwd=A,中途 Claude 切换到 cwd=B。
     // Claude CLI 用 first cwd 算 project_dir,resume 只能在 project_dir_A 找到 session。
