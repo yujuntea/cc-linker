@@ -22,6 +22,7 @@
 | **v2.1** | **2026-06-14** | **本次 patch。19 项变更：**<br>1) **§3.1 复用层** —— 实测 `claude --bg` 是真 bg session 入口（v2 假定但未验证），adapter 重写为 `Bun.spawn(['claude', '--bg', ...])`<br>2) **§4.2 work session 长生命周期** —— 每轮 `--bg` 起新 shortId 但 sessionId 跨轮不变；`panes.work` 同时追踪两者<br>3) **§5.1 JUDGE_BY_WORK / FIXING** —— 走 `RendezvousClient.injectReply()`（daemon 协议），**不**起新 bg session；v2 错误地假定用 `startSession` + `--resume`<br>4) **§6.1 PaneRegistry** —— 新增 `currentRoundShortId` 字段（每轮变）+ `sessionId` 字段（跨轮不变）<br>5) **§10.1 新增错误** —— daemon crash 检测（`~/.claude/daemon/roster.json`）+ 网络瞬态 503 重试 + CLI 版本校验<br>6) **§5.2 max_rounds 减半** —— Spec=4 / Plan=5 / Code=8 / Global=6（v2 的 8/10/15/12 跑满 ≈ 2h，太长）<br>7) **§8 Phase 1 砍 IDE** —— cc-linker 没有 HTTP 框架；Phase 1 改 CLI `--watch` 模式（rich terminal），Phase 2 再补 IDE<br>8) **§6.4 Reconciler 改保守策略** —— pane bg session 丢失 → `PANE_LOST` 状态 + CLI 询问用户（retry/abort/skip），不再直接 FAILED<br>9) **§3.3 CLI 改 subcommand group** —— 跟 `daemon` / `hook` 一致：`cc-linker review run/status/abort/report/decide/cancel/doctor` 7 个子命令<br>10) **§10.1 HUMAN_DECIDE 超时** —— 24h → 1h 默认，可配<br>11) **§9 PhaseDetector 加启发式 4** —— rawInput 含 `.ts/.py/.go` 后缀或 `line N/L:N` 引用 → 强制 code<br>12) **新增 `cc-linker review doctor`** —— 启动前验证：profile 引用的 provider 是否在 `~/.claude/providers/` + CLI 版本 + daemon 健康<br>13) **新增 `/cancel review <id>`** —— 用户飞书/CLI 中止正在跑的 review，自动清理 pane bg session（`claude stop <short>`）<br>14) **§11/§12 明确 review 不改源文件** —— Phase 1 review 只输出 Markdown 报告到 `<cwd>/.claude/reviews/<pipelineId>.md`，**不**修改用户项目源码；修改留 Phase 2 IDE<br>15) **§6.2 5 目录** —— 修 v2 写的"6 目录"，review pipeline 用 5 目录（running/human_pending/done/failed/aborted），**不**用 pending/<br>16) **§8 "1+N pane"** —— v2 写的"1+N+1 pane"改为"1+N pane"（无 arbiter）<br>17) **§12.1 Phase 1 重排** —— W6 IDE 任务删除；新增 T8 CLI `--watch` 模式任务<br>18) **§5.x R1/R2 改 self-review-and-fix + 删 ARBITRATION** —— R1/R2 先 fix 自己发现的问题再决定下一步；JUDGE_BY_WORK verdict 简化为 accept/reject 两值，由 P0/P1 rejection ratio 决定；删 ARBITRATION + JUDGE_ARBITER 两个状态；reject 直接走 HUMAN_DECIDE（不再起 arbiter bg session）<br>19) **§5.x R1/R2 拆出 FIXING 节点 + verify-first** —— R1/R2 改为 identify-only（不复修）；新增统一 FIXING 状态（source 字段区分 R1/R2/JUDGE/HUMAN 4 个调用点）；FIXING prompt 严格要求 "先验证每个 issue 是 real 还是 hallucination，对 real 的才修"；修复完成后由 source 决定下一状态（R1→R2 / R2→EXTERNAL_REVIEW / JUDGE→R1 postfix / HUMAN→R1 postfix） |
 | **v2.1 review 修正** | **2026-06-14** | **代码评审后 10 项修正：**<br>1) **§3.1 `injectReply`** —— 行号 151→实际 114；补充 `stateJsonPath` 参数说明（不传则走 legacy 长连接而非新 daemon 协议）<br>2) **§3.1/§7.5.6 `JobStateFile`** —— 磁盘 JSON 有 `output`/`sessionId` 字段但 TS 接口未声明；新增 §7.5.6 定义接口扩展方案<br>3) **§3.1 `resolvePeekContent`** —— 3 级降级→实际 4 级（linkScanPath → findJsonlForShort → roster parent → claude logs）<br>4) **§7.4 provider remediation** —— 路径错误 `~/.cc-linker/providers/` → `~/.claude/providers/`<br>5) **§7.5 新增 Output Contract** —— 定义 JSON 提取策略 + Zod schemas + parse 失败降级（状态机依赖结构化输出但之前完全没定义解析方式）<br>6) **§2.2 "不改源文件"** —— 与 FIXING prompt "修改文件" 矛盾；修正为"不自动 commit/PR，FIXING 在 cwd 内做最小化修改"<br>7) **§7 prompt** —— self_review 加 `{r1_or_r2_instruction}` 占位符区分 R1 vs R2 提示<br>8) **§5.1/§6.4 PANE_LOST** —— 单 pane 丢失（`lostPane`）→ 多 pane（`lostPanes: Array<{role, shortId}>`）<br>9) **§14 Context window** —— 新增 risk：work session 跨 8 轮 ~48 次注入 context 可能超 200k tokens + 缓解策略<br>10) **全文行号引用** —— 精确行号（`:151`/`:87`）→ 函数名引用，避免代码修改后失效 |
 | **v2.1.1** | **2026-06-15** | **v2.1 patch。6 项变更：**<br>1) **§3.1/§6.1 单一 Review 模型** —— EXTERNAL_REVIEW 阶段只 spawn 1 个 review bg session（v2.1 是 N 个并行）。`review.providers` 数组改为 `review.provider` 标量。显著简化状态机、PaneRegistry、并发控制、JUDGE verdict 计算<br>2) **§7.2 commit 前置指令** —— FIXING prompt 模板前面追加 "先 `git add -A && git commit -m 'pre-fix checkpoint by review engine'`，记录 checkpoint SHA 作为修复 baseline"，让用户能一键 `git reset --hard <sha>` 回滚<br>3) **§7.5.4 JSON parse 失败不静默** —— parse 失败 → retry 1 次（追加"严格按 JSON schema 输出"提示让 bg 重生成）→ 仍失败 → 标记 `parse_degraded: true` + 终端告警 + **排除该 review**（不再视为 0 issues）。PipelineRecord 新增 `parseDegraded[]` 字段<br>4) **§5.3/§10.1 Context Window 策略** —— 新增 context 用量检查（在 EXTERNAL_REVIEW 完成后、JUDGE_BY_WORK 注入前触发）。Profile 新增 `[guards]` 三个字段：`context_overflow_threshold_1m` / `context_overflow_threshold_default` / `context_overflow_strategy`（`reset` / `review_fix` / `abort`，默认 `reset`）<br>5) **§3.2 adapter 新增 `getContextUsage(shortId)` API** —— 读 linkScanPath 指向的 jsonl 末条 + 解析 usage；解析 `providerEnv.ANTHROPIC_MODEL` 后缀（`[1m]` / `[256k]`）拿 context 上限；复用现有 `src/agent-view/jsonl-last-assistant.ts` 解析逻辑<br>6) **§10.1 review_fix 模式约束自然满足** —— v2.1.1 单一 Review 模型后，review_fix 模式下天然就是单 session 串行执行，不再有 v2.1 中"多 review 并发写文件"的协调问题 |
+| **v2.1.1 评审反馈** | **2026-06-17** | **3 项反馈 + 1 项 I9 重设计：**<br>**反馈项**（patch 后追加）：<br>1) **§7.2 human_decide_timeout_ms 1h→4h（I10）** —— v2.1 改 1h 太激进，4h 覆盖午餐 + 半天工作场景<br>2) **§7.5.4 parse_retry_timeout 30s→15s + profile 可配（I11）** —— 默认 15s（90% retry 5-10s 完成），profile `parse_retry_timeout_ms` 可调高<br>3) **§7.5.6 / §3.2.1 等 7 个 P0 bug 修复** —— `output` 类型错（string→object）、`readLastAssistantUsage` 函数名错、executeReviewFix 引用未定义变量、model-parser 公式 num*num 冗余、signal 不可达底层、profile 缺参数、getContextUsage 注释与代码不一致等<br>4) **7 项 P1 一致性** —— 12+ 处 v2.1 review-A/B 残留、panes.review 生命周期、findDeadPanes 实现、JobStateFile 拍板等<br>**I9 重设计**（重大）：**`context_overflow_strategy` 删 `review_fix`，重设 `reset` 策略**为"杀 work + spawn 新 work + 注入 review issues + history + related docs → worker verify+fix → DONE"。理由：work session 最懂自己的代码；review 模型对代码上下文理解不如 work；新 worker 有 fresh context + 完整 issue 记忆。FIXING.source 枚举从 5 值回退到 4 值（v2.1 原设计），状态机简化 ~150 行 |
 
 > v2 的"§2 复用层（0 行新代码）"v2.1 **保留并加强**——实测 `claude --bg` + `--settings` + `--reply-on-resume` + `state.json` + `readJobState` + `RendezvousClient.injectReply` + `claude stop` + `claude logs` 全部现成可用。
 
@@ -57,7 +58,7 @@ v2.1 patch（本文档）在 v2 基础上做了 13 项修正，关键变化是**
 | G6 | **深度复用 Agent View**：实测 `claude --bg` + `--settings` + `--reply-on-resume` + `state.json` + `readJobState` + `RendezvousClient.injectReply` + `claude stop` 全部 0 行重复代码 | P0 |
 | G7 | **1+1** 个 bg session 自动出现在 `~/.claude/jobs/`，飞书 `/agents` 列表**免费**看到（Phase 2 飞书集成） | P1 |
 | G8 | **`cc-linker review doctor`** 启动前健康检查（profile 引用 + CLI 版本 + daemon 健康） | P0 |
-| G9 | **Context window 超限自动处理**（v2.1.1）：检测 work session 上下文用量，三种可配策略（`reset` 重建 work session / `review_fix` 让 review 模型 fix / `abort` 终止），避免恶性假收敛 | P0 |
+| G9 | **Context window 超限自动处理**（v2.1.1）：检测 work session 上下文用量，两种可配策略（`reset` 重建 work session + 注入 review issues 让 worker verify+fix / `abort` 终止），避免恶性假收敛 | P0 |
 
 ### 2.2 非目标
 
@@ -171,7 +172,7 @@ class ClaudeBGAdapter {
    *   - 缺 linkScanPath 或 jsonl 读失败 → null（调用方按 unavailable 处理）
    *
    * 注意：v2.1.1 当前**没有** estimate 分支（按累计 chars 估算）；如果想做，参见
-   * §13.4 v2.1.1 评审项"context overflow 三策略"的扩展空间。
+   * §13.4 v2.1.1 评审项"context overflow 策略"的扩展空间。
    */
   async getContextUsage(shortId: string): Promise<ContextUsage | null> {
     const state = await readJobState(shortId);
@@ -480,21 +481,24 @@ type ReviewState =
   // === Produce 阶段 ===
   | { kind: 'PRODUCING';         pipelineId; round: number; pane: 'work' }
   // === 自查阶段（v2.1 变更 19：identify-only，fix 在后续 FIXING 节点）===
+  // v2.1.1 I9 重设计：CONTEXT_CHECK→reset 时，新增 `injectedIssues` 字段携带 review 意见给新 worker
   | { kind: 'SELF_REVIEW_R1';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work';
-                                  contextReset?: boolean }  // v2.1.1 变更 4：context reset 后进 R1 时标记
+                                  contextReset?: boolean;       // v2.1.1 变更 4：context reset 后进 R1 时标记
+                                  injectedIssues?: Issue[] }    // v2.1.1 I9：context overflow reset 时由 engine 注入的 review 意见（让新 worker verify+fix）
   | { kind: 'SELF_REVIEW_R2';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
-  // === 修复节点（v2.1 变更 19：从 R1/R2/JUDGE/HUMAN 4 个调用点统一进入；v2.1.1 变更 4 加 CONTEXT_CHECK）===
-  | { kind: 'FIXING';            pipelineId; round: number;
-                                  pane: 'work' | 'review';  // v2.1.1 变更 4：CONTEXT_CHECK→review_fix 时是 review
-                                  source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE' | 'CONTEXT_CHECK';
+  // === 修复节点（v2.1 变更 19：从 R1/R2/JUDGE/HUMAN 4 个调用点统一进入）===
+  // v2.1.1 I9 重设计：删 CONTEXT_CHECK 路径（CONTEXT_CHECK→reset 不再走 FIXING，直接 spawn 新 worker 走 R1 with injectedIssues）
+  | { kind: 'FIXING';            pipelineId; round: number; pane: 'work';
+                                  source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE';
                                   inputIssues: Issue[] }
   // === 外审（可能并行 N 个 pane）===
   | { kind: 'EXTERNAL_REVIEW';   pipelineId; round: number; cycle: 'initial' | 'postfix';
                                   pane: { role: 'review'; shortId: string } }  // v2.1.1 变更 1：单数
   // === v2.1.1 变更 4 新增：context window 检查节点（在 EXTERNAL_REVIEW 完成后、JUDGE_BY_WORK 前）===
+  // v2.1.1 I9 重设计：删 review_fix 策略（不再让 review pane 修），保留 reset + abort
   | { kind: 'CONTEXT_CHECK';     pipelineId; round: number; pane: 'work';
                                   usage: { used: number; max: number; model: string } | null;
-                                  strategy: 'reset' | 'review_fix' | 'abort' }  // 来自 profile.guards.context_overflow_strategy
+                                  strategy: 'reset' | 'abort' }  // 来自 profile.guards.context_overflow_strategy（v2.1.1 I9 删 review_fix）
   // === 评判（v2.1 变更 18：2 值 verdict，不再有 ARBITRATION）===
   | { kind: 'JUDGE_BY_WORK';     pipelineId; round: number; pane: 'work' }
   // === v2.1 新增：pane 丢失（用户询问，不直接 FAILED）===
@@ -506,7 +510,7 @@ type ReviewState =
   | { kind: 'HUMAN_DECIDE';      pipelineId; round: number; pending: DecisionContext }
   // === 终态 ===
   | { kind: 'DONE';              pipelineId; round: number; totalCostUsd; issueTrail;
-                                  contextOverflowApplied?: 'reset' | 'review_fix' | 'abort' }  // v2.1.1 变更 4
+                                  contextOverflowApplied?: 'reset' | 'abort' }  // v2.1.1 I9：删 review_fix 值（保留 'reset' 标记 fix-by-injected-issues）
   | { kind: 'FAILED';            pipelineId; round: number; reason; totalCostUsd }
   | { kind: 'ABORTED';           pipelineId; round: number; reason; abortedBefore };
 ```
@@ -624,16 +628,15 @@ stateDiagram-v2
     FIXING --> EXTERNAL_REVIEW : verify and fix done (source R2)
     EXTERNAL_REVIEW --> CONTEXT_CHECK : all reviews done (v2.1.1)
     CONTEXT_CHECK --> JUDGE_BY_WORK : context OK
-    CONTEXT_CHECK --> FIXING : context overflow, strategy=review_fix
+    CONTEXT_CHECK --> SELF_REVIEW_R1 : context overflow, strategy=reset (round+1, new work session + injectedIssues; v2.1.1 I9)
     CONTEXT_CHECK --> ABORTED : context overflow, strategy=abort
-    CONTEXT_CHECK --> SELF_REVIEW_R1 : context overflow, strategy=reset (round+1, new work session)
     JUDGE_BY_WORK --> FIXING : verdict accept (source JUDGE)
     JUDGE_BY_WORK --> HUMAN_DECIDE : verdict reject
     FIXING --> SELF_REVIEW_R1 : fix done (source JUDGE or HUMAN), round plus 1
 
     HUMAN_DECIDE --> FIXING : user accepts (source HUMAN)
 
-    HUMAN_DECIDE --> ABORTED : user rejects or 1h timeout
+    HUMAN_DECIDE --> ABORTED : user rejects or 4h timeout
 
     PANE_LOST --> ABORTED : user abort or 24h timeout
 
@@ -823,8 +826,7 @@ stateDiagram-v2
 | **FIXING (source=R2)** | work bg done, verify+fix complete | EXTERNAL_REVIEW | 同上 | work (bg short5) |
 | **EXTERNAL_REVIEW** | all N reviews state=`done` | CONTEXT_CHECK | 收集 N 条 opinions | reviews (×N) |
 | **CONTEXT_CHECK** | work session context < threshold | JUDGE_BY_WORK | 正常路径 | work (短轮询) | 不变 |
-| **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`reset` | SELF_REVIEW_R1 | 杀 work + spawn 新 + **round += 1**，**cycle=initial** | work (新 session) | +1 |
-| **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`review_fix` | FIXING (source=CONTEXT_CHECK) | 让 review model fix；parse 失败则回退 reset | review (injectReply) | 不变 |
+| **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`reset` | SELF_REVIEW_R1 | 杀 work + spawn 新 + 注入 review issues + **round += 1**，**cycle=postfix** | work (新 session) | +1 |
 | **CONTEXT_CHECK** | work session context ≥ threshold, strategy=`abort` | ABORTED | reason=`context_overflow` | — | 不变 |
 | **JUDGE_BY_WORK** | work bg done, verdict=`accept` (P0/P1 rejection ratio < 30%) | FIXING (source=JUDGE) | 记录 accepted issues 作为 `inputIssues` | work (injectReply) |
 | **JUDGE_BY_WORK** | work bg done, verdict=`reject` (P0/P1 rejection ratio ≥ 30%) | HUMAN_DECIDE | 移到 `human_pending/` | work (injectReply) |
@@ -910,17 +912,24 @@ stateDiagram-v2
 | 0..N | 循环 FIXING → SELF_REVIEW_R1 → R2 → EXTERNAL_REVIEW → ... | 每次 R1 entry +1 | cycle 反复 |
 | round == 8 (Code phase max) | SELF_REVIEW_R1 entry | 8 | engine 检测 round ≥ max_rounds → ABORTED reason=`max_rounds_exceeded` |
 
-**review_fix 模式异常路径**（v2.1.1 变更 6，单 review 模型）：
+**reset 模式异常路径**（v2.1.1 I9 重设计：reset worker + 注入 review issues）：
 
 | t | 状态 | 事件 |
 |---|------|------|
-| 130 | EXTERNAL_REVIEW | reviews=busy×1（v2.1.1 单 review pane） |
-| 170 | CONTEXT_CHECK | work session context 超阈值，strategy=`review_fix` |
-| 170+ | FIXING (source=CONTEXT_CHECK) | engine injectReply 给 review pane 修复 prompt（10min timeout） |
-| ... | review pane 处理修复请求 | 单 session 串行执行，**无并发写冲突**（v2.1.1 简化点） |
-| 280+ | review pane parse 失败 | 兜底回退到 `executeContextReset`（杀 work + spawn 新 + round+=1） |
-| 280 | 成功 parse file_changes | engine 顺序 apply file_changes（一次只改一个文件） |
-| 280+ | DONE | contextOverflowApplied='review_fix'，跳过 R2/JUDGE/FIXING（review 自己 fix 完即 DONE） |
+| 130 | EXTERNAL_REVIEW | review=busy×1（v2.1.1 单 review pane） |
+| 170 | CONTEXT_CHECK | work session context 超阈值（`used/200K ≥ threshold`），strategy=`reset` |
+| 170+ | （reset 中） | engine 杀 work session + 收集 injectedIssues（review 提的所有 issues）+ history summary + related docs |
+| 180 | SELF_REVIEW_R1 (postfix, contextReset=true, injectedIssues=[5]) | spawn 新 work session，prompt 含 5 issues + history + docs；round+=1，cycle=postfix |
+| 180+ | （新 worker 处理） | 读每个 issue + verify-first（real vs hallucination） + fix real 的 + 输出 `{per_issue, all_real_fixed, remaining_real_unfixed_count}` |
+| 280 | DONE | contextOverflowApplied='reset'，跳过 R2/JUDGE/FIXING（worker verify+fix 完成即 DONE） |
+
+**reset 失败路径**：
+
+| t | 状态 | 事件 |
+|---|------|------|
+| 170 | CONTEXT_CHECK | work session context 超阈值，strategy=`reset` |
+| 170+ | （reset 中） | spawn 新 work session 失败（bg spawn error） |
+| 170+ | ABORTED | reason=`context_reset_spawn_failed`（无法 reset 时直接 abort，比 review_fix 失败更安全） |
 
 ### 5.4 Verdict Decision Logic（v2.1 变更 18 新增）
 
@@ -1113,12 +1122,13 @@ interface ParseDegradedEvent {  // v2.1.1 变更 3：parse 失败事件
   recoveredByRetry: boolean;    // true = retry 成功；false = 最终失败
 }
 
-interface ContextResetEvent {  // v2.1.1 变更 4：context overflow 处理事件
+interface ContextResetEvent {  // v2.1.1 变更 4 + I9：context overflow 处理事件
   ts: string;
   triggerRound: number;
   usageBefore: { used: number; max: number; model: string };
-  strategy: 'reset' | 'review_fix' | 'abort';
+  strategy: 'reset' | 'abort';  // v2.1.1 I9：删 review_fix
   checkpointSha: string | null;
+  injectedIssueCount?: number;   // v2.1.1 I9：reset 时注入给新 worker 的 issue 数量
 }
 
 interface HistoryEvent {
@@ -1220,7 +1230,7 @@ function isSameFixingTarget(pending: ReviewState, last: HistoryEvent): boolean {
 **v2.1 HUMAN_DECIDE → FIXING 期间 work session 状态**：
 - HUMAN_DECIDE 期间：work session 保持 `running` 状态（不被 stop），daemon 仍在；用户决策到达后立即 injectReply
 - 如果 HUMAN_DECIDE 期间 pane 消失：走 PANE_LOST 路径（而非 ABORTED），用户重连后可以决策 + 重新 spawn
-- 1h 超时触发 ABORTED 时：先 `claude stop` work session（防止 leak），再移到 `aborted/`
+- 4h 超时触发 ABORTED 时：先 `claude stop` work session（防止 leak），再移到 `aborted/`
 
 **v2.1 AbortController 注入路径**：
 ```typescript
@@ -1324,7 +1334,7 @@ export async function reconcile(): Promise<void> {
 | running/ 中 pipeline + 所有 pane 都还活着 | 继续推进 | 继续推进 | 幂等恢复 |
 | running/ 中 pipeline + **部分** pane 已消失 | 直接 FAILED | **PANE_LOST** + 用户决策 | 用户可能想 retry 或 skip；自动 FAILED 浪费 30min 工作 |
 | running/ 中 pipeline + **全部** pane 已消失 | FAILED | **PANE_LOST**（同样） | 同上 |
-| human_pending/ 中 pipeline | 发 IDE 通知，不主动推进 | 发 CLI watch 通知，不主动推进 | 等用户决策；超时由 `HUMAN_DECIDE_TIMEOUT` 控制（v2.1: 1h 默认） |
+| human_pending/ 中 pipeline | 发 IDE 通知，不主动推进 | 发 CLI watch 通知，不主动推进 | 等用户决策；超时由 `HUMAN_DECIDE_TIMEOUT` 控制（v2.1.1: 4h 默认） |
 
 **PANE_LOST 用户决策**（v2.1 新增交互）：
 ```
@@ -1425,7 +1435,7 @@ async function acquirePipelineSlot(profile: ReviewProfile): Promise<boolean> {
 **触发场景**：
 - 用户 `cc-linker review cancel <id>`（主动取消）
 - 用户 `cc-linker review abort <id>`（max_rounds 触发）
-- HUMAN_DECIDE 1h 超时 → ABORTED
+- HUMAN_DECIDE 4h 超时 → ABORTED
 - PANE_LOST 24h 超时 → ABORTED
 
 **Cleanup 步骤**（按顺序）：
@@ -1494,14 +1504,17 @@ provider = "kimi-for-coding"   # v2.1.1 变更 1：单数（之前是 providers[
 [guards]
 max_rounds = 6                       # v2.1 改：默认 6
 max_concurrent_pipelines = 1
-human_decide_timeout_ms = 3600000    # v2.1 改：1h 默认（v2 是 24h）
+human_decide_timeout_ms = 14400000   # v2.1.1 改：4h 默认（覆盖午餐 / 半天工作场景；v2.1 是 1h 太激进）
 p0_p1_reject_threshold = 0.30        # v2.1 新增：P0/P1 rejection ratio ≥ 30% → verdict=reject（详见 §5.4）
 
 # === v2.1.1 变更 4 新增：context overflow 策略 ===
 context_overflow_threshold_1m = 512000       # 1M+ 模型专用阈值（默认 512K ≈ 50%）
 context_overflow_threshold_default = 200000  # 其他模型阈值（默认 200K = 100%）
-context_overflow_strategy = "reset"          # "reset" | "review_fix" | "abort"（默认 reset 质量优先）
+context_overflow_strategy = "reset"          # "reset" | "abort"（v2.1.1 删 review_fix，统一走 reset+inject-issues；详见 §7.5.7.3）
 context_overflow_hysteresis_rounds = 1       # 触发后至少 N 轮不再检查（避免抖动）
+
+# === v2.1.1 新增：parse retry timeout（§7.5.4 parseBgOutputWithRetry 等待 bg 重生成）===
+parse_retry_timeout_ms = 15000               # 默认 15s（90% retry 5-10s 完成，>15s 视为结构性问题）
 
 # 可选：覆盖模型 context 上限（profile 级覆盖 adapter 内的 known map）
 [context_limits]
@@ -1787,8 +1800,9 @@ const ReviewOutputSchema = z.object({
 interface ParseRetryOptions {
   role: 'work' | 'review';
   round: number;
-  retryPrompt?: string;  // 默认追加的 retry 提示
-  maxRetries?: number;   // 默认 1
+  retryPrompt?: string;            // 默认追加的 retry 提示
+  maxRetries?: number;             // 默认 1
+  timeoutMs?: number;              // v2.1.1 新增：retry 等待 bg 重生成的 timeout（默认 15000ms，可配）
 }
 
 interface ParseSuccess<T> { ok: true; data: T; retries: number }
@@ -1809,6 +1823,7 @@ async function parseBgOutputWithRetry<T>(
   opts: ParseRetryOptions,
 ): Promise<ParseResult<T>> {
   const maxRetries = opts.maxRetries ?? 1;
+  const timeoutMs = opts.timeoutMs ?? 15_000;  // v2.1.1 改：默认 15s（原 30s 偏长）
   const retryPrompt = opts.retryPrompt ?? `
 你的上一次输出无法被解析（JSON 提取失败或 schema 不匹配）。
 请严格按指定的 JSON schema 输出，只输出 \`\`\`json ... \`\`\`，不要添加自然语言前缀。
@@ -1828,9 +1843,9 @@ async function parseBgOutputWithRetry<T>(
 
   // Retry：注入提示让 bg 重新生成
   logger.warn(`[output-contract] ${opts.role} round ${opts.round} parse failed, retrying: ${firstAttempt.error}`);
-  await bg.injectReply(retryPrompt, { timeoutMs: 30_000 });
-  // 等 bg 处理完（state=done）
-  await bg.waitForState('done', 30_000);
+  await bg.injectReply(retryPrompt, { timeoutMs });
+  // 等 bg 处理完（state=done）。timeoutMs 与 injectReply 相同，慢模型可在 profile 里调大
+  await bg.waitForState('done', timeoutMs);
 
   // 第 2 次 parse
   const secondAttempt = tryParse(bg.output, schema);
@@ -1978,9 +1993,6 @@ async function onExternalReviewComplete(pipeline: PipelineRecord): Promise<void>
     case 'reset':
       await executeContextReset(pipeline, contextCheck, profile);
       break;
-    case 'review_fix':
-      await executeReviewFix(pipeline, contextCheck, profile);
-      break;
     case 'abort':
       await executeContextAbort(pipeline, contextCheck);
       break;
@@ -2028,37 +2040,53 @@ async function checkContextOverflow(
 }
 ```
 
-##### 7.5.7.3 策略 1：`reset`（默认，质量优先）
+##### 7.5.7.3 策略 1：`reset`（默认，唯一非 abort 策略；v2.1.1 I9 重设计）
+
+**v2.1.1 I9 重设计动机**：原 v2.1.1 设计的 `review_fix` 策略（让 review pane 修）有三个问题：
+1. **质量差**：review 模型对 work session 的代码上下文理解不如 work session 自身
+2. **缺 R1 验证**：跳过 R1 后新引入的问题无法被 catch
+3. **依赖 review pane 状态**：如果 review pane 自己也出问题，整个 fallback 链崩
+
+**新设计**：context 超限时，**杀 work → spawn 新 work → 把 review 意见注入给新 worker → worker 验证+修复**。新 worker 有：
+- **fresh context**（避免旧 session 的"注意力稀释"）
+- **review 完整意见**（injectedIssues：所有 EXTERNAL_REVIEW 提的 issues）
+- **历史进度**（history summary：每轮修了什么）
+- **相关文档**（relatedDocs：review 提的 file path 列表 + 之前 work 修改的文件）
+- **之前 round 的 checkpoint**（git commit SHA 作为回滚锚点）
+
+worker 走 verify-first 流程：对每个 issue 读代码确认是 real → 修 real 的 → 输出修复结果。完成 → DONE。
 
 ```typescript
 async function executeContextReset(
   pipeline: PipelineRecord,
   contextCheck: ContextCheckResult,
-  profile: ReviewProfile,  // v2.1.1 修复：profile 必须显式传入（onExternalReviewComplete 已加载）
+  profile: ReviewProfile,
 ): Promise<void> {
   const workShortId = pipeline.panes.work!.currentRoundShortId!;
 
   // 1. snapshot cwd（work session 自身会做 git commit，但这里再保险一次）
   const checkpointSha = await snapshotCwd(pipeline.input.cwd, `pre-context-reset for pipeline ${pipeline.pipelineId}`);
 
-  // 2. 生成 round summary
-  const summary = generateRoundSummary(pipeline);  // 列出每轮修了什么 issue
+  // 2. 收集给新 worker 的"外部记忆"
+  const injectedIssues = collectAllExternalReviewIssues(pipeline);  // 来自 EXTERNAL_REVIEW state
+  const historySummary = generateRoundSummary(pipeline);          // 每轮修了什么 issue
+  const relatedDocs = collectRelatedDocs(pipeline, injectedIssues); // review 提的 file + 之前修改的 file
+  const injectedIssueCount = injectedIssues.length;
 
   // 3. kill work session
   await adapter.stop(workShortId);
   pipeline.panes.work = undefined;  // 标记为已死
 
-  // 4. spawn 新 work session with summary
-  const newWorkPrompt = `
-你的上一个 session 已被 reset（context 达到 ${contextCheck.usage.used}/${contextCheck.usage.max} tokens）。
-之前的 round summary：
-${summary}
-
-Checkpoint SHA: ${checkpointSha ?? 'N/A (non-git repo)'}
-
-请继续 review 当前 cwd 状态（从 git log 可以看到所有历史修改）。
-你处于 SELF_REVIEW_R1 round=${pipeline.state.round + 1}，请全面审查当前代码。
-`;
+  // 4. spawn 新 work session with 完整 context
+  const newWorkPrompt = buildContextResetPrompt({
+    pipelineId: pipeline.pipelineId,
+    contextUsage: contextCheck.usage,
+    checkpointSha,
+    historySummary,
+    injectedIssues,
+    relatedDocs,
+    nextRound: pipeline.state.round + 1,
+  });
   const newWork = await adapter.startSession({
     role: 'work',
     provider: profile.work.provider,
@@ -2071,108 +2099,180 @@ Checkpoint SHA: ${checkpointSha ?? 'N/A (non-git repo)'}
     provider: profile.work.provider,
     startedAt: new Date().toISOString(),
     roundShortIds: [newWork.shortId],
-    cycle: 'initial',  // 重新进入 initial cycle
+    cycle: 'postfix',  // v2.1.1 I9：cycle=postfix（不是 initial），与正常 postfix 循环同语义
   };
 
-  // 5. round += 1（进 R1 entry 时自然 +1）
+  // 5. 进 SELF_REVIEW_R1 + injectedIssues（新 worker 的 prompt 已包含 issues，verify+fix 后输出 → DONE）
   pipeline.state = {
     kind: 'SELF_REVIEW_R1',
     pipelineId: pipeline.pipelineId,
-    round: pipeline.state.round + 1,
-    cycle: 'initial',
+    round: pipeline.state.round + 1,  // R1 entry 自然 +1
+    cycle: 'postfix',
     pane: 'work',
-    contextReset: true,  // 标记这次 reset 事件
+    contextReset: true,        // 标记 reset 事件
+    injectedIssues,            // v2.1.1 I9：让 engine 在 worker 完成后能比对 issueTrail
   };
-  await pipelineStore.saveRunning(pipeline);
-  await cliWatch.notify(pipeline.pipelineId, { type: 'context_reset', ... });
-}
-```
 
-**优点**：
-- work session 仍是主修复者（设计一致性）
-- 不引入新的并发写问题（单 review 模型已解决，但保留 work session 主导也安全）
-- context 完全 fresh，R1 质量恢复
-
-**缺点**：
-- 丢失跨轮 context（通过 summary 缓解）
-- 重 spawn 慢（额外 60-90s）
-- 可能"重新发现"已修过的 issue（summary 显式标注"已修"）
-
-##### 7.5.7.4 策略 2：`review_fix`（速度优先）
-
-```typescript
-async function executeReviewFix(
-  pipeline: PipelineRecord,
-  contextCheck: ContextCheckResult,
-  profile: ReviewProfile,
-): Promise<void> {
-  const reviewShortId = pipeline.panes.review!.shortId;
-
-  // 1. injectReply 给 review model
-  // v2.1.1 单 review 模型下，天然是单 session 串行执行，无并发写冲突
-  const fixPrompt = `
-你之前 review 提了 issues。Work session 因为 context 超限（${contextCheck.usage.used}/${contextCheck.usage.max}）无法继续处理。
-
-请按优先级应用你提的 issues 的修复：
-
-1. 先 \`git status\` 检查 + \`git commit\` 当前状态作为 checkpoint
-2. 对每个 issue 应用最小化修复（verify-first：先读代码确认是 real 才修）
-3. 输出 JSON: { file_changes: [{ file, action: 'modify'|'create'|'delete', old_text, new_text }], checkpoint_sha }
-
-⚠️ 一次只改一个文件，避免大爆炸修改。
-`;
-  await adapter.injectReply({
-    shortId: reviewShortId,
-    text: fixPrompt,
-    timeoutMs: 600_000,  // 10min
+  // 6. 记录 context overflow 事件
+  pipeline.contextResets = pipeline.contextResets ?? [];
+  pipeline.contextResets.push({
+    ts: new Date().toISOString(),
+    triggerRound: pipeline.state.round - 1,  // 触发 reset 时的 round
+    usageBefore: { used: contextCheck.usage.used, max: contextCheck.usage.max, model: contextCheck.usage.model },
+    strategy: 'reset',
+    checkpointSha,
+    injectedIssueCount,
   });
 
-  // 2. 读 review session 实际 output（state.json.output.result）作为 parse 输入
-  const reviewOutput = await readReviewOutput(reviewShortId);
-
-  // 3. 解析 review model 的 fix 输出
-  const fixOutput = await parseBgOutputWithRetry(
-    { output: reviewOutput, injectReply: adapter.injectReply.bind(adapter), waitForState: adapter.waitForState.bind(adapter) },
-    ReviewFixOutputSchema,
-    { role: 'review', round: pipeline.state.round, maxRetries: 1 },
-  );
-  if (!fixOutput.ok) {
-    logger.error(`[engine] review_fix parse failed, falling back to context_reset`);
-    await executeContextReset(pipeline, contextCheck, profile);  // 兜底
-    return;
-  }
-
-  // 3. engine 顺序 apply file_changes
-  for (const change of fixOutput.data.file_changes) {
-    await applyFileChange(pipeline.input.cwd, change);
-  }
-
-  // 4. 跳过 R2/JUDGE，直接进 DONE
-  pipeline.state = {
-    kind: 'DONE',
-    pipelineId: pipeline.pipelineId,
-    round: pipeline.state.round,
-    totalCostUsd: pipeline.totalCostUsd + contextCheck.costIncurred,
-    issueTrail: pipeline.history.filter(e => e.issues).flatMap(e => e.issues ?? []),
-    contextOverflowApplied: 'review_fix',  // 标记 fix 模式
-  };
   await pipelineStore.saveRunning(pipeline);
-  await pipelineStore.moveToTerminal(pipeline);
+  await cliWatch.notify(pipeline.pipelineId, {
+    type: 'context_reset',
+    strategy: 'reset',
+    injectedIssueCount,
+    newWorkShortId: newWork.shortId,
+  });
+}
+
+/**
+ * 构建新 worker 的 prompt：
+ *   - 解释为什么被 reset（context 超限）
+ *   - 提供 history summary（避免重新发现已修 issue）
+ *   - 注入 review 完整意见（让 worker verify+fix）
+ *   - 列出相关文档（聚焦修改范围）
+ *   - 给出 verify-first + 修复指令
+ */
+function buildContextResetPrompt(ctx: {
+  pipelineId: string;
+  contextUsage: { used: number; max: number; model: string };
+  checkpointSha: string | null;
+  historySummary: string;
+  injectedIssues: Issue[];
+  relatedDocs: string[];
+  nextRound: number;
+}): string {
+  return `
+# 你的角色
+
+你是 work session for review-engine pipeline ${ctx.pipelineId}。前一个 session 因为 context 超限（${ctx.contextUsage.used}/${ctx.contextUsage.max} tokens）被 reset，你是一个**全新的 session**（context fresh）。
+
+# 你拿到的东西
+
+## 1. 之前 round 的 history summary
+${ctx.historySummary}
+
+## 2. 外部 review 模型提的 issues（你需要 verify-first + 修复 real 的）
+${ctx.injectedIssues.map((issue, i) => `
+### Issue ${i + 1} [${issue.severity}] (id: ${issue.id})
+- **Location**: ${issue.location}
+- **Description**: ${issue.description}
+- **Suggestion**: ${issue.suggestion}
+`).join('\n')}
+
+## 3. 相关文档（聚焦修改范围）
+${ctx.relatedDocs.map(doc => `- ${doc}`).join('\n')}
+
+## 4. Git checkpoint（修复前状态可回滚到此 SHA）
+${ctx.checkpointSha ?? 'N/A (non-git repo)'}
+
+# 你要做的事
+
+## Step 1: 严格 verify-first（每个 issue 都必须走）
+1. 重新读 issue 涉及的代码 / 上下文
+2. 判断是 **real**（真问题）还是 **hallucination**（review 模型的幻觉）
+3. 常见 hallucination：review 误读了代码 / review 提出了 spec 之外的不合理要求 / review 套用了错误的最佳实践
+
+## Step 2: 修复（仅 real 的）
+- 对 real 的 issue 应用**最小化修改**（只解决该 issue，不做额外改动）
+- 修改前先 \`git status\` 检查 + 必要时 \`git add -A && git commit -m 'pre-fix checkpoint'\`（在 verify-first preamble 控制下）
+
+## Step 3: 输出 JSON
+\`\`\`json
+{
+  "per_issue": [
+    {
+      "issue_id": "review-1",
+      "verdict": "real" | "hallucination",
+      "verdict_reason": "为什么判定为 real/hallucination",
+      "fix_applied": true | false,
+      "fix_summary": "修改了什么（如有）"
+    }
+  ],
+  "all_real_fixed": true | false,
+  "remaining_real_unfixed_count": 0
+}
+\`\`\`
+
+# 完成后
+
+Engine 会读你的 output，verify-first + 全部 fix → DONE（跳过 R2/JUDGE，因为 fix 是 verify 过的）。
+如果有 hallucination 或 fix 失败 → 走正常 R1→R2→ExtRev→Judge 链继续。
+
+# 注意
+
+- 你现在在 SELF_REVIEW_R1 round=${ctx.nextRound}（postfix cycle）
+- **不要**重新 R1 全面审查（history summary 已说明前几轮做了什么）
+- **不要**修 injectedIssues 之外的内容（除非你发现新 issue）
+- 如果注入的 issues 都已修过或不存在，输出 \`all_real_fixed: true, remaining_real_unfixed_count: 0\`
+`;
+}
+
+/**
+ * 收集 pipeline 走过的所有 EXTERNAL_REVIEW 提的 issues（去重 + 按 severity 排序）
+ */
+function collectAllExternalReviewIssues(pipeline: PipelineRecord): Issue[] {
+  const seen = new Set<string>();
+  const result: Issue[] = [];
+  for (const event of pipeline.history) {
+    if (event.role === 'review' && event.issues) {
+      for (const issue of event.issues) {
+        const key = `${issue.id}-${issue.location}-${issue.description}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          result.push(issue);
+        }
+      }
+    }
+  }
+  return result.sort((a, b) => severityOrder(a.severity) - severityOrder(b.severity));
+}
+
+function collectRelatedDocs(pipeline: PipelineRecord, issues: Issue[]): string[] {
+  const files = new Set<string>();
+  // review issues 提的 file
+  for (const issue of issues) {
+    if (issue.location.includes(':') || issue.location.includes('/')) {
+      files.add(issue.location.split(':')[0]);
+    }
+  }
+  // 之前 history 里 work 修改的 file（从 inputDigest/outputDigest 推断——这里简化为只取 issues 提的）
+  return Array.from(files).slice(0, 20);  // 上限 20 个 file
+}
+
+function severityOrder(s: 'P0' | 'P1' | 'P2' | 'P3'): number {
+  return { P0: 0, P1: 1, P2: 2, P3: 3 }[s];
 }
 ```
 
+**新 reset 策略的优缺点**：
+
 **优点**：
-- 快（不重 spawn）
-- review 模型的 review 输出是 fix 的"现成输入"（无需重新分析代码）
+- **work session 仍是主修复者**（work 最懂自己写的代码，质量保证）
+- **context 完全 fresh**（避免旧 session 的"注意力稀释"恶性假收敛）
+- **零信任 review 模型**：让 review 当"输入"（issue 列表），work 仍当"裁判"（verify 决定修不修）
+- **复用现有 FIXING 行为**（verify-first prompt + schema + 解析），无需新代码路径
+- **新 worker 不依赖 review pane 状态**（review pane 已 done，已收集 issues 即可）
 
 **缺点**：
-- 失去 work session 的 fix 质量（work session 最懂自己写的代码）
-- 没有新一轮 R1 验证，可能漏掉新引入的问题
-- review 模型对 work session 的代码上下文理解不如 work session 自身
+- 重 spawn 慢（额外 60-90s）—— 但比"恶性假收敛"省心
+- 新 worker 需要重新 read 文件来 verify issues（已通过 relatedDocs 缩小范围）
+- injectedIssues 数量很多时 prompt 体积大（如果 review 提 50+ issues，可考虑 top-N only）
 
-**v2.1.1 单 review 模型后**：review_fix 模式下天然是单 session 串行执行，无并发写问题（详见 §10.1 简化说明）。
+**v2.1.1 I9 简化效果**：
+- 删 `review_fix` 策略（1 个完整实现路径砍掉，约 100-150 行）
+- 状态机简化（CONTEXT_CHECK→FIXING(source=CONTEXT_CHECK) 路径不存在）
+- FIXING source 枚举从 5 个值回退到 4 个值（v2.1 原设计）
 
-##### 7.5.7.5 策略 3：`abort`（保守）
+##### 7.5.7.4 策略 2：`abort`（保守）
 
 ```typescript
 async function executeContextAbort(
@@ -2194,7 +2294,7 @@ async function executeContextAbort(
   cliWatch.notify(pipeline.pipelineId, {
     type: 'aborted',
     reason: 'context_overflow',
-    suggestion: '建议：调整 max_rounds / 改用 context_overflow_strategy="reset" / 升级到 1M 模型',
+    suggestion: '建议：调整 max_rounds / 升级到 1M 模型 / 让 work session 把任务拆细减少单次 context',
   });
 }
 ```
@@ -2371,12 +2471,12 @@ cc-linker review run "..."                # 自动识别失败抛 PhaseUnknownEr
 | **Issue 数过多** | 50+ issues | 自动按 severity 截断到 top 10 + 提示"还有 N 条未列出" |
 | **磁盘写入失败** | PipelineStore 原子写失败 | 立即停止状态机推进；状态保留在内存；终端输出 ❌ + 提示重试 |
 | **进程崩溃** | cc-linker SIGKILL | Reconciler 扫描 running/ 恢复 |
-| **人工决策超时** | HUMAN_DECIDE 1h 未响应（v2.1: 24h→1h） | 自动 ABORTED `human_decision_timeout` |
+| **人工决策超时** | HUMAN_DECIDE 4h 未响应（v2.1: 1h，v2.1.1: 4h） | 自动 ABORTED `human_decision_timeout` |
 | **pane 丢失超时** | PANE_LOST 24h 未决策（v2.1 新增） | 自动 ABORTED `pane_lost_timeout` |
 | **max_rounds 达到** | 计数器到上限 | 自动 ABORTED `max_rounds_exceeded` |
 | **CLI watch 客户端断连** | 用户 Ctrl-C | engine 继续在后台跑，pipeline 不中断（v2.1 设计目标） |
 | **AbortController 触发**（v2.1 新增） | 用户 `cc-linker review cancel` 或 pipeline 超时未响应 | `adapter.poll` 收到 abort signal 立即抛 `AbortError`；`adapter.injectReply` 当前 v2.1.1 不支持 signal，会跑满 timeoutMs（默认 60s）。engine catch 后调 cleanup（见 §6.4 PANE_LOST retry 中的 cancel 路径） |
-| **Context window 超限**（v2.1.1 变更 4 新增） | work session 跨多轮后 context 用量达到 profile.guards 阈值 | 在 EXTERNAL_REVIEW → JUDGE_BY_WORK 转换前触发 `checkContextOverflow` → 按 `context_overflow_strategy` 走 reset / review_fix / abort 三策略（详见 §7.5.7）。**注意**：默认 `reset` 策略需要重新 spawn work session（增加 ~60-90s + round 计数 +1） |
+| **Context window 超限**（v2.1.1 变更 4 + I9） | work session 跨多轮后 context 用量达到 profile.guards 阈值 | 在 EXTERNAL_REVIEW → JUDGE_BY_WORK 转换前触发 `checkContextOverflow` → 按 `context_overflow_strategy` 走 reset / abort 两策略（详见 §7.5.7）。**注意**：默认 `reset` 策略会杀 work + spawn 新 work + 注入 review issues（增加 ~60-90s + round 计数 +1）。v2.1.1 I9 删 review_fix 策略（改为让 worker verify+fix） |
 
 ### 10.2 Graceful degradation vs fail fast（v2.1 与 v2 一致）
 
@@ -2388,14 +2488,25 @@ cc-linker review run "..."                # 自动识别失败抛 PhaseUnknownEr
 | Profile 加载失败 | **Fail fast**：CLI 立即退出码 1 | 错误配置不该跑 pipeline |
 | Provider 配置文件 schema 错 | **Fail fast**：profile.load 验证 JSON schema | 错配置会污染整轮 review |
 
-### 10.1.1 review_fix 模式约束（v2.1.1 变更 6 显式说明）
+### 10.1.1 reset 模式约束（v2.1.1 I9 重设计）
 
-**v2.1.1 简化**：单一 Review 模型后，`context_overflow_strategy = "review_fix"` 模式下天然满足"单 review session 串行执行"，无需 v2.1 设计的 git branch / merge 协调机制。
+**v2.1.1 I9 设计**：原 `review_fix` 策略（让 review pane 修）被替换为新的 `reset` 策略（**让 work pane 修**——杀旧 work + spawn 新 work + 注入 review issues + history + docs）。理由：
+- work session 最懂自己写的代码，**修的质量 > review session**
+- 单一 review 模型后 review 提的 issues 是确定的输入，**work verify+fix** 是更可控的路径
+- 避免 v2.1 中"多 review 并发写文件"的协调问题（v2.1.1 删 review_fix 后此问题自然不存在）
 
-- 多个 review pane 并行 fix → 同一文件可能被多个 process 同时写（v2.1 隐患）
-- v2.1.1 单一 Review 模型后：只有 1 个 review session 在做 fix，串行执行（review session 是阻塞的 injectReply + waitForState），即使 review_fix 策略下也无需额外并发控制
+**新 reset 模式的 3 个关键不变量**：
+1. **work session 仍是唯一修复者**（quality ownership 不分散）
+2. **context fresh 但 issue 记忆保留**（injectedIssues + history summary + related docs）
+3. **verify-first 不变**（worker 仍要走 real vs hallucination 判断，不是 review 说什么就修什么）
 
-**注意**：如未来要重新支持多 review 模型（review.providers = [...] 数组），review_fix 模式下需要重新引入并发写约束：每个 review model 在独立 git branch 上 fix，engine 3-way merge 或人工合并。详见 §7.5.7 策略 2。
+**v2.1.1 I9 简化效果**：
+- 删 `review_fix` 策略（1 个完整路径砍掉，约 100-150 行代码）
+- 状态机简化（CONTEXT_CHECK→FIXING(source=CONTEXT_CHECK) 路径不存在）
+- FIXING.source 枚举从 5 个值回退到 4 个值（与 v2.1 原设计一致）
+- profile 配置从 3 选 1（reset/review_fix/abort）简化为 2 选 1（reset/abort）
+
+**注意**：如未来要重新支持多 review 模型（`review.providers = [...]` 数组），需要在状态机里重新引入"哪个 review 提的 issues 优先修"的判定逻辑。详见 §7.5.7.3 末尾"新 reset 策略的优缺点"。
 
 ### 10.3 Retry 策略（v2.1 强化）
 
@@ -2428,7 +2539,7 @@ function isTransientError(err: Error): boolean {
 
 ```bash
 # 1. pipeline 进入 HUMAN_DECIDE 后，CLI 输出：
-#   ⏸️ Pipeline 01HXYZK9... 等待人工决策（默认 1h 超时）
+#   ⏸️ Pipeline 01HXYZK9... 等待人工决策（默认 4h 超时）
 #   Issue 1: <description>  (Review A 提出)
 #   Issue 2: <description>  (Review B 提出)
 #   Work verdict: reject (P0/P1 rejection ratio ≥ 30%)
@@ -2494,7 +2605,7 @@ cc-linker review doctor
 5. **单一 review pane 流程**（v2.1.1 变更 1 新增）：验证 EXTERNAL_REVIEW 只 spawn 1 个 review pane（不是 N 个并行）；`review.provider` 单数配置正确解析
 6. **commit preamble + checkpoint SHA**（v2.1.1 变更 2 新增）：验证 FIXING 启动前 work session 做了 git commit；`fixingCheckpointSha` 字段被正确写入 HistoryEvent
 7. **JSON parse retry + parse_degraded**（v2.1.1 变更 3 新增）：模拟 bg session 输出非合法 JSON → 触发 retry 1 次 → 仍失败 → 标记 `parse_degraded: true` + 排除该 review
-8. **context overflow 三策略**（v2.1.1 变更 4 新增）：模拟 work session context 超阈值，分别验证 reset / review_fix / abort 三种策略路径
+8. **context overflow 策略 + injectedIssues**（v2.1.1 变更 4 + I9）：模拟 work session context 超阈值，分别验证 reset（杀 work + 注入 review issues + 新 worker verify+fix → DONE）/ abort（cleanup → ABORTED）两种策略路径。reset 路径需要 mock injectedIssues 收集 + 新 worker spawn + verify-first 解析
 
 ### 11.3 单测覆盖目标
 
@@ -2653,7 +2764,7 @@ T4 Adapter ──────────┘        ↓
 - [ ] **单一 review 模型**：v2.1.1 后 `review.provider` 是单数标量（不是数组），EXTERNAL_REVIEW 只 spawn 1 个 review pane。是否确认 v2.1 的多 review 用户能平滑迁移到 v2.1.1？如未来要重新支持 N reviews，review_fix 模式下需要重新引入并发写约束
 - [ ] **commit preamble**：FIXING 启动前 work session 自动 git commit 的策略，是否会让"不想 commit"的用户（项目非 git 仓库 / 临时实验）卡住？`preamble.enabled = false` 关闭路径是否清晰
 - [ ] **JSON parse retry**：v2.1 的"静默 false positive"问题（parse 失败视为 0 issues）在 v2.1.1 改为 retry + 显式 degraded。retry 30s + 终端告警是否会拖慢 pipeline？是否需要更激进的 timeout
-- [ ] **context overflow 三策略**：默认 `reset` 策略下，重新 spawn work session 会增加 ~60-90s 延迟且 round += 1。`review_fix` 策略会让 review model 接管修复（质量可能不如 work session）。`abort` 策略最保守。用户在 profile 中如何选择？是否需要在 doctor 阶段给出建议
+- [ ] **context overflow 策略**（v2.1.1 I9 重设计）：默认 `reset` 策略下，重新 spawn work session 会增加 ~60-90s 延迟且 round += 1。`reset` 注入的 issues 数量很大（review 提 50+）时 prompt 体积大，是否需要 top-N only？`abort` 策略最保守。用户在 profile 中如何选择？是否需要在 doctor 阶段给出建议
 
 ## 14. 关键风险（v2.1 新增识别）
 
@@ -2667,7 +2778,7 @@ T4 Adapter ──────────┘        ↓
 | **Polling 500ms 抖动** | 用户看 CLI watch 时 pane 状态变化有 0-500ms 延迟 | Phase 1 接受；Phase 2 用 file watcher (chokidar) 监听 `state.json` mtime 触发 |
 | **状态机 driver + Reconciler 抢同一个 pipeline** | Reconciler 恢复时 engine 也在跑，可能双重写 | Reconciler 加 `~/.cc-linker/review-pipelines/reconciler.lock` 文件锁；engine 启动前等锁释放 |
 | **CLI Ctrl-C 退出后 pipeline 继续跑，没人看** | pipeline 跑着但没观察者 | `--no-watch` 模式下 engine 启动 daemon 化（`process.daemon()` 或 `setsid`） |
-| **Context window 膨胀**（v2.1.1 重写） | work session 跨多轮后 context 可能超阈值（默认 200K / 1M+ 模型 512K），导致 R1 注意力稀释、漏掉真问题（恶性假收敛） | v2.1.1 变更 4 三策略：`reset`（默认，杀 work + spawn 新 + round+1）/ `review_fix`（让 review model fix）/ `abort`（保守中止）。详见 §7.5.7 |
+| **Context window 膨胀**（v2.1.1 I9 重写） | work session 跨多轮后 context 可能超阈值（默认 200K / 1M+ 模型 512K），导致 R1 注意力稀释、漏掉真问题（恶性假收敛） | v2.1.1 I9 二策略：`reset`（默认，杀 work + spawn 新 + 注入 review issues + round+1；新 worker verify+fix）/ `abort`（保守中止）。详见 §7.5.7 |
 | **JSON parse 退化**（v2.1.1 新增） | bg session 输出非合法 JSON（模型漏 fence / 套错 schema / 输出自然语言前缀），导致状态机"静默 false positive"——review 实际未生效但 pipeline 看起来正常 | v2.1.1 变更 3：retry 1 次（注入"严格按 JSON schema 输出"提示）→ 仍失败 → 标记 `parse_degraded: true` + 终端告警 + 排除该 review + raw 存档到 `parse-failures/<role>-<state>-<ts>.txt`。详见 §7.5.4 |
 
 ## 16. v2.1 → v2.1.1 影响清单（变更总览）
@@ -2706,7 +2817,7 @@ T4 Adapter ──────────┘        ↓
 | §10.2 Graceful degradation | 简化（`record.panes.reviews` → `record.panes.review`） | 小 |
 | §10.3 Retry 策略 | 不变 | — |
 | §10.5 review doctor | 新增 "context overflow 配置" + commit preamble 配置检查 | 小 |
-| §11 测试 | 新增 4 个场景（单 review / commit preamble / JSON retry / context overflow 三策略） | 中 |
+| §11 测试 | 新增 4 个场景（单 review / commit preamble / JSON retry / context overflow 策略 + injectedIssues） | 中 |
 | §12.1 Phase 1 排期 | 5-6 周 → **6-7 周** | 中 |
 | §13 评审 Checklist | 新增 4 条 v2.1.1 项（§13.4） | 小 |
 | §14 风险 | 新增 "JSON parse 退化" 行；重写 "Context window 膨胀" 行 | 中 |
@@ -2783,3 +2894,452 @@ T4 Adapter ──────────┘        ↓
 | `DaemonProbe.check` | `src/agent-view/daemon-probe.ts` | doctor 阶段校验 daemon 健康 |
 | `CLAUDE_JOBS_DIR` | `src/utils/paths.ts:55` | adapter / cli-watch 直接 import |
 | `chalk` | 现有依赖 | cli-watch 直接用 |
+
+---
+
+## 附录 C：v2.1 → v2.1.1 变更背景与细节
+
+> **本附录原为独立文件 `2026-06-15-multi-model-review-engine-v2.1.1-patch.md`**，因 design.md 与 patch.md 长期分叉造成理解成本，2026-06-17 评审反馈后整段并入 design.md 作为附录。原 patch.md 已标"已合并到 design.md"（见 §15 文档链接）。
+>
+> **阅读顺序**：design.md 的 1-16 章是"当前状态"（整合了 v2.1 + v2.1.1 + 评审反馈 + I9 重设计）。本附录是"v2.1 → v2.1.1 的变更叙事"（变更动机 + 详细实现示例 + 影响清单 + 排期 + 兼容性），适合：
+> - 评审者：了解"为什么这么改"
+> - 实施者：拿到具体 TypeScript 代码模板（即使部分已被 §7.5.7 替代为新设计）
+> - 维护者：了解 v2.1 → v2.1.1 改了什么（影响清单）
+
+### C.1 变更 1：单一 Review 模型（重大简化）
+
+#### C.1.1 动机
+
+v2.1 的多 review 模型并行设计带来以下复杂度（v2.1 评审中识别）：
+- **并发写冲突**：如果"context 超限后让 review 模型 fix"，N 个 review 并发写文件会撕裂
+- **JUDGE verdict 算法需要 N 视角综合**，但多视角的"权重"和"重叠度"难以界定
+- **PANE_LOST 状态需要追踪 N 个 pane 的存活**，lostPanes 数组的管理复杂
+- **API 调用和 token 成本翻倍**，但实际收益不显著（2-3 个 review 高度同质化时价值有限）
+- **P0/P1 rejection ratio 算法在 N 视角下不直观**（"两个 reviewer 都提的 issue"和"只有一个 reviewer 提的"权重应该不同，但方案没区分）
+
+**简化决策**（用户拍板）：v2.1.1 限定为**单一 review 模型**。"多模型交叉 review"的价值由"work 模型 + 1 个 review 模型"提供（2 个模型），不再追求 N 个 review 模型并行。
+
+#### C.1.2 Profile 配置变化
+
+**v2.1**：
+```toml
+[review]
+mode = "parallel"
+providers = ["kimi-for-coding", "bailian-qwen3.6"]   # 数组决定 EXTERNAL_REVIEW 几个 pane
+```
+
+**v2.1.1**：
+```toml
+[review]
+provider = "kimi-for-coding"   # 单数标量；EXTERNAL_REVIEW 只 spawn 1 个 review pane
+```
+
+#### C.1.3 状态机变化
+
+**v2.1 EXTERNAL_REVIEW**：
+```typescript
+{ kind: 'EXTERNAL_REVIEW'; pipelineId; round; cycle: 'initial' | 'postfix';
+  panes: { role: 'review-A' | 'review-B' | ...; shortId: string }[] }
+```
+
+**v2.1.1 EXTERNAL_REVIEW**：
+```typescript
+{ kind: 'EXTERNAL_REVIEW'; pipelineId; round; cycle: 'initial' | 'postfix';
+  pane: { role: 'review'; shortId: string } }  // 单数
+```
+
+**v2.1 PANE_LOST**：
+```typescript
+{ kind: 'PANE_LOST'; pipelineId; round;
+  lostPanes: Array<{ role: 'work' | 'review-A' | 'review-B' | ...; shortId: string }>;
+  detectedAt: string; retryTarget: ReviewState['kind'] }
+```
+
+**v2.1.1 PANE_LOST**：
+```typescript
+{ kind: 'PANE_LOST'; pipelineId; round;
+  lostPane?: { role: 'work' | 'review'; shortId: string };  // 可选单数
+  detectedAt: string; retryTarget: ReviewState['kind'] }
+```
+
+**v2.1 PaneRegistry**：
+```typescript
+interface PaneRegistry {
+  work?: { ... };
+  reviews: {
+    role: 'review-A' | 'review-B' | ...;
+    shortId: string; sessionId: string;
+    provider: string; round: number; cycle: 'initial' | 'postfix';
+  }[];
+}
+```
+
+**v2.1.1 PaneRegistry**：
+```typescript
+interface PaneRegistry {
+  work?: { ... };
+  review?: {                                    // 单数，可选
+    role: 'review';                             // 单一 role
+    shortId: string; sessionId: string;
+    provider: string; round: number; cycle: 'initial' | 'postfix';
+  };
+}
+```
+
+#### C.1.4 影响的章节清单
+
+| 章节 | 变更 |
+|------|------|
+| §2.1 目标 G7 | "1+N pane 飞书列表" 改为 "1+1 pane" |
+| §3.1 复用层 | 删除 ARBITRATION 关联注释（v2.1 已删，本节确认） |
+| §4.1 数据流 | T31-T34 重写：单 review pane 流程 |
+| §4.4 并发控制 | "EXTERNAL_REVIEW 轮次内 review-A/B Promise.all 并行" 改为 "EXTERNAL_REVIEW 单 review session" |
+| §5.1 ReviewState 枚举 | panes 改单数、lostPanes 改 lostPane |
+| §5.3 状态机 Mermaid 图 | EXTERNAL_REVIEW 节点从 `panes[]` 改为 `pane{}` |
+| §5.3.2 ASCII 备查版 | review-A/B 节点合并为单 review 节点 |
+| §5.3.4 转换表 | lostPanes → lostPane 等 |
+| §5.3.5 走查示例 | 重写为单 review pane 流程 |
+| §6.1 PipelineRecord | PaneRegistry.reviews → review 单数 |
+| §7 ReviewProfile | review.providers → review.provider |
+| §7.2 完整配置示例 | review.providers 改单数 |
+| §7.3 per-phase 深度 merge | "review.providers 完全替换" 改为 "review.provider 完全替换" |
+
+---
+
+### C.2 变更 2：commit 前置指令
+
+#### C.2.1 动机
+
+FIXING 阶段由 work session 修改用户 cwd 中的源文件。即使 verify-first 流程过滤了 hallucination，仍可能：
+- "real" 判定本身有误（work session 在 verify 阶段也可能犯错）
+- fix 引入新 issue（R1 / R2 后续轮可能发现）
+- 多 FIXING 节点（R1→R2→JUDGE）串行修改同一工作目录，错误雪球累积
+
+`git diff` + `git checkout` 可回滚已跟踪文件，但不能保护 untracked / 新建 / `.gitignore` 内的文件。**强制 checkpoint commit** 把"修复前状态"固化为一个 commit，作为一键回滚锚点。
+
+#### C.2.2 Engine 行为（参考 §7.2 完整配置 + §6.1 HistoryEvent.fixingCheckpointSha）
+
+```typescript
+// engine.ts: FIXING 状态启动前
+async function enterFIXING(pipeline: PipelineRecord, source: 'R1' | 'R2' | 'JUDGE' | 'HUMAN'): Promise<void> {
+  const profile = await profile.load(pipeline.input.profile);
+  if (!profile.prompts?.work?.fixing?.preamble?.enabled) {
+    return;  // 用户禁用 preamble，跳过
+  }
+  // 在 injectReply 的 prompt 前面追加 preamble
+  const preamble = renderTemplate(profile.prompts.work.fixing.preamble.template, {
+    pipelineId: pipeline.pipelineId,
+  });
+  const fixingPrompt = `${preamble}\n\n---\n\n${renderFixingPrompt(pipeline)}`;
+  await adapter.injectReply({
+    shortId: pipeline.panes.work!.currentRoundShortId!,
+    text: fixingPrompt,
+    timeoutMs: 300_000,  // 5min，比普通注入长（work session 需要做 git 操作 + fix）
+  });
+}
+
+// FIXING 完成后，engine 解析 output 并提取 checkpoint_sha
+const fixingOutput = await parseBgOutput(bg.output, FixingOutputSchema);
+pipeline.history.push({
+  ...,
+  fixingCheckpointSha: fixingOutput.data?.checkpoint_sha ?? null,
+});
+```
+
+#### C.2.3 Markdown 报告新增字段
+
+`<cwd>/.claude/reviews/<pipelineId>.md` 的 header 区域增加：
+```markdown
+## Checkpoints
+
+- pre-fix R1: abc1234... (2026-06-15 12:34:56)
+- pre-fix JUDGE: def5678... (2026-06-15 12:42:30)
+
+用户可 `git reset --hard <sha>` 回滚到任意 checkpoint。
+```
+
+#### C.2.4 边界 case
+
+| 场景 | 处理 |
+|------|------|
+| cwd 不是 git 仓库 | work session 输出 `checkpoint_sha: null`；报告里标注 "non-git repo, no rollback anchor" |
+| 用户 `preamble.enabled = false` | 跳过前置指令；用户自负风险 |
+| commit 失败（如 git 锁定） | work session 输出 `checkpoint_sha: null` + warn；继续 fix；报告标注 "checkpoint commit failed" |
+| 修复后想回滚到 checkpoint | 用户在 CLI watch 看到 SHA 摘要，或读 Markdown 报告 |
+
+---
+
+### C.3 变更 3：JSON parse 失败不静默
+
+#### C.3.1 动机
+
+v2.1 §7.5.4 的降级策略有严重隐患：
+- "Review parse 失败 → 视为 0 issues"：模型不能输出 JSON 时静默通过 review，pipeline 看起来一切正常实际什么都没 review
+- "JUDGE parse 失败 → 视为全部 accept"：同上
+- "FIXING parse 失败 → 视为 all_real_fixed=true"：可能让"没修完"误判为"已修完"
+
+这些降级在生产中会造成"silent false positive"——**最危险的失败模式**。
+
+#### C.3.2 降级策略修正（v2.1.1 §7.5.4 全文替换）
+
+| 场景 | v2.1 处理 | v2.1.1 处理 |
+|------|----------|------------|
+| **Review pane JSON parse 失败** | 视为 0 issues | **retry 1 次 → 仍失败 → 标记 `parse_degraded: true` + 告警 + 排除该 review**（如果 review 是唯一 pane，直接 DONE） |
+| **Work session R1/R2 parse 失败** | 视为 0 issues | **retry 1 次 → 仍失败 → 标记 `parse_degraded: true` + 告警**。**注意**：work session 是 owner，不能完全排除；该轮 R1/R2 视为"未识别 issues"（=0 issues 处理），但报告里清楚标注 |
+| **Work session JUDGE parse 失败** | 视为全部 accept | **retry 1 次 → 仍失败 → 标记 `parse_degraded: true` + 告警 + 视为全部 accept**（保守：让 review 通过，避免"rejected 但无法判定"） |
+| **Work session FIXING parse 失败** | 视为 all_real_fixed=true | **retry 1 次 → 仍失败 → 标记 `parse_degraded: true` + 告警 + 视为 all_real_fixed=true**（保守：认为修复已完成） |
+| **Review pane JSON retry 后仍失败且 review 是唯一 pane** | N/A | **直接 DONE + 报告 "review 解析失败，无可决策的 issues"** |
+
+#### C.3.3 Markdown 报告新增字段
+
+```markdown
+## Parse Degradation Events
+
+- [12:35:12] work session SELF_REVIEW_R1 round 1: parse failed, recovered by retry (took 28s)
+- [12:38:45] review pane EXTERNAL_REVIEW round 1: parse failed after 1 retry (raw output saved in debug/)
+
+⚠️ 本次 pipeline 有 1 个 parse degraded 事件未恢复。Review 完整性可能受损。
+```
+
+#### C.3.4 Raw 输出存档
+
+`parseDegraded` 事件触发时，raw bg session output 存档到：
+```
+~/.cc-linker/review-pipelines/<terminal>/<pipelineId>/parse-failures/<role>-<state>-<ts>.txt
+```
+
+便于事后诊断模型输出问题。
+
+---
+
+### C.4 变更 4：Context Window 策略（**I9 重设计后**）
+
+#### C.4.1 动机
+
+v2.1 §7.5.7 识别了 work session 跨 8 轮 ~48 次注入可能超 200k tokens 的风险，但缓解策略（prompt 自包含 + 显式 issues 传递）只解决信息传递问题，没解决"模型注意力稀释导致 R1 漏掉真问题"——R1 在第 5 轮可能已"忘了"第 1 轮修了什么，这是恶性假收敛。
+
+**v2.1.1 I9 重设计后**：
+- ❌ v2.1.1 原始方案：3 策略 `reset` / `review_fix` / `abort`（review_fix 让 review pane 修）
+- ✅ v2.1.1 I9 重设计：**2 策略 `reset` / `abort`**，reset 策略 = 杀 work + spawn 新 work + 注入 review issues + history + related docs → worker verify+fix → DONE
+
+**重设计理由**：
+1. work session 最懂自己的代码，**修的质量 > review session**
+2. 单一 review 模型后 review 提的 issues 是确定的输入，**work verify+fix** 是更可控的路径
+3. 删 review_fix 后状态机简化 ~150 行（CONTEXT_CHECK→FIXING(source=CONTEXT_CHECK) 路径不存在）
+
+#### C.4.2 Profile 配置（v2.1.1 §7 新增）
+
+```toml
+[guards]
+# === v2.1 已有 ===
+max_rounds = 6
+max_concurrent_pipelines = 1
+human_decide_timeout_ms = 14400000   # v2.1.1 改：4h 默认（v2.1 是 1h 太激进）
+p0_p1_reject_threshold = 0.30
+
+# === v2.1.1 新增：context overflow 策略（I9 重设计后 2 选 1）===
+context_overflow_threshold_1m = 512000      # 1M+ 模型专用阈值（默认 512K ≈ 50%）
+context_overflow_threshold_default = 200000 # 其他模型阈值（默认 200K = 100%）
+context_overflow_strategy = "reset"         # "reset" | "abort"（v2.1.1 I9 删 review_fix）
+context_overflow_hysteresis_rounds = 1      # 触发后至少 N 轮不再检查（避免抖动）
+
+# === v2.1.1 新增：parse retry timeout（§7.5.4）===
+parse_retry_timeout_ms = 15000               # 默认 15s
+
+# 可选：覆盖模型 context 上限
+[context_limits]
+"claude-sonnet-4-5" = 1000000
+"kimi-for-coding" = 256000
+```
+
+#### C.4.3 I9 reset 策略实现（关键代码）
+
+完整实现见 §7.5.7.3。这里记录关键设计点：
+
+**新 worker 的 prompt 模板（buildContextResetPrompt）**：
+```typescript
+const newWorkPrompt = buildContextResetPrompt({
+  pipelineId: pipeline.pipelineId,
+  contextUsage: contextCheck.usage,
+  checkpointSha,
+  historySummary,    // 每轮修了什么 issue
+  injectedIssues,    // 来自 EXTERNAL_REVIEW 的所有 issues
+  relatedDocs,       // review 提的 file + 之前 work 修改的 file
+  nextRound: pipeline.state.round + 1,
+});
+```
+
+**新 worker 行为**（详见 §7.5.7.3）：
+- Step 1: verify-first（每个 issue 读代码确认是 real vs hallucination）
+- Step 2: 修复（仅 real 的，最小化修改 + commit preamble）
+- Step 3: 输出 `{per_issue, all_real_fixed, remaining_real_unfixed_count}` → engine 解析 → DONE
+
+**3 个不变量**：
+1. work session 仍是唯一修复者（quality ownership 不分散）
+2. context fresh 但 issue 记忆保留（injectedIssues + history + relatedDocs）
+3. verify-first 不变（worker 仍要走 real vs hallucination 判断）
+
+#### C.4.4 PipelineRecord 字段扩展
+
+```typescript
+interface PipelineRecord {
+  // ... 现有字段 ...
+  contextResets: Array<{           // 累计所有 context reset 事件（v2.1.1 I9 删 review_fix）
+    ts: string;
+    triggerRound: number;
+    usageBefore: { used: number; max: number; model: string };
+    strategy: 'reset' | 'abort';
+    checkpointSha: string | null;
+    injectedIssueCount?: number;   // v2.1.1 I9：reset 时注入给新 worker 的 issue 数量
+  }>;
+}
+```
+
+---
+
+### C.5 变更 5：`getContextUsage` API
+
+#### C.5.1 动机
+
+state.json 中没有直接的 `usage` 字段，但 `linkScanPath` 指向的 jsonl 文件里有（已存在的 `src/agent-view/jsonl-last-assistant.ts` 就是干这个的）。v2.1.1 需要 engine 能查 work session 的当前 context 用量，作为变更 4 的判断输入。
+
+**v2.1.1 评审修正**：
+- 原 patch 引用 `readLastAssistantUsage`（函数名错误）→ 实际是 `readLastAssistantTurn`（返回 `LastAssistantTurn`，含 `.usage`）
+- 原 patch `output?: string | null`（类型错）→ 实际是 `output?: { result: string } | null`
+
+详见 §3.2.1 修正后的实现 + §7.4 复用表。
+
+---
+
+### C.6 变更 6：review_fix 模式约束（**v2.1.1 I9 重设计后已删除**）
+
+#### C.6.1 v2.1.1 原始设计（已废）
+
+v2.1.1 原始 patch 在 §10.1 显式说明：
+> 单一 Review 模型后，review_fix 模式天然满足"单 review session 串行执行"，无需 v2.1 设计的 git branch / merge 协调机制。
+
+#### C.6.2 v2.1.1 I9 废止
+
+**2026-06-17 评审反馈**：review_fix 模式有 3 个根本问题：
+1. review 模型对 work 代码上下文理解差，**修的质量低**
+2. 跳过 R1 验证，新引入的问题无法 catch
+3. 依赖 review pane 状态，**fallback 链脆弱**（review pane parse 失败 → 回退 reset → 复杂）
+
+**用户拍板**：context 超限时改为 **"杀 work + spawn 新 work + 注入 review issues + 让 worker verify+fix"**。理由：work 最懂自己代码，新 worker 有 fresh context + 完整 issue 记忆，verify-first 不变。
+
+**v2.1.1 I9 简化效果**：
+- 删 `review_fix` 策略（1 个完整实现路径砍掉，约 100-150 行）
+- 状态机简化（CONTEXT_CHECK→FIXING(source=CONTEXT_CHECK) 路径不存在）
+- FIXING.source 枚举从 5 个值回退到 4 个值（与 v2.1 原设计一致）
+- profile 配置从 3 选 1（reset/review_fix/abort）简化为 2 选 1（reset/abort）
+
+---
+
+### C.7 v2.1 → v2.1.1 完整影响清单
+
+按 v2.1 spec 章节顺序整理（含 v2.1.1 I9 重设计标注）：
+
+| v2.1 章节 | v2.1.1 变更 | v2.1.1 I9 后状态 | 重要度 |
+|----------|-----------|------------------|----------|
+| §2.1 目标 | G7 改 "1+1 pane"；新增 G9 | G9 改 2 策略（reset/abort） | 中 |
+| §3.1 复用层 | 不变 | 不变 | — |
+| §3.2 新建层 | adapter +1 API（`getContextUsage`）| + 新增 `model-parser.ts` | 小 |
+| §3.3 CLI 入口 | 不变 | 不变 | — |
+| §4.1 数据流 | T31-T34 重写（单 review pane）| 不变 | 中 |
+| §4.4 并发控制 | EXTERNAL_REVIEW 单 session | 不变 | 小 |
+| §5.1 ReviewState | panes 改单数、lostPanes 改 lostPane | + SELF_REVIEW_R1 加 `injectedIssues` 字段 | 中 |
+| §5.2 max_rounds | 不变 | 不变 | — |
+| §5.3 状态机 | 节点简化 + context 检查分支 | CONTEXT_CHECK→reset 走 SELF_REVIEW_R1 | 中 |
+| §5.3.4 转换表 | 多行更新 | 删 review_fix 行 | 中 |
+| §5.3.5 走查示例 | 重写 | 不变 | 中 |
+| §5.3.6 异常路径 | 重写 review_fix 例 | 重写为 reset 例 | 中 |
+| §5.4 Verdict | 不变 | 不变 | — |
+| §6.1 PipelineRecord | PaneRegistry 改单数；新增 `contextResets[]` / `parseDegraded[]` | + `fixingCheckpointSha` | 中 |
+| §6.2 持久化目录 | 不变 | 不变 | — |
+| §6.3 幂等性 | 不变 | 不变 | — |
+| §6.4 Reconciler | 简化（lostPanes → lostPane）| 不变 | 小 |
+| §6.5 并发控制 | 不变 | 不变 | — |
+| §6.6 Cleanup | 不变 | 不变 | — |
+| §7 ReviewProfile | review.providers→review.provider；新增 `context_overflow_*` | + `parse_retry_timeout_ms`；`context_overflow_strategy` 删 review_fix | 大 |
+| §7.2 完整配置示例 | 重写 | human_decide_timeout_ms 4h + parse_retry_timeout_ms 15s | 大 |
+| §7.3 per-phase merge | review.providers 改 review.provider | 不变 | 小 |
+| §7.4 Provider 映射 | 新增"模型 context 上限"表 | 不变 | 中 |
+| §7.5 Output Contract | §7.5.4 全文重写 | ParseRetryOptions 加 timeoutMs 字段 | 大 |
+| §7.5.7 Context Window | 替换为 §7.5.7 v2.1.1 | §7.5.7.3 reset 重设计为"杀 work + 注入 issues + worker verify+fix" | 大 |
+| §8 Phase 1 UX | 不变 | 不变 | — |
+| §9 PhaseDetector | 不变 | 不变 | — |
+| §10.1 错误处理 | 新增 context_overflow / parse_degraded | context_overflow 改 2 策略描述；§10.1.1 review_fix 改 reset | 中 |
+| §10.2 Graceful degradation | 简化（删 arbiter 行）| 不变 | 小 |
+| §10.3 Retry 策略 | 不变 | 不变 | — |
+| §10.5 review doctor | 新增 "context overflow 配置" 检查 | + parse_retry_timeout_ms 检查 | 小 |
+| §11 测试 | 新增 4 个场景 | 测试 #8 改"context overflow 策略 + injectedIssues" | 中 |
+| §12.1 Phase 1 排期 | T5/T6 engine 拆分更新 | 不变 | 中 |
+| §13 评审 Checklist | 新增 4 条 v2.1.1 项 | 新增 1 条 I9 评审项 | 小 |
+| §14 风险 | 新增 "JSON parse 退化"；重写 "Context window 膨胀" | "Context window 膨胀" 改 I9 二策略 | 中 |
+
+---
+
+### C.8 实施影响
+
+#### C.8.1 新增/修改文件
+
+**新增**：
+- `src/review/model-parser.ts` —— parseModelFromProviderEnv + lookupContextLimit
+- `src/review/context-overflow.ts` —— checkContextOverflow + reset 策略（注入 issues）+ abort 策略
+- `src/review/build-context-reset-prompt.ts` —— v2.1.1 I9 新增：新 worker prompt 模板（含 history + injectedIssues + relatedDocs）
+- `tests/unit/review/model-parser.test.ts` —— 模型解析单测
+- `tests/unit/review/context-overflow.test.ts` —— 策略单测
+- `tests/integration/review/get-context-usage.test.ts` —— adapter API 集成测试
+
+**修改**：
+- `src/review/adapter.ts` —— 新增 `getContextUsage` 方法
+- `src/review/engine.ts` —— EXTERNAL_REVIEW 完成回调加 context 检查 + JSON parseWithRetry
+- `src/review/types.ts` —— PaneRegistry.reviews → review 单数；新增 parseDegraded / contextResets / fixingCheckpointSha 字段；SELF_REVIEW_R1 加 injectedIssues
+- `src/review/output-contract.ts` —— 重写 parseBgOutput 为 parseBgOutputWithRetry（加 timeoutMs）
+- `src/review/profile.ts` —— 新增 context_overflow_* / context_limits / parse_retry_timeout_ms 配置解析
+- `src/cli/commands/review.ts` —— doctor 检查 context 配置 + parse_retry_timeout_ms
+
+#### C.8.2 排期影响
+
+v2.1 §12.1 Phase 1 排期（5-6 周）需要延长：
+- T4 Adapter 延长 1 天（新增 getContextUsage）
+- T5/T6 Engine 增加 context overflow 状态机分支（2-3 天）
+- T1 Profile 延长 1 天（context_overflow 配置 + commit preamble 配置 + parse_retry_timeout_ms）
+- T7 Output Contract 重写（1 天）
+- T1/T4 增加 parse_retry_timeout_ms 透传（0.5 天）
+
+**新总排期**：6-7 周（含 buffer）。
+
+#### C.8.3 兼容性与回滚
+
+- **profile 文件**：v2.1 用户的 `review.providers = ["x", "y"]` 配置在 v2.1.1 启动时检测到数组形式 → warn + 取第一个元素 + 继续（向后兼容）。v2.1.1 完整功能需要新配置
+- **v2.1.1 `context_overflow_strategy = "review_fix"`**：v2.1.1 I9 后此值不再合法，profile 加载时检测到 → warn + fallback 到 `reset` 策略（保留 I9 之前的兼容路径，避免 v2.1.1 早期用户升级 spec 后崩）
+- **PipelineRecord**：在 reading 旧 v2.1 record 时检测到 `reviews[]` 数组 → 兼容转换为单数 `review`（仅读，写新格式）
+- **回滚**：v2.1.1 引入的 parseWithRetry 在解析失败时 retry 1 次（比 v2.1 慢约 15s 但更安全），回滚到 v2.1 即放弃 retry 能力
+
+---
+
+## 附录 D：v2.1.1 评审反馈汇总（2026-06-17）
+
+| ID | 类别 | 问题 | 修复 |
+|---|---|---|---|
+| B1 | 🔴 P0 | `output` 类型错（string → 实测 {result:string}） | §3.2.1 / §7.5.1 / §7.5.6 / §7.4 全部修正 |
+| B2 | 🔴 P0 | `readLastAssistantUsage` 函数名错 | 改 `readLastAssistantTurn` + unwrap `.usage` |
+| B3 | 🔴 P0 | `executeReviewFix` 引用未定义变量 `reviewOutput` | 补 §7.5.7.0 共享类型 + `readReviewOutput` + `ContextCheckResult` |
+| B4 | 🔴 P0 | model-parser 公式 `num * num * 1_000` 冗余 | 改三目嵌套 |
+| B5 | 🔴 P0 | `FIXING (source=REVIEW_FIX)` 不在枚举 | I9 重设计：删 review_fix |
+| B6 | 🔴 P0 | `adapter.injectReply` `signal?` 不可达 | 移除 + 明确 v2.1.1 限制 + 长期方案 |
+| B7 | 🔴 P0（复查发现）| `executeContextReset` 缺 profile 参数 | 加 `profile` 参数 + 3 处调用点对齐 |
+| I1 | 🟡 P1 | 12+ 处 v2.1 review-A/B 残留 | 改单数（保留历史对比注释） |
+| I2 | 🟡 P1 | getContextUsage 注释与代码不一致 | 改注释为准确描述 + 明确无 estimate 分支 |
+| I3 | 🟡 P1 | panes.review 生命周期不清晰 | 补 set/clear 时机说明 |
+| I4 | 🟡 P1 | findDeadPanes 实现缺失 | 补完整实现 |
+| I5 | 🟡 P1 | JobStateFile 扩展未拍板 | 拍板 Phase 1 走 ExtendedJobStateFile |
+| I6 | 🟡 P1 | v2.1 兼容性描述矛盾 | 明确"v2.1.1 是 patch 不存在 v2.1 残留" |
+| I7 | 🟡 P1 | §5.3.5/§5.3.6 走查示例 review×2 残留 | 改单 review |
+| I8 | 🟡 P1 | work pane 死亡设计含糊 | 加 max_rounds 兜底 + history summary 注入 |
+| I9 | 🟡 P1（重大）| review_fix 模式质量差 | **重设计**：删 review_fix；reset 改为"杀 work + 注入 issues + worker verify+fix" |
+| I10 | 🟡 P1 | human_decide_timeout 1h 偏激进 | 改 4h 默认 |
+| I11 | 🟡 P1 | parse_retry_timeout 30s 偏长 + 硬编码 | 改 15s + profile 可配（`parse_retry_timeout_ms`） |
+
+**总工作量**：13 行 P0 + 8 行 P1 + 1 行 I9 重设计 + 2 行反馈（B7、I9 复查）。详见 commit `0c0dab8` (P0+P1 修复) + 本 commit (I9/I10/I11 + 文档合并)。

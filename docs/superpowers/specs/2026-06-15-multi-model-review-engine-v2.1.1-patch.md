@@ -1,8 +1,21 @@
 # cc-linker Multi-Model Review Engine v2.1.1 Patch
 
+> **⚠️ 本文件已合并到 design.md（2026-06-17）**
+>
+> 本文件原是 v2.1 → v2.1.1 的"变更叙事"（动机 + 详细实现 + 影响清单），与 design.md 长期分叉造成理解成本。2026-06-17 评审反馈后整段并入 `docs/superpowers/specs/2026-06-15-multi-model-review-engine-v2.1.1-design.md` 作为**附录 C**（v2.1 → v2.1.1 变更背景与细节）+ **附录 D**（评审反馈汇总）。
+>
+> **保留本文件的原因**：
+> 1. git history 追溯：6 项 v2.1.1 变更的原始定义
+> 2. 链接兼容：旧 PR 评论 / commit message 里引用的 `v2.1.1-patch.md` 路径仍能跳转
+> 3. archive 价值：v2.1 → v2.1.1 → v2.1.1 I9 的完整决策链
+>
+> **请阅读 design.md 的 1-16 章 + 附录 C/D 获取最新内容**。本文件仅供历史参考。
+
+---
+
 **日期：** 2026-06-15
 **基础版本：** v2.1（`docs/superpowers/specs/2026-06-14-multi-model-review-engine-v2.1-design.md`）
-**状态：** 待评审
+**状态：** ⚠️ 已合并到 design.md（见上）
 **作者：** Claude Code（基于 v2.1 评审反馈 + 用户拍板）
 
 ## 修订记录（追加到 v2.1 修订记录表末尾）
