@@ -22,7 +22,6 @@
 // linkScanPath,无需绕道还原。
 
 import { execFile } from 'node:child_process';
-import { statSync } from 'node:fs';
 import { VersionGuard } from './version-guard';
 import { DaemonProbe } from './daemon-probe';
 import { attachRosterSources, filterUserDispatched } from './snapshot';
@@ -90,45 +89,40 @@ export const AgentSnapshotFetcher = {
       }
 
       // v2.7+: stale state.json 检测 — bg slot 被 daemon 复用时,
-      // state.json 可能停留在旧 incarnation 的"done"状态(没有覆盖写),
-      // 导致 cc-linker 错把活 session 展示在"已完成"组。TUI 用 JSONL mtime
-      // freshness 检测这个问题,所以我们对齐 TUI 行为。
+      // state.json 可能停留在旧 incarnation 的"done/blocked"状态(没有覆盖写),
+      // 导致 cc-linker 错把活 session 展示在"已完成"或"等待输入"组。
       //
-      // 触发条件(应用范围: status === 'idle' 即 done/stopped/failed):
-      //   Signal 1 (主要): s.sessionId !== roster.workers[short].sessionId
+      // 当前唯一信号 (v2.7.3 P0 修复):
+      //   Signal 1: s.sessionId !== roster.workers[short].sessionId
       //     → bg slot reuse 后,roster 记录新进程 sessionId,state.json 没更新
       //     → 用 roster 的 sessionId + override 为 busy
-      //   Signal 2 (备份): JSONL mtime 比 state.json mtime 新
-      //     → bg 在 state.json 之后还在写 JSONL → state.json 已过时
-      //     → override 为 busy(不修改 sessionId,因为没有更权威的 source)
       //
-      // 为什么 Signal 2 不适用于 waiting (v2.7.2 P0 修复):
-      //   之前(b049f26 → 5381b40)把 Signal 2 扩展到 waiting,但 JSONL mtime 不是
-      //   assistant write 时间 — 它是 daemon settle event 触摸文件的时间。
-      //   真实数据(2026-06-17 用户截图 13 个 session,11 个被错误 override busy):
-      //     - 5 个 waiting sessions:state.json 1h 前 blocked,JSONL mtime 1min 前
-      //       (daemon settle 触摸),JSONL 比 state.json 新 → false override busy
-      //     - 多个 done sessions:同样的 mtime pattern,也被错误 override
-      //   修复:Signal 2 只覆盖 idle(终态可被 bg slot reuse 污染);
-      //   waiting (blocked + needs) 是实时 state machine 状态 — bg 在等用户,
-      //   state.json 是真相。Signal 1 已能覆盖 waiting 上的 bg slot reuse 误判。
+      // Signal 2 (JSONL mtime vs state.json mtime 比较) 已在 v2.7.2/2.7.3 完全移除:
+      //   真实数据(2026-06-17 用户 ~/.claude/jobs/*/)显示 JSONL 文件 mtime 不是
+      //   bg assistant write 时间 — 它是 daemon settle event 触摸文件的时间。
+      //   state.json mtime 是 state machine transition 时间(bg ask 时 / settle 时)。
+      //   两者相对顺序对 'bg 是否在跑' 没有意义,生产环境几乎所有 settled session
+      //   都满足 'JSONL 比 state.json 新'。
+      //
+      //   之前用 5min 阈值(b049f26)有 false-positive 窗口,改用 mtime 对比(5381b40)
+      //   又把误判扩大 — round 1 错误 override 5/5 waiting,round 2 错误 override 4/5 done。
+      //   完全移除 Signal 2:Signal 1 (roster.sessionId mismatch) 已能覆盖合法的
+      //   bg slot reuse 误判场景(用户原始 P0:0abb6d98 stale blocked,roster 是新进程
+      //   sessionId)。
+      //
+      //   已知 trade-off:无法检测 "bg alive 但 state.json stale 且 roster 也没记录" 的
+      //   边角案例。这种 case 极少且会自我修正(bg 真在跑的话会 ask / settle,
+      //   state.json 也会更新)。等 Claude CLI 提供更权威的 liveness 信号再扩展。
       //
       // 关于 s.sessionId: 直接用 jobStateToSession 算出的 canonical sessionId
       // (它已经做了 sessionId → resumeSessionId → env.short 的 fallback),与
       // sessionId.slice(0,8) 在下游(liveFork 解析、source attribution)用的字段一致。
       let overriddenSession: AgentSession | null = null;
-      // 只对 idle (done/stopped/failed) 做 Signal 2 mtime-based staleness override。
-      // busy 已正确不重写;waiting 不做 Signal 2(blocked + needs 是实时状态,
-      // JSONL mtime 是 daemon settle 触摸时间,跟 bg 活跃度无关)。
-      //
-      // 注意:Signal 1 (roster.sessionId mismatch) 在 idle + waiting 上都 fire —
-      // 它处理 bg slot reuse 的合法场景(reuse 后 state.json 可能是 blocked 状态)。
-      // 只有 Signal 2 被限制到 idle。
+      // Signal 1: bg slot 被 reuse (roster.sessionId 不同于 s.sessionId)
+      // 适用于 idle 和 waiting — bg slot reuse 可能产生任意 stale state
       const short = env.short;
       const rosterWorker = roster?.workers?.[short];
 
-      // Signal 1: bg slot 被 reuse (roster.sessionId 不同于 s.sessionId)
-      // 适用于 idle 和 waiting — bg slot reuse 可能产生任意 stale state
       if (
         (s.status === 'idle' || s.status === 'waiting')
         && rosterWorker?.sessionId
@@ -151,31 +145,6 @@ export const AgentSnapshotFetcher = {
           status: 'busy',
           name: s.name.replace(/^[✅🛑❌]\s*/, ''),
         };
-      }
-      // Signal 2: JSONL 比 state.json 新 — 只对 idle (终态) 适用
-      // waiting 状态被排除,因为 JSONL mtime 在生产环境对 waiting 状态是 false signal
-      // (详细原因见顶部注释 v2.7.2 P0 修复)
-      else if (s.status === 'idle' && env.state.linkScanPath) {
-        try {
-          const stat = statSync(env.state.linkScanPath);
-          const jsonlAgeMs = Date.now() - stat.mtimeMs;
-          const stateAgeMs = Date.now() - env.mtimeMs;
-          if (jsonlAgeMs < stateAgeMs) {
-            logger.warn(
-              `[agent-view] ${short}: state.json says ${s.status} but JSONL ` +
-              `${Math.round((stateAgeMs - jsonlAgeMs) / 1000)}s newer than state.json; ` +
-              `bg actively working, overriding to busy`,
-            );
-            const { completed: _completed, waitingFor: _waitingFor, ...rest } = s;
-            overriddenSession = {
-              ...rest,
-              status: 'busy',
-              name: s.name.replace(/^[✅🛑❌]\s*/, ''),
-            };
-          }
-        } catch {
-          // 文件不存在/读不了,graceful 跳过,保留 state.json 的 status
-        }
       }
 
       // 仅在 NOT overridden 时加 emoji prefix — 否则 ✅ 会被加再被剥

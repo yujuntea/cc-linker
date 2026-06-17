@@ -387,8 +387,49 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     expect(s.completed).toBeUndefined();
   });
 
-  test('Signal 2: state.json says done but linkScanPath JSONL mtime < 5min → override busy', async () => {
-    // 模拟 TUI 使用的 fallback 信号:JSONL 最近被改 → bg 实际在写
+  // 2026-06-17 P0 bug (round 2): Signal 2 (mtime comparison) 在生产环境
+  // 错误 override 4/5 个 done sessions。原因与 round 1 (waiting) 一样:
+  // JSONL 文件 mtime 不是 assistant write 时间 — 它是 daemon settle event
+  // 触摸文件的时间。state.json mtime 是 state machine transition 时间。
+  // 两者相对顺序对 'bg 是否在跑' 没有意义,真实环境下几乎每个 settled
+  // session 都满足 'JSONL 比 state.json 新'。
+  //
+  // 用户截图(2026-06-17 13:30): TUI 5 completed / 2 working / 5 needs input,
+  // Feishu 1 completed / 6 busy / 5 waiting。差 4 个 — 全部是 done 被错误
+  // override busy(3267aa2b, ecb21147, fa9ddf02, 8bbaa3c1)。
+  test('Signal 2 P0 round 2: done + JSONL mtime newer + no roster → keep idle + ✅', async () => {
+    // 真实数据模式 (2026-06-17 用户 ~/.claude/jobs/):
+    //   3267aa2b (done): state_age=75627s, jsonl_age=71357s → JSONL 新 4270s
+    //   ecb21147 (done): state_age=100058s, jsonl_age=96439s → JSONL 新 3619s
+    //   fa9ddf02 (done): state_age=176680s, jsonl_age=172308s → JSONL 新 4372s
+    //   8bbaa3c1 (done): state_age=53094s, jsonl_age=53061s → JSONL 新 33s
+    readRosterMock.mockImplementation(() => null);  // 无 Signal 1 roster mismatch
+    const daemonTouchedJsonl = join(tmpJsonlDir, 'daemon-touched-done.jsonl');
+    writeFileSync(daemonTouchedJsonl, '[]');  // mtime = now (daemon settle touched)
+    const now = Date.now();
+    const oneHourAgoMs = now - 60 * 60 * 1000;
+    mockJobs([makeEnv({
+      state: 'done', name: '真正 done 的 session (daemon touched JSONL after settle)',
+      linkScanPath: daemonTouchedJsonl,
+      mtimeMs: oneHourAgoMs,  // state.json 1h 前 (bg settle 时)
+      resumeSessionId: 'aaaaaaa1-1111-1111-1111-111111111111',
+    })]);
+    const r = await AgentSnapshotFetcher.fetch();
+    expect(r.ok).toBe(true); if (!r.ok) return;
+    const s = r.sessions[0];
+    // 关键:Signal 2 不应在 done 上 fire (mtime 是不可靠信号)
+    expect(s.status).toBe('idle');
+    expect(s.completed).toBe(true);
+    expect(s.name).toBe('✅ 真正 done 的 session (daemon touched JSONL after settle)');
+  });
+
+  test('v2.7.3: state=done + JSONL mtime fresh (no roster) → keep idle + ✅ (Signal 2 removed)', async () => {
+    // v2.7.3 修复:Signal 2 (mtime-based staleness override) 已完全移除,
+    // 因为生产环境数据证明 JSONL 文件 mtime 不是 bg write 时间(是 daemon settle
+    // 触摸时间)。原来这个 case 被错误 override 成 busy — 现在保持 idle + ✅。
+    //
+    // 跟下面 'Negative: 真正 done' 测试场景对称:不管 JSONL 是 stale 还是 fresh,
+    // 只要 state.json 说 done + 没有 roster mismatch → 保持 idle + ✅。
     readRosterMock.mockImplementation(() => null);  // roster 信息缺失
     const freshJsonl = join(tmpJsonlDir, 'fresh.jsonl');
     writeFileSync(freshJsonl, '[]');  // mtime = now
@@ -401,15 +442,16 @@ describe('AgentSnapshotFetcher.fetch — stale state.json detection (v2.7)', () 
     expect(r.ok).toBe(true); if (!r.ok) return;
     expect(r.sessions.length).toBe(1);
     const s = r.sessions[0];
-    expect(s.status).toBe('busy');  // overridden
-    expect(s.name).toBe('fresh active session');  // no ✅
+    // v2.7.3:Signal 2 移除,保持 idle
+    expect(s.status).toBe('idle');
+    expect(s.completed).toBe(true);
+    expect(s.name).toBe('✅ fresh active session');  // ✅ prefix 保留
   });
 
   test('Negative: 真正 done (no roster, JSONL stale) → 保持 idle + ✅', async () => {
     // 防御:不该 override 真正完成的 session
-    // 真实场景:bg 10 分钟前完成(state.json + JSONL 同时被 Claude CLI 更新,
-    // state.json 略晚于 JSONL)。我的 Signal 2 检查 "JSONL 比 state.json 新",
-    // 这里 JSONL 比 state.json 旧 10 分钟 → 不 override ✓
+    // v2.7.3:即使 Signal 2 存在,这个 case 也不该 override (JSONL stale < state.json)
+    // v2.7.3 后:Signal 2 完全移除,所有 done sessions 都保持 idle (除非 Signal 1 fire)
     readRosterMock.mockImplementation(() => null);
     const staleJsonl = join(tmpJsonlDir, 'stale.jsonl');
     writeFileSync(staleJsonl, '[]');
