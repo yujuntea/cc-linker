@@ -75,19 +75,20 @@ export function buildListCard(
           type: 'default',
         },
       ];
-      if (status === 'waiting') {
-        actions.push({
-          tag: 'button',
-          text: { tag: 'plain_text', content: 'Reply' },
-          value: {
-            tag: 'agent_view_reply_request',
-            shortId: s.sessionId.slice(0, 8),
-            sessionId: s.sessionId,
-            cwd: s.cwd,
-          },
-          type: 'primary',
-        });
-      }
+      // v2.7.4: Reply 在所有 status 下都显示(对齐 TUI 行为)
+      // 之前 status==='waiting' 才显示,busy / completed 用户无法 reply。
+      // 现在 busy: rendezvous 排队注入;completed: claude --resume 续对话。
+      actions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: 'Reply' },
+        value: {
+          tag: 'agent_view_reply_request',
+          shortId: s.sessionId.slice(0, 8),
+          sessionId: s.sessionId,
+          cwd: s.cwd,
+        },
+        type: 'primary',
+      });
       if (status === 'busy') {
         actions.push({
           tag: 'button',
@@ -705,19 +706,19 @@ function renderAttachedCardJson(opts: {
       type: 'default',
     },
   ];
-  if (opts.status === 'waiting') {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: 'Reply' },
-      value: {
-        tag: 'agent_view_reply_request',
-        shortId: opts.shortId,
-        sessionId: opts.sessionId,
-        cwd: opts.cwd,
-      },
-      type: 'primary',
-    });
-  }
+  // v2.7.4: Reply 在所有 status 下都显示(对齐 TUI 行为)
+  // busy → rendezvous 排队注入,completed → claude --resume 续对话。
+  actions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: 'Reply' },
+    value: {
+      tag: 'agent_view_reply_request',
+      shortId: opts.shortId,
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+    },
+    type: 'primary',
+  });
   if (opts.status === 'busy') {
     actions.push({
       tag: 'button',

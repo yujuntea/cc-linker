@@ -314,7 +314,10 @@ export class AgentViewManager {
     const buttons = {
       peek: true,
       attach: true,
-      reply: session.status === 'waiting',
+      // v2.7.4: Reply 在所有 status 都显示(对齐 TUI)。
+      // busy: rendezvous 排队;completed (idle): claude --resume 续对话。
+      // Stop 只在 busy 显示(dead session 无意义)。
+      reply: true,
       stop: session.status === 'busy',
       refresh: true,
     };
@@ -415,7 +418,8 @@ export class AgentViewManager {
       const buttons = {
         peek: true,
         attach: true,
-        reply: session.status === 'waiting',
+        // v2.7.4: Reply 在所有 status 都显示(对齐 TUI)。
+        reply: true,
         stop: session.status === 'busy',
         refresh: true,
       };
@@ -881,13 +885,12 @@ export class AgentViewManager {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return;
     }
-    if (session.status !== 'waiting') {
-      await this.deps.replyFn(
-        `⚠️ 该 session 不是 waiting 状态(当前 ${session.status}),无法 reply`,
-        { openId },
-      );
-      return;
-    }
+    // v2.7.4: 移除 'status !== waiting' guard(之前在 if-block 里 bail)。
+    // Reply 在所有 status 下都允许(对齐 TUI 行为):
+    //   - busy → rendezvous 排队注入(在当前 turn 完后)
+    //   - completed (idle) → claude --resume <sessionId> 续对话,作为新 turn
+    //   - waiting → 跟之前一样直接发卡
+    // runChatSDK 内部负责跟 status 协调。
     // 2. 发交互卡 — header + 等待原因 + AI 最近输出 + [❌ 取消等待]
     //
     // v2.3.13:之前是纯文本 prompt(replyFn),用户看不到 AI 上一句问的是什么 —
@@ -987,18 +990,14 @@ export class AgentViewManager {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return;
     }
-    // v2.6.1: status 检查软化
-    // - session.completed: bg 已 settle (done/stopped/failed),无法 reply,bail 给友好错误
-    // - session.status !== 'waiting': bg 还在跑(只是不在 waiting 状态),用户既然在 reply mode
-    //   应当允许 send,runChatSDK 内部用 rendezvous 注入,daemon 处理
-    if (session.completed) {
-      await this.expectedReply.clear(openId);
-      await this.deps.replyFn(
-        `⚠️ Claude 已切换到 idle,无法 reply`,
-        { openId },
-      );
-      return;
-    }
+    // v2.7.4: 移除 session.completed hard bail (之前在 if-block 里 return)。
+    // Reply 在所有 status 都允许(对齐 TUI 行为):
+    //   - busy → runChatSDK 走 rendezvous 路径,在当前 turn 完后注入
+    //   - completed (idle) → runChatSDK 走 SDK fallback,claude --resume <sessionId>
+    //     续对话,作为新 turn
+    //   - waiting → 跟之前一样
+    // v2.6.1 已经软化了 'status !== waiting' 检查(只 log info,不 bail),
+    // 现在进一步把 'completed' 也软化 — 不 bail,让 runChatSDK 处理。
     if (session.status !== 'waiting') {
       logger.info(
         `handleReply: bg 状态 ${session.status} 不是 waiting,但用户在 reply mode,继续 send (runChatSDK 会处理)`,

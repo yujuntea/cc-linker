@@ -668,21 +668,75 @@ describe('handleBackToChat', () => {
 });
 
 describe('handleReplyRequest (Step A)', () => {
-  test('rejects when status is not waiting', async () => {
-    const { mgr, replyFn, patchFn } = makeMgrWithSpies();
+  // v2.7.4: Reply 在所有 status 下都允许(对齐 TUI)。busy session 现在
+  // 会进 reply mode — bg 正在处理中,rendezvous 路径会排队等当前 turn 完后
+  // 注入(或 SDK fallback 走 claude --resume)。
+  test('v2.7.4: allows reply on busy session (no longer rejects)', async () => {
+    const { mgr, replyFn, patchFn, cardReplyFn } = makeMgrWithSpies();
     const busy = makeBusySession();
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
       ok: true,
       sessions: [busy],
     }));
+    // Stub peek hooks so card can build
+    const origHooks = { ...AgentViewManager._peekHooks };
+    AgentViewManager._peekHooks.readJobState = (async () => null) as any;
+    AgentViewManager._peekHooks.findJsonlForShort = (() => '/fake/own.jsonl') as any;
+    AgentViewManager._peekHooks.extractRecentAssistantText = (() => 'bg working...') as any;
+    AgentViewManager._peekHooks.readRoster = (() => null) as any;
 
-    await mgr.handleReplyRequest('ou_rr_busy', busy.sessionId.slice(0, 8), busy.sessionId, busy.cwd);
+    try {
+      await mgr.handleReplyRequest('ou_rr_busy', busy.sessionId.slice(0, 8), busy.sessionId, busy.cwd);
 
-    expect(replyFn).toHaveBeenCalledTimes(1);
-    expect(replyFn.mock.calls[0][0]).toContain('不是 waiting');
-    // No card patched and no expectedReply set
-    expect(patchFn).not.toHaveBeenCalled();
-    expect(mgr.expectedReply.get('ou_rr_busy')).toBeUndefined();
+      // 不再 bail — 应该走 cardReplyFn 发交互卡
+      expect(replyFn).not.toHaveBeenCalled();
+      expect(cardReplyFn).toHaveBeenCalledTimes(1);
+      // expectedReply 已 set
+      expect(mgr.expectedReply.get('ou_rr_busy')).toBeDefined();
+
+      // Clean up timer
+      await mgr.expectedReply.clear('ou_rr_busy');
+    } finally {
+      AgentViewManager._peekHooks = origHooks;
+    }
+  });
+
+  // v2.7.4: Reply 在 completed (idle+completed) session 也允许 —
+  // claude --resume 继续对话,作为新 turn。TUI 也允许。
+  test('v2.7.4: allows reply on completed session (claude --resume continues conversation)', async () => {
+    const { mgr, replyFn, patchFn, cardReplyFn } = makeMgrWithSpies();
+    const completed = makeBusySession({
+      name: 'done-task',
+      status: 'idle',
+      completed: true,
+      sessionId: 'cccccccc-3333-3333-3333-cccccccccccc',
+    });
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [completed],
+    }));
+    const origHooks = { ...AgentViewManager._peekHooks };
+    AgentViewManager._peekHooks.readJobState = (async () => null) as any;
+    AgentViewManager._peekHooks.findJsonlForShort = (() => '/fake/own.jsonl') as any;
+    AgentViewManager._peekHooks.extractRecentAssistantText = (() => 'previous turn output') as any;
+    AgentViewManager._peekHooks.readRoster = (() => null) as any;
+
+    try {
+      await mgr.handleReplyRequest(
+        'ou_rr_done',
+        completed.sessionId.slice(0, 8),
+        completed.sessionId,
+        completed.cwd,
+      );
+
+      expect(replyFn).not.toHaveBeenCalled();
+      expect(cardReplyFn).toHaveBeenCalledTimes(1);
+      expect(mgr.expectedReply.get('ou_rr_done')).toBeDefined();
+
+      await mgr.expectedReply.clear('ou_rr_done');
+    } finally {
+      AgentViewManager._peekHooks = origHooks;
+    }
   });
 
   test('v2.3.13: sends interactive card with peek content + cancel button (not plain text)', async () => {
@@ -794,6 +848,44 @@ describe('handleReply (Step B)', () => {
     // 关键:user-mapping 没被改回 type='session' → 下次发消息不会触发 busy check
     const entry = userManager.getEntry('ou_reply_ok');
     expect(entry?.type).toBe('pending_agent_reply');
+  });
+
+  // v2.7.4: bg 已 completed 时 handleReply 不再 bail —
+  // claude --resume <sessionId> 会继续对话,作为新 turn。
+  // 之前 v2.6.1 把 'session.completed' 当 hard bail,用户无法给已 settled 的
+  // session 发新指令。TUI (claude agents) 是允许的,Feishu 应该一致。
+  test('v2.7.4: completed session handleReply 不再 bail,继续 send (claude --resume)', async () => {
+    const { mgr, userManager, replyFn } = makeMgrWithSpies();
+    const completed = makeBusySession({
+      name: 'done-task',
+      status: 'idle',
+      completed: true,
+      sessionId: 'dddddddd-4444-4444-4444-dddddddddddd',
+    });
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: [completed],
+    }));
+    await mgr.expectedReply.set('ou_reply_done', {
+      shortId: completed.sessionId.slice(0, 8),
+      sessionId: completed.sessionId,
+      cwd: completed.cwd,
+    });
+    replyFn.mockClear();
+
+    const runSpy = mock(async () => ({
+      result: {}, handler: {}, cardMessageId: 'msg-resumed',
+      rendezvousHandled: false, bgAskedNewQuestion: false,
+    }));
+    mgr.deps.runChatSDK = runSpy as any;
+
+    await mgr.handleReply('ou_reply_done', '继续');
+
+    // v2.7.4:runChatSDK 必须被调用(不再 bail)
+    expect(runSpy).toHaveBeenCalled();
+    // 不应发"Claude 已切换到 idle,无法 reply"友好错误
+    const calledTexts = replyFn.mock.calls.map((c: any) => c[0]);
+    expect(calledTexts.some((t: string) => t.includes('已切换到 idle'))).toBe(false);
   });
 
   test('v2.3.4: clears expectedReply when runChatSDK throws (try/catch+reply)', async () => {
