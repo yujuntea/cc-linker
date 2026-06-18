@@ -131,6 +131,10 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
   // ─── Test 6: no session + /init → no_target prompt ───
   test('T6: no session + /init triggers no_target prompt mentioning /new', async () => {
     await env.bot.handleCommand(buildMsg('/init', 'ou_t6', 'msg_t6', noTarget('ou_t6')));
+    // Pre-fix returns "未知命令" which itself contains /list /switch /new from helpText —
+    // these alone don't discriminate. Add the "no 未知命令" check to make T6 a real discriminator.
+    const hasUnknown = env.textReplies.some(r => r.text.includes('未知命令'));
+    expect(hasUnknown).toBe(false);
     const reply = env.textReplies.find(r => r.text.includes('/new'));
     expect(reply).toBeDefined();
     // Same prompt as chat text would produce
