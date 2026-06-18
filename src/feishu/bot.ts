@@ -3226,6 +3226,7 @@ export class FeishuBot {
       '  /status                            - 查看状态',
       '  /whoami                            - 获取你的 open_id',
       '  /agents                            - 查看 agent 列表 (Agent View)',
+      '  /<其他命令>                        - 透传给当前会话的 Claude (如 /init /review /cost)',
     ].join('\n');
   }
 
