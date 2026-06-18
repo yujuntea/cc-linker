@@ -1,6 +1,5 @@
 import { describe, test, expect, afterEach, beforeEach } from 'bun:test';
 import { createTestBot, type TestBot } from '../../helpers/feishu-bot';
-import { ClaudeSessionManager } from '../../../src/proxy/session';
 import type { SpoolMessage } from '../../../src/queue/spool';
 import type { TargetSnapshot } from '../../../src/queue/spool';
 import type { SessionEntry } from '../../../src/registry/types';
@@ -23,6 +22,7 @@ function buildMsg(
     target,
     status: 'pending',
     createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -66,20 +66,20 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
 
   // ─── Test 2: /review pr diff reaches handleChat with full text ───
   test('T2: /review pr diff reaches handleChat session case; full text preserved', async () => {
-    // Mock sendSDKMessage to capture the prompt text without spawning real claude
+    // Mock runChatSDK on the bot instance to capture the prompt text without
+    // chasing through runChatSDK internals (resolveLiveSession / bg-conflict /
+    // short→full / sendSDKMessage). This still requires the session/userMapping
+    // setup so handleChat enters the `case 'session'` branch.
     const captured: { text?: string; sessionId?: string | null } = {};
-    const sm = new ClaudeSessionManager();
-    sm.sendSDKMessage = (async (sessionId: string | null, text: string, ..._rest: any[]) => {
-      captured.sessionId = sessionId;
-      captured.text = text;
+    (env.bot as any).runChatSDK = async (params: any) => {
+      captured.sessionId = params.sessionUuid;
+      captured.text = params.promptText;
       return {
-        result: { response: 'mocked', costUsd: 0, durationMs: 0, sessionId: sessionId ?? '', jsonlPath: null, sessionStatus: 'active' as const },
+        result: { response: 'mocked', costUsd: 0, durationMs: 0, sessionId: params.sessionUuid, jsonlPath: null, sessionStatus: 'active' as const },
         handler: {} as any,
+        cardMessageId: null,
       };
-    }) as any;
-
-    env.cleanup();
-    env = createTestBot({ tmpDirPrefix: 'bot-slash-passthrough-t2-', sessionManager: sm });
+    };
 
     // Set up session in registry + user-mapping so handleChat enters session case
     const sessionUuid = '11111111-1111-1111-1111-111111111111';
@@ -144,15 +144,14 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
 
   // ─── Test 7: with session + /init → enters session case ───
   test('T7: with session + /init enters handleChat session case', async () => {
-    // Mock sendSDKMessage to avoid real claude spawn (test env may lack binary)
-    const sm = new ClaudeSessionManager();
-    sm.sendSDKMessage = (async (sessionId: string | null, text: string, ..._rest: any[]) => ({
-      result: { response: 'mocked', costUsd: 0, durationMs: 0, sessionId: sessionId ?? '', jsonlPath: null, sessionStatus: 'active' as const },
+    // Mock runChatSDK on the bot instance to avoid real claude spawn. Bypasses
+    // runChatSDK internals (resolveLiveSession / bg-conflict / sendSDKMessage)
+    // so the test only verifies that handleChat enters `case 'session'`.
+    (env.bot as any).runChatSDK = async (params: any) => ({
+      result: { response: 'mocked', costUsd: 0, durationMs: 0, sessionId: params.sessionUuid, jsonlPath: null, sessionStatus: 'active' as const },
       handler: {} as any,
-    })) as any;
-
-    env.cleanup();
-    env = createTestBot({ tmpDirPrefix: 'bot-slash-passthrough-t7-', sessionManager: sm });
+      cardMessageId: null,
+    });
 
     const sessionUuid = '22222222-2222-2222-2222-222222222222';
     env.registry.upsert(sessionUuid, {
