@@ -60,7 +60,7 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
     const hasUnknown = env.textReplies.some(r => r.text.includes('未知命令'));
     expect(hasUnknown).toBe(false);
     // And the no_target prompt mentions /new
-    const hasNewPrompt = env.textReplies.some(r => r.includes('/new'));
+    const hasNewPrompt = env.textReplies.some(r => r.text.includes('/new'));
     expect(hasNewPrompt).toBe(true);
   });
 
@@ -191,6 +191,7 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
     const cancelCalls: string[] = [];
     const mockAgentView = {
       deps: {} as any,
+      attachedWatchers: { has: () => false, stop: async () => {} },
       handleCancelReply: async (openId: string) => { cancelCalls.push(openId); },
       expectedReply: {
         get: () => ({ sessionUuid: 'x', cwd: '/tmp', prompt: 'test' }),
@@ -235,6 +236,7 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
     const clearCalls: { openId: string; reason: string }[] = [];
     const mockAgentView = {
       deps: {} as any,
+      attachedWatchers: { has: () => false, stop: async () => {} },
       handleCancelReply: async () => {},
       expectedReply: {
         get: (openId: string) => ({ sessionUuid: 's', cwd: '/tmp', prompt: 'p' }),
