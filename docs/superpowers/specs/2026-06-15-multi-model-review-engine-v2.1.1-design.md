@@ -882,6 +882,9 @@ stateDiagram-v2
 | **PRODUCING** | work bg state=`done` | SELF_REVIEW_R1 | 记录 `panes.work.sessionId` | work (bg short1) | 0 → 1 |
 | **SELF_REVIEW_R1** | work bg done, issues=[] | DONE | 生成 report + 移到 `done/` | work (bg short2) | 1 |
 | **SELF_REVIEW_R1** | work bg done, issues=[N] | FIXING (source=R1) | 记录 R1 issues 作为 `inputIssues` | work (bg short2) |
+| **SELF_REVIEW_R1 (contextReset=true, injectedIssues≠[])** | work bg done, `all_real_fixed=true` + `remaining_real_unfixed_count=0` | DONE | **v2.1.1 P0-A1 修复**：reset 路径 happy path（worker verify+fix 全完成）| work (新 session) | round+1 |
+| **SELF_REVIEW_R1 (contextReset=true, injectedIssues≠[])** | work bg done, `all_real_fixed=true` + `remaining_real_unfixed_count>0` | SELF_REVIEW_R2 | **v2.1.1 P0-A1 修复**：reset 路径 mixed path（worker verify+fix 部分完成，剩余走正常 R2→ExtRev→Judge 循环）| work (新 session) | round+1 |
+| **SELF_REVIEW_R1 (contextReset=true, injectedIssues≠[])** | work bg parse 失败 | SELF_REVIEW_R1 (contextReset=false) | **v2.1.1 P0-A1 修复**：reset 路径 parse 失败 fallback（重新 prompt worker 走 R1 standard 模式，输出 `{issues, unfixed_count}`）| work (新 session) | round+1 |
 | **SELF_REVIEW_R2** | work bg done, issues=[] | DONE | 生成 report + 移到 `done/` | work (bg short3) |
 | **SELF_REVIEW_R2** | work bg done, issues=[N] | FIXING (source=R2) | 记录 R2 issues 作为 `inputIssues` | work (bg short3) |
 | **FIXING (source=R1)** | work bg done, verify+fix complete | SELF_REVIEW_R2 | 记录 `per_issue` (real/hallucination) + `all_real_fixed` | work (bg short4) |
@@ -906,6 +909,25 @@ stateDiagram-v2
 | **PANE_LOST** | 24h timeout | ABORTED | reason=`pane_lost_timeout` | — |
 | **PRODUCING** | work bg spawn 失败 | FAILED | reason=`bg_spawn_failed` | — |
 | **任意状态 X** | profile 加载失败（doctor 阶段） | FAILED | reason=`profile_invalid` | — |
+
+**v2.1.1 P0-A6 修复：DONE/FAILED/ABORTED 完整 reason 枚举**
+
+| 终态 | reason | 触发位置 | spec 章节 |
+|------|--------|----------|----------|
+| **DONE** | (无 reason 字段) | R1/R2 issues=[] / reset happy path | §5.3.4 |
+| **FAILED** | `bg_spawn_failed` | PRODUCING spawn | §10.1 |
+| **FAILED** | `profile_invalid` | doctor 阶段 | §10.1 |
+| **FAILED** | `r1_parse_degraded` | work R1 parse 失败（v2.1.1 P0-D4） | §7.5.4 |
+| **ABORTED** | `max_rounds_exceeded` | R1 entry round≥max | §5.2 |
+| **ABORTED** | `pane_lost_timeout` | PANE_LOST 24h | §5.3.4 |
+| **ABORTED** | `human_decision_timeout` | HUMAN_DECIDE 4h | §10.1 |
+| **ABORTED** | `context_overflow` | EXTERNAL_REVIEW strategy=abort | §7.5.7.4 |
+| **ABORTED** | `context_reset_spawn_failed` | CONTEXT_CHECK→reset 中 startSession 抛错 | §5.3.6 |
+| **ABORTED** | `work_session_lost_exceeds_max_rounds` | retryPANE_LOST 触发 | §6.4 |
+| **ABORTED** | `user_cancelled` | `cc-linker review cancel` | §6.6 |
+| **ABORTED** | `budget_exceeded` | 累计 costUsd > max_cost_usd | §7.2 (P0-D9) |
+| **ABORTED** | `reset_loop` | contextResets 次数 > max_context_resets_per_pipeline | §7.2 (P0-A2) |
+| **ABORTED** | `reset_timeout` | 单次 reset 耗时 > max_reset_duration_ms | §7.2 (P0-A2) |
 
 **v2.1 简化（FIXING 通用规则）**：
 - **FIXING(source=X)** 完成 → 下一状态由 source 决定：`R1 → R2`、`R2 → EXTERNAL_REVIEW`、`JUDGE/HUMAN → R1(postfix)`
@@ -1301,6 +1323,41 @@ async function transition(pipeline: PipelineRecord, event: EngineEvent): Promise
 2. State machine 转换函数本身幂等：纯函数，相同 input 永远相同 output
 3. Polling 间隔去重：adapter.poll 500ms 一次，但只在 state 变化时 emit 事件
 
+**v2.1.1 P0-A4 修复：4 路并发文件锁保护**
+4. **文件锁**：`pipelineState` 读写 + `pipelineStore` 读写 走 `~/.cc-linker/review-pipelines/.lock` 文件锁（用 codebase 已有的 `proper-lockfile` 依赖），粒度 per-pipeline。
+   - engine 每次 `saveRunning` 前 acquire lock，写入后 release
+   - reconciler `reconcile()` 进入时 acquire lock，扫完 release（见 §6.4）
+   - cancel 路径 `cancelPipeline` 进入时 acquire lock，调 cleanup 后 release
+   - HUMAN_DECIDE 4h watcher 触发 cleanup 时 acquire lock
+
+**锁协议**：
+```typescript
+// §6.3 锁协议（v2.1.1 P0-A4）
+async function withLock<T>(pipelineId: string, fn: () => Promise<T>): Promise<T> {
+  const lockPath = `~/.cc-linker/review-pipelines/${pipelineId}.lock`;
+  await acquireLock(lockPath);
+  try {
+    return await fn();
+  } finally {
+    await releaseLock(lockPath);
+  }
+}
+
+// engine.transition 包锁
+async function transition(pipeline, event) {
+  return withLock(pipeline.pipelineId, async () => {
+    // 现有 transition 逻辑
+  });
+}
+
+// cancelPipeline 包锁
+async function cancelPipeline(pipelineId, reason) {
+  return withLock(pipelineId, async () => {
+    // 现有 cleanup 逻辑
+  });
+}
+```
+
 **v2.1 变更 19 新增：FIXING source-aware 幂等性**：
 ```typescript
 // FIXING 状态的幂等性检查要考虑 source 字段
@@ -1628,6 +1685,7 @@ context_overflow_threshold_1m = 512000       # 1M+ 模型专用阈值（默认 5
 context_overflow_threshold_default = 200000  # 其他模型阈值（默认 200K = 100%）
 context_overflow_strategy = "reset"          # "reset" | "abort"（v2.1.1 删 review_fix，统一走 reset+inject-issues；详见 §7.5.7.3）
 context_overflow_hysteresis_rounds = 1       # 触发后至少 N 轮不再检查（避免抖动）
+max_injected_issues = 20                     # v2.1.1 P0-A2：reset 注入 issues 数量上限（按 severity 降序 top-N；防止 reset 路径 prompt 体积爆炸）
 
 # === v2.1.1 新增：parse retry timeout（§7.5.4 parseBgOutputWithRetry 等待 bg 重生成）===
 parse_retry_timeout_ms = 15000               # 默认 15s（90% retry 5-10s 完成，>15s 视为结构性问题）
@@ -2188,41 +2246,55 @@ async function executeContextReset(
   contextCheck: ContextCheckResult,
   profile: ReviewProfile,
 ): Promise<void> {
-  const workShortId = pipeline.panes.work!.currentRoundShortId!;
+  // v2.1.1 P0-A8 修复：每步之间检查 abortController.signal，防止 cancel 触发 orphan spawn
+  const signal = pipelineState.get(pipeline.pipelineId)?.abortController.signal;
+  const checkAbort = () => {
+    if (signal?.aborted) {
+      throw new AbortError('reset aborted by user cancel');
+    }
+  };
 
-  // 1. snapshot cwd（work session 自身会做 git commit，但这里再保险一次）
-  const checkpointSha = await snapshotCwd(pipeline.input.cwd, `pre-context-reset for pipeline ${pipeline.pipelineId}`);
+  try {
+    const workShortId = pipeline.panes.work!.currentRoundShortId!;
 
-  // 2. 收集给新 worker 的"外部记忆"
-  const injectedIssues = collectAllExternalReviewIssues(pipeline);  // 来自 EXTERNAL_REVIEW state
-  const historySummary = generateRoundSummary(pipeline);          // 每轮修了什么 issue
-  const relatedDocs = collectRelatedDocs(pipeline, injectedIssues); // review 提的 file + 之前修改的 file
-  const injectedIssueCount = injectedIssues.length;
+    // 1. snapshot cwd（work session 自身会做 git commit，但这里再保险一次）
+    const checkpointSha = await snapshotCwd(pipeline.input.cwd, `pre-context-reset for pipeline ${pipeline.pipelineId}`);
+    checkAbort();
 
-  // 3. kill work session
-  await adapter.stop(workShortId);
-  pipeline.panes.work = undefined;  // 标记为已死
+    // 2. 收集给新 worker 的"外部记忆"
+    const { issues: injectedIssues, truncatedCount } = collectAllExternalReviewIssues(pipeline, profile);  // v2.1.1 P0-A2：加 profile 参数
+    const historySummary = generateRoundSummary(pipeline);          // 每轮修了什么 issue
+    const relatedDocs = collectRelatedDocs(pipeline, injectedIssues); // review 提的 file + 之前修改的 file
+    const injectedIssueCount = injectedIssues.length;
+    checkAbort();
 
-  // 4. spawn 新 work session with 完整 context
-  const newWorkPrompt = buildContextResetPrompt({
-    pipelineId: pipeline.pipelineId,
-    contextUsage: contextCheck.usage,
-    checkpointSha,
-    historySummary,
-    injectedIssues,
-    relatedDocs,
-    nextRound: pipeline.state.round + 1,
-  });
-  const newWork = await adapter.startSession({
-    role: 'work',
-    provider: profile.work.provider,
-    prompt: newWorkPrompt,
-    cwd: pipeline.input.cwd,
-  });
-  pipeline.panes.work = {
-    sessionId: newWork.sessionId,
-    currentRoundShortId: newWork.shortId,
-    provider: profile.work.provider,
+    // 3. kill work session
+    await adapter.stop(workShortId);
+    checkAbort();
+
+    // 4. spawn 新 work session with 完整 context
+    const newWorkPrompt = buildContextResetPrompt({
+      pipelineId: pipeline.pipelineId,
+      contextUsage: contextCheck.usage,
+      checkpointSha,
+      historySummary,
+      injectedIssues,
+      relatedDocs,
+      truncatedCount,  // v2.1.1 P0-A2：让 prompt 标注"另有 N 个 issues 被截断未注入"
+      nextRound: pipeline.state.round + 1,
+    });
+    const newWork = await adapter.startSession({
+      role: 'work',
+      provider: profile.work.provider,
+      prompt: newWorkPrompt,
+      cwd: pipeline.input.cwd,
+    });
+    checkAbort();  // v2.1.1 P0-A8：spawn 成功后检查，避免 cancel 后 orphan session
+
+    pipeline.panes.work = {
+      sessionId: newWork.sessionId,
+      currentRoundShortId: newWork.shortId,
+      provider: profile.work.provider,
     startedAt: new Date().toISOString(),
     roundShortIds: [newWork.shortId],
     cycle: 'postfix',  // v2.1.1 I9：cycle=postfix（不是 initial），与正常 postfix 循环同语义
@@ -2344,22 +2416,29 @@ Engine 会读你的 output，verify-first + 全部 fix → DONE（跳过 R2/JUDG
 
 /**
  * 收集 pipeline 走过的所有 EXTERNAL_REVIEW 提的 issues（去重 + 按 severity 排序）
+ * v2.1.1 P0-A1 修复：dedup key 用 `issue.id`（不再依赖 location 拼字符串）
+ * v2.1.1 P0-A2 修复：加截断逻辑（按 severity 降序 top-N，N 由 profile 配，默认 20）
  */
-function collectAllExternalReviewIssues(pipeline: PipelineRecord): Issue[] {
+function collectAllExternalReviewIssues(pipeline: PipelineRecord, profile: ReviewProfile): { issues: Issue[]; truncatedCount: number } {
   const seen = new Set<string>();
   const result: Issue[] = [];
   for (const event of pipeline.history) {
     if (event.role === 'review' && event.issues) {
       for (const issue of event.issues) {
-        const key = `${issue.id}-${issue.location}-${issue.description}`;
-        if (!seen.has(key)) {
-          seen.add(key);
+        if (!seen.has(issue.id)) {  // v2.1.1 P0-A1：直接用 issue.id
+          seen.add(issue.id);
           result.push(issue);
         }
       }
     }
   }
-  return result.sort((a, b) => severityOrder(a.severity) - severityOrder(b.severity));
+  const sorted = result.sort((a, b) => severityOrder(a.severity) - severityOrder(b.severity));
+  const maxInjected = profile.guards.max_injected_issues ?? 20;  // v2.1.1 P0-A2：截断
+  const truncated = sorted.slice(0, maxInjected);
+  return {
+    issues: truncated,
+    truncatedCount: sorted.length - truncated.length,  // 用于 Markdown 报告标注
+  };
 }
 
 function collectRelatedDocs(pipeline: PipelineRecord, issues: Issue[]): string[] {
