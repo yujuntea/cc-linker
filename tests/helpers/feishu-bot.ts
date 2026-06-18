@@ -38,6 +38,10 @@ export interface TestBotOptions {
    * Example: `{ 'queue.max_pending': 5, 'security.allowed_roots': [] }`.
    */
   extraConfigMutations?: Record<string, unknown>;
+  /** Optional override for the ClaudeSessionManager instance. When provided,
+   *  tests can stub sendMessage/sendSDKMessage to assert passthrough behavior
+   *  without spawning real `claude -p` subprocesses. */
+  sessionManager?: ClaudeSessionManager;
 }
 
 export interface TestBot {
@@ -109,7 +113,7 @@ export function createTestBot(opts: TestBotOptions = {}): TestBot {
   const listSnapshotManager = new ListSnapshotManager(join(tmpDir, 'list-snapshot.json'));
   const spoolQueue = new SpoolQueue(tmpDir);
   const registry = new RegistryManager(tmpDir);
-  const sessionManager = new ClaudeSessionManager();
+  const sessionManager = opts.sessionManager ?? new ClaudeSessionManager();
 
   const textReplies: ReplyCapture[] = [];
   const cardReplies: CardCapture[] = [];
