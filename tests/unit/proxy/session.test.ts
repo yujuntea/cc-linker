@@ -142,7 +142,7 @@ describe('ClaudeSessionManager', () => {
     });
   });
 
-  // v2026-06-18: 测试 sendMessage line 416 用的 helper classsifyExecutionStatus。
+  // v2026-06-18: 测试 sendMessage line 416 用的 helper classifyExecutionStatus。
   // 区分 Claude 业务错 (parsed.is_error, 可恢复) vs CLI 进程崩 (基础设施错)。
   // 关键 regression 测试: 之前 line 416 会把 Claude 错 (如 context 超限) 误标 degraded,
   // 导致 /switch 永久阻断。修复后所有 Claude 业务错都保持 'active'。
