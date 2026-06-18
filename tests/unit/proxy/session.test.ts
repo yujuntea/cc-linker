@@ -67,6 +67,80 @@ describe('ClaudeSessionManager', () => {
     manager.cleanupIdleSessions(0); // 0 timeout should kill nothing since no active processes
     expect(manager.listSessions()).toHaveLength(0);
   });
+
+  // 回归测试:2026-06-18 bug —— context 超限后 session 被错标 degraded,/switch 阻断。
+  //
+  // 范围说明:这些测试覆盖 `_buildStreamingResult` (非 SDK 路径,在 `sendMessage` 内调用)
+  // 和 `_errorResult` (line 650)。SDK 路径 (`sendSDKMessage`,line 770/890/917/926) 的
+  // 修复是 4 处简单 find-and-replace,逻辑与 _buildStreamingResult 一致;同一份代码
+  // 修改在两处都生效,所以单元测试覆盖任一路径就足以证明修复。
+  //
+  // ⚠️ test #3 (infrastructure) 不是 red-phase 测试 —— `_errorResult` 不改,它在当前
+  // 代码已经 PASS。它的作用是 regression guard:防止未来误改 _errorResult 绕过 doSwitch
+  // 的 corrupted/CLI 缺失保护。
+
+  describe('_buildStreamingResult sessionStatus classification', () => {
+    // 私有方法,通过 (manager as any) 直接调,覆盖 line 691 (non-SDK streaming 路径)。
+
+    it('returns active (not degraded) when SDK reports subtype=error_max_turns', async () => {
+      // 模拟 SDK 正常返回 result chunk,subtype != 'success' (line 680: hasError=true)
+      const m = manager as any;
+      const lastResult = {
+        type: 'result',
+        subtype: 'error_max_turns',
+        is_error: true,
+        session_id: 'test-uuid-abc',
+        result: 'max turns reached',
+        errors: ['max turns reached'],
+        total_cost_usd: 0.01,
+        duration_ms: 5000,
+        usage: { input_tokens: 100, output_tokens: 50 },
+      };
+      const r = await m._buildStreamingResult(
+        lastResult, 0, '', 'test-uuid-abc', Date.now(), 5000, false,
+      );
+      // 修复前:line 691 hasError ? 'degraded' → 'degraded',测试失败
+      // 修复后:line 691 = 'active' → 'active',测试通过
+      expect(r.sessionStatus).toBe('active');
+      expect(r.error).toContain('max turns');
+    });
+
+    it('returns active when SDK returns lastResult with is_error=true but subtype=success', async () => {
+      // 边缘 case:is_error=true 但 subtype='success' (line 680: hasError=true)
+      const m = manager as any;
+      const lastResult = {
+        type: 'result',
+        subtype: 'success',
+        is_error: true,  // is_error 单独为 true (罕见但合法)
+        session_id: 'test-uuid-def',
+        result: 'partial',
+        errors: ['minor warning'],
+        total_cost_usd: 0.01,
+        duration_ms: 1000,
+        usage: { input_tokens: 50, output_tokens: 20 },
+      };
+      const r = await m._buildStreamingResult(
+        lastResult, 0, '', 'test-uuid-def', Date.now(), 1000, false,
+      );
+      // 修复前:line 691 hasError ? 'degraded' → 'degraded',测试失败
+      // 修复后:line 691 = 'active' → 'active',测试通过
+      expect(r.sessionStatus).toBe('active');
+    });
+
+    it('[regression guard] infrastructure errors (CLI not in PATH) still write degraded via _errorResult', async () => {
+      // ⚠️ 这个测试不是 red-phase —— _errorResult (line 650) 保持不变,本测试在当前
+      // 代码已经 PASS。它的作用是防止后续误改 _errorResult 绕过 doSwitch 的保护。
+      // _errorResult 的 4 个调用点 (line 527/530/550/732) 全部是基础设施错误,
+      // 这些场景必须继续写 degraded。
+      const m = manager as any;
+      const r1 = m._errorResult('cwd is empty', null);
+      const r2 = m._errorResult('Claude CLI 未找到: "claude" 不在 PATH 中', null);
+      const r3 = m._errorResult('Failed to start Claude process: spawn ENOENT', 'sid');
+      expect(r1.sessionStatus).toBe('degraded');
+      expect(r2.sessionStatus).toBe('degraded');
+      expect(r3.sessionStatus).toBe('degraded');
+    });
+  });
 });
 
 describe('resolveJsonlPath', () => {
