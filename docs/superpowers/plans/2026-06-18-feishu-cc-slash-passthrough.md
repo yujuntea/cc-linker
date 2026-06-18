@@ -154,34 +154,28 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
   });
 
   // ─── Test 2: /review pr diff reaches handleChat with full text ───
-  test('T2: /review pr diff reaches handleChat with leading slash preserved', async () => {
-    // Stub sessionManager.sendSDKMessage to capture the prompt text
-    const captured: { text?: string } = {};
+  test('T2: /review pr diff reaches handleChat session case; full text preserved', async () => {
+    // Mock sendSDKMessage to capture the prompt text without spawning real claude
+    const captured: { text?: string; sessionId?: string | null } = {};
     const sm = new ClaudeSessionManager();
-    sm.sendSDKMessage = (async (..._args: any[]) => ({
-      result: { response: 'mocked', costUsd: 0, durationMs: 0, sessionId: '', jsonlPath: null, sessionStatus: 'active' as const },
-      handler: {} as any,
-    })) as any;
-    const origSend = sm.sendSDKMessage;
-    // Wrap to capture text arg
-    (sm as any).sendSDKMessage = async (sessionId: any, text: any, ...rest: any[]) => {
+    sm.sendSDKMessage = (async (sessionId: string | null, text: string, ..._rest: any[]) => {
+      captured.sessionId = sessionId;
       captured.text = text;
-      return origSend.call(sm, sessionId, text, ...rest);
-    };
+      return {
+        result: { response: 'mocked', costUsd: 0, durationMs: 0, sessionId: sessionId ?? '', jsonlPath: null, sessionStatus: 'active' as const },
+        handler: {} as any,
+      };
+    }) as any;
 
     env.cleanup();
     env = createTestBot({ tmpDirPrefix: 'bot-slash-passthrough-t2-', sessionManager: sm });
 
-    // Set up session in registry + user-mapping
+    // Set up session in registry + user-mapping so handleChat enters session case
     const sessionUuid = '11111111-1111-1111-1111-111111111111';
     env.registry.upsert(sessionUuid, {
-      cwd: '/tmp',
-      project_name: 'test',
-      title: 't2',
-      message_count: 0,
-      created_at: new Date().toISOString(),
-      last_active: new Date().toISOString(),
-      status: 'active',
+      cwd: '/tmp', project_name: 'test', title: 't2',
+      message_count: 0, created_at: new Date().toISOString(),
+      last_active: new Date().toISOString(), status: 'active',
       jsonl_path: null,
     } as Partial<SessionEntry> as any);
     await env.userManager.compareAndSwap('ou_t2', null, {
@@ -192,11 +186,9 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
       buildMsg('/review pr diff', 'ou_t2', 'msg_t2', sessionTarget('ou_t2', sessionUuid, '/tmp')),
     );
 
-    // Spec §6.1 #2: 文本含前导斜杠
-    // Note: SDK mode may not be reached if config disables it; we just assert
-    // no 未知命令 reply and handleChat was invoked (no_target case is not entered).
-    const hasUnknown = env.textReplies.some(r => r.text.includes('未知命令'));
-    expect(hasUnknown).toBe(false);
+    // Spec §6.1 #2: handleChat 收到完整文本 `/review pr diff`（含前导斜杠）
+    expect(captured.text).toBe('/review pr diff');
+    expect(captured.sessionId).toBe(sessionUuid);
   });
 
   // ─── Test 3: /clear falls through ───
@@ -237,15 +229,21 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
 
   // ─── Test 7: with session + /init → enters session case ───
   test('T7: with session + /init enters handleChat session case', async () => {
+    // Mock sendSDKMessage to avoid real claude spawn (test env may lack binary)
+    const sm = new ClaudeSessionManager();
+    sm.sendSDKMessage = (async (sessionId: string | null, text: string, ..._rest: any[]) => ({
+      result: { response: 'mocked', costUsd: 0, durationMs: 0, sessionId: sessionId ?? '', jsonlPath: null, sessionStatus: 'active' as const },
+      handler: {} as any,
+    })) as any;
+
+    env.cleanup();
+    env = createTestBot({ tmpDirPrefix: 'bot-slash-passthrough-t7-', sessionManager: sm });
+
     const sessionUuid = '22222222-2222-2222-2222-222222222222';
     env.registry.upsert(sessionUuid, {
-      cwd: '/tmp',
-      project_name: 'test',
-      title: 't7',
-      message_count: 0,
-      created_at: new Date().toISOString(),
-      last_active: new Date().toISOString(),
-      status: 'active',
+      cwd: '/tmp', project_name: 'test', title: 't7',
+      message_count: 0, created_at: new Date().toISOString(),
+      last_active: new Date().toISOString(), status: 'active',
       jsonl_path: null,
     } as Partial<SessionEntry> as any);
 
@@ -253,11 +251,12 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
       type: 'session', sessionUuid, cwd: '/tmp',
     });
 
-    // Don't mock sendSDKMessage — busy check + session case will exercise the path
-    // We just assert: no 未知命令 reply was sent (handleChat session case took over)
     await env.bot.handleCommand(
       buildMsg('/init', 'ou_t7', 'msg_t7', sessionTarget('ou_t7', sessionUuid, '/tmp')),
     );
+
+    // Spec §6.1 #7: case 'session' 路径, busy check / rendezvous probe 启动
+    // 断言: handleChat session case 进入 (非 default), 不返回 未知命令
     const hasUnknown = env.textReplies.some(r => r.text.includes('未知命令'));
     expect(hasUnknown).toBe(false);
   });
@@ -273,24 +272,31 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
   });
 
   // ─── Test 9: /cancel in Agent View expectedReply state ───
-  test('T9: /cancel clears expectedReply at entry; switch default → handleChat /cancel branch', async () => {
-    // Install a mock agentView with handleCancelReply
+  test('T9: /cancel clears expectedReply at entry AND triggers handleChat /cancel branch', async () => {
+    const clearCalls: { openId: string; reason: string }[] = [];
     const cancelCalls: string[] = [];
     const mockAgentView = {
       deps: {} as any,
       handleCancelReply: async (openId: string) => { cancelCalls.push(openId); },
       expectedReply: {
         get: () => ({ sessionUuid: 'x', cwd: '/tmp', prompt: 'test' }),
-        clear: async () => true,
+        clear: async (openId: string, reason: string) => {
+          clearCalls.push({ openId, reason });
+          return true;
+        },
       },
     };
     env.bot.setAgentView(mockAgentView as any);
 
     await env.bot.handleCommand(buildMsg('/cancel', 'ou_t9', 'msg_t9', noTarget('ou_t9')));
 
-    // Spec §6.1 #9: handleCommand 入口清 expectedReply (silent if expectedReply.set)
-    // Then switch default → handleChat → handleCancelReply called (may be silent if already cleared)
-    // Either way, no 未知命令 reply
+    // Spec §6.1 #9 + §6.2 /cancel 等待中 行:
+    // 1. 入口 expectedReply.clear called with reason='overwrite'
+    expect(clearCalls).toHaveLength(1);
+    expect(clearCalls[0].reason).toBe('overwrite');
+    // 2. handleChat /cancel branch → handleCancelReply called
+    expect(cancelCalls).toEqual(['ou_t9']);
+    // 3. No 未知命令 reply (was the old broken behavior)
     const hasUnknown = env.textReplies.some(r => r.text.includes('未知命令'));
     expect(hasUnknown).toBe(false);
   });
@@ -594,7 +600,7 @@ In `src/feishu/bot.ts`, find the helpText array. The current last entry is:
       '  /agents                            - 查看 agent 列表 (Agent View)',
 ```
 
-Append one new line after it (use 28 spaces between `>` and `-` to align with existing entries at column 37; Chinese chars are 2 display cells each):
+Append one new line after it (use 24 spaces between `>` and `-` to align at column 37; `  /<其他命令>` = 2 + 1 + 1 + 8 (4 Chinese × 2 cells) + 1 = 13 display cells, so 37 - 13 = 24 spaces):
 
 ```typescript
       '  /<其他命令>                            - 透传给当前会话的 Claude (如 /init /review /cost)',
@@ -605,7 +611,7 @@ Wait — the new line should go AFTER `/agents` (the existing last entry), not b
 
 ```typescript
       '  /agents                            - 查看 agent 列表 (Agent View)',
-      '  /<其他命令>                            - 透传给当前会话的 Claude (如 /init /review /cost)',
+      '  /<其他命令>                        - 透传给当前会话的 Claude (如 /init /review /cost)',
 ```
 
 - [ ] **Step 3: Run typecheck**
