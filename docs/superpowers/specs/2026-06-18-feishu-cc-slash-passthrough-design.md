@@ -192,7 +192,7 @@ cc-linker 命令 (`/list /switch /help /resume /model /status /agents /stop /can
 | 9 | `/cancel`（Agent View） | handleChat 内 `/cancel` 分支保留：handleCommand 入口先清 expectedReply + 提示；switch default → handleChat → handleCancelReply 静默。净效果 cancel 成功（旧行为是 "未知命令: /cancel"） |
 | 10 | 串行递归防护 | 删除 dead code 后，`/xxx` 不会再二次进入 handleCommand（mock `handleCommand` 调用计数，删除 dead code 前 = 2 次，删除后 = 1 次） |
 | 11 | `expectedReply` 清空 | `/xxx` 进入 handleCommand 入口清空分支。`/help /status /whoami` 不清（isReadOnly=true），其他 `/xxx` 触发清空 + 提示。需断言 entry 那条"⏱ 等待输入已自动取消(因你跑了 /init)" reply |
-| 12 | `serialKey` 不变 | `/xxx` 仍用 `cmd:${openId}:${messageId}` 独立锁。SpoolQueue claim/file lock 跟 serialKey 一致。注意：sessionManager lockKey 也用 `cmd:openId:msgId`，意味着两次 `/xxx` 到同一 session 不互锁（已知限制，靠 busy check 兜底） |
+| 12 | `serialKey` 不变 | `/xxx` 仍用 `cmd:${openId}:${messageId}` 独立锁。SpoolQueue claim/file lock 跟 serialKey 一致。**已知行为**：两次 `/xxx` 到同一 session 不互锁，但 busy check + force-send 显式确认是兜底（见 §7 风险矩阵"已接受"项）。不做并发修。 |
 
 **测试技巧**：
 - 复用 `createTestBot` helper，依赖真实 `UserManager` / `SpoolQueue` / `RegistryManager` + mock `replyFn`
@@ -250,7 +250,7 @@ grep -rn "msg.text.startsWith" tests/
 | 现有测试断言 "未知命令" 文本，破窗式批量改 | 🟡 中 | Step 3 单独跑 + 列 diff 走 review |
 | 删除 dead code 后，隐藏在 dead branch 里的隐式行为暴露 | 🟢 低 | dead code 注释自己说"已知 dead"，且 v2.4.x 已在生产稳跑约 2 周（PR 2 ship date 2026-06-04，今日 2026-06-18） |
 | `handleChat` 串行递归 | 🔴 高 | Step 2 必须同时改 handleChat dead code，不能留尾巴 |
-| `/xxx` 同 session 并发（serialKey=`cmd:openId:msgId` 不锁同 session） | 🟡 中 | busy check 是主要兜底（bot.ts:1153-1193 `isSessionActive`）；force-send 路径仍可能并发 → 已知限制，文档化。后续若需要，handleChat session case 可改为 `lockKey=sessionUuid`（超出本 spec 范围） |
+| `/xxx` 同 session 并发（serialKey=`cmd:openId:msgId` 不锁同 session） | 🟢 低（已接受） | **决策：接受 Option A，不修**。理由：busy check（bot.ts:1153-1193 `isSessionActive`）是主要兜底；force-send 是用户显式 override，已承担风险；自动并发窗口窄（要 start marker 未写 + busy check 已读的竞态）；真出问题用户 `/resume` 即可恢复。后续若实际发生率高，再考虑 handleChat session case 改 `lockKey=sessionUuid`（超出本 spec 范围） |
 | `/cancel` 文本行为变化（旧 "未知命令" → 新 静默） | 🟡 中 | spec §6.2 显式记录；属"修复了之前 broken 的命令"，不算 regression |
 | `expectedReply` 清空 + 提示重复触发 | 🟢 低 | handleCommand 入口清空已经覆盖；handleChat 路径不再二次清 |
 | 命名冲突（`/help /resume /model /status /agents`）让用户困惑 | 🟡 中 | helpText 末尾加透传说明；未来加 `/cc-help` escape hatch 是 YAGNI，先不做 |
@@ -306,6 +306,7 @@ grep -rn "msg.text.startsWith" tests/
 |---|---|---|
 | v1 | 2026-06-18 | 初版，brainstorming 拍板：全自动透传 + 冲突降级，5 处代码改动，12 条单元测试 |
 | v1.1 | 2026-06-18 | Spec review fixes（7 处）：<br>1) **§7 风险矩阵** —— 加 `serialKey` 同 session 不互锁（busy check 兜底）+ `/cancel` 行为变化（修复之前 broken）+ "3 周" → "约 2 周"（PR 2 ship 2026-06-04）<br>2) **§5.4 helpText** —— 对齐修正到第 37 列（中文 2 cell/字）<br>3) **§6.1 测试用例** —— 9/10/11/12 措辞更精确，加 entry reply 断言细节<br>4) **§6.1 测试技巧** —— 明确推荐扩展 `createTestBot` 接受 `opts.sessionManager`<br>5) **§6.2 错误处理矩阵** —— 新增 `/cancel`（等待中）+ `/cancel`（无等待）两行<br>6) **§6.4 grep** —— 扩展到 4 个 pattern：`startsWith('/')` + `未知命令` + `handleCommand.*handleChat` + `msg.text.startsWith` |
+| v1.2 | 2026-06-19 | 用户拍板：Issue 1 serialKey 并发风险**接受 Option A 不修**。理由：busy check + force-send 显式确认已是兜底；自动并发窗口窄；force-send 是用户 override，行为一致；出问题 `/resume` 可恢复。修改：§7 风险矩阵降级 🟡 → 🟢 低（已接受），§6.1 用例 #12 措辞改为"不做并发修" |
 
 ## 11. 后续步骤
 
