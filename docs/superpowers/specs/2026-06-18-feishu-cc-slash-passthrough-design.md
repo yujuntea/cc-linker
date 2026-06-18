@@ -179,7 +179,7 @@ cc-linker 命令 (`/list /switch /help /resume /model /status /agents /stop /can
 
 | # | 用例 | 断言 |
 |---|---|---|
-| 1 | `/init` 无 cc-linker 命令表 | `handleCommand` 不走 default "未知命令" 路径；调 `handleChat` |
+| 1 | `/init` 不在 cc-linker 命令列表中 | `handleCommand` 不走 default "未知命令" 路径；调 `handleChat` |
 | 2 | `/review pr diff` | `handleChat` 收到完整文本 `/review pr diff`（含前导斜杠） |
 | 3 | `/clear` | 同上，原文透传 |
 | 4 | `//help` | 双斜杠：cmd 解析为 `help`（cc-linker 匹配），不走 default |
@@ -290,3 +290,7 @@ grep -rn "handleCommand.*handleChat.*startsWith" tests/
 | 版本 | 日期 | 关键变更 |
 |---|---|---|
 | v1 | 2026-06-18 | 初版，brainstorming 拍板：全自动透传 + 冲突降级，5 处代码改动，12 条单元测试 |
+
+## 11. 后续步骤
+
+本文档为设计 spec。批准后调用 superpowers 的 `writing-plans` skill 把 §9 实施步骤拆为可执行任务清单（含 TDD 红/绿/重构节奏），落到 `docs/superpowers/plans/`。
