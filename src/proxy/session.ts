@@ -714,7 +714,14 @@ export class ClaudeSessionManager {
     // v2026-06-18: 修复 /switch 阻断 bug —— SDK/Claude 已经正常运行过的路径
     // 上任何失败都是可恢复的 (context 超限、max_turns、rate_limit),不应锁死 session。
     // 错误信息走 error 字段,registry upsert 时会写到 last_error。
+    //
+    // v2026-06-18 follow-up: 但 mid-stream crash (lastResult=null, exitCode !== 0)
+    // 表明 CLI 进程崩了,跟 sendMessage 的 classifyExecutionStatus 同样的语义,
+    // 应该标 'degraded' 而不是 'active'。否则用户 /switch 成功但下次发消息又崩。
     let sessionStatus: 'active' | 'provisioning' | 'degraded' = 'active';
+    if (!lastResult && exitCode !== 0 && exitCode !== null) {
+      sessionStatus = 'degraded';
+    }
 
     if (isNew && resolvedSessionId) {
       jsonlPath = await resolveJsonlPath(resolvedSessionId);

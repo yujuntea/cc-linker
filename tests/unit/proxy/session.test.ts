@@ -134,6 +134,19 @@ describe('ClaudeSessionManager', () => {
       expect(r.sessionStatus).toBe('active');
     });
 
+    it('returns degraded when CLI crashes mid-stream (lastResult=null, exitCode=1)', async () => {
+      // v2026-06-18 follow-up: 之前修复让所有 hasError=true 都返回 'active',
+      // 但 lastResult=null + exitCode !== 0 表示 CLI 进程崩了 (基础设施错),
+      // 应该跟 sendMessage 的 classifyExecutionStatus 一样标 'degraded'。
+      // 否则用户 /switch 成功但下次发消息又崩,陷入循环。
+      const m = manager as any;
+      const r = await m._buildStreamingResult(
+        null, 1, 'SIGKILL', 'test-uuid-mid', Date.now(), 5000, false,
+      );
+      expect(r.sessionStatus).toBe('degraded');
+      expect(r.error).toBeTruthy();
+    });
+
     it('[regression guard] infrastructure errors (CLI not in PATH) still write degraded via _errorResult', async () => {
       // ⚠️ 这个测试不是 red-phase —— _errorResult (line 650) 保持不变,本测试在当前
       // 代码已经 PASS。它的作用是防止后续误改 _errorResult 绕过 doSwitch 的保护。
