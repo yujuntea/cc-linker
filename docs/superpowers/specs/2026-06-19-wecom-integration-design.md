@@ -188,26 +188,84 @@ export interface StreamUpdater {
 ### 4.2 新增 `src/wecom/` 通道
 
 #### `src/wecom/aibot-client.ts` (~200 行)
-封装 `@wecom/aibot-node-sdk` WSS 长连接，五个对外方法：`connect / send / update / onMessage / onCardAction`
-- 单例管理 WSS 连接
-- 30s 心跳保活
-- 重连退避：1s → 30s 指数
-- 内部把 aibot 事件归一化为回调参数
+封装 `@wecom/aibot-node-sdk@1.0.7` WSS 长连接，五个对外方法：`connect / send / updateStream / onMessage / onCardAction`
+
+**SDK 实际 API（已 PoC 验证，2026-06-19）**：
+```typescript
+import { WSClient, MessageType, EventType, generateReqId } from '@wecom/aibot-node-sdk';
+
+const wsClient = new WSClient({
+  botId: '<bot_id>',
+  secret: '<secret>',
+  // reconnectInterval: 1000,    // 默认
+  // maxReconnectAttempts: 10,   // -1 = 无限
+  // heartbeatInterval: 30000,
+  // requestTimeout: 10000,
+  // wsUrl: 'wss://openws.work.weixin.qq.com',  // 默认
+});
+wsClient.connect();  // chainable
+```
+
+**Stream API**（SDK 用 `replyStream` + 同 `req_id` 持续 patch）：
+```typescript
+const streamId = generateReqId('stream');         // 如 'stream_1781826086256_a46e51c6'
+await wsClient.replyStream(frame, streamId, 'thinking...', false);
+await wsClient.replyStream(frame, streamId, '更新内容', false);    // 同 streamId = patch
+await wsClient.replyStream(frame, streamId, '完成', true);          // finish=true 终止流
+await wsClient.replyStreamWithCard(frame, streamId, '完成', true, { templateCard });  // 流式 + 收尾卡片
+```
+
+**主动推送**（无 callback frame）：
+```typescript
+await wsClient.sendMessage(chatid, { msgtype: 'markdown', markdown: { content } });
+```
+
+**按钮回调 5s 窗口**：
+```typescript
+await wsClient.replyWelcome(frame, { msgtype: 'template_card', template_card: { ... } });     // 5s
+await wsClient.updateTemplateCard(frame, templateCard, userids?);                               // 5s
+```
+
+**事件订阅**（EventEmitter 风格）：
+```typescript
+wsClient.on('connected', () => ...);
+wsClient.on('authenticated', () => ...);
+wsClient.on('disconnected', (reason) => ...);
+wsClient.on('reconnecting', (attempt) => ...);
+wsClient.on('error', (err) => ...);
+wsClient.on('message', (msg) => ...);
+wsClient.on('message.text', (msg) => ...);       // type=Text
+wsClient.on('message.image', (msg) => ...);      // type=Image
+wsClient.on('message.mixed', (msg) => ...);
+wsClient.on('event.enter_chat', (evt) => ...);
+wsClient.on('event.template_card_event', (evt) => ...);
+wsClient.on('event.feedback_event', (evt) => ...);
+```
+
+**aibot-client.ts 内部职责**：
+- 单例管理 WSClient 实例
+- 30s 心跳保活（SDK 默认）
+- 重连退避：1s → 30s 指数（用 SDK 的 `reconnectInterval` / `maxReconnectAttempts`）
+- 把 SDK EventEmitter 事件归一化为内部 callback：`onMessage(PlatformMessage)` / `onCardAction(PlatformCardAction)`
+- 把 SDK 抛出的 `WSAuthFailureError`（botId/secret 错）映射到 CCError
+- 把 SDK 抛出的 `WSReconnectExhaustedError`（重连耗尽）映射到 CCError
 
 #### `src/wecom/stream-updater.ts` (~150 行)
-实现 `StreamUpdater`，用 aibot `stream.id` 流式消息协议
-- `start()` → `aibot_send_msg(stream.create)` → 拿 streamId
-- `update()` → `aibot_send_msg(stream.update, streamId)` → 同 id patch
-- 节流：**2000ms**（30/min 上限保护）
-- `finish()` → `aibot_send_msg(stream.finish=true)`
-- 限频 buffer：errcode 45009/45033 → buffer 累积 → finish 时合并
+实现 `StreamUpdater`，用 SDK `replyStream` 流式消息协议
+- `start(initialText)` → `wsClient.replyStream(frame, streamId, initialText, false)` → 返回 streamId
+- `update(messageId, chunk)` → `wsClient.replyStream(frame, messageId, merged, false)` → 同 streamId patch
+- **节流**：2000ms（30/min 上限保护）
+- **Content 上限**：20480 bytes（SDK 硬限制）；超长 buffer 截断 + finish 时丢弃
+- `finish(messageId, finalContent, {asCard: true})` → `replyStreamWithCard` 流式终止 + 收尾卡片；或 `replyStream(..., true)` 纯文本收尾
+- `fail(messageId, errorText)` → `replyStream(..., true)` 发 markdown 错误 + `replyTemplateCard` 附"重试/取消"按钮
+- **限频 buffer**：errcode 45009/45033 → buffer 累积 → finish 时合并到 finalContent
 
 #### `src/wecom/bot.ts` (~500 行)
 `WecomBot` 主类，对标 `feishu/bot.ts` 最简版
-- `onMessage()` → 归一化为 `PlatformMessage` → 入 `SpoolQueue`
-- `handleChat()` → 调 `ClaudeSessionManager` → `StreamChunk[]` → 调 `StreamUpdater`
+- `onMessage(PlatformMessage)` → 写 serialKey `new:${userId}` → 入 `SpoolQueue`
+- `handleChat()` → 调 `ClaudeSessionManager` → 拿 `StreamChunk[]` → 调 `StreamUpdater`
 - `handleCommand()` → 委托给 `platform/command-handler`
-- `onCardAction()` → 5 秒占位 + 异步处理
+- `onCardAction()` → 5 秒内 `replyWelcome` 发占位卡片 → 异步处理 → 处理完成后 `updateTemplateCard` 或新发
 - 错误处理走 `handleError()` 共享模块
 
 #### `src/wecom/card.ts` (~200 行)
@@ -340,10 +398,37 @@ aibot event: template_card_event { message_id, action_tag, action_value }
   ↓
 WecomBot.onCardAction(event)
   1. 解析 action → { type: 'retry' | 'stop' | 'confirm-stop' | 'list-refresh', ... }
-  2. 立即调 aibot_respond_update_msg(message_id, thinkingCard)  ← 必须 5 秒内
+  2. 立即调 wsClient.replyWelcome(frame, thinkingCard)  ← 必须 5 秒内
   3. 异步执行实际动作（重试 Claude / 停止 session / 刷新列表）
-  4. 动作完成后：aibot_respond_update_msg 或发新消息
+  4. 动作完成后 wsClient.updateTemplateCard 或 sendMessage 发新结果
 ```
+
+### 5.7 跨平台 session 隔离模型（Issue #3 决策）
+
+**关键事实**（2026-06-19 已通过读源码验证）：
+- `UserManager.mapping.entries[openId]`（`src/feishu/mapping.ts:39,122`）—— key 是**平台特定** userId
+- `SpoolQueue serialKey = `new:${event.open_id}``（`src/feishu/bot.ts:331`）—— 同样按平台 userId 聚合
+- 飞书的 `open_id` 与企微的 `external_userid` **完全不交叉**
+
+**结论**：
+- **同一真实用户**在飞书和企微各有独立 userId、各有独立 mapping entry、各有独立 sessionUuid
+- 同一真实用户即使同时在飞书和企微发消息：
+  - 飞书侧 → 飞书 session 跑飞书 claude 进程 → 流式回复到飞书
+  - 企微侧 → 企微 session 跑企微 claude 进程 → 流式回复到企微
+  - **两个 session 完全独立，不会互相阻塞**
+- 飞书内部已有的 busy 判断（`pending_new_session_claimed` CAS，`mapping.ts:171-189`）只在飞书用户之间有效
+- **跨平台没有"同 session 抢资源"的并发问题**
+
+**用户感知**：
+- 自用 + 团队场景：用户在某个平台活跃不会干扰另一平台的 session
+- **能力缺失（不在 v1 范围）**：跨平台"继续同一会话"——如果用户在飞书跑了一个长 session，想去企微"接着聊"，目前需要重新描述上下文
+  - 未来可做：用 `mobile` / `email` 等做 user identity 关联，跨平台映射 sessionUuid
+  - v1 不做，spec 显式 YAGNI
+
+**SpoolQueue 跨平台策略**（PR 3 实施）：
+- `--platform=all` 时，两个 Bot 共用一个 `SpoolQueue` 实例（共享 `~/.cc-linker/spool/`）
+- 但飞书消息和企微消息天然按 userId 隔离，不会冲突
+- `Worker` 拉取消息时按 `serialKey` 分发，与现有逻辑一致
 
 ### 5.5 关键时序约束
 
@@ -383,6 +468,14 @@ WecomBot.onCardAction(event)
 
 ### 6.2 A. 网络层（企微专属）
 
+**A0. SDK 抛错（PoC 实测已识别）**
+- `WSAuthFailureError`：botId/secret 错导致认证连续失败耗尽 maxAuthFailureAttempts → **不可恢复**
+  - 处理：映射到 CCError E_CONFIG → fail-fast 进程自杀 + 用户必须修正 config 后重启
+  - 日志：error（一次性，附完整 stack）
+- `WSReconnectExhaustedError`：WSS 重连次数耗尽 maxReconnectAttempts → 网络持续不可达
+  - 处理：触发 A3 进程自杀逻辑
+  - 日志：error
+
 **A1. WSS 断线**
 - 退避：1s, 2s, 4s, 8s, 16s, 30s (max)
 - 重连成功：清零退避；SpoolQueue reconcile 拉回 processing
@@ -392,6 +485,12 @@ WecomBot.onCardAction(event)
 
 **A2. 心跳超时**
 - 30s 内未收到 pong → 单次重试 → 二次失败触发 A1
+
+**A3. 进程自杀触发条件**
+- `WSReconnectExhaustedError` 抛出
+- A1 持续 >10min
+- `WSAuthFailureError` 抛出（认证失败）
+- launchd / systemd 重启 → `startupReconcile` 恢复 SpoolQueue
 
 ### 6.3 B. aibot 限频（协议级硬约束）
 
@@ -464,19 +563,44 @@ WecomBot.onCardAction(event)
        └──────────────────┘
 ```
 
-### 7.2 Bun 兼容性 PoC（前置，必做）
+### 7.2 Bun + SDK 兼容性 PoC（前置，必做）✅ 已于 2026-06-19 验证
 
-在写代码**之前**，先用 PoC 验证 SDK 兼容性：
+**PoC 结论**（已实测，PoC 代码在 `/tmp/aibot-poc/`）：
 
-```bash
-bun run poc/aibot-connect.ts    # WSS 握手 + 收发
-bun run poc/aibot-stream.ts     # stream.id 流式
-bun run poc/bun-compat-check.ts # ws / crypto / Buffer
+| 验证项 | 结果 | 备注 |
+|---|---|---|
+| `@wecom/aibot-node-sdk@1.0.7` 在 Bun v1.3.14 加载 | ✅ 通过 | named + default imports 都正确 |
+| `new WSClient({ botId, secret })` 实例化 | ✅ 通过 | constructor 选项齐 |
+| EventEmitter 事件订阅 | ✅ 通过 | `on('message.text')` 等正常工作 |
+| `node:crypto` / `node:events` / `ws` | ✅ 通过 | 全部可用 |
+| `bun build --compile` 打包 standalone binary | ✅ 通过 | 61MB binary，所有 SDK 行为正常 |
+
+**PoC-3 关键 API 实测**（用于 §4.2 SDK 调用）：
+```typescript
+// 真实 SDK API（不是 spec 自创的）
+wsClient.replyStream(frame, streamId, content, finish?, msgItem?, feedback?);
+wsClient.replyStreamWithCard(frame, streamId, content, finish?, { msgItem?, templateCard?, ... });
+wsClient.replyWelcome(frame, body);              // 5s 窗口
+wsClient.updateTemplateCard(frame, templateCard, userids?);  // 5s 窗口
+wsClient.sendMessage(chatid, body);              // 主动推送（无 callback frame）
+
+// 事件
+wsClient.on('message.text', handler);
+wsClient.on('message.image', handler);
+wsClient.on('event.template_card_event', handler);
+wsClient.on('event.enter_chat', handler);
+
+// 内容上限
+// content max 20480 bytes（SDK 硬限制）
+
+// 错误类
+WSAuthFailureError       // botId/secret 错 → CCError
+WSReconnectExhaustedError // 重连耗尽 → CCError
 ```
 
-**通过门槛**：3 个脚本全部成功 + 无 Node 警告 + 无 process.exit 异常。
+**备选方案不再需要**：PoC 完全通过，无需走 Bun 原生 WebSocket 自实现协议层。
 
-**备选**：PoC 失败则用 Bun 原生 WebSocket (`Bun.connect` with TLS) + 自实现 aibot 协议层（+300 行）。
+**PoC 后续保留**：作为 PR 2 的 smoke test fixture，`bun test tests/poc/` 跑回归。
 
 ### 7.3 单元测试 (~80 case)
 
@@ -599,21 +723,23 @@ bun run poc/bun-compat-check.ts # ws / crypto / Buffer
 
 ### 9.1 已知风险
 
-| 风险 | 影响 | 缓解 |
-|---|---|---|
-| `@wecom/aibot-node-sdk` Bun 不兼容 | PR 2 阻塞 | PoC 前置验证；备选用 Bun 原生 WebSocket |
-| aibot 限频 30/min 影响长对话 UX | 流式体验下降 | buffer 合并 + finish 完整；节流提到 2000ms |
-| 按钮回调 5s 时窗导致"卡住"错觉 | 用户感知差 | 立即占位卡片 + 异步处理 |
-| 抽公共代码时破坏飞书边缘行为 | 飞书回归 | PR 1 强制 E2E + 单测覆盖 ≥90% |
-| OpenClaw 官方 SDK 行为变更 | 持续维护成本 | 抽象层隔离 + 单元测试覆盖 |
-| 用户接入需扫"联系我"二维码 | 自用 0 摩擦，团队 1 次性 | README 写清流程 |
+| 风险 | 影响 | 缓解 | 状态 |
+|---|---|---|---|
+| `@wecom/aibot-node-sdk` Bun 不兼容 | ~~PR 2 阻塞~~ | ~~PoC 前置验证~~ | ✅ **PoC 已通过**（2026-06-19，见 §7.2） |
+| `bun build --compile` 不能打包 SDK | ~~PR 2 阻塞~~ | ~~改 Bun 原生 WebSocket~~ | ✅ **PoC 已通过**（61MB standalone binary 行为正常） |
+| aibot 限频 30/min 影响长对话 UX | 流式体验下降 | buffer 合并 + finish 完整；节流提到 2000ms | ⚠️ 协议级硬约束 |
+| 按钮回调 5s 时窗导致"卡住"错觉 | 用户感知差 | 立即占位卡片（`replyWelcome`）+ 异步处理 | ⚠️ 协议级硬约束 |
+| 抽公共代码时破坏飞书边缘行为 | 飞书回归 | PR 1 强制 E2E + 单测覆盖 ≥90% | 🔄 PR 1 风险 |
+| SDK 抛 `WSAuthFailureError` 误显示 | 配置错时 user 看不懂 | 映射到 CCError + 一次性 error 日志 | 🔄 已识别，PR 2 处理 |
+| 跨平台 userId 隔离导致"无法跨平台继续会话" | 用户体验缺陷 | **v1 显式 YAGNI**，未来用 mobile/email 做 identity 关联 | 🔄 已知约束，v1 不解决 |
+| 用户接入需扫"联系我"二维码 | 自用 0 摩擦，团队 1 次性 | README 写清流程 | 🟢 可控 |
 
-### 9.2 未决问题（需 PoC 验证）
+### 9.2 未决问题（生产观测）
 
-1. `@wecom/aibot-node-sdk` 在 Bun 下的实际行为（PR 2 前置 PoC 验证）
-2. aibot WSS 重连稳定性（生产观测）
-3. stream.id 流式 patch 的实际节流行为（30/min 是否包括 stream patch 还是仅 send）
-4. 未认证主体是否能创建智能机器人（实测）
+1. aibot WSS 重连稳定性（生产 1 周观测）
+2. stream.id 流式 patch 的实际节流行为（30/min 是否包括 stream patch 还是仅 send）
+3. 未认证主体是否能创建智能机器人（需用户实测；spec 已推荐"个人组建团队"作为兜底路径）
+4. 限频触发的精确阈值（30/min 是 SDK 文档值，实际可能浮动）
 
 ### 9.3 不在 v1 范围（未来可能）
 
@@ -621,6 +747,8 @@ bun run poc/bun-compat-check.ts # ws / crypto / Buffer
 - 公众号 / 小程序接入（范式不同，不考虑）
 - 完全 Platform Adapter 抽象（待 3 个平台以上时再做）
 - 飞书侧行为优化（独立需求，不在本次范围）
+- 跨平台"继续同一会话"（user identity 关联）
+- 复杂监控 / metric 导出（按 Issue #4 决策暂不做）
 
 ## 10. 验收标准（v1 完成判定）
 
