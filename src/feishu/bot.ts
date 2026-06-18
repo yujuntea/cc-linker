@@ -2412,7 +2412,15 @@ export class FeishuBot {
       // I-1 fix: if SDK short-circuited (e.g. E_SDK_NO_CLAUDE), render an error card
       // instead of a green success card. The sessionId is truthy (resume UUID) so we
       // can't rely on `!result.sessionId` like the new-session path does.
-      if (result.sessionStatus === 'degraded' && cardUpdater) {
+      //
+      // v2026-06-18 follow-up: 之前 gate 是 `result.sessionStatus === 'degraded'`。
+      // 但之前的 fix 把 transient 错误 (context 超限 / max_turns / rate_limit) 改成
+      // 返回 'active' + error 字段。这条 if 因此对 transient 错误永远不成立,用户
+      // 看到的是绿色 success 卡片里渲染错误文字,体验差。
+      // 改成 `result.error && cardUpdater` 同时覆盖两种情况:
+      //   - 基础设施错 (sessionStatus='degraded'): error 字段有值,渲染错误卡
+      //   - 业务错 (sessionStatus='active', error 有值): 同样渲染错误卡
+      if (result.error && cardUpdater) {
         await cardUpdater.error(result.error ?? result.response);
         cardMessageId = cardUpdater.getCardMessageId();
         cardUpdater.dispose();
@@ -3761,13 +3769,18 @@ export class FeishuBot {
    * 之前 degraded 引导用户跑 `cc-linker repair` (命令不存在) 和
    * `general.claude_bin` (优先级低,SDK 实际先读 [sdk] claude_executable)。
    * 集中在这里确保 doSwitch (line 3511, 3515) 和 doResume (line 3753) 同步更新。
+   *
+   * v2026-06-18 second follow-up: 之前 hint 写 `cc-linker list` 但默认 filter 掉
+   * non-active sessions (list.ts:20),用户按提示运行看不到 degraded/corrupted。
+   * 改用 `cc-linker list --archived` 才显示。
+   * 之前 corrupted hint 说"删除 entry"但无 delete 子命令,改"编辑 registry.json 手动清理"。
    */
   private formatSessionStatusHint(uuid: string, kind: 'corrupted' | 'degraded'): string {
     if (kind === 'corrupted') {
-      return `⚠️ 会话 ${uuid.slice(0, 8)} 已损坏，不能直接操作。\n💡 建议: 在终端运行 \`cc-linker list\` 查看损坏 session 列表,或删除该 entry 后重新创建。`;
+      return `⚠️ 会话 ${uuid.slice(0, 8)} 已损坏，不能直接操作。\n💡 建议: 在终端运行 \`cc-linker list --archived\` 查看损坏 session 列表,或编辑 \`~/.cc-linker/registry.json\` 手动清理该 entry。`;
     }
     // degraded
-    return `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态 (可能原因: Claude CLI 缺失 / cwd 不可访问 / 环境配置异常)。\n💡 建议: 在终端运行 \`cc-linker list\` 查看所有 session 状态,或检查 \`~/.cc-linker/config.toml\` 的 [sdk] claude_executable / [general] claude_bin 配置。`;
+    return `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态 (可能原因: Claude CLI 缺失 / cwd 不可访问 / 环境配置异常)。\n💡 建议: 在终端运行 \`cc-linker list --archived\` 查看所有 session 状态,或检查 \`~/.cc-linker/config.toml\` 的 [sdk] claude_executable / [general] claude_bin 配置。`;
   }
 
   private async doResumeReply(openId: string, uuid: string, msg: SpoolMessage): Promise<void> {
