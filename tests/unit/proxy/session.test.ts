@@ -70,10 +70,17 @@ describe('ClaudeSessionManager', () => {
 
   // 回归测试:2026-06-18 bug —— context 超限后 session 被错标 degraded,/switch 阻断。
   //
-  // 范围说明:这些测试覆盖 `_buildStreamingResult` (非 SDK 路径,在 `sendMessage` 内调用)
-  // 和 `_errorResult` (line 650)。SDK 路径 (`sendSDKMessage`,line 770/890/917/926) 的
-  // 修复是 4 处简单 find-and-replace,逻辑与 _buildStreamingResult 一致;同一份代码
-  // 修改在两处都生效,所以单元测试覆盖任一路径就足以证明修复。
+  // 范围说明:这些测试覆盖以下 3 个 sessionStatus 写入点:
+  //   - `_buildStreamingResult` (line 694,被 `sendStreamingMessage` 调用,非 SDK 流式路径)
+  //   - `_errorResult` (line 650,基础设施错误的 helper)
+  //   - `classifyExecutionStatus` (顶层 helper,被 `sendMessage` line 416 调用,Fix 1 新增)
+  //
+  // SDK 路径 (`sendSDKMessage`,line 893/920/932 修复后) 的 3 处 return 走相同模式
+  // (三元 'active' hardcode + 错误信息走 error 字段),且:
+  //   - mock `@anthropic-ai/claude-agent-sdk` 的 query() 成本高
+  //   - 与 _buildStreamingResult 改动模式字面相同
+  // 所以测试选择覆盖 _buildStreamingResult + classifyExecutionStatus,通过"代码读 + 模式
+  // 一致"保证 SDK 路径行为。如果未来有人只在 SDK 路径改而忘了非 SDK 路径,本测试会报警。
   //
   // ⚠️ test #3 (infrastructure) 不是 red-phase 测试 —— `_errorResult` 不改,它在当前
   // 代码已经 PASS。它的作用是 regression guard:防止未来误改 _errorResult 绕过 doSwitch
