@@ -1165,23 +1165,68 @@ p0_p1_reject_threshold = 0.30   # 默认 30%（v2.1）
 Engine 在生成 `reviews_json_for_each_role` 时**必须**按以下规则生成 issue_id，确保 work session 返回的 per_issue 能匹配：
 
 ```typescript
-function generateIssueId(role: string, index: number): string {
-  // v2.1.1 单 review 模型：role 固定为 'review'
-  // v2.1 是 'review-A' | 'review-B' | 'work' (FIXING input)
-  // index = 该 role 内的 issue 序号（从 1 开始）
-  return `${role}-${index}`;
+// v2.1.1 P0-B3 修复：完整的 issue_id 生成算法（跨轮稳定）
+
+/**
+ * 生成稳定的 issue_id（跨轮稳定）
+ *
+ * 算法：
+ *   1. 计算 issue 的 fingerprint = SHA256(role + severity + location + description).substring(0, 8)
+ *   2. 查历史 issue map（pipeline.issueIdMap），看是否已有匹配
+ *   3. 匹配规则：fingerprint 相同 OR location 相同 + severity 相同 + description 相似度 > 0.8
+ *   4. 如果匹配到 → 复用旧 id（如 "review-3"）
+ *   5. 如果没匹配到 → 分配新 id（如 "review-N"，N = 该 role 内下一个可用序号）
+ *
+ * 跨 round 稳定性保证：
+ *   - R1 提的 issue-3 在 R2 仍是 issue-3（基于 fingerprint 匹配）
+ *   - issue 消失（R2 没发现）→ id 不再使用（但不回收）
+ *   - issue 合并（R2 把 2 个 issue 合并成 1 个）→ 保留第 1 个的 id，第 2 个 id 废弃
+ */
+function generateIssueId(
+  issue: Issue,
+  role: string,
+  existingIssues: Issue[],  // 历史 issue map
+): string {
+  const fingerprint = crypto.createHash('sha256')
+    .update(`${role}:${issue.severity}:${issue.location}:${issue.description}`)
+    .digest('hex')
+    .substring(0, 8);
+
+  // 查历史匹配
+  for (const existing of existingIssues) {
+    if (existing.role === role) {
+      // 精确匹配：fingerprint 相同
+      if (existing.fingerprint === fingerprint) {
+        return existing.id;
+      }
+      // 模糊匹配：location 相同 + severity 相同 + description 相似度 > 0.8
+      if (existing.location === issue.location &&
+          existing.severity === issue.severity &&
+          similarity(existing.description, issue.description) > 0.8) {
+        return existing.id;
+      }
+    }
+  }
+
+  // 没匹配到 → 分配新 id
+  const maxIndex = existingIssues
+    .filter(e => e.role === role)
+    .map(e => parseInt(e.id.split('-')[1]))
+    .reduce((a, b) => Math.max(a, b), 0);
+  return `${role}-${maxIndex + 1}`;
 }
 
 // 示例（v2.1.1 单 review）：
-// review-1 = review pane 的第 1 个 issue
-// review-3 = review pane 的第 3 个 issue
-// work-2 = work pane self_review 的第 2 个 issue（FIXING 输入）
+// review-1 = review pane 的第 1 个 issue（fingerprint: a1b2c3d4）
+// review-3 = review pane 的第 3 个 issue（fingerprint: e5f6g7h8）
+// work-2 = work pane self_review 的第 2 个 issue（fingerprint: i9j0k1l2）
+// R1 提的 review-3 在 R2 仍是 review-3（基于 fingerprint 匹配）
 ```
 
 **注意**：
 - issue_id 必须跨轮稳定（同一 issue 在 R1 → R2 → JUDGE 多轮中保持相同 id）
-- 实现：engine 在生成 review JSON 时按 (role, severity, location) 生成稳定 hash 作为 index key，确保同一 issue 跨轮 id 一致
-- 跨 round 后 issue 可能消失或合并，engine 需要做 issue 匹配（基于 location hash 而非序号）
+- **v2.1.1 P0-B3 修复**：用 fingerprint + 历史匹配算法，不再依赖序号（序号在 issue 消失/合并时会错位）
+- work session prompt 中明确 "请用以下 issue_id（来自 engine 注入）"，不要自己生成 id
 
 ## 6. PipelineStore & Reconciler
 
@@ -1450,6 +1495,46 @@ async function reconcileInternal(): Promise<ReconcileResult> {
     if (isTerminal(record.state.kind)) {
       await store.moveToTerminal(record);
       continue;
+    }
+
+    // 1.1 v2.1.1 P0-B4：检查 HUMAN_DECIDE 4h 超时
+    if (record.state.kind === 'HUMAN_DECIDE' && record.state.pending) {
+      const profile = await loadProfile(record.input.profile);
+      const timeout = profile.guards.human_decide_timeout_ms ?? 14400000;  // 默认 4h
+      const enteredAt = record.state.pending.enteredAt;  // ISO timestamp
+      const elapsed = Date.now() - new Date(enteredAt).getTime();
+      if (elapsed >= timeout) {
+        await cleanupPipeline(record.pipelineId, 'human_decision_timeout');
+        record.state = {
+          kind: 'ABORTED',
+          pipelineId: record.pipelineId,
+          round: record.state.round,
+          reason: 'human_decision_timeout',
+          abortedBefore: 'HUMAN_DECIDE',
+        };
+        await store.moveToTerminal(record);
+        result.timedOut.push(record.pipelineId);
+        continue;
+      }
+    }
+
+    // 1.2 v2.1.1 P0-B4：检查 PANE_LOST 24h 超时
+    if (record.state.kind === 'PANE_LOST') {
+      const detectedAt = record.state.detectedAt;  // ISO timestamp
+      const elapsed = Date.now() - new Date(detectedAt).getTime();
+      if (elapsed >= 24 * 3600_000) {
+        await cleanupPipeline(record.pipelineId, 'pane_lost_timeout');
+        record.state = {
+          kind: 'ABORTED',
+          pipelineId: record.pipelineId,
+          round: record.state.round,
+          reason: 'pane_lost_timeout',
+          abortedBefore: 'PANE_LOST',
+        };
+        await store.moveToTerminal(record);
+        result.timedOut.push(record.pipelineId);
+        continue;
+      }
     }
 
     // 2. v2.1：验证每个 pane bg session 是否还活着
@@ -2029,9 +2114,25 @@ async function parseBgOutputWithRetry<T>(
 ): Promise<ParseResult<T>> {
   const maxRetries = opts.maxRetries ?? 1;
   const timeoutMs = opts.timeoutMs ?? 15_000;  // v2.1.1 改：默认 15s（原 30s 偏长）
+  // v2.1.1 P0-B2 修复：完整的 retry prompt 模板（带原 prompt 摘要 + schema 示例）
   const retryPrompt = opts.retryPrompt ?? `
 你的上一次输出无法被解析（JSON 提取失败或 schema 不匹配）。
-请严格按指定的 JSON schema 输出，只输出 \`\`\`json ... \`\`\`，不要添加自然语言前缀。
+
+**错误信息**：${firstAttempt.error}
+
+**请严格按指定的 JSON schema 输出**，只输出 \`\`\`json ... \`\`\`，不要添加自然语言前缀。
+
+**期望的 schema**：
+\`\`\`json
+${JSON.stringify(getSchemaExample(schema), null, 2)}
+\`\`\`
+
+**示例输出**：
+\`\`\`json
+${JSON.stringify(getSchemaExample(schema), null, 2)}
+\`\`\`
+
+请重新生成输出。
 `;
 
   // 第 1 次 parse
