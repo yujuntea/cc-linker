@@ -3512,7 +3512,7 @@ export class FeishuBot {
           : status === 'provisioning'
             ? `⚠️ 会话 ${uuid.slice(0, 8)} 正在等待系统自动修复，请稍后再试。`
             : status === 'degraded'
-              ? `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态，建议先保持 cc-linker 运行让系统自动修复。`
+              ? `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态 (可能原因: Claude CLI 缺失 / cwd 不可访问 / 环境配置异常)。\n💡 建议: 在终端运行 \`cc-linker repair\` 修复环境,或检查 \`~/.cc-linker/config.toml\` 的 general.claude_bin 配置。`
               : status === 'archived'
                 ? `⚠️ 会话 ${uuid.slice(0, 8)} 已归档，不能直接切换。`
                 : `⚠️ 会话 ${uuid.slice(0, 8)} 状态为 ${status}，无法切换。`;
