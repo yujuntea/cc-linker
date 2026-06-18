@@ -361,7 +361,24 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
 bun test tests/unit/feishu/bot-slash-passthrough.test.ts 2>&1 | tail -40
 ```
 
-Expected: tests T1, T3, T6, T7, T8 fail with `expected false to be true` or similar (current code returns "未知命令"). T2, T4, T5 may pass if the assertion is too lenient — adjust assertions if needed. T9, T10, T11, T12 should fail or partially fail. **The goal is that AT LEAST T1, T3, T6, T8 fail with 未知命令 assertion** (these are the core passthrough cases).
+Expected outcome (which tests fail BEFORE Task 3 implementation):
+
+| Test | Before fix | Reason |
+|---|---|---|
+| T1 (`/init` → handleChat) | **FAIL** | default branch returns "未知命令"; no /new prompt |
+| T2 (`/review pr diff`) | **FAIL** | default returns "未知命令"; sendSDKMessage mock not invoked → `captured.text` undefined |
+| T3 (`/clear`) | **FAIL** | default returns "未知命令" |
+| T4 (`//help`) | PASS | Already matches case 'help' (no fix needed) |
+| T5 (`/HELP`) | PASS | Already lowercased to 'help' |
+| T6 (no session + `/init`) | **FAIL** | default returns "未知命令"; no /new reply |
+| T7 (with session + `/init`) | **FAIL** | default returns "未知命令"; mock not invoked |
+| T8 (`//foo`) | **FAIL** | default returns "未知命令" |
+| T9 (`/cancel` flow) | **FAIL** | handleCancelReply not called (cancelCalls empty) |
+| T10 (recursion guard) | PASS | Already no recursion before fix (regression guard only) |
+| T11 (expectedReply clear) | PASS | Entry-level clear happens regardless of switch outcome |
+| T12 (serialKey invariant) | PASS | Pure invariant check |
+
+**Goal**: at minimum T1, T2, T3, T6, T7, T8, T9 must FAIL with current code. T4, T5, T10, T11, T12 are regression guards that pass before AND after fix.
 
 - [ ] **Step 3: Commit (red phase)**
 
@@ -432,7 +449,13 @@ with:
 
 - [ ] **Step 3: Remove dead code in `handleChat` (lines 1031-1051)**
 
-In `src/feishu/bot.ts`, delete the entire block from line 1031 (the comment "注意: 这里的 if (msg.text.startsWith('/')) 分支在 v2.4.x 已成死代码") through line 1051 (the closing `}` of the `if` block). Replace with a single updated comment:
+In `src/feishu/bot.ts`, delete the contiguous block of lines 1031-1051:
+- L1031-1033: 3-line comment introducing the dead block (`// 注意: 这里的 if (msg.text.startsWith('/')) ...`)
+- L1034: `if (msg.text.startsWith('/')) {`
+- L1035-1050: block body (16 lines)
+- L1051: closing `}`
+
+Leave line 1052+ (`// 非 / 开头普通消息:检查 expectedReply`) and below untouched. Replace the deleted 21 lines with:
 
 ```typescript
       // v2.5: 移除 v2.4.x 的 /startsWith('/') dead code — 原意图是 safety net,
@@ -441,7 +464,7 @@ In `src/feishu/bot.ts`, delete the entire block from line 1031 (the comment "注
       // 此处只处理 /cancel (Agent View 专用) 和普通文本。
 ```
 
-The block to delete spans approximately 21 lines (1031-1051). Verify by visual inspection that the comment-and-code block is contiguous and contains the dead `if (msg.text.startsWith('/'))` branch.
+Verify by visual inspection that the comment-and-code block you delete is contiguous and contains the dead `if (msg.text.startsWith('/'))` branch.
 
 - [ ] **Step 4: Run new tests to verify they pass (TDD green)**
 
@@ -594,25 +617,14 @@ Verify the function starts at line 3223 and ends with `'/agents'` entry.
 
 - [ ] **Step 2: Append new line to helpText array**
 
-In `src/feishu/bot.ts`, find the helpText array. The current last entry is:
-
-```typescript
-      '  /agents                            - 查看 agent 列表 (Agent View)',
-```
-
-Append one new line after it (use 24 spaces between `>` and `-` to align at column 37; `  /<其他命令>` = 2 + 1 + 1 + 8 (4 Chinese × 2 cells) + 1 = 13 display cells, so 37 - 13 = 24 spaces):
-
-```typescript
-      '  /<其他命令>                            - 透传给当前会话的 Claude (如 /init /review /cost)',
-      '  /agents                            - 查看 agent 列表 (Agent View)',
-```
-
-Wait — the new line should go AFTER `/agents` (the existing last entry), not before. Reverse the order. Final shape:
+In `src/feishu/bot.ts`, find the helpText array. Insert one new line **after** the existing `/agents` entry:
 
 ```typescript
       '  /agents                            - 查看 agent 列表 (Agent View)',
       '  /<其他命令>                        - 透传给当前会话的 Claude (如 /init /review /cost)',
 ```
+
+Alignment: `  /<其他命令>` occupies 13 display cells (2 leading spaces + `/` + `<` + 4 Chinese chars × 2 cells + `>`). To align `-` at column 38 (existing convention), insert 24 spaces between `>` and `-`.
 
 - [ ] **Step 3: Run typecheck**
 
@@ -664,7 +676,7 @@ cc-linker 命令 (`/list /switch /help /resume /model /status /agents /stop /can
 grep -c "^### " CLAUDE.md
 ```
 
-Expected count increases by 1 (from 12 to 13, since the project has 12 existing `### ` subsections and we add 1 more).
+Expected count: 10 (project currently has 9 `### ` subsections; we add 1).
 
 - [ ] **Step 4: Commit**
 
