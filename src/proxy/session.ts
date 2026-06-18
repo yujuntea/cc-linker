@@ -688,7 +688,10 @@ export class ClaudeSessionManager {
     if (!response) response = '(空回复)';
 
     let jsonlPath: string | null = null;
-    let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasError ? 'degraded' : 'active';
+    // v2026-06-18: 修复 /switch 阻断 bug —— SDK/Claude 已经正常运行过的路径
+    // 上任何失败都是可恢复的 (context 超限、max_turns、rate_limit),不应锁死 session。
+    // 错误信息走 error 字段,registry upsert 时会写到 last_error。
+    let sessionStatus: 'active' | 'provisioning' | 'degraded' = 'active';
 
     if (isNew && resolvedSessionId) {
       jsonlPath = await resolveJsonlPath(resolvedSessionId);
@@ -887,7 +890,7 @@ export class ClaudeSessionManager {
             durationMs: Date.now() - startTime,
             sessionId: sessionId ?? '',
             jsonlPath: null,
-            sessionStatus: 'degraded',
+            sessionStatus: 'active',  // v2026-06-18: 失败可恢复,允许用户换模型重试
             error: errMsg,
           },
           handler,
@@ -914,7 +917,7 @@ export class ClaudeSessionManager {
             durationMs,
             sessionId: sessionId ?? '',
             jsonlPath: null,
-            sessionStatus: hasError ? 'degraded' : 'active',
+            sessionStatus: 'active',  // v2026-06-18: SDK 跑过即视为可恢复
             error: hasError ? 'no_result_returned' : undefined,
           },
           handler,
@@ -923,7 +926,10 @@ export class ClaudeSessionManager {
 
       const resolvedSessionId = (lastResult.session_id as string) || (sessionId ?? '');
       let jsonlPath: string | null = null;
-      let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasError ? 'degraded' : 'active';
+      // v2026-06-18: Claude 正常返回了 result chunk 但 subtype 不是 'success'
+      // (如 error_max_turns、error_during_execution、error_rate_limit) 都是
+      // 业务错误,用户换模型或稍后重试即可恢复。不锁死 session。
+      let sessionStatus: 'active' | 'provisioning' | 'degraded' = 'active';
 
       if (isNew && resolvedSessionId) {
         jsonlPath = await resolveJsonlPath(resolvedSessionId);
