@@ -185,15 +185,25 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
     expect(agentView.expectedReply.get('ou_routing_1')).toBeDefined();
 
     const msg = makeSpoolMessage({ text: '/help' });
-    await (bot as any).handleChat(msg);
+    // v2.4.x: 命令消息在 dispatcher 走 handleCommand (不进 handleChat),
+    // expectedReply 清空逻辑也搬到了 handleCommand 入口。
+    // 必须用真实 handleCommand(setup 里的 mock 会盖掉生产逻辑),
+    // 这里临时取出原型方法再装回去,跑完再装回 mock。
+    const realHandleCommand = FeishuBot.prototype.handleCommand;
+    const originalMock = bot.handleCommand;
+    bot.handleCommand = realHandleCommand.bind(bot) as any;
+    try {
+      await (bot as any).handleCommand(msg);
+    } finally {
+      bot.handleCommand = originalMock;
+    }
 
-    // handleCommand was called (routing goes through to /help dispatch)
-    expect(handleCommandCalls).toHaveLength(1);
-    expect(handleCommandCalls[0].text).toBe('/help');
-    // The expectedReply is still set (read-only command doesn't consume it)
+    // 进入 /help 分支,expectedReply 不应被清(read-only)
     expect(agentView.expectedReply.get('ou_routing_1')).toBeDefined();
     // No "已自动取消" message was sent
     expect(textReplies.some((t) => t.includes('已自动取消'))).toBe(false);
+    // /help 应该有 help 文本回复(说明确实进了 help 分支)
+    expect(textReplies.some((t) => t.includes('/help'))).toBe(true);
     // Cleanup
     await agentView.expectedReply.clear('ou_routing_1');
   });
@@ -206,11 +216,17 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
     });
 
     const msg = makeSpoolMessage({ text: '/status' });
-    await (bot as any).handleChat(msg);
+    // v2.4.x: 命令消息走 handleCommand — 临时还原真实方法(参见 /help 测试注释)
+    const realHandleCommand = FeishuBot.prototype.handleCommand;
+    const originalMock = bot.handleCommand;
+    bot.handleCommand = realHandleCommand.bind(bot) as any;
+    try {
+      await (bot as any).handleCommand(msg);
+    } finally {
+      bot.handleCommand = originalMock;
+    }
 
-    // handleCommand routed through
-    expect(handleCommandCalls).toHaveLength(1);
-    // expectedReply still set
+    // expectedReply still set (read-only 不清)
     expect(agentView.expectedReply.get('ou_routing_1')).toBeDefined();
     // No auto-cancel message
     expect(textReplies.some((t) => t.includes('已自动取消'))).toBe(false);
@@ -228,7 +244,15 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
     expect(agentView.expectedReply.get('ou_routing_1')).toBeDefined();
 
     const msg = makeSpoolMessage({ text: '/new /tmp/proj' });
-    await (bot as any).handleChat(msg);
+    // v2.4.x: 命令消息走 handleCommand — 临时还原真实方法(参见 /help 测试注释)
+    const realHandleCommand = FeishuBot.prototype.handleCommand;
+    const originalMock = bot.handleCommand;
+    bot.handleCommand = realHandleCommand.bind(bot) as any;
+    try {
+      await (bot as any).handleCommand(msg);
+    } finally {
+      bot.handleCommand = originalMock;
+    }
 
     // expectedReply is cleared (write command consumes it)
     expect(agentView.expectedReply.get('ou_routing_1')).toBeUndefined();
@@ -245,7 +269,15 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
     });
 
     const msg = makeSpoolMessage({ text: '/list' });
-    await (bot as any).handleChat(msg);
+    // v2.4.x: 命令消息走 handleCommand — 临时还原真实方法(参见 /help 测试注释)
+    const realHandleCommand = FeishuBot.prototype.handleCommand;
+    const originalMock = bot.handleCommand;
+    bot.handleCommand = realHandleCommand.bind(bot) as any;
+    try {
+      await (bot as any).handleCommand(msg);
+    } finally {
+      bot.handleCommand = originalMock;
+    }
 
     expect(agentView.expectedReply.get('ou_routing_1')).toBeUndefined();
     expect(textReplies.some((t) => t.includes('已自动取消'))).toBe(true);
