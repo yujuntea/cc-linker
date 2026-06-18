@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { ClaudeSessionManager, resolveJsonlPath, terminateProcessTree, cleanupOrphanProcesses } from '../../../src/proxy/session';
+import { ClaudeSessionManager, classifyExecutionStatus, resolveJsonlPath, terminateProcessTree, cleanupOrphanProcesses } from '../../../src/proxy/session';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -139,6 +139,42 @@ describe('ClaudeSessionManager', () => {
       expect(r1.sessionStatus).toBe('degraded');
       expect(r2.sessionStatus).toBe('degraded');
       expect(r3.sessionStatus).toBe('degraded');
+    });
+  });
+
+  // v2026-06-18: 测试 sendMessage line 416 用的 helper classsifyExecutionStatus。
+  // 区分 Claude 业务错 (parsed.is_error, 可恢复) vs CLI 进程崩 (基础设施错)。
+  // 关键 regression 测试: 之前 line 416 会把 Claude 错 (如 context 超限) 误标 degraded,
+  // 导致 /switch 永久阻断。修复后所有 Claude 业务错都保持 'active'。
+
+  describe('classifyExecutionStatus', () => {
+    it('returns active when Claude reports business error (is_error=true, exitCode=0)', () => {
+      // context-exceeded / max_turns / rate_limit 都属于这种情况
+      const parsed = { is_error: true, session_id: 'sid', result: 'too long' } as any;
+      expect(classifyExecutionStatus(parsed, 0)).toBe('active');
+    });
+
+    it('returns degraded when CLI crashes with no parsed output (exitCode != 0, parsed=null)', () => {
+      // CLI 崩了连 JSON 都没输出 → 基础设施错
+      expect(classifyExecutionStatus(null, 1)).toBe('degraded');
+    });
+
+    it('returns degraded when CLI exits non-zero and Claude did not report error', () => {
+      // Claude 跑了但 CLI 崩在 output 之后 → 基础设施错
+      const parsed = { is_error: false, session_id: 'sid', result: 'ok' } as any;
+      expect(classifyExecutionStatus(parsed, 1)).toBe('degraded');
+    });
+
+    it('returns active when Claude succeeds (is_error=false, exitCode=0)', () => {
+      // 正常成功路径,line 416 之前返回 active,保持不变
+      const parsed = { is_error: false, session_id: 'sid', result: 'ok' } as any;
+      expect(classifyExecutionStatus(parsed, 0)).toBe('active');
+    });
+
+    it('returns active when parsed is null but exitCode is also null (process killed before exit)', () => {
+      // 进程被 kill 没正常退出码,但 Claude 也可能根本没机会报 is_error
+      // 这种情况 line 416 之前返回 active (因为 exitCode 是 null)
+      expect(classifyExecutionStatus(null, null)).toBe('active');
     });
   });
 });

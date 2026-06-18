@@ -129,6 +129,26 @@ interface SessionLock {
   release: () => void;
 }
 
+/**
+ * v2026-06-18: 区分 Claude 业务错 (parsed.is_error, 业务层报错, 可恢复)
+ * 与 CLI 进程崩 (exitCode !== 0 且 Claude 没报错, 基础设施错, 不可恢复)。
+ *
+ * 跟 _buildStreamingResult (line 691 修复后) 和 sendSDKMessage (line 893/920/932
+ * 修复后) 保持同样语义: SDK/CLI 已成功启动后任何失败都是可恢复的,
+ * 只有 CLI 进程本身崩了才标 degraded。
+ *
+ * @param parsed - 从 Claude CLI stdout 解析的 JSON 结果 (parse 失败时为 null)
+ * @param exitCode - Claude CLI 进程退出码 (null = 进程未正常退出,例如被 kill)
+ * @returns 'degraded' 仅当 CLI 崩了且 Claude 没报业务错;否则 'active'
+ */
+export function classifyExecutionStatus(
+  parsed: ClaudeJsonOutput | null,
+  exitCode: number | null,
+): 'active' | 'degraded' {
+  const isInfraError = (exitCode !== 0 && exitCode !== null) && !parsed?.is_error;
+  return isInfraError ? 'degraded' : 'active';
+}
+
 export class ClaudeSessionManager {
   private activeProcesses = new Map<string, ClaudeSession>();
   /**
@@ -410,10 +430,13 @@ export class ClaudeSessionManager {
     const resolvedSessionId = parsed?.session_id ?? sessionId ?? '';
     const finalResponse = parsed?.result?.trim() || '';
     const baseError = parsed?.errors?.join('; ') || stderrText.trim();
+    // v2026-06-18: 用 helper 区分 Claude 业务错 (parsed.is_error, 可恢复) vs
+    // CLI 进程崩 (exitCode !== 0 且 Claude 没报错, 基础设施错, 不可恢复)。
+    // 保持 'degraded' 仅用于真正的不可恢复错误,允许 transient 错误后 /switch 不被阻断。
     const hasExecutionError = Boolean(parsed?.is_error) || (exitCode !== 0 && exitCode !== null);
-
     let jsonlPath: string | null = null;
-    let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasExecutionError ? 'degraded' : 'active';
+    let sessionStatus: 'active' | 'provisioning' | 'degraded' =
+      classifyExecutionStatus(parsed, exitCode);
 
     if (isNew && resolvedSessionId) {
       jsonlPath = await resolveJsonlPath(resolvedSessionId);
