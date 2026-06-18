@@ -12,6 +12,12 @@
 - **cc-linker ≥ 0.6.3**（当前 master，`c5a8b8d`）
 - **`~/.claude/providers/` 至少配置 2 个 provider**（work + 1 review），缺失会由 `cc-linker review doctor` 报错
 - **cwd 推荐为 git 仓库**（commit preamble 要求；如果非 git repo，preamble 会输出 `checkpoint_sha: null` 跳过 commit）
+- **v2.1.1 P0-D2 修复：cwd 不能是 monorepo 子目录** —— 如果 cwd 的父级有 `.git` 目录（说明是 monorepo 子目录），doctor 会 warn：
+  ```
+  ⚠️ cwd 是 monorepo 子目录，git 操作可能影响整个 monorepo
+     建议：cd 到 monorepo root 再跑 review，或用 --cwd /path/to/monorepo/root
+  ```
+  doctor 检查：`git rev-parse --show-toplevel` 返回的 root 如果等于 cwd，OK；如果不等于，warn
 
 ## 修订记录
 
@@ -302,6 +308,7 @@ cc-linker review report <id>    [--format md|json] [--out <file>] [--partial]
 cc-linker review decide <id>    --accept-all | --accept "1,3" | --reject-all   # HUMAN_DECIDE 接收
 cc-linker review cancel <id>    # 用户主动中止（区别于 abort 的 max_rounds 触发）
 cc-linker review skip <id>      [--reason "manually reviewed"]   # v2.1.1 P0-C1：用户手审完后温和收尾（标 DONE，不动 pane）
+cc-linker review resume <id>    # v2.1.1 P0-D7：从当前 PipelineRecord state 继续（保留 history）—— FAILED network_timeout 后恢复
 cc-linker review doctor         # 启动前健康检查：profile 引用 / provider 存在 / CLI 版本 / daemon 健康
 cc-linker review profiles       # 列出 ~/.cc-linker/review-profiles/*.toml（每条 profile 显示 work + review providers 名 + max_rounds 默认）
 ```
@@ -1695,6 +1702,15 @@ max_injected_issues = 20                     # v2.1.1 P0-A2：reset 注入 issue
 # === v2.1.1 新增：parse retry timeout（§7.5.4 parseBgOutputWithRetry 等待 bg 重生成）===
 parse_retry_timeout_ms = 15000               # 默认 15s（90% retry 5-10s 完成，>15s 视为结构性问题）
 
+# === v2.1.1 P0-D9 新增：成本/性能硬约束（防 1 天烧穿月预算）===
+max_cost_usd = 5.00                          # 单 pipeline cost 硬上限（默认 $5.00；happy path 5x 余裕；达到 → ABORTED reason=budget_exceeded）
+max_context_resets_per_pipeline = 1          # 单 pipeline 内 reset 次数硬上限（防 reset 反复触发变 token 黑洞；达到 → ABORTED reason=reset_loop）
+max_reset_duration_ms = 120000               # 单次 reset 硬上限（默认 120s；超过 → ABORTED reason=reset_timeout）
+max_token_in = 500000                        # 软警告阈值（输入 token，达到 80% → watch UI 黄色；100% → ABORTED）
+max_token_out = 100000                       # 同上，输出 token
+api_rate_limit_strategy = "backoff"          # "backoff" | "fail-fast"（429 / TPM 撞限流时 backoff 退避到 RPM/TPM 内；fail-fast 直接 ABORTED）
+api_rate_limit_429_backoff_ms = [2000, 4000, 8000, 16000]  # 429 exponential backoff（4 次重试）
+
 # 可选：覆盖模型 context 上限（profile 级覆盖 adapter 内的 known map）
 [context_limits]
 "claude-sonnet-4-5" = 1000000
@@ -2618,7 +2634,31 @@ review 跑完后，产出 Markdown 报告：
 **Raw 输出存档**（v2.1.1 变更 3）：parseDegraded 事件触发时，raw bg session output 存档到：
 
 ```
-~/.cc-linker/review-pipelines/<terminal>/<pipelineId>/parse-failures/<role>-<state>-<ts>.txt
+**v2.1.1 P0-D5 修复：raw 路径显示问题**
+
+```bash
+# v2.1.1 P0-D5：Markdown 报告里 raw 路径改为绝对路径 + 一键 cat 命令
+#   ⚠️ 本次 pipeline 有 1 个 parse degraded 事件未恢复
+#   - [12:38:45] review pane EXTERNAL_REVIEW round 1: parse failed after 1 retry
+#     Raw output: /Users/me/.cc-linker/review-pipelines/done/01HXYZK9.../parse-failures/review-EXTERNAL_REVIEW-1234.txt
+#     查看: cat /Users/me/.cc-linker/review-pipelines/done/01HXYZK9.../parse-failures/review-EXTERNAL_REVIEW-1234.txt
+#     或: cc-linker review report 01HXYZK9... --show-parse-failures
+```
+
+**v2.1.1 P0-D5：CLI 加 `--show-parse-failures` flag**
+
+```bash
+# v2.1.1 P0-D5：一键查看所有 parse failures
+cc-linker review report <id> --show-parse-failures
+# 输出：cat 出所有 parse-failures/*.txt 内容
+```
+
+**watch mode 提示**（v2.1.1 P0-D5）：
+```bash
+# watch mode 出现 parse_degraded: true 时显示：
+#   ⚠️ parse_degraded: true (1 event)
+#   查看 raw output: cc-linker review report <id> --show-parse-failures
+```
 ```
 
 便于事后诊断模型输出问题。
