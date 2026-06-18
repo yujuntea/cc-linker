@@ -3508,11 +3508,11 @@ export class FeishuBot {
       const status = session.status;
       const failReply =
         status === 'corrupted'
-          ? `⚠️ 会话 ${uuid.slice(0, 8)} 已损坏，不能直接切换。建议先在终端运行 \`cc-linker repair\` 修复。`
+          ? this.formatSessionStatusHint(uuid, 'corrupted')
           : status === 'provisioning'
             ? `⚠️ 会话 ${uuid.slice(0, 8)} 正在等待系统自动修复，请稍后再试。`
             : status === 'degraded'
-              ? `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态 (可能原因: Claude CLI 缺失 / cwd 不可访问 / 环境配置异常)。\n💡 建议: 在终端运行 \`cc-linker repair\` 修复环境,或检查 \`~/.cc-linker/config.toml\` 的 general.claude_bin 配置。`
+              ? this.formatSessionStatusHint(uuid, 'degraded')
               : status === 'archived'
                 ? `⚠️ 会话 ${uuid.slice(0, 8)} 已归档，不能直接切换。`
                 : `⚠️ 会话 ${uuid.slice(0, 8)} 状态为 ${status}，无法切换。`;
@@ -3748,11 +3748,26 @@ export class FeishuBot {
   private async doResume(openId: string, uuid: string, messageId?: string): Promise<string> {
     const entry = this.registry.get(uuid);
     if (!entry) return '未找到对应会话，请先执行 /list。';
-    if (entry.status === 'corrupted') return `会话 ${uuid.slice(0, 8)} 已损坏，不能直接恢复。`;
+    if (entry.status === 'corrupted') return this.formatSessionStatusHint(uuid, 'corrupted');
     if (entry.status === 'provisioning' || entry.status === 'degraded') {
-      return `会话 ${uuid.slice(0, 8)} 状态为 ${entry.status}，建议先保持 cc-linker 运行让系统自动修复。`;
+      if (entry.status === 'degraded') return this.formatSessionStatusHint(uuid, 'degraded');
+      return `⚠️ 会话 ${uuid.slice(0, 8)} 状态为 provisioning,正在等待系统自动修复,请稍后再试。`;
     }
     return `在终端执行: cc-linker resume ${uuid.slice(0, 8)}`;
+  }
+
+  /**
+   * v2026-06-18 follow-up: 共享 degraded/corrupted 状态的用户引导文案。
+   * 之前 degraded 引导用户跑 `cc-linker repair` (命令不存在) 和
+   * `general.claude_bin` (优先级低,SDK 实际先读 [sdk] claude_executable)。
+   * 集中在这里确保 doSwitch (line 3511, 3515) 和 doResume (line 3753) 同步更新。
+   */
+  private formatSessionStatusHint(uuid: string, kind: 'corrupted' | 'degraded'): string {
+    if (kind === 'corrupted') {
+      return `⚠️ 会话 ${uuid.slice(0, 8)} 已损坏，不能直接操作。\n💡 建议: 在终端运行 \`cc-linker list\` 查看损坏 session 列表,或删除该 entry 后重新创建。`;
+    }
+    // degraded
+    return `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态 (可能原因: Claude CLI 缺失 / cwd 不可访问 / 环境配置异常)。\n💡 建议: 在终端运行 \`cc-linker list\` 查看所有 session 状态,或检查 \`~/.cc-linker/config.toml\` 的 [sdk] claude_executable / [general] claude_bin 配置。`;
   }
 
   private async doResumeReply(openId: string, uuid: string, msg: SpoolMessage): Promise<void> {
