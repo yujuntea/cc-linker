@@ -3749,8 +3749,8 @@ export class FeishuBot {
     const entry = this.registry.get(uuid);
     if (!entry) return '未找到对应会话，请先执行 /list。';
     if (entry.status === 'corrupted') return this.formatSessionStatusHint(uuid, 'corrupted');
-    if (entry.status === 'provisioning' || entry.status === 'degraded') {
-      if (entry.status === 'degraded') return this.formatSessionStatusHint(uuid, 'degraded');
+    if (entry.status === 'degraded') return this.formatSessionStatusHint(uuid, 'degraded');
+    if (entry.status === 'provisioning') {
       return `⚠️ 会话 ${uuid.slice(0, 8)} 状态为 provisioning,正在等待系统自动修复,请稍后再试。`;
     }
     return `在终端执行: cc-linker resume ${uuid.slice(0, 8)}`;
