@@ -155,11 +155,13 @@ if (msg.text.startsWith('/')) {
 
 **当前**（`bot.ts:3223-3242`）：末尾是 `/agents` 一行
 
-**改为**：在 `/agents` 之后加一行：
+**改为**：在 `/agents` 之后加一行（对齐到现有第 37 列）：
 
 ```
-'  /<其他命令>                          - 透传给当前会话的 Claude (如 /init /review /cost)',
+'  /<其他命令>                            - 透传给当前会话的 Claude (如 /init /review /cost)',
 ```
+
+对齐说明：`/help` 后是 30 个空格到 `-`（位置 37）。`/<其他命令>` 中文算 4 字 × 2 cell = 8 cell，加 `/<` `>` 共 11 cell。所以 `/<其他命令>` 后需要 26 个空格到位置 37。
 
 ### 5.5 改动 5：CLAUDE.md 文档
 
@@ -187,15 +189,17 @@ cc-linker 命令 (`/list /switch /help /resume /model /status /agents /stop /can
 | 6 | 无活跃会话 + `/init` | 走 `case 'no_target'`，提示跟 chat 一致 |
 | 7 | 有会话 + `/init` | `case 'session'`，启动 busy check / rendezvous 路径 |
 | 8 | `//foo` | cmd 解析为 `foo`，未命中，default→handleChat，文本为 `//foo` |
-| 9 | `/cancel` | handleChat 内 `/cancel` 分支保留（Agent View 用），不会被 default 抢占 |
-| 10 | 串行递归防护 | 删除 dead code 后，`/xxx` 不会再二次进入 handleCommand（mock 计数） |
-| 11 | `expectedReply` 清空 | `/xxx` 进入 handleCommand 入口清空分支，cmd 不在 `['help','status','whoami']`，触发清空 + 提示 |
-| 12 | `serialKey` 不变 | `/xxx` 仍用 `cmd:${openId}:${messageId}` 独立锁，sessionManager 锁 key 同步 |
+| 9 | `/cancel`（Agent View） | handleChat 内 `/cancel` 分支保留：handleCommand 入口先清 expectedReply + 提示；switch default → handleChat → handleCancelReply 静默。净效果 cancel 成功（旧行为是 "未知命令: /cancel"） |
+| 10 | 串行递归防护 | 删除 dead code 后，`/xxx` 不会再二次进入 handleCommand（mock `handleCommand` 调用计数，删除 dead code 前 = 2 次，删除后 = 1 次） |
+| 11 | `expectedReply` 清空 | `/xxx` 进入 handleCommand 入口清空分支。`/help /status /whoami` 不清（isReadOnly=true），其他 `/xxx` 触发清空 + 提示。需断言 entry 那条"⏱ 等待输入已自动取消(因你跑了 /init)" reply |
+| 12 | `serialKey` 不变 | `/xxx` 仍用 `cmd:${openId}:${messageId}` 独立锁。SpoolQueue claim/file lock 跟 serialKey 一致。注意：sessionManager lockKey 也用 `cmd:openId:msgId`，意味着两次 `/xxx` 到同一 session 不互锁（已知限制，靠 busy check 兜底） |
 
 **测试技巧**：
 - 复用 `createTestBot` helper，依赖真实 `UserManager` / `SpoolQueue` / `RegistryManager` + mock `replyFn`
-- 用 `_bgConflictHooks` 类似的导出 hook 把 `runChatSDK` / `sendSDKMessage` 替换成 mock（避免真实跑 Claude CLI）
-- 验证调用 `handleChat` 不是通过 re-call 计数，而是 mock `sessionManager.sendMessage` 看是否被调，参数里 `text === '/init'`
+- 扩展 `createTestBot`（`tests/helpers/feishu-bot.ts`）支持可选 `sessionManager` override：当前实现 `const sessionManager = new ClaudeSessionManager()` 写死，要 mock 需改 constructor 接受 opts.sessionManager；或者给 `ClaudeSessionManager` 加测试 hook（类似 `_bgConflictHooks`）。**推荐方案**：扩展 `createTestBot` 接受 `opts.sessionManager`，零侵入现有 helper。
+- 验证 `/xxx` 落到 handleChat 而不是 default 路径：用 `textReplies` 断言**不含** `"未知命令: /xxx"` 文本（含则失败）
+- 验证 `/xxx` 真正进入 chat 处理（而非卡在 default）：mock `sessionManager.sendMessage` 或 `sendSDKMessage`，断言被调用且 `text === '/xxx'`（含前导斜杠）
+- 边界用例（无会话、busy）通过断言 reply 文本内容确认
 
 ### 6.2 错误处理矩阵
 
@@ -209,6 +213,8 @@ cc-linker 命令 (`/list /switch /help /resume /model /status /agents /stop /can
 | `rendezvous` attached 状态 + `/xxx` | 走 handleChat → 进 attached 分支 → `tryRendezvousReply` 把 `/xxx` 注入 bg |
 | `expectedReply` 等待中 + `/xxx` | handleCommand 入口清空 expectedReply + 提示（已有逻辑） |
 | 自定义命令 `/foo`（`~/.claude/commands/foo.md` 存在） | 字面量 `/foo` 发给模型，模型看不到文件内容，等同文本命令 |
+| 用户文本发 `/cancel`（预期回复等待中） | 1. handleCommand 入口清 expectedReply + 发"⏱ 等待输入已自动取消(因你跑了 /cancel)"<br>2. switch default → handleChat<br>3. handleChat `/cancel` 分支：`handleCancelReply` 看到 `wasPending=false` → **静默**<br>净效果：cancel 成功 + 用户只看到入口那一条提示，**比之前 "未知命令: /cancel" 更合理**（修复了之前 broken 行为） |
+| 用户文本发 `/cancel`（无预期回复等待） | 1. 入口：`expectedReply.get` 返 undefined → 不发消息<br>2. switch default → handleChat<br>3. `/cancel` 分支静默<br>净效果：完全静默（之前是 "未知命令: /cancel"） |
 
 ### 6.3 边界场景
 
@@ -223,20 +229,29 @@ cc-linker 命令 (`/list /switch /help /resume /model /status /agents /stop /can
 
 ```
 grep -rn "startsWith('/')" tests/
-grep -rn "handleCommand.*handleChat.*startsWith" tests/
+grep -rn "未知命令" tests/
+grep -rn "handleCommand.*handleChat" tests/unit/feishu/
+grep -rn "msg.text.startsWith" tests/
 ```
 
-预期：找不到。若有，需移除或更新断言。
+预期：
 
-`bot-command.test.ts` 现有断言（"未知命令: /xxx" 文本）需要更新 —— 改为断言 "调用了 handleChat" 或 "产生了 chat 路径调用"。
+- `startsWith('/')`：仅在 dead code 路径或别处的字符串测试中可能存在，需逐个看
+- `未知命令`：在 `bot-command.test.ts` 里基本肯定有断言（之前测试 default 分支报错路径），需要批量改
+- `handleCommand.*handleChat`：确认无跨函数依赖
+- `msg.text.startsWith`：dead code 引用，删除后断言要删或更新
+
+`bot-command.test.ts` 现有断言（"未知命令: /xxx" 文本）需要更新 —— 改为断言 "无 未知命令 文本" 或 "调用了 handleChat" 或 "产生了 chat 路径调用"。
 
 ## 7. 风险评估
 
 | 风险 | 等级 | 缓解 |
 |---|---|---|
 | 现有测试断言 "未知命令" 文本，破窗式批量改 | 🟡 中 | Step 3 单独跑 + 列 diff 走 review |
-| 删除 dead code 后，隐藏在 dead branch 里的隐式行为暴露 | 🟢 低 | dead code 注释自己说"已知 dead"，且 v2.4.x 已在生产稳跑至少 3 周（PR 2 ship date 2026-06-04） |
+| 删除 dead code 后，隐藏在 dead branch 里的隐式行为暴露 | 🟢 低 | dead code 注释自己说"已知 dead"，且 v2.4.x 已在生产稳跑约 2 周（PR 2 ship date 2026-06-04，今日 2026-06-18） |
 | `handleChat` 串行递归 | 🔴 高 | Step 2 必须同时改 handleChat dead code，不能留尾巴 |
+| `/xxx` 同 session 并发（serialKey=`cmd:openId:msgId` 不锁同 session） | 🟡 中 | busy check 是主要兜底（bot.ts:1153-1193 `isSessionActive`）；force-send 路径仍可能并发 → 已知限制，文档化。后续若需要，handleChat session case 可改为 `lockKey=sessionUuid`（超出本 spec 范围） |
+| `/cancel` 文本行为变化（旧 "未知命令" → 新 静默） | 🟡 中 | spec §6.2 显式记录；属"修复了之前 broken 的命令"，不算 regression |
 | `expectedReply` 清空 + 提示重复触发 | 🟢 低 | handleCommand 入口清空已经覆盖；handleChat 路径不再二次清 |
 | 命名冲突（`/help /resume /model /status /agents`）让用户困惑 | 🟡 中 | helpText 末尾加透传说明；未来加 `/cc-help` escape hatch 是 YAGNI，先不做 |
 | Claude 把 `/xxx` 当文本误识别成 prompt 内容（不是命令） | 🟢 低 | 用户显式发 `/xxx` 知道语义；透传就是透传 |
@@ -290,6 +305,7 @@ grep -rn "handleCommand.*handleChat.*startsWith" tests/
 | 版本 | 日期 | 关键变更 |
 |---|---|---|
 | v1 | 2026-06-18 | 初版，brainstorming 拍板：全自动透传 + 冲突降级，5 处代码改动，12 条单元测试 |
+| v1.1 | 2026-06-18 | Spec review fixes（7 处）：<br>1) **§7 风险矩阵** —— 加 `serialKey` 同 session 不互锁（busy check 兜底）+ `/cancel` 行为变化（修复之前 broken）+ "3 周" → "约 2 周"（PR 2 ship 2026-06-04）<br>2) **§5.4 helpText** —— 对齐修正到第 37 列（中文 2 cell/字）<br>3) **§6.1 测试用例** —— 9/10/11/12 措辞更精确，加 entry reply 断言细节<br>4) **§6.1 测试技巧** —— 明确推荐扩展 `createTestBot` 接受 `opts.sessionManager`<br>5) **§6.2 错误处理矩阵** —— 新增 `/cancel`（等待中）+ `/cancel`（无等待）两行<br>6) **§6.4 grep** —— 扩展到 4 个 pattern：`startsWith('/')` + `未知命令` + `handleCommand.*handleChat` + `msg.text.startsWith` |
 
 ## 11. 后续步骤
 
