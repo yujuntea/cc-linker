@@ -319,9 +319,8 @@ export class FeishuBot {
     }
 
     const isCommand = isCommandMessage(text);
-    const target = isCommand
-      ? { type: 'no_target' as const, openId: event.open_id, mappingVersion: this.userManager.getVersion() }
-      : await this.resolveChatTarget(event.open_id, event.message_id);
+    // v2.5: 总是解析 target — cc-linker 命令忽略 target, 但 /xxx 透传路径走 handleChat 需要真 target
+    const target = await this.resolveChatTarget(event.open_id, event.message_id);
 
     // command 走独立 serialKey（每个 messageId 独立），避免被 session streaming 阻塞
     // 注意：必须用 isCommand 标志，不按命令白名单——/listdir / 未来新增命令都自动覆盖
@@ -1009,9 +1008,15 @@ export class FeishuBot {
         this.spoolQueue.markDone(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
         return;
 
-      default:
-        await this.replyAndFinalize(msg, `未知命令: /${cmd}\n\n${this.helpText()}`);
+      default: {
+        // v2.5: cc-linker 未识别的 /xxx → 作为 prompt 文本透传给当前会话的 Claude。
+        // - 模型已训练识别 /init /review /cost 等内置 slash 命令
+        // - 自定义命令 ~/.claude/commands/*.md 不展开 (跟 claude -p 模式对齐)
+        // - busy check / rendezvous / 流式 / 错误处理全部复用 handleChat 既有路径
+        // - serialKey 仍是 cmd:openId:messageId (独立锁), 不影响 chat 的 sessionUuid 锁
+        await this.handleChat(msg);
         return;
+      }
     }
   }
 
@@ -1028,27 +1033,10 @@ export class FeishuBot {
         await this.agentView.handleCancelReply(msg.openId, msg.messageId);
         return;
       }
-      // 注意: 这里的 if (msg.text.startsWith('/')) 分支在 v2.4.x 已成死代码 —
-      // 命令消息在 dispatcher (line ~848) 走 isCommandMessage → handleCommand
-      // 不进 handleChat。保留只是为了 safety net (万一某条消息漏过 dispatcher)。
-      if (msg.text.startsWith('/')) {
-        const cmd = msg.text.split(/\s+/)[0]?.replace(/^\/+/, '').toLowerCase();
-        // 只读命令直接转交 (不清 expectedReply)
-        const isReadOnly = ['help', 'status', 'whoami'].includes(cmd || '');
-        if (!isReadOnly) {
-          // 写命令: 防御性清 expectedReply + 提示
-          const info = this.agentView.expectedReply.get(msg.openId);
-          if (info) {
-            await this.agentView.expectedReply.clear(msg.openId, 'overwrite');
-            await this.replyFn(
-              `⏱ 等待输入已自动取消(因你跑了 /${cmd})`,
-              { openId: msg.openId, requestUuid: uniqueUuid() },
-            );
-          }
-        }
-        await this.handleCommand(msg);
-        return;
-      }
+      // v2.5: 移除 v2.4.x 的 /startsWith('/') dead code — 原意图是 safety net,
+      // 现在 fallthrough 路径是 default→handleChat, 这里再分发会无限递归。
+      // 命令消息一律在 dispatcher (line ~848) 通过 isCommandMessage 路由到 handleCommand,
+      // 此处只处理 /cancel (Agent View 专用) 和普通文本。
       // 非 / 开头普通消息:检查 expectedReply
       const info = this.agentView.expectedReply.get(msg.openId);
       if (info) {
