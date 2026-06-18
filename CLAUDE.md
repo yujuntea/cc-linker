@@ -67,6 +67,10 @@ Feishu WSClient → onMessage() → SpoolQueue.enqueue()
 - Worker concurrency is controlled by `queue.worker_concurrency` (default 5).
 - On startup, `startupReconcile()` (`src/runtime/reconciler.ts`) recovers any `processing` messages back to `pending`.
 
+### Slash Command Passthrough (v2.5)
+
+cc-linker 命令 (`/list /switch /help /resume /model /status /agents /stop /cancel /listdir /new /whoami`) 优先处理；其他 `/xxx` 作为 prompt 文本透传给当前会话的 Claude，由 model 自行识别（model 已训练识别 /init /review /cost 等内置命令）。无活跃会话时与普通聊天文本一致：提示需要先 `/new`。自定义命令 `~/.claude/commands/*.md` 不展开（与 `claude -p` 模式对齐）。Known limitation: 两次 `/xxx` 到同 session 不互锁（serialKey 不同），靠 busy check + force-send 显式确认兜底。
+
 ### Session Proxy & Streaming
 
 `ClaudeSessionManager` (`src/proxy/session.ts`) spawns Claude CLI processes:
