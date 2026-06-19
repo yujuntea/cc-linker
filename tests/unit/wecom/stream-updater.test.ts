@@ -32,13 +32,12 @@ describe('WecomStreamUpdater', () => {
   });
 
   it('PR 2 v1.2.1 (M4): throws when inboundFrame is missing', async () => {
-    // 不传 inboundFrame → fail fast 避免 846605 bug 复现
-    expect(updater.startProcessing('user-1')).rejects.toThrow(/inboundFrame is required/);
+    // M-7 final: inboundFrame 必传，不传 throw fail fast
+    expect(updater.startProcessing('user-1', undefined as any)).rejects.toThrow(/inboundFrame is required/);
   });
 
-  it('PR 2 v1.2.1 (M4): setInboundFrame works as backward-compat fallback', async () => {
-    updater.setInboundFrame(mockInboundFrame('compat'));
-    const id = await updater.startProcessing('user-1');
+  it('PR 2 v1.2.1 (M4): accepts inboundFrame as required second arg', async () => {
+    const id = await updater.startProcessing('user-1', mockInboundFrame('compat'));
     expect(id).toMatch(/^stream_/);
   });
 

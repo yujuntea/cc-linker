@@ -46,10 +46,10 @@ describe('WecomUserManager', () => {
     expect(entry?.type).toBe('pending_new_session_claimed');
   });
 
-  it('bindSession transitions claimed → session', async () => {
+  it('bindSessionToClaim transitions claimed → session', async () => {
     await manager.setPending('ext-2', { cwd: '/tmp' });
     await manager.claimPending('ext-2', 'msg-2');
-    const bound = await manager.bindSession('ext-2', 'msg-2', 'uuid-xyz', '/tmp');
+    const bound = await manager.bindSessionToClaim('ext-2', 'msg-2', 'uuid-xyz', '/tmp');
     expect(bound).toBe(true);
     const entry = manager.getEntry('ext-2');
     expect(entry?.type).toBe('session');

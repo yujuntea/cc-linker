@@ -52,6 +52,14 @@ export class WecomBot {
     if (this.running) return;
     this.running = true;
 
+    // PR 2 v1.2.1 final (C-1 PoC 模式): 启动日志明确标注"框架已就绪，Claude 流式待 PR 4"
+    // 历史: PR 2/3 commit 标题（"完整 CLI 路由"）让 review 同事误以为 wecom 通道
+    //   对真用户功能可用，但 handleChat 仍写死 echo 字符串，没接 ClaudeSessionManager。
+    // 修法: 启动时 WARN 标注 PoC 模式，避免误用。
+    logger.warn('[wecom-bot] ⚠️  PoC MODE: handleChat 当前 echo 硬编码字符串，未接 Claude 流式');
+    logger.warn('[wecom-bot] ⚠️  PoC MODE: 消息可接收、SDK 字段映射、SpoolQueue、dispatch loop 全部 OK');
+    logger.warn('[wecom-bot] ⚠️  PoC MODE: 真实 AI 对话需等 PR 4（修 846605 invalid req_id 根因 + 接入 ClaudeSessionManager）');
+
     this.client.onMessage((event) => {
       logger.info(`[wecom-bot] onMessage received: ${JSON.stringify(event).slice(0, 300)}`);
       const platformMsg = aibotMessageToPlatform(event);
@@ -101,8 +109,17 @@ export class WecomBot {
     const loop = async () => {
       while (!stopped && this.running) {
         try {
+          // 0. PR 2 v1.2.1 final (M-6): 同步回滚 user-mapping 中过时的 claim
+          // 历史 bug: spool 60s 重新入队但 user-mapping.pending_new_session_claimed
+          //   仍卡 10min，导致用户后续消息在 claimPending 阶段被 `creating` 状态挡住。
+          // 修法: 每次 tick 调一次 rollbackTimedOutClaims()，默认 10 分钟超时
+          //   （虽然慢于 60s spool requeue，但确保不永久卡 user-mapping）。
+          await this.userManager.rollbackTimedOutClaims();
+
           // 1. 重试卡在 processing 超时的消息（>60s 的丢回 pending）
-          const processing = this.spoolQueue.listProcessing();
+          // PR 2 v1.2.1 final (M-4): 传 'wecom' 过滤自己平台的消息，避免共享 SpoolQueue 时
+          //   误处理飞书 worker 的卡住消息
+          const processing = this.spoolQueue.listProcessing('wecom');
           for (const msg of processing) {
             const age = Date.now() - new Date(msg.updatedAt).getTime();
             if (age > 60_000) {
@@ -112,7 +129,8 @@ export class WecomBot {
           }
 
           // 2. 拉所有 pending → claim → handle
-          const pending = this.spoolQueue.listPending();
+          // PR 2 v1.2.1 final (M-4): 传 'wecom' 过滤（同 listProcessing 注释）
+          const pending = this.spoolQueue.listPending('wecom');
           for (const msg of pending) {
             const claimed = this.spoolQueue.claimNext(msg.serialKey);
             if (claimed) {

@@ -43,16 +43,14 @@ export class WecomStreamUpdater implements StreamUpdater {
   private throttleMs: number;
   private currentStreamId: string | null = null;
   /**
-   * PR 2 v1.2.1 final (F2 修复): lastInboundFrame 在 startProcessing 存好
+   * PR 2 v1.2.1 final (F2 修复) + M-7 final review: 单一 lastInboundFrame 字段
    * complete/error/cancel/flushBuffer 都用它，不再 fallback 到 currentStreamId
    * 避免 846605 "invalid req_id" bug 复现
+   *
+   * 历史: M-7 删了 setInboundFrame / inboundFrame alias（field 多了容易混用），
+   * 强制调用方传 startProcessing(userId, inboundFrame)
    */
   private lastInboundFrame: any = null;
-  /**
-   * 保留 setInboundFrame API 作为 backward-compat
-   * 新代码优先用 startProcessing(userId, inboundFrame)
-   */
-  private inboundFrame: any = null;
   private buffer: BufferedChunk | null = null;
   private lastFlushAt = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -62,21 +60,15 @@ export class WecomStreamUpdater implements StreamUpdater {
     this.throttleMs = opts.throttleMs ?? DEFAULT_THROTTLE_MS;
   }
 
-  /** 注入 inbound frame（必须先于 startProcessing 调用） */
-  setInboundFrame(frame: any): void {
-    this.inboundFrame = frame;
-  }
-
   async startProcessing(userId: string, inboundFrame?: any): Promise<string> {
     this.currentStreamId = generateReqId('stream');
-    const frame = inboundFrame ?? this.inboundFrame;
-    if (!frame) {
+    if (!inboundFrame) {
       throw new Error('WecomStreamUpdater.startProcessing: inboundFrame is required (SDK replyStream 需要 inbound frame 的 headers.req_id)');
     }
     // 存下 inboundFrame 供 complete/error/cancel/flushBuffer 复用
-    this.lastInboundFrame = frame;
+    this.lastInboundFrame = inboundFrame;
     const initialMarkdown = '🤔 思考中...';
-    await this.sdk.replyStream(frame, this.currentStreamId, this.truncate(initialMarkdown), false);
+    await this.sdk.replyStream(inboundFrame, this.currentStreamId, this.truncate(initialMarkdown), false);
     this.lastFlushAt = Date.now();
     this.buffer = null;
     return this.currentStreamId;
@@ -148,6 +140,11 @@ export class WecomStreamUpdater implements StreamUpdater {
   /**
    * 终态方法统一前置 — 验证 lastInboundFrame 必须存在
    * PR 2 v1.2.1 final (F2): 拒绝 fallback 到 generated streamId（846605 根因）
+   *
+   * PR 2 v1.2.1 final (M-3): complete/error/cancel 抛错被 try/catch 吞掉
+   * 历史 bug: replyStream 抛错（典型场景：user 中途发新消息导致 server-side 流
+   *   标识滚动，req_id 失效）会冒泡到 dispatch 循环，只 log 不重试，用户看不到反馈。
+   * 修法: 终态方法 try/catch + 仅 log。SDK 服务端行为不可控，吞错降级优于崩溃。
    */
   private getTerminalFrame(): { streamId: string; frame: any } | null {
     if (!this.currentStreamId || !this.lastInboundFrame) return null;
@@ -167,7 +164,11 @@ export class WecomStreamUpdater implements StreamUpdater {
       logger.warn('[wecom-stream] complete skipped: missing inboundFrame (startProcessing never called with frame)');
       return;
     }
-    await this.sdk.replyStream(t.frame, t.streamId, this.truncate(response), true);
+    try {
+      await this.sdk.replyStream(t.frame, t.streamId, this.truncate(response), true);
+    } catch (err) {
+      logger.error(`[wecom-stream] complete replyStream failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     this.clearTerminalState();
   }
 
@@ -178,7 +179,11 @@ export class WecomStreamUpdater implements StreamUpdater {
       logger.warn('[wecom-stream] error skipped: missing inboundFrame');
       return;
     }
-    await this.sdk.replyStream(t.frame, t.streamId, `❌ ${message}`, true);
+    try {
+      await this.sdk.replyStream(t.frame, t.streamId, `❌ ${message}`, true);
+    } catch (err) {
+      logger.error(`[wecom-stream] error replyStream failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     this.clearTerminalState();
   }
 
@@ -189,7 +194,11 @@ export class WecomStreamUpdater implements StreamUpdater {
       logger.warn('[wecom-stream] cancel skipped: missing inboundFrame');
       return;
     }
-    await this.sdk.replyStream(t.frame, t.streamId, `⏹ 已取消${reason ? `: ${reason}` : ''}`, true);
+    try {
+      await this.sdk.replyStream(t.frame, t.streamId, `⏹ 已取消${reason ? `: ${reason}` : ''}`, true);
+    } catch (err) {
+      logger.error(`[wecom-stream] cancel replyStream failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     this.clearTerminalState();
   }
 
@@ -197,7 +206,6 @@ export class WecomStreamUpdater implements StreamUpdater {
   private clearTerminalState(): void {
     this.currentStreamId = null;
     this.lastInboundFrame = null;
-    this.inboundFrame = null;
   }
 
   private truncate(content: string): string {

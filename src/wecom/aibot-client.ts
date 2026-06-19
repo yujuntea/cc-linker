@@ -127,19 +127,34 @@ export class AibotClient extends EventEmitter {
     this.wsClient.on('message.image', (msg: any) => {
       defaultLogger.info(`[aibot] message.image received: ${JSON.stringify(msg).slice(0, 500)}`);
       const body = msg.body ?? msg;
-      // PR 2 v1.2.1 (C7 修复): 字段路径未验证，保守 fallback + 探测未知字段
-      // 候选: body.image_list (aibot 文档) / body.image (历史猜测) / body.images / body.attachments
-      const imageArr = body.image_list ?? body.image ?? body.images ?? body.attachments;
-      if (!imageArr && (body.image_list === undefined && body.image === undefined && body.images === undefined && body.attachments === undefined)) {
+
+      // PR 2 v1.2.1 final (M-1): 重写 image 字段 fallback 链，避免 ?? dead code
+      // 历史 bug: `body.image_list ?? body.image ?? body.images ?? body.attachments` 链
+      //   只挡 nullish。空数组 []、空字符串 "" 都会通过 fallthrough，但空数组
+      //   也不算"有图片"。更糟的是后续 `if (!imageArr && (... === undefined && ...))`
+      //   永远 false（WARN 永远不会触发）。
+      // 修法: 列举所有候选 key，**第一个非 undefined**（用 `in` 严格检测）作为 imageArr。
+      //       全部 undefined → 打 WARN + early return（不 echo [图片] 占位）。
+      const candidates: Array<[string, unknown]> = [
+        ['image_list', body.image_list],
+        ['image', body.image],
+        ['images', body.images],
+        ['attachments', body.attachments],
+      ];
+      const hit = candidates.find(([_, v]) => v !== undefined);
+      if (!hit) {
         defaultLogger.warn(`[aibot] message.image 字段路径未识别，请上报真实 shape 供 PR 3 PoC 验证: ${JSON.stringify(msg).slice(0, 500)}`);
+        return;
       }
+      const [, imageArrRaw] = hit;
+      const imageArr = Array.isArray(imageArrRaw) ? imageArrRaw : [imageArrRaw];
       const event = {
         externalUserId: body.from?.userid ?? body.from?.user_id ?? '',
         chatId: body.msgid ?? body.chat_id ?? body.from?.chat_id ?? '',
         chatType: body.chattype === 'group' || body.chat_type === 'group' ? 'group' as const : 'single' as const,
         messageId: body.msgid ?? body.message_id ?? '',
         text: '[图片]',
-        images: Array.isArray(imageArr) ? imageArr.map((img: any) => ({ fileKey: img.file_key ?? img.media_id ?? img.fileKey, url: img.url })) : undefined,
+        images: imageArr.map((img: any) => ({ fileKey: img.file_key ?? img.media_id ?? img.fileKey, url: img.url })),
         inboundFrame: msg,
       };
       this.messageHandlers.forEach(h => h(event));

@@ -378,14 +378,24 @@ export class SpoolQueue {
     return moved;
   }
 
-  /** List all pending messages */
-  listPending(): SpoolMessage[] {
-    return this.listFromDir(this.pendingDir);
+  /**
+   * List all pending messages (optionally filtered by platform).
+   * PR 2 v1.2.1 final (M-4): 双平台共享 SpoolQueue 时，dispatch worker 需要按
+   * platform 过滤自己的消息，否则飞书 worker 可能误处理 wecom 消息（反之亦然）。
+   * 不传 platform = 返回所有（向后兼容）。
+   */
+  listPending(platform?: 'feishu' | 'wecom'): SpoolMessage[] {
+    const all = this.listFromDir(this.pendingDir);
+    return platform ? all.filter(m => m.platform === platform) : all;
   }
 
-  /** List all processing messages */
-  listProcessing(): SpoolMessage[] {
-    return this.listFromDir(this.processingDir);
+  /**
+   * List all processing messages (optionally filtered by platform).
+   * PR 2 v1.2.1 final (M-4): 同 listPending
+   */
+  listProcessing(platform?: 'feishu' | 'wecom'): SpoolMessage[] {
+    const all = this.listFromDir(this.processingDir);
+    return platform ? all.filter(m => m.platform === platform) : all;
   }
 
   listReplied(): SpoolMessage[] {

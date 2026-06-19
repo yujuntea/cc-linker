@@ -177,12 +177,13 @@ export class StateCoordinator {
   static isLocked(platformOrLockPath?: Platform | string, baseLockPath?: string): boolean {
     let path: string;
 
-    if (platformOrLockPath === 'feishu') {
+    if (platformOrLockPath === 'feishu' || platformOrLockPath === 'wecom') {
+      // PR 2 v1.2.1 final (M-2): 用 dirname + basename 重组 platform-specific 路径
+      // 历史: `base.replace(/owner\.lock$/, 'owner.feishu.lock')` 当 baseLockPath
+      //   不以 `owner.lock` 结尾时 replace 不匹配，**返回原字符串**（fallback 失效）。
+      // 修法: 永远以 dirname + `owner.${platform}.lock` 重组，与 baseLockPath 文件名解耦。
       const base = baseLockPath ?? RUNTIME_OWNER_LOCK_PATH;
-      path = base.replace(/owner\.lock$/, 'owner.feishu.lock');
-    } else if (platformOrLockPath === 'wecom') {
-      const base = baseLockPath ?? RUNTIME_OWNER_LOCK_PATH;
-      path = base.replace(/owner\.lock$/, 'owner.wecom.lock');
+      path = join(dirname(base), `owner.${platformOrLockPath}.lock`);
     } else if (typeof platformOrLockPath === 'string') {
       // 旧 API：第一个参数直接是 lockPath
       path = platformOrLockPath;

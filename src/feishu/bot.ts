@@ -784,7 +784,8 @@ export class FeishuBot {
     // v2.5 fix: serialKey 现在有两种 — sessionUuid (普通 chat) 或 cmd:openId:msgId
     // (slash 命令透传)。两条路径的消息都可能因 busy check 进入 processing/。
     // 只查 sessionUuid 会漏掉 /xxx 命令,导致 force-send 误返回"消息已被处理"。
-    const processingMsgs = this.spoolQueue.listProcessing()
+    // PR 2 v1.2.1 final (M-4): 传 'feishu' 过滤（共享 SpoolQueue 时不拉 wecom 消息）
+    const processingMsgs = this.spoolQueue.listProcessing('feishu')
       .filter(m => m.openId === openId && (
         m.serialKey === entry.sessionUuid ||
         m.serialKey.startsWith('cmd:')
@@ -845,7 +846,8 @@ export class FeishuBot {
 
   /** Claim one message from pending queue */
   private claimOne(): SpoolMessage | null {
-    const pending = this.spoolQueue.listPending();
+    // PR 2 v1.2.1 final (M-4): 传 'feishu' 过滤（同 listProcessing 注释）
+    const pending = this.spoolQueue.listPending('feishu');
     for (const msg of pending) {
       const claimed = this.spoolQueue.claimNext(msg.serialKey);
       if (claimed) return claimed;
@@ -3111,7 +3113,8 @@ export class FeishuBot {
     }
 
     const serialKeyForCancel = sessionUuid ?? `new:${openId}`;
-    const processingMsgs = this.spoolQueue.listProcessing()
+    // PR 2 v1.2.1 final (M-4): 传 'feishu' 过滤（同 listProcessing 注释）
+    const processingMsgs = this.spoolQueue.listProcessing('feishu')
       .filter(m => m.serialKey === serialKeyForCancel && m.openId === openId);
     logger.info(`[stop] found ${processingMsgs.length} processing message(s) for serialKey=${serialKeyForCancel}`);
     for (const pMsg of processingMsgs) {

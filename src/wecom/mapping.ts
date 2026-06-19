@@ -100,12 +100,6 @@ export class WecomUserManager extends PlatformUserManager {
 
     return outcome;
   }
-
-  /** 企微特有：bindSession 别名（与基类 bindSessionToClaim 行为一致，
-   * 但 feishu/bot.ts 之外的 wecom 测试用 bindSession 调用） */
-  async bindSession(externalUserId: string, messageId: string, sessionUuid: string, cwd: string): Promise<boolean> {
-    return this.bindSessionToClaim(externalUserId, messageId, sessionUuid, cwd);
-  }
 }
 
 /** 全局单例 */

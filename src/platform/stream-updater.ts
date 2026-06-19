@@ -11,8 +11,12 @@ export type StreamUpdateToolUse = {
 };
 
 export interface StreamUpdater {
-  /** 启动一条流式消息（飞书：发送 processing 卡；企微：start stream）。返回消息 ID */
-  startProcessing(userId: string): Promise<string>;
+  /**
+   * 启动一条流式消息（飞书：发送 processing 卡；企微：start stream）。返回消息 ID。
+   * PR 2 v1.2.1 final (M-7): inboundFrame optional（飞书不需要）。
+   * 企微实现会严格校验：漏传 throw fail-fast 避免 846605 "invalid req_id" 复现。
+   */
+  startProcessing(userId: string, inboundFrame?: any): Promise<string>;
 
   /** 更新流式内容（飞书：patch card；企微：replyStream with same streamId）。
    *  thinking: 模型的思考过程文本
