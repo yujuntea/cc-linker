@@ -1,6 +1,7 @@
 import {
   readFileSync, writeFileSync, renameSync, existsSync, mkdirSync,
-  readdirSync, statSync, unlinkSync
+  readdirSync, statSync, unlinkSync,
+  openSync, writeSync, closeSync, fsyncSync
 } from 'fs';
 import { join } from 'path';
 import {
@@ -585,7 +586,18 @@ export class SpoolQueue {
 
   private writeAtomic(path: string, data: unknown): void {
     const tmp = path + '.tmp';
-    writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+    // PR 5 (M-3 修复): writeFileSync + renameSync 在 macOS fsync 时序问题下可能留 0 字节
+    //   (PR 4.1 final 在 saveMapping 验证发现，daemon SIGKILL 时 write 还没落盘)
+    // 改用 openSync + writeSync (sync 写) + fsyncSync (强制刷盘) + closeSync + renameSync,
+    // 与 src/platform/user-state.ts:95-110 saveMapping 修法对称
+    const dataStr = JSON.stringify(data, null, 2);
+    const fd = openSync(tmp, 'w', 0o600);
+    try {
+      writeSync(fd, dataStr);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, path);
   }
 
