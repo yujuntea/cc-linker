@@ -33,6 +33,16 @@ export function handleError(err: unknown): never {
         '安装 Claude Code CLI: npm install -g @anthropic-ai/claude-code',
         '或在 config.toml 的 [sdk] section 显式设置 claude_executable',
       ],
+      'E_CONFIG_WECOM_AUTH': [
+        '检查 config.toml [wecom] 节的 bot_id 和 secret 是否正确',
+        '运行 cc-linker init-wecom 重新配置企微凭证',
+        '确认企业微信管理后台该智能机器人未被停用/删除',
+      ],
+      'E_CONFIG_WECOM_NETWORK': [
+        '检查本机网络是否可达 wss://openws.work.weixin.qq.com',
+        '如持续失败，launchd 会自动重启 bot 进程',
+        '查看日志 ~/.cc-linker/logs/ 定位具体重连失败原因',
+      ],
     };
 
     if (suggestions[err.code]) {
