@@ -204,7 +204,7 @@ export class WecomBot {
    * 动态选 existing_session vs new_session_claim，避免续聊消息被强制走新会话路径
    *
    * **SpoolMessage 字段策略（PR 1 v1.2 兼容）**：
-   * - openId / text: 写空串（企微侧永远不读这两个字段，但保留必填约束以兼容 ~30 个飞书调用方）
+   * - openId / text: 写空串（企微侧永远不读这两个字段，但保留必填约束以兼容 ~70 个飞书调用方 grep msg.openId/spoolMsg.openId）
    * - userId / platform: 写 wecom 真值（spec §3.3 兼容策略）
    */
   private async handleMessage(msg: PlatformMessage & { inboundFrame?: any }): Promise<void> {
