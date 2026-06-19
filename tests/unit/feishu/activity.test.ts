@@ -229,6 +229,98 @@ describe('FeishuBot activity sync (busy → force-send round-trip)', () => {
     }
   });
 
+  /**
+   * v2.5 regression: /xxx (slash command passthrough) with busy session.
+   *
+   * Bug fixed: handleForceSendCardAction previously filtered processing
+   * messages by serialKey === sessionUuid only. /xxx messages use
+   * serialKey = cmd:openId:msgId, so force-send couldn't find them and
+   * wrongly returned "消息已被处理" instead of re-queuing.
+   *
+   * This test verifies force-send now correctly handles both serialKey forms.
+   */
+  test('v2.5: /compact (slash command) busy session → force-send re-queues with cmd: serialKey', async () => {
+    const sessionUuid = '22222222-2222-2222-2222-222222222222';
+    const openId = 'ou_activity2';
+
+    appendFileSync(jsonlPath, '{"role":"assistant","content":"warming up"}\n');
+
+    registry.upsert(sessionUuid, {
+      origin: 'cli',
+      cwd: '/tmp/activity-test-project',
+      project_name: 'activity-test-project',
+      title: 'Activity Test Session 2',
+      message_count: 1,
+      last_active: new Date().toISOString(),
+      jsonl_path: jsonlPath,
+    });
+    await registry.flush();
+
+    await userManager.compareAndSwap(openId, null, {
+      type: 'session',
+      sessionUuid,
+      createdAt: new Date().toISOString(),
+      cwd: '/tmp/activity-test-project',
+    });
+
+    let writerActive = true;
+    const writerInterval = setInterval(() => {
+      if (!writerActive) return;
+      try {
+        appendFileSync(jsonlPath, '{"role":"assistant","content":"tick"}\n');
+      } catch {}
+    }, 30);
+
+    try {
+      const client = makeMockFeishuClient();
+      bot.setFeishuClient(client);
+
+      // Send /compact — a slash command (cmd: serialKey, NOT sessionUuid)
+      await bot.onMessage({
+        open_id: openId,
+        message_id: 'msg-compact-1',
+        content: JSON.stringify({ text: '/compact' }),
+        chat_type: 'p2p',
+        message_type: 'text',
+      });
+
+      await bot.dispatch();
+
+      // Busy check should have triggered. Message is in processing/
+      // with cmd: serialKey (NOT sessionUuid).
+      const processingAfterBusy = spoolQueue.listProcessing();
+      expect(processingAfterBusy).toHaveLength(1);
+      expect(processingAfterBusy[0].messageId).toBe('msg-compact-1');
+      expect(processingAfterBusy[0].serialKey).toBe(`cmd:${openId}:msg-compact-1`);
+      expect(processingAfterBusy[0].awaitingForceSend).toBe(true);
+      // Busy card was sent
+      expect(client.im.v1.message.create).toHaveBeenCalled();
+
+      // === User clicks "强制发送" ===
+      const result = await bot.handleCardAction({
+        open_id: openId,
+        action: {
+          tag: 'force_send',
+          value: { type: 'cli_force_send' },
+        },
+        message: { message_id: 'msg-compact-1' },
+      });
+
+      // The fix: handleForceSendCardAction now finds the message despite
+      // cmd: serialKey. It returns null (no error card) and re-queues.
+      expect(result).toBeNull();
+      expect(spoolQueue.listProcessing()).toHaveLength(0);
+      const pendingAfterForce = spoolQueue.listPending();
+      expect(pendingAfterForce).toHaveLength(1);
+      expect(pendingAfterForce[0].messageId).toBe('msg-compact-1');
+      expect(pendingAfterForce[0].skipActivityCheck).toBe(true);
+      expect(pendingAfterForce[0].awaitingForceSend).toBe(false);
+    } finally {
+      writerActive = false;
+      clearInterval(writerInterval);
+    }
+  });
+
   test('inactive session: message proceeds normally, no busy card, no awaitingForceSend flag', async () => {
     const sessionUuid = '22222222-2222-2222-2222-222222222222';
     const openId = 'ou_activity2';

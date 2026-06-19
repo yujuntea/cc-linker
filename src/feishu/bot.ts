@@ -783,8 +783,14 @@ export class FeishuBot {
     }
 
     // 在 processing 目录中查找属于该 session 的消息
+    // v2.5 fix: serialKey 现在有两种 — sessionUuid (普通 chat) 或 cmd:openId:msgId
+    // (slash 命令透传)。两条路径的消息都可能因 busy check 进入 processing/。
+    // 只查 sessionUuid 会漏掉 /xxx 命令,导致 force-send 误返回"消息已被处理"。
     const processingMsgs = this.spoolQueue.listProcessing()
-      .filter(m => m.serialKey === entry.sessionUuid && m.openId === openId);
+      .filter(m => m.openId === openId && (
+        m.serialKey === entry.sessionUuid ||
+        m.serialKey.startsWith('cmd:')
+      ));
 
     if (processingMsgs.length === 0) {
       // User clicked but no message in processing/ for this session.
