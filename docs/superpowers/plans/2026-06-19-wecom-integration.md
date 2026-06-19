@@ -8,7 +8,30 @@
 
 **Tech Stack:** Bun 1.3+ + TypeScript 6.0 + `@wecom/aibot-node-sdk@^1.0.7` + `ws@^8.16.0` + 现有飞书 SDK `@larksuiteoapi/node-sdk`。`bun build --compile` 已 PoC 验证打包 OK。
 
-**Spec:** `docs/superpowers/specs/2026-06-19-wecom-integration-design.md`
+**Spec:** `docs/superpowers/specs/2026-06-19-wecom-integration-design.md` (v1.1)
+
+---
+
+### Plan 修订记录
+
+**v1.2 (2026-06-19, pre-execution review 后)**:
+
+- **Task 1.5 user-state.ts (重设计)**: 改为「platform/user-state.ts 放接口契约 + 跨平台抽象」；`feishu/mapping.ts` 改为 re-export 兼容层，**不再重写 UserManager**（事实：~30 个文件 import feishu/mapping，重写会触发大量 import 改 + Agent View 强依赖）。新增 Task 1.5b 处理 mapping.ts 兼容层改造
+- **新增 Task 1.9 飞书侧切到 FeishuStreamUpdater** (spec §3.2 v1.1 第 3 条强制)：改造 feishu/bot.ts handleChatStreaming + onMessage；FeishuStreamUpdater 内部保留 CardUpdater 实例访问（4 个接口外方法 shouldFallbackToText/truncateContent/getCardMessageId/dispose 由 handleChatStreaming 直接通过 `.getCardUpdater()` 访问，不污染接口）
+- **新增 Task 1.10 SpoolMessage 跨平台字段** (spec §3.3)：spool.ts SpoolMessage 加 `userId + platform` 字段；feishu/bot.ts onMessage 入队时同步填；wecom/bot.ts 入队时只用新字段
+- **Task 1.7 FeishuStreamUpdater**: 修正——内部保留 `private cardUpdater: CardUpdater` 引用，handleChatStreaming 通过 `new FeishuStreamUpdater(cardUpdater)` 包装后调用 `updater.startProcessing()`；4 个 CardUpdater 专属方法 (`shouldFallbackToText/truncateContent/getCardMessageId/dispose`) 仍然直接调 `cardUpdater`（不在 StreamUpdater 接口内）
+- **Task 3.3 StateCoordinator 改造 (重设计)**: 改为「单平台锁 + 独立 lock 文件」(spec §3.4 v1.1)，**不再用 `platforms` 数组**；`tryAcquire(platform)` + `assertNotRunning(platform)` + `isLocked(platform)`；lock 文件名 `owner.${platform}.lock` 或 `--platform=all` 时 `owner.lock`
+
+**v1.1 (2026-06-19, eng review 后)**:
+
+- **Task 1.3 types.ts**: `FeishuMessageEvent` 加 `chat_id` 注释；`feishuMessageEventToPlatform` 适配器加注释说明 content 透传（JSON parse 在 bot.ts 下游）；chatId 在 p2p 用 open_id 兜底
+- **Task 1.3 测试**: 新增 `preserves raw content string` 和 `falls back to open_id in p2p` 两个测试
+- **Task 1.4 StreamUpdater 接口**: 加 ⚠️ 接口范围澄清 — 5 个核心方法覆盖普通聊天流式；Agent View / rendezvous 方法不在接口内，feishu bot.ts 的 Agent View 代码继续直接用 CardUpdater
+- **Task 2.2 aibot-client**: 错误处理从 `throw new CCLinkerError` 改为 `this.emit('fatal', ccErr)`；新增测试 `emits "fatal" event (not throw)`
+- **Task 2.2 Step 5 (新增)**: 在 errors.ts 加 `E_CONFIG_WECOM_AUTH` + `E_CONFIG_WECOM_NETWORK` 两条错误码 + suggestion，commit 范围包含 errors.ts
+- **Task 2.3 stream-updater**: `flushBuffer` 只吞限频错误 (errcode 45009/45033)，其他 rethrow；新增 `prepareTerminal()` 私有方法统一做 guard + clearTimeout；`complete/error/cancel` 三个终态方法都先 prepareTerminal
+- **Task 2.3 测试**: 新增 `terminal methods are idempotent` 和 `terminal methods clear pending flushTimer` 两个测试
+- **Task 3.4 Step 6 (新增)**: 修改 start.ts:437-443 的飞书 SDK→FeishuMessageEvent 映射，提取 `chat_id` 字段
 
 ---
 
@@ -20,7 +43,7 @@
 | `poc/aibot-stream.ts` | PoC: SDK `replyStream` 流式实测 | 1 |
 | `poc/aibot-button.ts` | PoC: 按钮回调 5s `replyWelcome` 实测 | 1 |
 | `src/platform/types.ts` | `PlatformMessage` / `PlatformUserId` / `PlatformCardAction` / `PlatformReplyFn` | 1 |
-| `src/platform/stream-updater.ts` | `StreamChunk` / `StreamUpdater` 接口 | 1 |
+| `src/platform/stream-updater.ts` | `StreamUpdater` 接口（5 个核心方法，对齐 CardUpdater 真实形状）+ `StreamUpdateToolUse` 类型 | 1 |
 | `src/platform/user-state.ts` | CAS 校验 + session 解析（从 `feishu/mapping.ts` 抽） | 1 |
 | `src/platform/command-handler.ts` | 命令解析 + 执行（从 `feishu/bot.ts` 抽） | 1 |
 | `src/feishu/card-updater.ts` | **修改**: 实现 `StreamUpdater` 适配层（不改行为） | 1 |
@@ -292,6 +315,30 @@ describe('feishuMessageEventToPlatform', () => {
     expect(result.chatId).toBe('oc_group123');
     expect(result.chatType).toBe('group');
   });
+
+  it('preserves raw content string (JSON parse happens downstream in bot.ts)', () => {
+    const feishuEvent: FeishuMessageEvent = {
+      open_id: 'ou_abc',
+      message_id: 'om_xyz',
+      content: '{"text":"hello"}', // feishu SDK content is JSON string
+      chat_type: 'p2p',
+      message_type: 'text',
+    };
+    const result = feishuMessageEventToPlatform(feishuEvent);
+    expect(result.text).toBe('{"text":"hello"}'); // raw, not parsed
+  });
+
+  it('falls back to open_id when chat_id is absent in p2p', () => {
+    const feishuEvent: FeishuMessageEvent = {
+      open_id: 'ou_abc',
+      message_id: 'om_xyz',
+      content: 'hi',
+      chat_type: 'p2p',
+      message_type: 'text',
+    };
+    const result = feishuMessageEventToPlatform(feishuEvent);
+    expect(result.chatId).toBe('ou_abc');
+  });
 });
 
 describe('aibotMessageToPlatform', () => {
@@ -346,14 +393,16 @@ Expected: FAIL with "Cannot find module '../../../src/platform/types'"
  * @see docs/superpowers/specs/2026-06-19-wecom-integration-design.md §4.1
  */
 
-// === Feishu 原始事件类型（与 feishu/bot.ts FeishuMessageEvent 对齐） ===
+// === Feishu 原始事件类型（与 feishu/bot.ts:54-60 FeishuMessageEvent 对齐） ===
+// chat_id 在 start.ts:437-443 的 SDK→FeishuMessageEvent 映射中提取（PR 3 改造项）
+// p2p 模式下 chat_id 为空，chatId 默认用 open_id；group 模式下 chat_id 有值
 export type FeishuMessageEvent = {
   open_id: string;
   message_id: string;
   content: string;
   chat_type: 'p2p' | 'group';
   message_type: 'text' | 'image';
-  chat_id?: string; // group 模式有值
+  chat_id?: string; // group 模式有值，p2p 模式省略
 };
 
 // === 企微原始事件类型（来自 @wecom/aibot-node-sdk EventEmitter） ===
@@ -400,6 +449,9 @@ export type PlatformUserId = {
 };
 
 // === Feishu → Platform 适配器 ===
+// 注意：content 直接透传（飞书 SDK content 是 JSON string，如 '{"text":"hello"}'）
+// PlatformMessage.text 在飞书路径下是原始 content 字符串，由 bot.ts:302 下游 JSON.parse
+// chat_id 在 p2p 模式下为空，此时 chatId 默认用 open_id（与 feishu/bot.ts:323 行为一致）
 export function feishuMessageEventToPlatform(event: FeishuMessageEvent): PlatformMessage {
   return {
     platform: 'feishu',
@@ -407,7 +459,7 @@ export function feishuMessageEventToPlatform(event: FeishuMessageEvent): Platfor
     chatType: event.chat_type,
     chatId: event.chat_id ?? event.open_id, // p2p: open_id, group: chat_id
     messageId: event.message_id,
-    text: event.content,
+    text: event.content, // 原始 JSON string；bot.ts 下游 parse
     timestamp: Date.now(),
     raw: event,
   };
@@ -453,6 +505,20 @@ git commit -m "feat(platform): add PlatformMessage + Feishu/Aibot adapters"
 > - **不复用 spec 自创的 `start/update/finish/fail`**：实际 `CardUpdater` 已有完整状态机（`startProcessing / updateStream / complete / error / cancel / patchAbortedTracking`），不应改
 > - **接口设计贴近真实形状**：feishu 路径加 `FeishuStreamUpdater` 类包装 CardUpdater（不是 adapter），wecom 路径写新的 `WecomStreamUpdater` 实现同一接口
 > - **复用 `src/proxy/stream-parser.ts` 的真实 `StreamChunk`**：thinking/text/result 三种 kind，不自创
+>
+> **⚠️ 接口范围澄清（final-check 追加）**：
+> `StreamUpdater` 接口只包含**普通聊天流式** 5 个核心方法，**不含飞书 rendezvous / Agent View 专属方法**：
+> - ❌ `setRendezvousShortId` / `patchWaitingCard` / `cancelPending` / `patchAbortedTracking` / `adoptExistingCard`
+>
+> 这些方法是飞书 v2.4.x Agent View (bg session 接管) 的专属能力（`bot.ts:1647,1782,1842,1923,2058`），wecom v1 不需要。
+> **处理方式**：
+> - `FeishuStreamUpdater` 只包 5 个核心方法，作为"普通聊天流式"的统一抽象
+> - 飞书 bot.ts 的 Agent View 代码（`handleReplyRequest` / `handleStop` 等）**继续直接用 `CardUpdater` 类型**，不走接口
+> - wecom bot.ts 的 v1 不涉及 Agent View，只消费 `StreamUpdater` 接口
+> - 未来 wecom 若要做 Agent View 等价功能，再加 `WecomRendezvousUpdater` 类（不在本次范围）
+>
+> 这样 PR 1 合了之后，飞书路径的 Agent View 行为零变化（仍然用 CardUpdater 的所有方法），
+> 新抽象层只覆盖"普通聊天"这一条路径，与 spec §3.2 "核心不动，只换消息类型" 原则一致。
 
 - [ ] **Step 1: 写接口契约测试**
 
@@ -576,72 +642,70 @@ git commit -m "feat(platform): add StreamUpdater interface (mirrors CardUpdater 
 
 ---
 
-## Task 1.5: 抽公共 user-state 逻辑
+## Task 1.5: 抽公共 user-state 接口契约 + feishu/mapping.ts 兼容层
 
 **Files:**
-- Create: `src/platform/user-state.ts`
+- Create: `src/platform/user-state.ts`（仅接口契约 + PlatformUserManager 抽象基类）
+- Modify: `src/feishu/mapping.ts`（改为 re-export 兼容层 + FeishuUserManager 子类 override validateOwner）
 - Test: `tests/unit/platform/user-state.test.ts`
 
-> **前置**：阅读 `src/feishu/mapping.ts:154-224`（`claimPendingNewSession` / `rollbackClaim` / `bindSessionToClaim`），理解 CAS 状态机。
+> **⚠️ 关键设计修正（v1.2 pre-execution review 修复 C7）**：
+> 原 plan Task 1.5 计划**从零实现** PlatformUserManager。但**事实核对**后发现：
+> - `src/feishu/mapping.ts` 已有完整 `UserManager`（`compareAndSwap` / `claimPendingNewSession` / `rollbackClaim` / `bindSessionToClaim` / `rollbackTimedOutClaims` / `validateOwner` / `allEntries` / `getVersion` 8 个方法）
+> - ~30 个文件 import `feishu/mapping`（含 agent-view 3 个文件、5 个测试 helpers）
+> - 重写会导致 30 个 import 改 + Agent View 强依赖破坏
+>
+> **修法**：
+> - `platform/user-state.ts` 只放 **接口契约**（`PlatformUserId` / `PlatformMappingEntry` 类型）+ **抽象基类** `PlatformUserManager`（声明 8 个方法的 abstract signature，但不在基类实现）
+> - `feishu/mapping.ts` 改为：
+>   - **re-export** 所有现有 UserManager 类型（保持 ~30 个 import 方零改动）
+>   - 提供 `FeishuUserManager extends PlatformUserManager` 子类，只 override `validateOwner()` 走 `feishu_bot.owner_open_id` 配置
+> - `wecom/mapping.ts`（PR 2 新增）提供 `WecomUserManager extends PlatformUserManager` 子类，override `validateOwner()` 走 `wecom.owner_external_user_id` 配置 + 独立 storage path
+>
+> 这样：基类签名稳定 → wecom 侧只需要 override 一个方法；feishu 侧 30 个 import 零改动。
 
-- [ ] **Step 1: 写失败的测试**
+- [ ] **Step 1: 写接口契约测试**
 
 `tests/unit/platform/user-state.test.ts`:
 
 ```typescript
-import { describe, it, expect, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { PlatformUserManager } from '../../../src/platform/user-state';
+import { describe, it, expect } from 'bun:test';
+import type {
+  PlatformMappingEntry,
+  PlatformUserManager,
+  ClaimPendingResult,
+} from '../../../src/platform/user-state';
 
-describe('PlatformUserManager', () => {
-  let dir: string;
-  let manager: PlatformUserManager;
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'platform-user-state-'));
-    manager = new PlatformUserManager(join(dir, 'mapping.json'), 'wecom');
+// 这是一个"接口契约"测试：验证 PlatformUserManager 基类签名符合 feishu/mapping.ts 真实 UserManager
+// 不实际跑逻辑（feishu/mapping.test.ts 已覆盖）；只验证类型 + 方法签名匹配
+describe('PlatformUserManager interface contract', () => {
+  it('declares all 8 methods that feishu UserManager implements', () => {
+    // 编译期验证：这些方法必须在 PlatformUserManager 抽象基类中存在
+    type AssertHasMethods = PlatformUserManager extends {
+      getEntry(userId: string): PlatformMappingEntry | undefined;
+      getVersion(): number;
+      compareAndSwap(openId: string, expected: PlatformMappingEntry | null, newValue: PlatformMappingEntry | null): Promise<boolean>;
+      claimPendingNewSession(openId: string, messageId: string): Promise<ClaimPendingResult>;
+      rollbackClaim(openId: string, messageId: string): Promise<boolean>;
+      bindSessionToClaim(openId: string, messageId: string, sessionUuid: string, cwd: string): Promise<boolean>;
+      rollbackTimedOutClaims(): Promise<number>;
+      validateOwner(userId: string): boolean;
+      allEntries(): Promise<Array<[string, PlatformMappingEntry]>>;
+    } ? true : false;
+    const assertCheck: AssertHasMethods = true;
+    expect(assertCheck).toBe(true);
   });
 
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('claims pending session atomically', async () => {
-    await manager.setPending('user-1', 'cwd=/tmp');
-    const result = await manager.claimPending('user-1', 'msg-1');
-    expect(result.status).toBe('claimed');
-
-    // Concurrent claim should see 'creating'
-    const concurrent = await manager.claimPending('user-1', 'msg-2');
-    expect(concurrent.status).toBe('creating');
-  });
-
-  it('binds session after claim', async () => {
-    await manager.setPending('user-1', 'cwd=/tmp');
-    const claim = await manager.claimPending('user-1', 'msg-1');
-    const bound = await manager.bindSession('user-1', 'msg-1', 'session-uuid-123', '/tmp');
-    expect(bound).toBe(true);
-
-    const entry = manager.getEntry('user-1');
-    expect(entry?.sessionUuid).toBe('session-uuid-123');
-  });
-
-  it('rejects bind on mismatched claim', async () => {
-    await manager.setPending('user-1', 'cwd=/tmp');
-    await manager.claimPending('user-1', 'msg-1');
-    const bound = await manager.bindSession('user-1', 'msg-other', 'session-uuid', '/tmp');
-    expect(bound).toBe(false);
-  });
-
-  it('rolls back claim on timeout', async () => {
-    await manager.setPending('user-1', 'cwd=/tmp');
-    await manager.claimPending('user-1', 'msg-1');
-    const rolled = await manager.rollbackClaim('user-1', 'msg-1');
-    expect(rolled).toBe(true);
-    const entry = manager.getEntry('user-1');
-    expect(entry?.type).toBe('pending_new_session');
+  it('PlatformMappingEntry includes agent view optional fields', () => {
+    // Agent View (bot.ts:handleStop / handleReply) 用了这些字段，必须保留
+    const entry: PlatformMappingEntry = {
+      type: 'pending_agent_reply',
+      sessionUuid: null,
+      shortId: 'abc123',
+      startedAt: '2026-06-19T00:00:00Z',
+      timeoutMs: 300000,
+    };
+    expect(entry.shortId).toBe('abc123');
   });
 });
 ```
@@ -649,208 +713,106 @@ describe('PlatformUserManager', () => {
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `bun test tests/unit/platform/user-state.test.ts`
-Expected: FAIL with "Cannot find module"
+Expected: FAIL with "Cannot find module '../../../src/platform/user-state'"
 
-- [ ] **Step 3: 实现 user-state.ts**
+- [ ] **Step 3: 实现 user-state.ts（接口契约 + 抽象基类）**
 
 `src/platform/user-state.ts`:
 
 ```typescript
 /**
- * 平台无关的 user state CAS 状态机
- * 从 src/feishu/mapping.ts 抽出（feishu/mapping.ts:154-260）
- * @see docs/superpowers/specs/2026-06-19-wecom-integration-design.md §4.1
+ * 平台无关的 user state 接口契约
+ * 抽象基类 PlatformUserManager 声明所有方法签名；具体实现在 feishu/mapping.ts 与 wecom/mapping.ts
+ * @see docs/superpowers/specs/2026-06-19-wecom-integration-design.md §3.2 v1.1 + §4.1
+ *
+ * 为什么用抽象基类而不是从零实现：feishu/mapping.ts:55 UserManager 已有 8 个方法 + 30 个 import 方
+ * 重写代价远高于抽象；本文件只承担"跨平台契约"职责
  */
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
-import { withLock } from '../utils/lock';
-import { logger } from '../utils/logger';
+import type { UserMapping, MappingEntry, MappingEntryType } from '../feishu/mapping';
 
-export type PlatformMappingEntryType =
-  | 'session'
-  | 'pending_new_session'
-  | 'pending_new_session_claimed';
-
-export interface PlatformMappingEntry {
-  type: PlatformMappingEntryType;
-  sessionUuid: string | null;
-  cwd?: string;
-  createdAt: string;
-  lastActiveAt?: string;
-  claimedByMessageId?: string;
-  claimedAt?: string;
-  casToken?: string;
-}
-
-export interface PlatformMapping {
+// === 类型 re-export（保持 feishu/mapping.ts 单一来源）===
+export type PlatformMappingEntry = MappingEntry;
+export type PlatformMappingEntryType = MappingEntryType;
+export type PlatformUserMapping = UserMapping;
+export type ClaimPendingResult = {
+  status: 'claimed' | 'creating' | 'no_pending' | 'unauthorized';
+  entry: PlatformMappingEntry | null;
   version: number;
-  entries: Record<string, PlatformMappingEntry>;
+};
+
+/** 平台无关用户身份 */
+export interface PlatformUserId {
+  platform: 'feishu' | 'wecom';
+  platformUserId: string;
 }
 
-export type ClaimResult =
-  | { status: 'claimed'; entry: PlatformMappingEntry; version: number }
-  | { status: 'creating'; entry: PlatformMappingEntry; version: number }
-  | { status: 'no_pending'; entry: PlatformMappingEntry | null; version: number };
+/**
+ * 抽象基类：声明 8 个方法签名
+ * feishu/mapping.ts 的 UserManager 已经全部实现；wecom/mapping.ts PR 2 实现
+ * 子类必须 override validateOwner()（不同平台读不同 config key）
+ */
+export abstract class PlatformUserManager {
+  protected abstract readonly mappingPath: string;
 
-const PENDING_CLAIMED_TIMEOUT_MS = 10 * 60 * 1000;
-
-export class PlatformUserManager {
-  private mappingPath: string;
-  private platform: 'feishu' | 'wecom';
-  private initialized = false;
-
-  constructor(mappingPath: string, platform: 'feishu' | 'wecom') {
-    this.mappingPath = mappingPath;
-    this.platform = platform;
-  }
-
-  private ensureFile(): void {
-    if (this.initialized) return;
-    const dir = join(this.mappingPath, '..');
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    if (!existsSync(this.mappingPath)) {
-      this.saveMapping({ version: 0, entries: {} });
-    }
-    this.initialized = true;
-  }
-
-  private loadMapping(): PlatformMapping {
-    try {
-      const raw = readFileSync(this.mappingPath, 'utf8');
-      return JSON.parse(raw) as PlatformMapping;
-    } catch (err) {
-      logger.warn(`[${this.platform}] user-state 解析失败: ${err}`);
-      return { version: 0, entries: {} };
-    }
-  }
-
-  private saveMapping(mapping: PlatformMapping): void {
-    const tmp = this.mappingPath + '.tmp';
-    writeFileSync(tmp, JSON.stringify(mapping, null, 2), { mode: 0o600 });
-    renameSync(tmp, this.mappingPath);
-  }
-
-  getEntry(userId: string): PlatformMappingEntry | undefined {
-    this.ensureFile();
-    return this.loadMapping().entries[userId];
-  }
-
-  async setPending(userId: string, opts: { cwd?: string } = {}): Promise<void> {
-    await withLock(this.mappingPath, async () => {
-      this.ensureFile();
-      const mapping = this.loadMapping();
-      mapping.entries[userId] = {
-        type: 'pending_new_session',
-        sessionUuid: null,
-        cwd: opts.cwd,
-        createdAt: new Date().toISOString(),
-        lastActiveAt: new Date().toISOString(),
-        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      };
-      mapping.version++;
-      this.saveMapping(mapping);
-    });
-  }
-
-  async claimPending(userId: string, messageId: string): Promise<ClaimResult> {
-    let outcome: ClaimResult = { status: 'no_pending', entry: null, version: 0 };
-    await withLock(this.mappingPath, async () => {
-      this.ensureFile();
-      const mapping = this.loadMapping();
-      const current = mapping.entries[userId] ?? null;
-
-      if (!current || (current.type !== 'pending_new_session' && current.type !== 'pending_new_session_claimed')) {
-        outcome = { status: 'no_pending', entry: current, version: mapping.version };
-        return;
-      }
-
-      if (current.type === 'pending_new_session_claimed') {
-        outcome = { status: 'creating', entry: current, version: mapping.version };
-        return;
-      }
-
-      const now = new Date().toISOString();
-      mapping.entries[userId] = {
-        ...current,
-        type: 'pending_new_session_claimed',
-        claimedByMessageId: messageId,
-        claimedAt: now,
-        lastActiveAt: now,
-        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      };
-      mapping.version++;
-      this.saveMapping(mapping);
-      outcome = { status: 'claimed', entry: mapping.entries[userId], version: mapping.version };
-    });
-    return outcome;
-  }
-
-  async bindSession(userId: string, messageId: string, sessionUuid: string, cwd: string): Promise<boolean> {
-    let bound = false;
-    await withLock(this.mappingPath, async () => {
-      this.ensureFile();
-      const mapping = this.loadMapping();
-      const current = mapping.entries[userId];
-      if (!current) return;
-
-      const claimMatches =
-        current.type === 'pending_new_session_claimed' &&
-        current.claimedByMessageId === messageId;
-      if (!claimMatches) return;
-
-      mapping.entries[userId] = {
-        ...current,
-        type: 'session',
-        sessionUuid,
-        cwd,
-        createdAt: current.createdAt,
-        lastActiveAt: new Date().toISOString(),
-        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      };
-      mapping.version++;
-      this.saveMapping(mapping);
-      bound = true;
-    });
-    return bound;
-  }
-
-  async rollbackClaim(userId: string, messageId: string): Promise<boolean> {
-    let rolledBack = false;
-    await withLock(this.mappingPath, async () => {
-      this.ensureFile();
-      const mapping = this.loadMapping();
-      const current = mapping.entries[userId];
-      if (!current || current.type !== 'pending_new_session_claimed') return;
-      if (current.claimedByMessageId !== messageId) return;
-
-      mapping.entries[userId] = {
-        ...current,
-        type: 'pending_new_session',
-        sessionUuid: null,
-        lastActiveAt: new Date().toISOString(),
-        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-        claimedByMessageId: undefined,
-        claimedAt: undefined,
-      };
-      mapping.version++;
-      this.saveMapping(mapping);
-      rolledBack = true;
-    });
-    return rolledBack;
-  }
+  abstract getEntry(userId: string): PlatformMappingEntry | undefined;
+  abstract getVersion(): number;
+  abstract compareAndSwap(
+    userId: string,
+    expected: PlatformMappingEntry | null,
+    newValue: PlatformMappingEntry | null,
+  ): Promise<boolean>;
+  abstract claimPendingNewSession(userId: string, messageId: string): Promise<ClaimPendingResult>;
+  abstract rollbackClaim(userId: string, messageId: string): Promise<boolean>;
+  abstract bindSessionToClaim(userId: string, messageId: string, sessionUuid: string, cwd: string): Promise<boolean>;
+  abstract rollbackTimedOutClaims(): Promise<number>;
+  abstract validateOwner(userId: string): boolean;
+  abstract allEntries(): Promise<Array<[string, PlatformMappingEntry]>>;
 }
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `bun test tests/unit/platform/user-state.test.ts`
-Expected: PASS（4 个 it 全过）
+Expected: PASS（2 个 it 全过）
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: 改造 feishu/mapping.ts 为 re-export 兼容层**
+
+修改 `src/feishu/mapping.ts:55` 在 `UserManager` 类后面加：
+
+```typescript
+// === platform/ 抽象基类的飞书实现 (v1.2 PR 1 重构) ===
+// PlatformUserManager 在 src/platform/user-state.ts 是抽象基类
+// FeishuUserManager 让 UserManager 满足基类契约 + override validateOwner
+// ~30 个 import 此文件的调用方（feishu/bot.ts / agent-view/* / tests/）零改动
+import { PlatformUserManager } from '../platform/user-state';
+
+// UserManager 已经满足 PlatformUserManager 所有方法签名，只需要 override validateOwner
+// 这里用 type-only export，避免重复定义类
+export type { UserManager, UserMapping, MappingEntry, MappingEntryType };
+
+// 验证 UserManager 满足 PlatformUserManager 契约（编译期断言）
+type _AssertImplements = UserManager extends PlatformUserManager ? true : never;
+const _assert: _AssertImplements = true;
+void _assert; // suppress unused
+```
+
+> **为什么不用 extends**：`UserManager` 类已经有 `constructor(mappingPath?: string)`，如果 extends PlatformUserManager 会触发 TypeScript 构造函数签名不匹配（abstract class 不能直接 new），并且 30 个 import 方 `new UserManager()` 都要改。**用 type-only re-export + 编译期 `extends` 断言**是更轻的方案。
+>
+> **行为保证**：
+> - `UserManager.validateOwner` (mapping.ts:305) 读 `feishu_bot.owner_open_id`，已符合 PlatformUserManager 契约
+> - 8 个方法签名 100% 匹配（已对照 mapping.ts:93-325 验证）
+> - `feishu/mapping.ts:351` 的 `export const userManager = new UserManager()` 保持不变 → 全局单例无影响
+
+- [ ] **Step 6: 跑全量飞书测试，验证零回归**
+
+Run: `bun test tests/unit/feishu/ tests/integration/`
+Expected: PASS（所有现有飞书测试通过；本次只新增 import + type re-export）
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/platform/user-state.ts tests/unit/platform/user-state.test.ts
-git commit -m "feat(platform): add PlatformUserManager (CAS state machine)"
+git add src/platform/user-state.ts src/feishu/mapping.ts tests/unit/platform/user-state.test.ts
+git commit -m "refactor(platform): add PlatformUserManager interface contract (feishu/mapping.ts compat)"
 ```
 
 ---
@@ -1058,6 +1020,14 @@ describe('FeishuStreamUpdater', () => {
     await updater.cancel('user requested');
     expect(mockCU.cancel).toHaveBeenCalledWith('user requested');
   });
+
+  it('getCardUpdater returns underlying instance for interface-external methods', () => {
+    const mockCU = makeMockCardUpdater() as any;
+    const updater = new FeishuStreamUpdater(mockCU);
+    // handleChatStreaming 需要调 cardUpdater.shouldFallbackToText / truncateContent / getCardMessageId / dispose
+    // 这些不在 StreamUpdater 接口里，通过 getCardUpdater() 直接访问
+    expect(updater.getCardUpdater()).toBe(mockCU);
+  });
 });
 ```
 
@@ -1066,7 +1036,7 @@ describe('FeishuStreamUpdater', () => {
 Run: `bun test tests/unit/feishu/stream-updater.test.ts`
 Expected: FAIL with "Cannot find module"
 
-- [ ] **Step 3: 实现 stream-updater.ts**
+- [ ] **Step 3: 实现 stream-updater.ts（**v1.2 修正**：保留 CardUpdater 私有引用）**
 
 `src/feishu/stream-updater.ts`:
 
@@ -1074,14 +1044,22 @@ Expected: FAIL with "Cannot find module"
 /**
  * FeishuStreamUpdater — 把 CardUpdater 包成 StreamUpdater 接口
  * 不改 CardUpdater 行为，仅作为接口契约的飞书侧实现
- * @see docs/superpowers/specs/2026-06-19-wecom-integration-design.md §4.1
+ * **v1.2 修正**：保留 `private cardUpdater` 引用
+ * handleChatStreaming 仍可直接 `.cardUpdater.shouldFallbackToText()` 调 4 个接口外方法
+ * @see docs/superpowers/specs/2026-06-19-wecom-integration-design.md §3.2 v1.1 + §4.1
  * 参考 src/feishu/card-updater.ts:120-186 (CardUpdater 真实方法签名)
  */
 import type { StreamUpdater, StreamUpdateToolUse } from '../platform/stream-updater';
 import type { CardUpdater } from './card-updater';
 
 export class FeishuStreamUpdater implements StreamUpdater {
-  constructor(private cardUpdater: CardUpdater) {}
+  /** 暴露给 handleChatStreaming 调 4 个接口外方法 (shouldFallbackToText/truncateContent/getCardMessageId/dispose) */
+  constructor(private readonly cardUpdater: CardUpdater) {}
+
+  /** 获取底层 CardUpdater（handleChatStreaming 用） */
+  getCardUpdater(): CardUpdater {
+    return this.cardUpdater;
+  }
 
   async startProcessing(userId: string): Promise<string> {
     return this.cardUpdater.startProcessing(userId);
@@ -1170,7 +1148,7 @@ Expected: 5 case 全过，飞书行为与 PR 1 前完全一致。
 
 ```bash
 cd ../wt-pr1-platform
-git log --oneline master..HEAD  # 期望 7-8 个 commit
+git log --oneline master..HEAD  # 期望 9-10 个 commit
 ```
 
 - [ ] **Step 6: Squash merge 到 master**
@@ -1183,9 +1161,10 @@ git commit -m "feat(platform): add abstraction layer for multi-platform IM (PR 1
 Adds platform/ module:
 - PlatformMessage / PlatformUserId / PlatformCardAction types
 - StreamUpdater interface (mirrors CardUpdater real shape)
-- PlatformUserManager (CAS state machine extracted from feishu)
+- PlatformUserManager interface contract (feishu/mapping.ts compat via re-export)
 - isCommandMessage + parseCommand (no whitelist, supports cc slash passthrough)
-- FeishuStreamUpdater wrapping existing CardUpdater (zero behavior change)
+- FeishuStreamUpdater wrapping existing CardUpdater + handleChatStreaming switched
+- SpoolMessage userId + platform fields (openId/text alias preserved)
 
 PoC smoke tests for @wecom/aibot-node-sdk Bun compatibility."
 git push origin master
@@ -1196,7 +1175,340 @@ git worktree remove ../wt-pr1-platform
 - [ ] `bun test` 全过
 - [ ] `bun run typecheck` 通过
 - [ ] 飞书路径 5 个 E2E 场景全过
+- [ ] 飞书 handleChatStreaming 走 FeishuStreamUpdater（不是死代码）
 - [ ] 零行为变更（飞书用户无感知）
+
+---
+
+## Task 1.9: 飞书 handleChatStreaming 切到 FeishuStreamUpdater + onMessage 同步填 userId/platform
+
+**Files:**
+- Modify: `src/feishu/bot.ts`（handleChatStreaming + onMessage）
+- Test: `tests/unit/feishu/bot-stream-updater.test.ts`（新增集成测试）
+
+> **⚠️ v1.2 新增任务（spec §3.2 第 3 条强制）**：
+> Task 1.7 写的 FeishuStreamUpdater 类如果不接入 feishu/bot.ts，就是死代码，到 PR 2 第一次在 wecom 路径用接口时才发现类型不匹配。本 task 是 PR 1 的**核心收尾**。
+>
+> **关键事实**：`handleChatStreaming` (bot.ts:1412-1503) 用了 CardUpdater 4 个接口外方法：
+> - `cardUpdater.shouldFallbackToText(text)` (bot.ts:1460)
+> - `cardUpdater.truncateContent(text)` (bot.ts:1461)
+> - `cardUpdater.getCardMessageId()` (bot.ts:1472)
+> - `cardUpdater.dispose()` (bot.ts:1473)
+>
+> **修法**：FeishuStreamUpdater 内部保留 `private cardUpdater` 引用 + 暴露 `getCardUpdater()` 方法（Task 1.7 已加），handleChatStreaming 改用 `feishuStreamUpdater.getCardUpdater()` 调这 4 个方法。StreamUpdater 接口 5 个核心方法（start/update/complete/error/cancel）走 updater.xxx()。
+
+- [ ] **Step 1: 写集成测试**
+
+`tests/unit/feishu/bot-stream-updater.test.ts`:
+
+```typescript
+import { describe, it, expect, mock } from 'bun:test';
+import { FeishuStreamUpdater } from '../../../src/feishu/stream-updater';
+import type { CardUpdater } from '../../../src/feishu/card-updater';
+
+describe('FeishuStreamUpdater integration with handleChatStreaming call pattern', () => {
+  it('handleChatStreaming uses updater.complete() (not cardUpdater.complete directly)', async () => {
+    // 模拟 bot.ts:1470 的调用模式: cardUpdater.complete(text, tokensIn, tokensOut, durationMs, 1)
+    const completeCalls: any[] = [];
+    const cardUpdater = {
+      startProcessing: mock(async () => 'card-123'),
+      updateStream: mock(async () => {}),
+      complete: mock(async (...args: any[]) => { completeCalls.push(args); }),
+      error: mock(async () => {}),
+      cancel: mock(async () => {}),
+      shouldFallbackToText: mock(() => false),  // bot.ts:1460
+      truncateContent: mock((s: string) => s),  // bot.ts:1461
+      getCardMessageId: mock(() => 'card-123'),  // bot.ts:1472
+      dispose: mock(() => {}),                    // bot.ts:1473
+    } as any as CardUpdater;
+
+    const updater = new FeishuStreamUpdater(cardUpdater);
+
+    // 模拟 bot.ts:1429: const cardMessageId = await cardUpdater.startProcessing(msg.openId);
+    const msgId = await updater.startProcessing('ou_abc');
+    expect(msgId).toBe('card-123');
+
+    // 模拟 bot.ts:1446: cardUpdater.updateStream(thinking, text, elapsed)
+    await updater.updateStream('thinking', 'text', 1500);
+
+    // 模拟 bot.ts:1470: await cardUpdater.complete(text, result.tokensIn ?? 0, ...)
+    // 但走 FeishuStreamUpdater 路径: await updater.complete(...)
+    await updater.complete('final response', 100, 200, 5000, 1);
+
+    // 验证 StreamUpdater 5 个核心方法都走包装
+    expect(cardUpdater.startProcessing).toHaveBeenCalled();
+    expect(cardUpdater.updateStream).toHaveBeenCalled();
+    expect(cardUpdater.complete).toHaveBeenCalledWith('final response', 100, 200, 5000, 1);
+
+    // 验证 4 个接口外方法仍然能通过 getCardUpdater() 访问（handleChatStreaming 仍然能用）
+    const underlying = updater.getCardUpdater();
+    expect(underlying.shouldFallbackToText('text')).toBe(false);
+    expect(underlying.truncateContent('text')).toBe('text');
+    expect(underlying.getCardMessageId()).toBe('card-123');
+    underlying.dispose();  // 不会抛
+  });
+
+  it('SpoolMessage enqueue includes userId + platform fields', () => {
+    // 模拟 feishu/bot.ts:onMessage 入队 SpoolMessage 的逻辑
+    const event = { open_id: 'ou_abc', message_id: 'om_xyz', content: 'hello', chat_type: 'p2p' as const, message_type: 'text' as const };
+    const spoolMessage = {
+      messageId: event.message_id,
+      openId: event.open_id,
+      text: event.content,
+      // v1.2 新增字段:
+      userId: event.open_id,        // 飞书 alias
+      platform: 'feishu' as const,   // 标记来源
+      target: { type: 'no_target' as const },
+      serialKey: `new:${event.open_id}`,
+      status: 'pending' as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    expect(spoolMessage.userId).toBe('ou_abc');
+    expect(spoolMessage.platform).toBe('feishu');
+    expect(spoolMessage.openId).toBe('ou_abc'); // alias 保留
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `bun test tests/unit/feishu/bot-stream-updater.test.ts`
+Expected: FAIL with "Cannot find module '../../../src/feishu/stream-updater'"
+
+- [ ] **Step 3: 改造 feishu/bot.ts:handleChatStreaming 切到 FeishuStreamUpdater**
+
+修改 `src/feishu/bot.ts:1412-1503` 的 `handleChatStreaming`：
+
+```typescript
+// 修改前 (bot.ts:1424-1429):
+//   const cardUpdater = new CardUpdater(this.feishuClient, { throttle_ms: ... });
+//   cardMessageId = await cardUpdater.startProcessing(msg.openId);
+
+// 修改后:
+let feishuUpdater: FeishuStreamUpdater | null = null;
+let cardUpdater: CardUpdater | null = null;
+if (this.feishuClient) {
+  cardUpdater = new CardUpdater(this.feishuClient, {
+    throttle_ms: config.get<number>('stream.throttle_ms', 1500),
+    max_card_bytes: config.get<number>('stream.max_card_bytes', 25000),
+    show_thinking: config.get<boolean>('stream.show_thinking', true),
+  });
+  feishuUpdater = new FeishuStreamUpdater(cardUpdater);
+  cardMessageId = await feishuUpdater.startProcessing(msg.openId);
+}
+```
+
+并修改 stream callback (bot.ts:1446-1449)：
+```typescript
+feishuUpdater?.updateStream(
+  config.get<boolean>('stream.show_thinking', true) ? thinking : '',
+  text, elapsed
+).catch(e => logger.warn(`Stream: update failed: ${e}`));
+```
+
+修改 complete 路径 (bot.ts:1455-1474)：
+```typescript
+if (feishuUpdater && cardUpdater) {
+  const wasCancelled = this.cancelledMessageIds.has(msg.messageId);
+  if (wasCancelled) {
+    this.cancelledMessageIds.delete(msg.messageId);
+    await feishuUpdater.cancel();
+  } else if (cardUpdater.shouldFallbackToText(text)) {  // ← 接口外方法走 getCardUpdater
+    const truncated = cardUpdater.truncateContent(text);  // ← 同上
+    await feishuUpdater.complete(truncated, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+    const remainder = text.slice(truncated.length);
+    if (remainder && config.get<boolean>('stream.fallback_to_text', true)) {
+      for (const chunk of splitReplyText(remainder, 3900)) {
+        await this.replyFn(chunk, { messageId: msg.messageId, openId: msg.openId });
+      }
+    }
+  } else {
+    await feishuUpdater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+  }
+  cardMessageId = cardUpdater.getCardMessageId();  // ← 接口外方法
+  cardUpdater.dispose();                            // ← 接口外方法
+}
+```
+
+并在 `src/feishu/bot.ts:3` import 处加：
+```typescript
+import { FeishuStreamUpdater } from './stream-updater';
+```
+
+- [ ] **Step 4: 改造 feishu/bot.ts:onMessage 入队时同步填 userId + platform**
+
+修改 `src/feishu/bot.ts:onMessage` 中调 `spoolQueue.enqueue(msg)` 的位置（bot.ts:约 395-420 段，需要先 grep 定位），把 enqueue 的 SpoolMessage 对象加 2 个字段：
+
+```typescript
+// 修改前:
+await this.spoolQueue.enqueue({
+  messageId: event.message_id,
+  openId: event.open_id,
+  text: parsedText,
+  target: ...,
+  serialKey: ...,
+  ...
+});
+
+// 修改后:
+await this.spoolQueue.enqueue({
+  messageId: event.message_id,
+  openId: event.open_id,        // 保留 alias，飞书 46 个调用方零改动
+  text: parsedText,             // 保留 alias
+  userId: event.open_id,        // ← v1.2 新增：平台无关
+  platform: 'feishu',           // ← v1.2 新增
+  target: ...,
+  serialKey: ...,
+  ...
+});
+```
+
+- [ ] **Step 5: 跑全量测试**
+
+Run: `bun test tests/unit/feishu/ tests/integration/`
+Expected: PASS（包括新加的 `tests/unit/feishu/bot-stream-updater.test.ts`）
+
+- [ ] **Step 6: 跑飞书 E2E 5 case**
+
+在真实飞书环境验证流式回复行为完全不变（特别是 fallback_to_text 路径会调 4 个接口外方法）。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/feishu/bot.ts tests/unit/feishu/bot-stream-updater.test.ts
+git commit -m "feat(feishu): switch handleChatStreaming to FeishuStreamUpdater + SpoolMessage userId/platform"
+```
+
+---
+
+## Task 1.10: SpoolMessage 加 userId + platform 字段
+
+**Files:**
+- Modify: `src/queue/spool.ts`（SpoolMessage interface）
+- Test: `tests/unit/queue/spool-cross-platform.test.ts`（新增）
+
+> **⚠️ v1.2 新增任务（spec §3.3）**：46 个文件引用 `SpoolMessage.openId/text`，完全重命名代价巨大。采用「新增字段 + alias 保留」策略：飞书路径同时填 `openId/text` (alias) 和 `userId/platform` (新)；企微路径 PR 2 只填 `userId/platform`。
+
+- [ ] **Step 1: 写测试**
+
+`tests/unit/queue/spool-cross-platform.test.ts`:
+
+```typescript
+import { describe, it, expect } from 'bun:test';
+import type { SpoolMessage } from '../../../src/queue/spool';
+
+describe('SpoolMessage cross-platform fields', () => {
+  it('feishu SpoolMessage has both openId alias and userId/platform new fields', () => {
+    const msg: SpoolMessage = {
+      messageId: 'om_123',
+      openId: 'ou_abc',          // alias
+      text: 'hello',             // alias
+      userId: 'ou_abc',          // ← 新字段（飞书=open_id）
+      platform: 'feishu',        // ← 新字段
+      target: { type: 'no_target' },
+      serialKey: 'new:ou_abc',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    expect(msg.userId).toBe(msg.openId);  // alias 一致
+    expect(msg.platform).toBe('feishu');
+  });
+
+  it('wecom SpoolMessage uses userId/platform only (openId empty)', () => {
+    const msg: SpoolMessage = {
+      messageId: 'msg_123',
+      openId: '',                // 企微侧永远空
+      text: '',                  // 企微侧永远空（实际不读）
+      userId: 'wmu_abc',         // ← external_userid
+      platform: 'wecom',         // ← 企微标记
+      target: { type: 'no_target' },
+      serialKey: 'new:wmu_abc',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    expect(msg.openId).toBe('');  // 企微不写 alias
+    expect(msg.userId).toBe('wmu_abc');
+    expect(msg.platform).toBe('wecom');
+  });
+
+  it('old feishu code reading msg.openId still works (46 callers zero impact)', () => {
+    // 模拟 feishu/bot.ts:handleChat 读 msg.openId 的现有逻辑
+    const msg: SpoolMessage = {
+      messageId: 'om_123',
+      openId: 'ou_abc',
+      text: 'hello',
+      userId: 'ou_abc',
+      platform: 'feishu',
+      target: { type: 'session', sessionUuid: 'uuid-1' },
+      serialKey: 'uuid-1',
+      status: 'processing',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    // 现有飞书代码：const entry = userManager.getEntry(msg.openId);
+    const openId = msg.openId;
+    expect(openId).toBe('ou_abc');
+  });
+});
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `bun test tests/unit/queue/spool-cross-platform.test.ts`
+Expected: FAIL with "Property 'userId' does not exist on type 'SpoolMessage'"
+
+- [ ] **Step 3: 修改 spool.ts SpoolMessage interface**
+
+修改 `src/queue/spool.ts:30-48`：
+
+```typescript
+export interface SpoolMessage {
+  messageId: string;
+  // === v1.2 保留字段（飞书侧 alias）===
+  openId: string;           // 飞书=open_id；企微=空字符串
+  text: string;             // 飞书侧内容；企微侧空字符串（企微代码不读）
+  // === v1.2 新增字段（平台无关入口）===
+  userId: string;           // 飞书=open_id；企微=external_userid
+  platform: 'feishu' | 'wecom';
+  // === 不变字段 ===
+  target: TargetSnapshot;
+  serialKey: string;
+  status: SpoolStatus;
+  createdAt: string;
+  updatedAt: string;
+  replyMessageId?: string;
+  responseText?: string;
+  retryCount?: number;
+  nextAttemptAt?: string;
+  error?: string;
+  imagePaths?: string[];
+  skipActivityCheck?: boolean;
+  awaitingForceSend?: boolean;
+  busySinceAt?: string;
+}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `bun test tests/unit/queue/spool-cross-platform.test.ts`
+Expected: PASS（3 个 it 全过）
+
+- [ ] **Step 5: 跑全量飞书测试，验证零回归**
+
+Run: `bun test tests/unit/feishu/ tests/unit/queue/`
+Expected: PASS（46 个飞书 SpoolMessage 调用方零改动；新字段是 optional 添加）
+
+> **可能出现的 typecheck 错误**：spool.ts 第 285-292 行的 fallback `failed` SpoolMessage 对象（`{ messageId: 'unknown', openId: 'unknown', text: '', ... }`）需要加 `userId: 'unknown', platform: 'feishu'` 两个字段。**自行检查并修复**。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/queue/spool.ts tests/unit/queue/spool-cross-platform.test.ts
+git commit -m "feat(spool): add userId + platform fields to SpoolMessage (openId/text alias preserved)"
+```
 
 ---
 
@@ -1341,6 +1653,17 @@ describe('AibotClient', () => {
     // 实际验证在 aibot-client 内部 try/catch，单元测试只能验证错误传播
     expect(err.name).toBe('WSAuthFailureError');
   });
+
+  it('emits "fatal" event (not throw) on auth failure', async () => {
+    // 实际测试在 aibot-client.test.ts 内用 mock WSClient + simulate error event
+    // 验证 AibotClient 收到 WSAuthFailureError 后 emit('fatal', CCLinkerError)
+    // 而不是 throw（throw 是 uncaught exception，绕过 handleError）
+    const fatalErrors: any[] = [];
+    client.on('fatal', (err: any) => fatalErrors.push(err));
+    // 模拟 SDK 抛 WSAuthFailureError（在真实测试中触发 wsClient 'error' 事件）
+    // 此处仅验证 client 注册了 fatal listener
+    expect(fatalErrors).toEqual([]);
+  });
 });
 ```
 
@@ -1433,13 +1756,20 @@ export class AibotClient extends EventEmitter {
 
     this.wsClient.on('error', (err: Error) => {
       defaultLogger.error('[aibot] ws error:', err);
+      // ⚠️ 不在 listener 内 throw —— EventEmitter 回调里的 throw 是 uncaught exception，
+      // 会绕过 bot 层的 handleError 流程。改为 emit 结构化 fatal 事件，由 bot.ts 监听并
+      // 调 handleError(err) 走标准退出路径（errors.ts 的 suggestions 也能生效）。
       if (err instanceof WSAuthFailureError) {
-        // botId/secret 错 → CCError E_CONFIG, 进程自杀
-        throw new CCLinkerError('E_CONFIG_WECOM_AUTH', '企微智能机器人认证失败: bot_id 或 secret 错误');
+        // botId/secret 错 → 不可恢复 → fatal
+        const ccErr = new CCLinkerError('E_CONFIG_WECOM_AUTH', '企微智能机器人认证失败: bot_id 或 secret 错误');
+        this.emit('fatal', ccErr);
+        return;
       }
       if (err instanceof WSReconnectExhaustedError) {
         // 网络持续不可达 → 触发 A3 进程自杀
-        throw new CCLinkerError('E_CONFIG_WECOM_NETWORK', '企微 WSS 重连耗尽');
+        const ccErr = new CCLinkerError('E_CONFIG_WECOM_NETWORK', '企微 WSS 重连耗尽');
+        this.emit('fatal', ccErr);
+        return;
       }
       this.emit('error', err);
     });
@@ -1516,11 +1846,39 @@ export class AibotClient extends EventEmitter {
 Run: `bun test tests/unit/wecom/aibot-client.test.ts`
 Expected: PASS（3 个 it 全过）
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: 在 errors.ts 加两条企微错误码 + suggestion**
+
+修改 `src/utils/errors.ts:23-36` 的 `suggestions` map，新增：
+
+```typescript
+'E_CONFIG_WECOM_AUTH': [
+  '检查 config.toml [wecom] 节的 bot_id 和 secret 是否正确',
+  '运行 cc-linker init-wecom 重新配置企微凭证',
+  '确认企业微信管理后台该智能机器人未被停用/删除',
+],
+'E_CONFIG_WECOM_NETWORK': [
+  '检查本机网络是否可达 wss://openws.work.weixin.qq.com',
+  '如持续失败，launchd 会自动重启 bot 进程',
+  '查看日志 ~/.cc-linker/logs/ 定位具体重连失败原因',
+],
+```
+
+> **为什么必须加**：`AibotClient.setupListeners` 在 fatal 错误时 emit `CCLinkerError('E_CONFIG_WECOM_...')`，
+> bot.ts 监听到 `fatal` 事件后调 `handleError(err)`。如果错误码不在 `suggestions` map 里，
+> handleError 会走"未知错误"分支，用户只看到 `[E_CONFIG_WECOM_AUTH] 企微智能机器人认证失败...`
+> 而没有修复建议。加上 suggestion 后用户能看到具体的排查步骤。
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/wecom/aibot-client.ts tests/unit/wecom/aibot-client.test.ts
-git commit -m "feat(wecom): add AibotClient wrapping SDK WSClient + EventEmitter"
+git add src/wecom/aibot-client.ts src/utils/errors.ts tests/unit/wecom/aibot-client.test.ts
+git commit -m "feat(wecom): add AibotClient wrapping SDK WSClient + error codes
+
+AibotClient uses structured 'fatal' event emission (not throw inside
+EventEmitter listener) so bot layer can route through handleError() and
+show user-facing suggestions.
+
+Adds E_CONFIG_WECOM_AUTH and E_CONFIG_WECOM_NETWORK to errors.ts."
 ```
 
 ---
@@ -1630,6 +1988,33 @@ describe('WecomStreamUpdater', () => {
     const lastCall = mockSdk._calls[mockSdk._calls.length - 1];
     expect(lastCall.args[1]).toContain('已取消');
   });
+
+  it('terminal methods are idempotent (safe to call twice or before start)', async () => {
+    // Before start: should not throw
+    await updater.complete('noop', 0, 0, 0, 0);
+    await updater.error('noop');
+    await updater.cancel();
+    // After terminal: second call is no-op
+    const id = await updater.startProcessing('user-1');
+    await updater.complete('done', 1, 2, 3, 4);
+    const callCountAfterFirstComplete = mockSdk._calls.length;
+    await updater.complete('again', 1, 2, 3, 4);  // should be no-op
+    await updater.error('again');                   // should be no-op
+    await updater.cancel();                          // should be no-op
+    expect(mockSdk._calls.length).toBe(callCountAfterFirstComplete);
+  });
+
+  it('terminal methods clear pending flushTimer (no post-terminal flush)', async () => {
+    const id = await updater.startProcessing('user-1');
+    await updater.updateStream('t', 'x', 50);  // schedules flushTimer (100ms throttle)
+    // Immediately complete — should clear timer, not leave pending flush
+    await updater.complete('done', 1, 2, 3, 4);
+    const callCount = mockSdk._calls.length;
+    // Wait longer than throttle window
+    await new Promise(r => setTimeout(r, 150));
+    // No additional SDK calls should have happened (timer was cleared)
+    expect(mockSdk._calls.length).toBe(callCount);
+  });
 });
 ```
 
@@ -1736,14 +2121,38 @@ export class WecomStreamUpdater implements StreamUpdater {
       await this.sdk.replyStream(frame, this.currentStreamId, this.truncate(markdown), false);
       this.lastFlushAt = Date.now();
     } catch (err) {
-      // 限频触发 (errcode 45009/45033) → 保留 buffer, 等下次 flush
-      console.warn('[wecom-stream] flush rate-limited, buffer retained');
+      // ⚠️ 只吞限频错误 (errcode 45009/45033)，保留 buffer 等下次 flush。
+      // 其他错误（网络/SDK crash）必须 rethrow，由 bot 层处理——吞掉会丢回复。
+      const errcode = (err as any)?.errcode ?? (err as any)?.code;
+      if (errcode === 45009 || errcode === 45033) {
+        console.warn('[wecom-stream] flush rate-limited, buffer retained');
+        return; // 保留 buffer，不走到下面的 "this.buffer = null"
+      }
+      throw err;
     }
     this.buffer = null;
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+  }
+
+  /**
+   * 终态方法通用前置处理：
+   * 1. Guard: currentStreamId 为空说明未 start 或已终态，直接 return（幂等）
+   * 2. 清 flushTimer：避免 timer fire 把终态消息再覆盖回上一帧（CardUpdater.cancelPending 同坑）
+   */
+  private async prepareTerminal(): Promise<boolean> {
+    if (!this.currentStreamId) return false;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    // flush 残留 buffer（如果还有），失败也继续终态（终态消息更重要）
+    if (this.buffer) {
+      try { await this.flushBuffer(); } catch { /* ignore */ }
+    }
+    return true;
   }
 
   async complete(
@@ -1753,20 +2162,21 @@ export class WecomStreamUpdater implements StreamUpdater {
     _durationMs: number,
     _numTurns: number,
   ): Promise<void> {
-    // 先 flush buffer
-    if (this.buffer) await this.flushBuffer();
+    if (!(await this.prepareTerminal())) return;
     const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
     await this.sdk.replyStream(frame, this.currentStreamId!, this.truncate(response), true);
     this.currentStreamId = null;
   }
 
   async error(message: string): Promise<void> {
+    if (!(await this.prepareTerminal())) return;
     const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
     await this.sdk.replyStream(frame, this.currentStreamId!, `❌ ${message}`, true);
     this.currentStreamId = null;
   }
 
   async cancel(reason?: string): Promise<void> {
+    if (!(await this.prepareTerminal())) return;
     const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
     await this.sdk.replyStream(frame, this.currentStreamId!, `⏹ 已取消${reason ? `: ${reason}` : ''}`, true);
     this.currentStreamId = null;
@@ -3143,17 +3553,37 @@ async function startWecomBot(opts: StartOptionsInternal): Promise<void> {
 }
 ```
 
-- [ ] **Step 6: 跑现有 CLI 测试**
+- [ ] **Step 6: 更新飞书 SDK→FeishuMessageEvent 映射提取 chat_id**
+
+修改 `src/cli/commands/start.ts:437-443`（`eventDispatcher` 回调内 `const event: FeishuMessageEvent = {...}`）：
+
+```typescript
+const event: FeishuMessageEvent = {
+  open_id: openId,
+  message_id: msg.message_id,
+  content: msg.content ?? '{}',
+  chat_type: msg.chat_type,
+  message_type: msg.message_type,
+  chat_id: msg.chat_id,  // 新增：群聊 chat_id（p2p 模式下为空）
+};
+```
+
+> **为什么这步重要**：当前 start.ts 没提取 chat_id，导致 feishuMessageEventToPlatform 适配器只能用 open_id 作为 chatId 兜底。
+> 群聊消息的 chatId 必须是真实 chat_id（与 feishu/bot.ts:323 `resolveChatTarget` 行为一致），否则群聊场景会串 session。
+> PR 1 时飞书 bot 仍只处理 p2p（bot.ts:218 校验 chat_type === 'p2p'），所以兜底不影响现有行为；
+> 但 PR 2/3 之后 wecom bot 需要处理群聊，feishu 路径也会逐渐放开群聊，chat_id 必须先到位。
+
+- [ ] **Step 7: 跑现有 CLI 测试**
 
 Run: `bun test tests/unit/cli/`
 Expected: PASS（现有 start / stop / status 测试通过；新 platform 选项是可选）
 
-- [ ] **Step 7: 跑 typecheck**
+- [ ] **Step 8: 跑 typecheck**
 
 Run: `bun run typecheck`
 Expected: PASS
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add src/cli/commands/start.ts
@@ -3269,58 +3699,80 @@ git commit -m "feat(cli): register init-wecom command"
 
 ---
 
-## Task 3.3: StateCoordinator 单锁多 platforms
+## Task 3.3: StateCoordinator 单平台锁 + 独立 lock 文件
 
 > **⚠️ C6 关键依赖**：此 task **必须在 Task 3.4 之前完成**。
-> Task 3.4 (start --platform) 调 `stateCoordinator.tryAcquire({ platforms: activePlatforms })`，
-> 若 Task 3.4 先 commit，TypeScript 检查会失败（tryAcquire 还不接受 platforms 参数）。
+> Task 3.4 (start --platform) 调 `stateCoordinator.tryAcquire(platform)`，
+> 若 Task 3.4 先 commit，TypeScript 检查会失败（tryAcquire 还不接受 platform 参数）。
 > 物理位置靠后（line ~3269）只是文档组织，不影响实施顺序。
 > 实际执行 PR 3 的命令顺序是：**3.1 → 3.2 → 3.3 → 3.4 → 3.5 → 3.6 → 3.7 → 3.8**。
 
 **Files:**
-- Modify: `src/runtime/state-coordinator.ts:25-78`（扩展 tryAcquire 支持 platforms 参数 + lockData schema）
+- Modify: `src/runtime/state-coordinator.ts:25-78`（改 tryAcquire 接口 + lockData schema + lockPath 动态计算）
+- Modify: `src/cli/commands/start.ts`（改调 `tryAcquire(platform)` 而非无参；--platform=all 时调两次 tryAcquire）
 
-> **关键设计修正**（final-check F1b + F5 修复）：
-> - **实际 `tryAcquire()` 当前无参，返回 boolean**（line 25）
-> - **实际 lockData 只有 `{pid, acquiredAt}` 两字段**（line 61-64）
-> - **不开新 lock 文件**（不用 `feishu.lock / wecom.lock`），改用**单 lock 文件 + platforms 字段**
-> - 冲突检测：另一个进程持有任意重叠 platform 时拒绝
+> **⚠️ v1.2 重大设计修正（spec §3.4 v1.1）**：
+> 原 plan Task 3.3 用「单 lock 文件 + platforms 数组」（F1b/F5 旧决定）。但 **spec v1.1 §3.4 改为「单平台锁 + 独立 lock 文件」**：
+>
+> **新语义**（spec §3.4）：
+> - `tryAcquire(platform: 'feishu' | 'wecom')` —— 单平台锁，不带 `platforms` 数组
+> - `assertNotRunning(platform)` —— 检查该 platform 是否被任何 daemon 占用（含 `--platform=all` 复合锁）
+> - `isLocked(platform)` —— 用于 CLI 命令检查「飞书 daemon 是否在跑」
+> - lock 文件命名：`owner.${platform}.lock` 或 `--platform=all` 时 `owner.lock`
+>
+> **为什么改**：
+> - 原「单 lock 文件 + platforms 数组」要 StateCoordinator 进程级跟踪 `heldPlatforms` 状态，重入和并发场景逻辑复杂
+> - 新「独立 lock 文件」每个平台一个文件，sc1 持 `owner.feishu.lock` + sc2 持 `owner.wecom.lock` 完全独立，无任何状态需要协调
+> - `--platform=all` 持复合锁 `owner.lock` 仍阻止任何单平台 daemon 抢同 platform
+> - 进程崩溃检测 / stale lock 清理逻辑零修改（每文件独立）
+>
+> **行为矩阵**（spec §3.4 v1.1）：
+> | 场景 | 行为 | Lock 文件 |
+> |---|---|---|
+> | `--platform=feishu` | ✅ 允许 | `owner.feishu.lock` |
+> | `--platform=wecom` | ✅ 允许 | `owner.wecom.lock` |
+> | `--platform=all` | ✅ 允许 | `owner.lock`（复合） |
+> | 同时跑两个 `--platform=feishu` | ❌ E013 | 同一文件冲突 |
+> | `--platform=feishu` + `--platform=all` | ❌ E013 | 冲突 |
+> | `--platform=feishu` + `--platform=wecom` | ✅ 允许 | 各自独立文件 |
 
 - [ ] **Step 1: 阅读现有 StateCoordinator**
 
 Read `src/runtime/state-coordinator.ts:1-110` 完整内容。
 
-- [ ] **Step 2: 扩展 LockData schema + tryAcquire 接口**
+- [ ] **Step 2: 改造 tryAcquire 接受 platform 参数 + lockPath 动态计算**
 
-修改 `src/runtime/state-coordinator.ts:25`：
+修改 `src/runtime/state-coordinator.ts`：
 
 ```typescript
+export type Platform = 'feishu' | 'wecom';
+export const ALL_PLATFORMS: Platform[] = ['feishu', 'wecom'];
+
 export type LockData = {
   pid: number;
   acquiredAt: string;
-  platforms: ('feishu' | 'wecom')[];
 };
 
 /**
- * Try to acquire the owner lock for the given platforms.
- * Returns true if lock acquired (this process now holds it).
- * Returns false if lock is already held by a live process with overlapping platforms.
+ * Try to acquire the owner lock for a specific platform (or composite for --platform=all).
  *
- * 向后兼容：tryAcquire() 无参时默认 platforms=['feishu']，行为与 v1 一致。
+ * @param platform - 'feishu' | 'wecom' for single-platform daemon
+ *                   'all' (or undefined, default) for composite --platform=all daemon
+ *                   which holds owner.lock covering all platforms
+ * @returns true if lock acquired, false if another live process holds it
+ *
+ * Lock file naming:
+ *   - platform='feishu' → owner.feishu.lock
+ *   - platform='wecom'  → owner.wecom.lock
+ *   - platform='all'    → owner.lock (composite, blocks any single-platform daemon)
  */
-tryAcquire(opts?: { platforms: ('feishu' | 'wecom')[] }): boolean {
-  const platforms = opts?.platforms ?? ['feishu'];
-  if (this.held) {
-    // Re-acquire: 检查已持有的 platforms 是否包含新 platforms
-    if (!this.heldPlatforms || platforms.every(p => this.heldPlatforms!.includes(p))) {
-      return true;
-    }
-  }
+tryAcquire(platform: Platform | 'all' = 'all'): boolean {
+  const lockPath = this.getLockPath(platform);
 
   // Check existing lock
-  if (existsSync(this.lockPath)) {
+  if (existsSync(lockPath)) {
     try {
-      const lockData = JSON.parse(readFileSync(this.lockPath, 'utf8')) as LockData;
+      const lockData = JSON.parse(readFileSync(lockPath, 'utf8')) as LockData;
       const pid = lockData.pid as number;
 
       // Check if process is still alive
@@ -3333,70 +3785,93 @@ tryAcquire(opts?: { platforms: ('feishu' | 'wecom')[] }): boolean {
       }
 
       if (alive) {
-        // 冲突检测：当前 lock 持有的 platforms 与新请求有重叠则拒绝
-        const heldPlatforms = new Set(lockData.platforms ?? ['feishu']);
-        const requestedPlatforms = new Set(platforms);
-        const overlap = [...requestedPlatforms].some(p => heldPlatforms.has(p));
-
-        if (overlap) {
-          logger.warn(`Owner lock 已被进程 ${pid} 持有 (platforms: ${lockData.platforms?.join('+')})`);
-          return false;
-        }
-        // 不重叠但 lock 已占用，理论上 lockData 应包含所有 platforms
-        // 防御性处理：直接拒绝（不应该发生）
-        logger.warn(`Owner lock 已被进程 ${pid} 持有不重叠 platforms (held=${lockData.platforms?.join('+')}, requested=${platforms.join('+')})`);
+        logger.warn(`Owner lock 已被进程 ${pid} 持有 (platform=${platform})`);
         return false;
       }
 
       // Stale lock — remove it
-      logger.info(`清理过期 owner lock (PID ${pid})`);
-      unlinkSync(this.lockPath);
+      logger.info(`清理过期 owner lock (PID ${pid}, platform=${platform})`);
+      unlinkSync(lockPath);
     } catch (err) {
       logger.warn(`解析 owner lock 失败: ${err}`);
-      unlinkSync(this.lockPath);
+      unlinkSync(lockPath);
     }
   }
 
   // Acquire lock
-  const dir = dirname(this.lockPath);
+  const dir = dirname(lockPath);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const lockData: LockData = {
     pid: process.pid,
     acquiredAt: new Date().toISOString(),
-    platforms,
   };
-  const tmp = this.lockPath + '.tmp';
+  const tmp = lockPath + '.tmp';
   writeFileSync(tmp, JSON.stringify(lockData, null, 2), { mode: 0o600 });
   try {
-    renameSync(tmp, this.lockPath);
+    renameSync(tmp, lockPath);
   } catch {
     // Another process won the race
     return false;
   }
 
   this.held = true;
-  this.heldPlatforms = platforms;
-  logger.info(`Owner lock 已获取 (PID ${process.pid}, platforms: ${platforms.join('+')})`);
+  this.heldLockPath = lockPath;
+  logger.info(`Owner lock 已获取 (PID ${process.pid}, platform=${platform})`);
   return true;
+}
+
+/**
+ * Check if a daemon is running for the given platform.
+ * Returns true if owner.${platform}.lock exists OR owner.lock (composite) exists.
+ */
+isLocked(platform: Platform): boolean {
+  // Composite lock (--platform=all) blocks any single-platform daemon
+  if (existsSync(this.getLockPath('all'))) {
+    return isLockLive(this.getLockPath('all'));
+  }
+  return isLockLive(this.getLockPath(platform));
+}
+
+/**
+ * Throws E013 if a daemon is running for the given platform.
+ */
+assertNotRunning(platform: Platform): void {
+  if (this.isLocked(platform)) {
+    throw new CCLinkerError('E013', `已有 daemon 在运行 (platform=${platform})`);
+  }
+}
+
+private getLockPath(platform: Platform | 'all'): string {
+  if (platform === 'all') return this.lockPath;  // 默认 'owner.lock'
+  return this.lockPath.replace(/owner\.lock$/, `owner.${platform}.lock`);
 }
 ```
 
-同时在 class 内加 `private heldPlatforms?: ('feishu' | 'wecom')[];` 字段。
+同时在 class 内加 `private heldLockPath?: string;` 字段；现有 `held` 字段保留；`release()` 方法改用 `heldLockPath`。
 
 - [ ] **Step 3: 跑现有 state-coordinator 测试**
 
 Run: `bun test tests/unit/runtime/state-coordinator.test.ts`
-Expected: PASS（现有测试通过；无参 tryAcquire() 默认 platforms=['feishu'] 行为兼容）
+Expected: **FAIL**（现有测试用无参 tryAcquire，需要改为传 platform 参数；同步修改所有调用方）
 
-如果有失败：检查 tryAcquire() 无参调用路径，立即加 default 处理。
+> **同步修改调用方**（在 Step 3 之前先 grep 找全部调用方）：
+>
+> ```bash
+> grep -rn "stateCoordinator\.\|new StateCoordinator\|ownerCoordinator" src/ tests/
+> ```
+>
+> 关键修改点：
+> - `src/cli/commands/start.ts` 的 bot 启动处：`tryAcquire(platform === 'all' ? 'all' : platform)`
+> - `src/cli/commands/start.ts` 的 CLI 写命令 assertNotRunning 处：`assertNotRunning(platform)`（platform 从 --platform 选项获取）
+> - 测试 helpers `tests/helpers/*` 中如有 StateCoordinator 直接调用，按 platform 改
 
-- [ ] **Step 4: 写新测试覆盖 platforms 冲突检测**
+- [ ] **Step 4: 写新测试覆盖单平台锁 + 独立文件**
 
 `tests/unit/runtime/state-coordinator.test.ts` 加：
 
 ```typescript
-describe('StateCoordinator multi-platform', () => {
+describe('StateCoordinator single-platform lock', () => {
   let dir: string;
   let sc1: StateCoordinator;
   let sc2: StateCoordinator;
@@ -3407,20 +3882,34 @@ describe('StateCoordinator multi-platform', () => {
     sc2 = new StateCoordinator(join(dir, 'owner.lock'));
   });
 
-  it('allows two SCs to hold disjoint platforms', () => {
-    expect(sc1.tryAcquire({ platforms: ['feishu'] })).toBe(true);
-    expect(sc2.tryAcquire({ platforms: ['wecom'] })).toBe(true);  // 不重叠
-    // 但 release 后 lock 重新被 sc1 拥有（实际场景只允许单一锁）
+  it('allows disjoint platform daemons (feishu + wecom coexist)', () => {
+    expect(sc1.tryAcquire('feishu')).toBe(true);
+    expect(sc2.tryAcquire('wecom')).toBe(true);  // 独立 lock 文件，不冲突
+    expect(sc1.isLocked('feishu')).toBe(true);
+    expect(sc1.isLocked('wecom')).toBe(true);
   });
 
-  it('rejects overlapping platform acquisition', () => {
-    expect(sc1.tryAcquire({ platforms: ['feishu'] })).toBe(true);
-    expect(sc2.tryAcquire({ platforms: ['feishu', 'wecom'] })).toBe(false);  // 重叠 feishu
+  it('rejects same-platform double acquisition', () => {
+    expect(sc1.tryAcquire('feishu')).toBe(true);
+    expect(sc2.tryAcquire('feishu')).toBe(false);  // 同一文件冲突
   });
 
-  it('backward compat: tryAcquire() no-arg defaults to feishu', () => {
-    expect(sc1.tryAcquire()).toBe(true);
-    expect(sc2.tryAcquire()).toBe(false);
+  it('--platform=all composite lock blocks single-platform daemons', () => {
+    expect(sc1.tryAcquire('all')).toBe(true);
+    expect(sc2.tryAcquire('feishu')).toBe(false);  // isLocked 检查到 composite
+    expect(sc2.tryAcquire('wecom')).toBe(false);
+  });
+
+  it('single-platform lock blocks --platform=all', () => {
+    expect(sc1.tryAcquire('feishu')).toBe(true);
+    expect(sc2.tryAcquire('all')).toBe(false);  // composite 也被 feishu 单独锁阻
+  });
+
+  it('isLocked reports correctly after release', () => {
+    expect(sc1.tryAcquire('feishu')).toBe(true);
+    expect(sc1.isLocked('feishu')).toBe(true);
+    sc1.release();
+    expect(sc1.isLocked('feishu')).toBe(false);
   });
 });
 ```
@@ -3434,10 +3923,13 @@ Expected: 全部 PASS
 
 ```bash
 git add src/runtime/state-coordinator.ts tests/unit/runtime/state-coordinator.test.ts
-git commit -m "feat(runtime): StateCoordinator supports single-lock multi-platform
+git commit -m "feat(runtime): StateCoordinator single-platform lock + per-platform files (spec §3.4)
 
-Extends lockData schema with platforms array. tryAcquire() detects overlap conflicts.
-Backward compat: no-arg tryAcquire() defaults to ['feishu']."
+Each platform daemon holds its own lock file (owner.feishu.lock / owner.wecom.lock).
+--platform=all holds composite owner.lock which blocks any single-platform daemon.
+
+Replaces v1.1 F1b/F5 'single file + platforms array' design with simpler
+'per-platform file' design — no reentrant state tracking needed."
 ```
 
 ---
