@@ -42,6 +42,8 @@ export class WecomStreamUpdater implements StreamUpdater {
   private sdk: WSClient;
   private throttleMs: number;
   private currentStreamId: string | null = null;
+  /** inbound frame — replyStream 需要用它的 headers.req_id */
+  private inboundFrame: any = null;
   private buffer: BufferedChunk | null = null;
   private lastFlushAt = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -51,9 +53,15 @@ export class WecomStreamUpdater implements StreamUpdater {
     this.throttleMs = opts.throttleMs ?? DEFAULT_THROTTLE_MS;
   }
 
+  /** 注入 inbound frame（必须先于 startProcessing 调用） */
+  setInboundFrame(frame: any): void {
+    this.inboundFrame = frame;
+  }
+
   async startProcessing(userId: string): Promise<string> {
     this.currentStreamId = generateReqId('stream');
-    const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
+    // 关键：用 inbound frame 的 req_id（SDK 要求这个 req_id 与 inbound 时一致）
+    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId } };
     const initialMarkdown = '🤔 思考中...';
     await this.sdk.replyStream(frame, this.currentStreamId, this.truncate(initialMarkdown), false);
     this.lastFlushAt = Date.now();
@@ -87,7 +95,7 @@ export class WecomStreamUpdater implements StreamUpdater {
     if (!this.buffer || !this.currentStreamId) return;
     const { thinking, text, elapsedMs, toolUses } = this.buffer;
     const markdown = renderMarkdown(thinking, text, toolUses, elapsedMs);
-    const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
+    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId } };
     try {
       await this.sdk.replyStream(frame, this.currentStreamId, this.truncate(markdown), false);
       this.lastFlushAt = Date.now();
@@ -134,21 +142,21 @@ export class WecomStreamUpdater implements StreamUpdater {
     _numTurns: number,
   ): Promise<void> {
     if (!(await this.prepareTerminal())) return;
-    const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
+    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId! } };
     await this.sdk.replyStream(frame, this.currentStreamId!, this.truncate(response), true);
     this.currentStreamId = null;
   }
 
   async error(message: string): Promise<void> {
     if (!(await this.prepareTerminal())) return;
-    const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
+    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId! } };
     await this.sdk.replyStream(frame, this.currentStreamId!, `❌ ${message}`, true);
     this.currentStreamId = null;
   }
 
   async cancel(reason?: string): Promise<void> {
     if (!(await this.prepareTerminal())) return;
-    const frame = { headers: { req_id: this.currentStreamId } } as any as WsFrame;
+    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId! } };
     await this.sdk.replyStream(frame, this.currentStreamId!, `⏹ 已取消${reason ? `: ${reason}` : ''}`, true);
     this.currentStreamId = null;
   }

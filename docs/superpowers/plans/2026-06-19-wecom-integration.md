@@ -1139,7 +1139,7 @@ Expected: PASS（无 TS 错误）
 1. 手机飞书发文本 → 流式回复
 2. /list 命令 → 返回 session 列表
 3. /switch UUID → CAS 更新 mapping
-4. /bridge new → 创建 pending → 下条消息触发 Claude
+4. /new [路径] → 创建 pending → 下条消息触发 Claude
 5. 按钮回调"重试" → 占位卡片 + 重试
 
 Expected: 5 case 全过，飞书行为与 PR 1 前完全一致。

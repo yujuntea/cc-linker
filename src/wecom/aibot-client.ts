@@ -30,6 +30,8 @@ export type AibotMessageHandler = (event: {
   messageId: string;
   text: string;
   images?: Array<{ fileKey: string; url?: string }>;
+  /** inbound frame — replyStream 需要用它的 headers.req_id */
+  inboundFrame: any;
 }) => void;
 
 export type AibotCardActionHandler = (event: {
@@ -37,6 +39,7 @@ export type AibotCardActionHandler = (event: {
   messageId: string;
   actionTag: string;
   actionValue: string | Record<string, unknown>;
+  inboundFrame?: any;
 }) => void;
 
 export class AibotClient extends EventEmitter {
@@ -94,24 +97,32 @@ export class AibotClient extends EventEmitter {
     });
 
     this.wsClient.on('message.text', (msg: any) => {
+      defaultLogger.info(`[aibot] message.text received: ${JSON.stringify(msg).slice(0, 500)}`);
+      // SDK 实际字段: msg.body.from.userid (无下划线), msg.body.chattype, msg.body.msgid
+      const body = msg.body ?? msg;
       const event = {
-        externalUserId: msg.from?.user_id ?? '',
-        chatId: msg.chat_id ?? msg.from?.chat_id ?? '',
-        chatType: msg.chat_type === 'group' ? 'group' as const : 'single' as const,
-        messageId: msg.message_id,
-        text: msg.text?.content ?? '',
+        externalUserId: body.from?.userid ?? body.from?.user_id ?? '',
+        chatId: body.msgid ?? body.chat_id ?? body.from?.chat_id ?? '',
+        chatType: body.chattype === 'group' || body.chat_type === 'group' ? 'group' as const : 'single' as const,
+        messageId: body.msgid ?? body.message_id ?? '',
+        text: body.text?.content ?? '',
+        // 保留 inbound frame, 给 replyStream 用作 req_id
+        inboundFrame: msg,
       };
       this.messageHandlers.forEach(h => h(event));
     });
 
     this.wsClient.on('message.image', (msg: any) => {
+      defaultLogger.info(`[aibot] message.image received: ${JSON.stringify(msg).slice(0, 500)}`);
+      const body = msg.body ?? msg;
       const event = {
-        externalUserId: msg.from?.user_id ?? '',
-        chatId: msg.chat_id ?? msg.from?.chat_id ?? '',
-        chatType: msg.chat_type === 'group' ? 'group' as const : 'single' as const,
-        messageId: msg.message_id,
+        externalUserId: body.from?.userid ?? body.from?.user_id ?? '',
+        chatId: body.msgid ?? body.chat_id ?? body.from?.chat_id ?? '',
+        chatType: body.chattype === 'group' || body.chat_type === 'group' ? 'group' as const : 'single' as const,
+        messageId: body.msgid ?? body.message_id ?? '',
         text: '[图片]',
-        images: msg.image?.map((img: any) => ({ fileKey: img.media_id, url: img.url })),
+        images: body.image?.map((img: any) => ({ fileKey: img.media_id, url: img.url })),
+        inboundFrame: msg,
       };
       this.messageHandlers.forEach(h => h(event));
     });
@@ -122,6 +133,7 @@ export class AibotClient extends EventEmitter {
         messageId: evt.message_id,
         actionTag: evt.event?.action_tag ?? '',
         actionValue: evt.event?.action_value ?? {},
+        inboundFrame: evt,
       };
       this.cardActionHandlers.forEach(h => h(actionEvent));
     });
