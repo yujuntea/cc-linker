@@ -50,6 +50,9 @@ export interface SpoolMessage {
   skipActivityCheck?: boolean;    // 强制发送标记
   awaitingForceSend?: boolean;    // 等待用户决策
   busySinceAt?: string;           // 等待开始时间 (Issue 2.1 orphan timeout)
+  // PR 2 v1.2.1: 平台无关元数据（替代 responseText 临时存 inboundFrame 的反模式）
+  // 飞书侧/企微侧可以塞入任意附加信息（inboundFrame、retry 元数据等）
+  metadata?: Record<string, unknown>;
 }
 
 export interface Receipt {

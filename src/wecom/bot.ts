@@ -21,7 +21,7 @@ export type WecomBotConfig = {
   /** 可注入依赖 - 默认用真实实现 */
   client?: AibotClient;
   spoolQueue?: SpoolQueue;
-  sessionManager?: any;
+  // PR 3: 接入 ClaudeSessionManager 之前，handleChat 走 echo back 路径
 };
 
 export class WecomBot {
@@ -40,7 +40,7 @@ export class WecomBot {
       throttleMs: config.throttleMs ?? 2000,
     });
     this.userManager = new WecomUserManager(config.userMappingPath);
-    this.spoolQueue = config.spoolQueue ?? (globalThis as any).__wecom_spoolQueue ?? new SpoolQueue();
+    this.spoolQueue = config.spoolQueue ?? new SpoolQueue();
   }
 
   start(): void {
@@ -218,9 +218,9 @@ export class WecomBot {
       status: 'pending',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      // v1.2.1: 存 inboundFrame 到 responseText 临时槽（不是真 response，仅 dispatch 阶段用）
-      // PR 3 重构: responseText 应改成正式的 inboundFrame 字段
-      responseText: msg.inboundFrame ? JSON.stringify(msg.inboundFrame) : undefined,
+      // PR 2 v1.2.1 修复: inboundFrame 存到 metadata 而不是 responseText
+      // 避免语义破坏（responseText 在飞书侧是 AI 回复）+ 敏感信息（response_url）落地到 SpoolQueue
+      metadata: msg.inboundFrame ? { inboundFrame: msg.inboundFrame } : undefined,
     };
 
     logger.info(`[wecom-bot] enqueue attempt: serialKey=${serialKey}`);
@@ -241,7 +241,13 @@ export class WecomBot {
    * 卡片按钮回调: 5s 占位 + 异步处理
    * 参考 spec §5.4 + sdk replyWelcome 5s 窗口约束
    */
-  private async handleCardAction(event: { externalUserId: string; messageId: string; actionTag: string; actionValue: any }): Promise<void> {
+  private async handleCardAction(event: {
+    externalUserId: string;
+    messageId: string;
+    actionTag: string;
+    actionValue: any;
+    inboundFrame?: any;  // SDK callback 事件，含 headers.req_id
+  }): Promise<void> {
     logger.info(`[wecom-bot] card action: userId=${event.externalUserId}, actionTag=${event.actionTag}`);
 
     // 1. 5s 内 replyWelcome 发占位卡片
@@ -250,8 +256,12 @@ export class WecomBot {
       content: `执行 ${event.actionTag}...`,
     });
     try {
+      // PR 2 v1.2.1 修复: 必须用 inboundFrame.headers.req_id（SDK 内部流标识）
+      // 不能用 messageId（那是发给用户的原消息 ID），否则 SDK 服务端会拒收
+      // 与 WecomStreamUpdater.setInboundFrame 同样的 846605 根因
+      const reqId = event.inboundFrame?.headers?.req_id ?? event.messageId;
       await this.client.sdk.replyWelcome(
-        { headers: { req_id: event.messageId } } as any,
+        { headers: { req_id: reqId } } as any,
         { msgtype: 'template_card', template_card: placeholderCard as any },
       );
     } catch (err) {
@@ -267,7 +277,13 @@ export class WecomBot {
     });
   }
 
-  private async executeCardAction(event: { externalUserId: string; messageId: string; actionTag: string; actionValue: any }): Promise<void> {
+  private async executeCardAction(event: {
+    externalUserId: string;
+    messageId: string;
+    actionTag: string;
+    actionValue: any;
+    inboundFrame?: any;
+  }): Promise<void> {
     switch (event.actionTag) {
       case 'retry':
       case 'confirm-stop':

@@ -9,7 +9,6 @@ describe('wecom integration: text message → spool enqueue', () => {
   let dir: string;
   let mockServer: MockAibotServer;
   let mockSpoolQueue: any;
-  let mockSessionManager: any;
   let bot: WecomBot;
 
   beforeEach(() => {
@@ -20,18 +19,9 @@ describe('wecom integration: text message → spool enqueue', () => {
       markDone: async () => {},
       lastEnqueued: null as any,
     };
-    mockSessionManager = {
-      sendStreamingMessage: async function* () {
-        yield { type: 'thinking', content: 'mock thinking' };
-        yield { type: 'text', content: 'mock response' };
-        yield { type: 'result', result: 'mock response', session_id: 'mock-uuid', total_cost_usd: 0.01, duration_ms: 1500, stop_reason: 'end_turn', subtype: 'success', is_error: false };
-      },
-    };
-
+    // PR 3 之前没有 ClaudeSessionManager 注入点 — 集成测试只验证 SpoolQueue enqueue
+    // Claude 流式接 pipeline 由 PR 3 单独写测试覆盖
     const mockAibotClient: any = {
-      // WecomBot 调 client.onMessage(handler)，handler 实际由 setupListeners 调用
-      // 真实 AibotClient 是 push 到 messageHandlers[] 数组
-      // 集成测试 mock 必须 push 才能让 WecomBot 收到
       onMessage: (h: any) => mockServer.on('message.text', h),
       onCardAction: (h: any) => mockServer.on('event.template_card_event', h),
       connect: () => {},
@@ -39,19 +29,12 @@ describe('wecom integration: text message → spool enqueue', () => {
       sdk: mockServer.buildMockSdk(),
     };
 
-    // Pre-register handlers like real AibotClient would do on construct
-    // (模拟 setupListeners 内部的 wsClient.on('message.text', ...) 行为)
-    // WecomBot.start() 调 client.onMessage(h)，handler 立即注册到 mockServer
-    // simulateXxx 触发 mockServer.emit() → handler 被调
-    // 这个 wiring 是 WecomBot.start() 内部做的，不需要手动预注册
-
     bot = new WecomBot({
       botId: 'test-bot',
       secret: 'test-secret',
       userMappingPath: join(dir, 'mapping.json'),
       client: mockAibotClient,
       spoolQueue: mockSpoolQueue,
-      sessionManager: mockSessionManager,
     });
   });
 
