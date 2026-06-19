@@ -506,6 +506,51 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
     //  but we verify that the caller properly handles the rendezvousHandled:false
     //  fallback path by returning a real-looking result.)
   });
+
+  /**
+   * v2.5 regression: /xxx in expectedReply state should NOT trigger
+   * "请先 /new" no_target prompt.
+   *
+   * Bug: resolveChatTarget didn't recognize `pending_agent_reply` entry
+   * type, falling through to `no_target`. Combined with handleCommand
+   * entry's expectedReply clear, the user saw contradictory messages:
+   * "等待输入已自动取消(因你跑了 /context)" + "当前没有活跃会话。请先 /new".
+   *
+   * Fix: resolveChatTarget now routes pending_agent_reply to session target
+   * (since the entry carries sessionUuid + cwd).
+   */
+  test('/xxx in pending_agent_reply state: not no_target; expectedReply cleared', async () => {
+    // Seed expectedReply → creates pending_agent_reply entry in user-mapping
+    await agentView.expectedReply.set('ou_routing_1', {
+      shortId: 'shortid',
+      sessionId: 'session-uuid-pending',
+      cwd: '/tmp/proj',
+    });
+    expect(userManager.getEntry('ou_routing_1')?.type).toBe('pending_agent_reply');
+
+    const msg = makeSpoolMessage({ text: '/context' });
+    // v2.4.x: /xxx routed through handleCommand; entry clear runs first
+    const realHandleCommand = FeishuBot.prototype.handleCommand;
+    const originalMock = bot.handleCommand;
+    bot.handleCommand = realHandleCommand.bind(bot) as any;
+    try {
+      await (bot as any).handleCommand(msg);
+    } finally {
+      bot.handleCommand = originalMock;
+    }
+
+    // expectedReply cleared (write command behavior)
+    expect(agentView.expectedReply.get('ou_routing_1')).toBeUndefined();
+    // The "no_target" / "请先 /new" prompt must NOT fire —
+    // pending_agent_reply now routes to session target
+    const noNewPrompt = textReplies.some((t) => t.includes('请先 /new'));
+    expect(noNewPrompt).toBe(false);
+    // The auto-cancel message still fires (write command semantic, expected)
+    const cancelMsg = textReplies.some((t) => t.includes('已自动取消'));
+    expect(cancelMsg).toBe(true);
+    // user-mapping entry was cleared by markSent-like flow
+    expect(userManager.getEntry('ou_routing_1')).toBeUndefined();
+  });
 });
 
 afterEach(() => {

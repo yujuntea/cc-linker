@@ -3254,6 +3254,19 @@ export class FeishuBot {
       };
     }
 
+    // v2.5 fix: pending_agent_reply 也是 session 目标 (有 sessionUuid + cwd)。
+    // 之前 fallthrough 到 no_target,导致 Agent View 等待状态下 /xxx (如 /context)
+    // 收到矛盾的 "已自动取消" + "请先 /new" 两条消息。
+    if (entry.type === 'pending_agent_reply' && entry.sessionUuid) {
+      return {
+        type: 'session',
+        sessionUuid: entry.sessionUuid,
+        cwd: entry.cwd || this.registry.get(entry.sessionUuid)?.cwd,
+        openId,
+        mappingVersion,
+      };
+    }
+
     if (entry.type === 'pending_new_session') {
       return {
         type: 'new_session_claim',
