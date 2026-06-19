@@ -1302,13 +1302,15 @@ describe('WecomBot handleChat owner validation (PR 5: C-1+C-2)', () => {
       metadata: { inboundFrame: { headers: { req_id: 'inbound_unauth_poc' } } },
     };
 
-    await bot.__test_handleChat(msg);
+    await bot.__test_handleClaimed(msg);
 
-    // 1. 调 validateOwner 验证
+    // 1. 调 validateOwner 验证 (PR 5.1: 上移到 handleClaimed 统一入口)
     expect(mockUserManager.validateOwner).toHaveBeenCalledWith('wmu_attacker');
 
-    // 2. 不调 sendMessage (PoC 路径被 owner 验证拦截)
-    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+    // 2. 调 sendMessage 发 "❌ 未授权用户" 反馈 (替代 silent no-op 的 updater.error)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('wmu_attacker', expect.objectContaining({
+      msgtype: 'markdown',
+    }));
 
     // 3. 不调 replyStream (Claude 路径未到达)
     expect(mockClient.sdk.replyStream).not.toHaveBeenCalled();
@@ -1350,9 +1352,9 @@ describe('WecomBot handleChat owner validation (PR 5: C-1+C-2)', () => {
       metadata: { inboundFrame: { headers: { req_id: 'inbound_unauth_claude' } } },
     };
 
-    await bot.__test_handleChat(msg);
+    await bot.__test_handleClaimed(msg);
 
-    // 1. 调 validateOwner 验证
+    // 1. 调 validateOwner 验证 (PR 5.1: 上移到 handleClaimed 统一入口)
     expect(mockUserManager.validateOwner).toHaveBeenCalledWith('wmu_attacker');
 
     // 2. 不调 sendStreamingMessage (核心: 不 spawn claude 子进程)
@@ -1361,8 +1363,10 @@ describe('WecomBot handleChat owner validation (PR 5: C-1+C-2)', () => {
     // 3. 不调 replyStream (startProcessing 未被调, 不应触发任何流)
     expect(mockClient.sdk.replyStream).not.toHaveBeenCalled();
 
-    // 4. 不调 sendMessage (PoC 路径也未触发)
-    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+    // 4. 调 sendMessage 发 "❌ 未授权用户" 反馈
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('wmu_attacker', expect.objectContaining({
+      msgtype: 'markdown',
+    }));
 
     // 5. 调 markDone (不 requeue — 未授权消息重试无意义)
     expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_unauth_claude', 'new:wmu_attacker');

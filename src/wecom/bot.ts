@@ -173,6 +173,26 @@ export class WecomBot {
    */
   private async handleClaimed(msg: SpoolMessage): Promise<void> {
     logger.info(`[wecom-bot] handleClaimed: serialKey=${msg.serialKey}, text=${msg.text.slice(0, 50)}`);
+
+    // PR 5.1 followup: C-1+C-2 command path 修复 — owner 验证移到 handleClaimed 统一入口
+    // 历史: 原 C-1+C-2 修复只在 handleChat 入口加 validateOwner, handleCommand 没受保护
+    //   → 攻击者可 /switch <uuid> 切换 owner session, /stop <short> 终止 bg session
+    // 修法: handleClaimed 入口加 validateOwner, 覆盖 handleCommand + handleChat + handleCardAction 全部子路径
+    if (!this.userManager.validateOwner(msg.userId)) {
+      logger.warn(`[wecom-bot] handleClaimed: unauthorized userId=${msg.userId}, msgType=${msg.serialKey.startsWith('cmd:') ? 'cmd' : 'chat'}, skipping`);
+      // 直接 sendMessage 而非 updater.error (后者依赖 startProcessing, 未授权路径无 stream state → silent no-op)
+      try {
+        await this.client.sdk.sendMessage(msg.userId, {
+          msgtype: 'markdown',
+          markdown: { content: '❌ 未授权用户' },
+        });
+      } catch (sendErr) {
+        logger.warn(`[wecom-bot] unauthorized notify failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+      }
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      return;
+    }
+
     // 命令直接 echo（完整命令处理是 PR 3 Task 3.6）
     if (msg.serialKey.startsWith('cmd:')) {
       await this.handleCommand(msg);
@@ -430,21 +450,8 @@ export class WecomBot {
   private async handleChat(msg: SpoolMessage): Promise<void> {
     logger.info(`[wecom-bot] handleChat: userId=${msg.userId}, text=${msg.text.slice(0, 50)}`);
 
-    // PR 5: 合并后 C-1+C-2 修复 — owner 验证统一在 handleChat 入口
-    // 历史: PoC echo 路径和 Claude 流式路径都跳过 validateOwner
-    //   → 未配 owner / owner 不匹配时仍 spawn claude 子进程 + 无差别回复 (C-1 + C-2)
-    // 修法: handleChat 入口先验证 msg.userId (外部 userid), 不通过 → error 卡片 + markDone
-    if (!this.userManager.validateOwner(msg.userId)) {
-      logger.warn(`[wecom-bot] handleChat: unauthorized userId=${msg.userId}, skipping`);
-      try {
-        const inboundFrame = msg.metadata?.inboundFrame as any;
-        if (inboundFrame) {
-          await this.updater.error('未授权用户');
-        }
-      } catch { /* ignore */ }
-      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
-      return;
-    }
+    // PR 5.1 followup: C-1+C-2 owner 验证已上移到 handleClaimed 统一入口
+    // (PR 5 原修复在 handleChat 入口, 但漏掉 handleCommand 路径; 现统一在 handleClaimed 处理)
 
     // PR 4.1: PoC fallback — sessionManager 未注入时走 sendMessage echo 路径
     // 用于 staging / 单测 (确保向后兼容未升级的 wecom-only 启动)
@@ -598,7 +605,15 @@ export class WecomBot {
       updatedAt: new Date().toISOString(),
       // PR 2 v1.2.1 修复: inboundFrame 存到 metadata 而不是 responseText
       // 避免语义破坏（responseText 在飞书侧是 AI 回复）+ 敏感信息（response_url）落地到 SpoolQueue
-      metadata: msg.inboundFrame ? { inboundFrame: msg.inboundFrame } : undefined,
+      metadata: (() => {
+        // PR 5.1 followup: M-1 production fix — handleMessage 写 chatId/chatType 到 metadata
+        // 历史: commit 33968ae M-1 修复 handleCommand 用 metadata.chatId, 但 handleMessage 从不写 chatId,
+        //   → 群聊 sendMessage 永远 fallback userId, 私聊回复给发送者而非发到群 (production no-op)
+        // 修法: handleMessage enqueue 时把 chatId + chatType 写到 metadata
+        const m: Record<string, any> = { chatId: msg.chatId, chatType: msg.chatType };
+        if (msg.inboundFrame) m.inboundFrame = msg.inboundFrame;
+        return m;
+      })(),
     };
 
     logger.info(`[wecom-bot] enqueue attempt: serialKey=${serialKey}`);
@@ -709,6 +724,15 @@ export class WecomBot {
    */
   public async __test_handleChat(msg: SpoolMessage): Promise<void> {
     return this.handleChat(msg);
+  }
+
+  /**
+   * PR 5.1 followup: 测试 seam — 暴露 handleClaimed 给单测直接调用。
+   * 测 owner 验证 (validateOwner 在 handleClaimed 入口, 不在 handleChat) 时用。
+   * @internal
+   */
+  public async __test_handleClaimed(msg: SpoolMessage): Promise<void> {
+    return this.handleClaimed(msg);
   }
 
   /**
