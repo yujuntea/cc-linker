@@ -17,6 +17,7 @@ import { search } from './cli/commands/search';
 import { clean } from './cli/commands/clean';
 import { start, stop } from './cli/commands/start';
 import { initFeishu } from './cli/commands/init-feishu';
+import { initWecom } from './cli/commands/init-wecom';
 import { setup } from './cli/commands/setup';
 import { activityHook } from './cli/commands/activity-hook';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
@@ -200,6 +201,12 @@ program
   .command('init-feishu')
   .description('交互式配置飞书集成（App ID + App Secret + Owner）')
   .action(() => initFeishu());
+
+// PR 3.6: init-wecom 交互式配置企业微信
+program
+  .command('init-wecom')
+  .description('交互式配置企业微信集成（Bot ID + Secret + Owner external_user_id）')
+  .action(() => initWecom());
 
 program
   .command('activity-hook')
