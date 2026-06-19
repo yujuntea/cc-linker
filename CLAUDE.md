@@ -56,8 +56,9 @@ Feishu WSClient → onMessage() → SpoolQueue.enqueue()
                               dispatch() worker pool
                                      ↓
                            handleClaimed()
-                              /bridge cmd → handleCommand()
+                              cmd → handleCommand()
                               chat msg    → handleChat() → ClaudeSessionManager
+                              (注: /bridge 已废弃 2026-06-20, cc-connect 移除后孤儿)
 ```
 
 **Key design points:**
@@ -101,7 +102,8 @@ const args = ['claude', '-p', text, '--output-format', 'stream-json'];
 `UserManager` (`src/feishu/mapping.ts`) manages per-openId state in `~/.cc-linker/user-mapping.json`:
 
 - `type: 'session'` — user has an active session
-- `type: 'pending_new_session'` — user ran `/bridge new` without a prompt, waiting for next message
+- `type: 'pending_new_session'` — user ran `/new` without a prompt, waiting for next message
+  (历史: 飞书侧曾用 `/bridge new`, PR 4.5 简化为 `/new`, /bridge 已废弃 2026-06-20)
 - `type: 'pending_new_session_claimed'` — message claimed, Claude process spawning
 
 All updates use **compare-and-swap (CAS)** with `casToken` to prevent race conditions between concurrent workers. The `entriesMatch()` function compares `type`, `sessionUuid`, `cwd`, and `casToken` — it does NOT compare `defaultProvider`.

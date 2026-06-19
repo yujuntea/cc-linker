@@ -879,7 +879,7 @@ WSReconnectExhaustedError // 重连耗尽 → CCError
 | 2 | 群聊 @机器人 → 同上流程 |
 | 3 | 图片消息 → 下载 → buildPromptWithImages |
 | 4 | 限频持续触发 → buffer 合并到 finish |
-| 5-7 | /list /switch /bridge new 命令 |
+| 5-7 | /list /switch /new /resume /stop 命令（/bridge 已废弃, 2026-06-20 spec §5.7 YAGNI） |
 | 8 | 按钮回调"重试" → 5s 占位 + 异步处理 |
 | 9 | Claude mid-stream crash → 部分结果 + 重试按钮 |
 | 10 | WSS 断开 → 重连 → reconcile 恢复 |
@@ -1044,7 +1044,8 @@ WSReconnectExhaustedError // 重连耗尽 → CCError
 **基础（PR 1-3 验收）：**
 - [ ] cc-linker start --platform=wecom 可启动企微 Bot
 - [ ] 手机企微发文本/图片 → Claude 流式回复
-- [ ] /list /switch /bridge /new /resume /stop 命令全部工作
+- [ ] /list /switch /new /resume /stop 命令全部工作
+- [ ] /bridge 命令返回 YAGNI 提示（spec §5.7 显式 YAGNI 跨平台 session 同步, 2026-06-20 决定不复活）
 - [ ] 按钮回调（重试 / 停止 / 刷新列表）正常
 - [ ] WSS 重连稳定（断网 5 分钟内自动恢复）
 - [ ] 限频场景下回复完整（buffer 合并生效）

@@ -36,7 +36,9 @@ describe('parseCommand', () => {
     expect(parseCommand('/switch uuid-123')).toEqual({ cmd: 'switch', args: ['uuid-123'] });
   });
 
-  it('parses /bridge new with args', () => {
+  it('parses /bridge (deprecated, parseCommand 不拒绝)', () => {
+    // /bridge 已废弃 (历史 cc-connect 命令, 2026-06-20 决定不复活)
+    // parseCommand 不做白名单, /bridge 仍能被解析, 下游 executeCommand 负责返回 YAGNI 提示
     expect(parseCommand('/bridge new')).toEqual({ cmd: 'bridge', args: ['new'] });
   });
 

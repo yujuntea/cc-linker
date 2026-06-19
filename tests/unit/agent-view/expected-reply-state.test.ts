@@ -125,7 +125,8 @@ describe('ExpectedReplyState — CAS conflict', () => {
   });
 
   test('v2.3.12: set auto-clears pending_new_session entry (user pasted /new, then clicks Reply 改变主意)', async () => {
-    // /bridge new 没带 prompt → user-mapping 是 pending_new_session,等下一条 message。
+    // /new 没带 prompt → user-mapping 是 pending_new_session,等下一条 message。
+    // 注: 历史 /bridge new 在 PR 4.5 简化为企微侧 /new (cc-connect 移除后, /bridge 已废弃)
     // 没有任何 in-flight 异步工作 (区别于 claimed),用户点 Reply 改主意 — 安全自动清。
     const userManager = new UserManager(tmpMapping);
     await userManager.compareAndSwap('open1', null, {
