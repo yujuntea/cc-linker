@@ -75,6 +75,12 @@ interface ConfigData {
     timeout_ms: number;
     claude_executable: string;
   };
+  // PR 2 v1.2.1: 企微通道配置（PR 3 完整集成时扩展）
+  wecom: {
+    bot_id: string;
+    secret: string;
+    owner_external_user_id: string;
+  };
   images: {
     enabled: boolean;
     max_size_bytes: number;
@@ -171,6 +177,12 @@ const DEFAULTS: ConfigData = {
     // version incompatible with this SDK release).
     claude_executable: '',
   },
+  // PR 2 v1.2.1: 企微 channel 配置（PR 3 完整集成时扩展）
+  wecom: {
+    bot_id: '',
+    secret: '',
+    owner_external_user_id: '',
+  },
   images: {
     enabled: true,
     max_size_bytes: 10 * 1024 * 1024,
@@ -205,6 +217,7 @@ function cloneDefaults(): ConfigData {
     stream: { ...DEFAULTS.stream },
     claude: { ...DEFAULTS.claude },
     sdk: { ...DEFAULTS.sdk },
+    wecom: { ...DEFAULTS.wecom },
     images: { ...DEFAULTS.images },
     agent_view: { ...DEFAULTS.agent_view },
   };
