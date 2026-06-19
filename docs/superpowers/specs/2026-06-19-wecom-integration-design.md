@@ -287,14 +287,18 @@ wsClient.on('event.feedback_event', (evt) => ...);
 
 ### 4.3 改造模块（最小化）
 
-| 文件 | 改动 | 行数 |
-|---|---|---|
-| `src/feishu/card-updater.ts` | 加适配层实现 `StreamUpdater` | +80 |
-| `src/cli/commands/start.ts` | 加 `--platform` 选项 | +50 |
-| `src/cli/commands/setup.ts` | 加 `--wecom` 选项 | +30 |
-| `src/index.ts` | `start` 命令注册 `init-wecom` | +20 |
-| `src/utils/config.ts` | 加 `[wecom]` 节 + env override | +30 |
-| `src/registry/types.ts` | `SessionEntry.platform` 字段（默认 `feishu`） | +15 |
+| 文件 | 改动 | 行数 | PR |
+|---|---|---|---|
+| `src/feishu/card-updater.ts` | 加适配层实现 `StreamUpdater` | +80 | 1 |
+| `src/cli/commands/start.ts` | 加 `--platform` 选项 | +50 | 3 |
+| `src/utils/config.ts` | 加 `[wecom]` 节 + env override | +30 | 3 |
+| `src/registry/types.ts` | `SessionEntry.platform` 字段（默认 `feishu`） | +15 | 3 |
+| `src/runtime/state-coordinator.ts` | `tryAcquire({ platforms })` 单锁多平台 | +50 | 3 |
+| `src/queue/spool.ts` | `SpoolMessage` + `TargetSnapshot` 加 `platform` / `userId` 字段（openId alias） | +10 | 3 |
+| `src/cli/commands/setup.ts` | 重构为渠道多选 + ChannelConfigurator 调度 | +180 | 3.5 |
+| `src/cli/commands/init-feishu.ts` | 提取 `runFeishuWizard()` export（setup 复用） | +30 | 3.5 |
+| `src/cli/commands/channel-configurator.ts` | **新增**：统一接口 + registry | +120 | 3.5 |
+| `src/index.ts` | `start` 命令注册 `init-wecom` + `init-feishu` 不变 | +20 | 3 + 3.5 |
 
 ### 4.4 文件清单汇总
 
@@ -310,17 +314,169 @@ src/wecom/bot.ts                            (~500 行)
 src/wecom/card.ts                           (~200 行)
 src/wecom/mapping.ts                        (~150 行)
 src/wecom/index.ts                          (~20 行)
-src/cli/commands/init-wecom.ts              (~100 行)
+src/cli/commands/init-wecom.ts              (~250 行) ← PR 3.5 扩展为完整 wizard
+src/cli/commands/channel-configurator.ts    (~120 行) ← PR 3.5 新增
 
 改造：
-src/feishu/card-updater.ts                  (+80)
-src/cli/commands/start.ts                   (+50)
-src/cli/commands/setup.ts                   (+30)
-src/index.ts                                (+20)
-src/utils/config.ts                         (+30)
-src/registry/types.ts                       (+15)
+src/feishu/card-updater.ts                  (+80)   ← PR 1
+src/cli/commands/start.ts                   (+50)   ← PR 3
+src/utils/config.ts                         (+30)   ← PR 3
+src/registry/types.ts                       (+15)   ← PR 3
+src/runtime/state-coordinator.ts           (+50)   ← PR 3
+src/queue/spool.ts                          (+10)   ← PR 3
+src/cli/commands/setup.ts                   (+180)  ← PR 3.5 重构
+src/cli/commands/init-feishu.ts             (+30)   ← PR 3.5 提取 wizard
+src/index.ts                                (+20)   ← PR 3+3.5
 
-总计：~1740 行新增 + ~225 行改造
+总计：~1990 行新增 + ~465 行改造
+```
+
+### 4.5 Setup 多渠道 + ChannelConfigurator 抽象
+
+**目标**：把 setup 从"飞书 hardcoded"改造为"渠道多选"，init-feishu / init-wecom 都通过 `ChannelConfigurator` 接口接入，setup 动态调度。
+
+#### 4.5.1 现状问题
+
+当前 `setup.ts:53-188` 是 4 个 hardcoded step：
+1. 初始化 registry
+2. 权限模式
+3. 安装 hook
+4. 飞书 Bot 配置（不可跳过 / 不可加其他渠道）
+
+`init-feishu.ts` 完整 9-step wizard 是独立命令。`init-wecom` 计划中是简化版（100 行）—— **远不及 init-feishu 的用户体验**。
+
+#### 4.5.2 解决方案
+
+**`ChannelConfigurator` 接口**：
+
+```typescript
+// src/cli/commands/channel-configurator.ts
+export type ChannelConfigurator = {
+  platform: 'feishu' | 'wecom';
+
+  /** 检查当前是否已配置（config.toml 已有完整凭证） */
+  isConfigured(): boolean;
+
+  /** 检测 daemon 冲突（与现有 Bot 共享 WSS 时） */
+  checkDaemonConflict(): Promise<'ok' | 'conflict' | 'no-config'>;
+
+  /** 输出"创建机器人 / 创建应用"引导文字（图文步骤） */
+  printCreationGuide(): void;
+
+  /** 接收用户输入（inquirer prompt） */
+  promptCredentials(existing?: Record<string, any>): Promise<{ config: any; skip?: boolean }>;
+
+  /** 验证凭证（fetch + WSClient 试连） */
+  verifyCredentials(config: any): Promise<boolean>;
+
+  /** 自动捕获 owner_user_id（飞书 captureOpenId / 企微 enter_chat） */
+  captureOwnerUserId(config: any, timeoutMs?: number): Promise<string | null>;
+
+  /** 保存到 config.toml */
+  saveConfig(config: any): void;
+
+  /** 询问并启动 bot + 配置开机自启 */
+  postInstall(config: any): Promise<{ started: boolean; autoStart: boolean }>;
+};
+
+export const configurators: Record<'feishu' | 'wecom', ChannelConfigurator> = {
+  feishu: new FeishuConfigurator(),
+  wecom: new WecomConfigurator(),
+};
+```
+
+**`runChannelWizard()` 调度函数**：
+
+```typescript
+export async function runChannelWizard(platform: 'feishu' | 'wecom'): Promise<ChannelResult> {
+  const cfg = configurators[platform];
+  // 1. Daemon conflict check
+  // 2. If isConfigured() → 询问 reconfigure
+  // 3. printCreationGuide()（仅首次）
+  // 4. promptCredentials()
+  // 5. verifyCredentials()（失败重试或退出）
+  // 6. captureOwnerUserId()（用户给机器人发消息）
+  // 7. saveConfig()
+  // 8. postInstall()（启动 bot + 开机自启）
+  return result;
+}
+```
+
+**新的 setup.ts 流程**：
+
+```typescript
+export async function setup(registry: RegistryManager, opts: SetupOptions = {}): Promise<void> {
+  // Step 0: 渠道选择（多选 checkbox）
+  const channels = opts.channels?.split(',') ?? await promptChannelSelection();
+  // channels: ['feishu' | 'wecom'] 或 []
+
+  // Step 1: 初始化 registry（无论如何）
+  // Step 2: Claude 权限模式（无论如何）
+  // Step 3: 安装 hook（无论如何）
+
+  // Step 4..N: 各渠道 wizard（按选择顺序）
+  const results: Record<string, ChannelResult> = {};
+  for (const ch of channels) {
+    results[ch] = await runChannelWizard(ch);
+  }
+
+  // Final: summary（显示所有渠道状态）
+  printSummary(sessionCount, hookInstalled, results);
+}
+```
+
+**新增 CLI 选项**：
+
+```
+cc-linker setup                              # 交互式渠道选择（默认勾选飞书）
+cc-linker setup --channels=feishu           # 仅飞书（向后兼容）
+cc-linker setup --channels=wecom            # 仅企微
+cc-linker setup --channels=feishu,wecom     # 双渠道
+cc-linker setup --skip-feishu --skip-hook   # 旧选项仍可用（兼容）
+```
+
+#### 4.5.3 微信"准一键"接入设计
+
+**微信"一键扫码"真相**（已研究）：
+- OpenClaw 的"一键扫码"是腾讯云控制台特有：Lighthouse → 快捷配置 → 腾讯云 OAuth → 代用户创建机器人
+- cc-linker 是本地 CLI，**没有云端 OAuth 入口**，无法直接复制
+- **可行的"准一键"**：CLI 引导 + 自动捕获 external_user_id（类比飞书 captureOpenId）
+
+**init-wecom.ts 完整 wizard（7-step，与 init-feishu 镜像对齐）**：
+
+```
+Step 1: 检测 daemon 运行 → 询问（与 feishu 同）
+Step 2: 输出"创建机器人"引导（图文 + 步骤清单）
+Step 3: 接收 bot_id（inquirer input）
+Step 4: 接收 secret（inquirer password）
+Step 5: 启动 aibot SDK WSS 长连接 + 输出"等待 SDK onReady..."
+Step 6: 输出"请在企业微信给机器人发一条任意消息"
+        监听 event.enter_chat → 捕获 external_user_id → 保存为 owner_external_user_id
+Step 7: 保存 config.toml + 询问 start now + 询问 autoStart
+```
+
+**对自用场景完全够用**：
+- 你（admin）刚创建的机器人会自动出现在你企业微信工作台
+- 发一条消息触发 enter_chat 事件
+- CLI 自动捕获 owner_external_user_id 完成配置
+
+#### 4.5.4 不破坏现有 setup
+
+- `cc-linker setup` 默认行为：勾选飞书（向后兼容）
+- `init-feishu` / `init-wecom` 独立命令仍可用（不变）
+- PR 3.5 改造后立即 commit，验证飞书 E2E 5 case 全部通过
+
+#### 4.5.5 文件清单
+
+```
+新增：
+src/cli/commands/channel-configurator.ts    (~120 行)
+src/cli/commands/init-wecom.ts              (~250 行)  ← 从 PR 3 的 100 行扩展
+
+改造：
+src/cli/commands/setup.ts                   (~250 行)  ← 从 467 行重构到 600+ 行
+src/cli/commands/init-feishu.ts             (+30 行)  ← 提取 runFeishuWizard export
+src/index.ts                                (+5 行)   ← 注册 init-wecom 命令（PR 3 已加）
 ```
 
 ## 5. 数据流
@@ -698,26 +854,53 @@ WSReconnectExhaustedError // 重连耗尽 → CCError
 
 **风险**：aibot SDK 行为细节 → 集成测试覆盖所有 SDK 错误码
 
-### PR 3：CLI 整合
+### PR 3：CLI 整合（基础）
 
-**目标**：把企微通道接入 CLI + setup 向导
+**目标**：把企微通道接入 CLI 命令 + config schema
 
 **前置**：PR 2 已合并
 
 **范围**：
 - 改造 `src/cli/commands/start.ts` 加 `--platform`
-- 改造 `src/cli/commands/setup.ts` 加 `--wecom`
-- 新增 `src/cli/commands/init-wecom.ts`
-- 改造 `src/index.ts` 注册新命令
 - 改造 `src/utils/config.ts` 加 `[wecom]` 节
-- 改造 `src/registry/types.ts` 加 `platform` 字段
+- 改造 `src/registry/types.ts` 加 `platform` 字段（v4→v5 migration）
+- 改造 `src/runtime/state-coordinator.ts` 单锁多 `platforms`
+- 改造 `src/queue/spool.ts` 加 `platform` + `userId` 字段
+- 新增 `src/cli/commands/init-wecom.ts`（**简化版**：仅 bot_id + secret 写入 config，验证 + capture 由 PR 3.5 补充）
+- 改造 `src/index.ts` 注册 `init-wecom`
 
 **验收**：
 - `--platform=feishu|wecom|all` 三种模式均工作
-- `init-wecom` 交互流程顺畅
+- `init-wecom` 简化版能写 config
 - `config.toml [wecom]` + env override 正确
 - StateCoordinator 双平台锁不冲突
 - 双平台并存 (`--platform=all`) 跑 1 小时无异常
+
+### PR 3.5：Setup 多渠道改造（新增，本节提交时确认）
+
+**目标**：把 `setup` 从"飞书 hardcoded"改造为"渠道多选"，统一体验
+
+**前置**：PR 3 已合并
+
+**范围**（详见 §4.5）：
+- **新增** `src/cli/commands/channel-configurator.ts`（统一接口 + registry）
+- **改造** `src/cli/commands/setup.ts`：移除 hardcoded 飞书 step，加渠道选择 + 动态 wizard 调度 + 统一 summary
+- **改造** `src/cli/commands/init-feishu.ts`：提取 `runFeishuWizard()` export（setup 复用）
+- **扩展** `src/cli/commands/init-wecom.ts`：从 PR 3 简化版扩展为完整 7-step wizard（加 verify / captureOwnerUserId / 启动 / 自启）
+- 改造 `src/index.ts` 注册 `init-wecom`（PR 3 已加）
+
+**验收**：
+- `cc-linker setup` 默认勾选飞书，向后兼容
+- `cc-linker setup --channels=feishu,wecom` 跳过交互式选择
+- `cc-linker setup --channels=wecom` 独立配企微
+- `init-wecom` 7-step wizard 跑通：bot_id + secret → SDK 连 → enter_chat 捕获 → 写 config → 启动 → 自启
+- 飞书路径 E2E 5 case 全部回归（setup 重构不破坏）
+- 双渠道 `init-feishu` + `init-wecom` 独立命令仍可用
+
+**与 PR 3 的拆分理由**：
+- PR 3 关注"命令行能跑起来"（基础）
+- PR 3.5 关注"setup 向导用户体验"（进阶）
+- 拆分后 PR 3 review 更轻量，PR 3.5 单独 review setup 改造不与 start --platform 混合
 
 ## 9. 风险与未决问题
 
@@ -754,12 +937,22 @@ WSReconnectExhaustedError // 重连耗尽 → CCError
 
 ### 10.1 功能验收
 
+**基础（PR 1-3 验收）：**
 - [ ] cc-linker start --platform=wecom 可启动企微 Bot
 - [ ] 手机企微发文本/图片 → Claude 流式回复
 - [ ] /list /switch /bridge /new /resume /stop 命令全部工作
 - [ ] 按钮回调（重试 / 停止 / 刷新列表）正常
 - [ ] WSS 重连稳定（断网 5 分钟内自动恢复）
 - [ ] 限频场景下回复完整（buffer 合并生效）
+
+**Setup 多渠道（PR 3.5 验收）：**
+- [ ] `cc-linker setup` 默认勾选飞书，向后兼容（飞书用户无感）
+- [ ] `cc-linker setup --channels=feishu,wecom` 双渠道配置跑通
+- [ ] `cc-linker setup --channels=wecom` 独立配企微跑通
+- [ ] `init-wecom` 7-step wizard 跑通：bot_id + secret → SDK 连 → enter_chat 捕获 owner_external_user_id → 写 config → 启动 → 自启
+- [ ] `init-feishu` 9-step wizard 仍可用（独立命令不被破坏）
+- [ ] `ChannelConfigurator` 接口：feishu / wecom 各实现一套，setup 调度统一
+- [ ] 飞书路径 setup 5 case E2E 全部回归（setup 重构零破坏）
 
 ### 10.2 飞书零回归（硬约束）
 
