@@ -21,6 +21,11 @@ export type AibotClientConfig = {
   maxReconnectAttempts?: number;
   heartbeatInterval?: number;
   requestTimeout?: number;
+  /**
+   * PR 2 v1.2.1 (M7 修复): 可选 wsClient 注入点
+   * 真实场景不传（构造时 new WSClient）；测试场景传 mock 用于验证字段映射
+   */
+  wsClientFactory?: (opts: { botId: string; secret: string; wsUrl: string; reconnectInterval: number; maxReconnectAttempts: number; heartbeatInterval: number; requestTimeout: number; logger: Logger }) => WSClient;
 };
 
 export type AibotMessageHandler = (event: {
@@ -56,7 +61,7 @@ export class AibotClient extends EventEmitter {
       error: (...args: any[]) => defaultLogger.error('[aibot] ' + args.map(a => a instanceof Error ? a.stack ?? a.message : (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')),
     };
 
-    this.wsClient = new WSClient({
+    const wsClientOpts = {
       botId: config.botId,
       secret: config.secret,
       wsUrl: config.wsUrl ?? 'wss://openws.work.weixin.qq.com',
@@ -65,7 +70,10 @@ export class AibotClient extends EventEmitter {
       heartbeatInterval: config.heartbeatInterval ?? 30000,
       requestTimeout: config.requestTimeout ?? 10000,
       logger: sdkLogger,
-    });
+    };
+    this.wsClient = config.wsClientFactory
+      ? config.wsClientFactory(wsClientOpts)
+      : new WSClient(wsClientOpts);
 
     this.setupListeners();
   }

@@ -42,7 +42,10 @@ export class WecomStreamUpdater implements StreamUpdater {
   private sdk: WSClient;
   private throttleMs: number;
   private currentStreamId: string | null = null;
-  /** inbound frame — replyStream 需要用它的 headers.req_id */
+  /**
+   * PR 2 v1.2.1 (M4 修复): inboundFrame 改为 startProcessing 必传参数
+   * 避免 bot 忘记 setInboundFrame 后 fallback 成 generated streamId → 846605 bug 复现
+   */
   private inboundFrame: any = null;
   private buffer: BufferedChunk | null = null;
   private lastFlushAt = 0;
@@ -58,10 +61,14 @@ export class WecomStreamUpdater implements StreamUpdater {
     this.inboundFrame = frame;
   }
 
-  async startProcessing(userId: string): Promise<string> {
+  async startProcessing(userId: string, inboundFrame?: any): Promise<string> {
     this.currentStreamId = generateReqId('stream');
-    // 关键：用 inbound frame 的 req_id（SDK 要求这个 req_id 与 inbound 时一致）
-    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId } };
+    // PR 2 v1.2.1 (M4): inboundFrame 必传——优先用 startProcessing 参数，回退到 setInboundFrame
+    const frame = inboundFrame ?? this.inboundFrame;
+    if (!frame) {
+      // 显式 fail fast: 调用方漏传参数，提示 PR 3 ClaudeSessionManager 接入时必传
+      throw new Error('WecomStreamUpdater.startProcessing: inboundFrame is required (SDK replyStream 需要 inbound frame 的 headers.req_id)');
+    }
     const initialMarkdown = '🤔 思考中...';
     await this.sdk.replyStream(frame, this.currentStreamId, this.truncate(initialMarkdown), false);
     this.lastFlushAt = Date.now();

@@ -190,6 +190,9 @@ export class WecomBot {
    * 把入站消息归一化 + 派生 serialKey + 入 SpoolQueue
    * 参考 feishu/bot.ts:325-345 (enqueue 模式)
    *
+   * **PR 2 v1.2.1 (M2 修复)**: target.type 根据 WecomUserManager.getEntry(userId).sessionUuid
+   * 动态选 existing_session vs new_session_claim，避免续聊消息被强制走新会话路径
+   *
    * **SpoolMessage 字段策略（PR 1 v1.2 兼容）**：
    * - openId / text: 写空串（企微侧永远不读这两个字段，但保留必填约束以兼容 46 个飞书调用方）
    * - userId / platform: 写 wecom 真值（spec §3.3 兼容策略）
@@ -197,20 +200,29 @@ export class WecomBot {
   private async handleMessage(msg: PlatformMessage & { inboundFrame?: any }): Promise<void> {
     logger.info(`[wecom-bot] handleMessage entered: userId=${msg.userId}, text=${msg.text.slice(0, 50)}`);
     const isCommand = isCommandMessage(msg.text);
-    const serialKey = isCommand
-      ? `cmd:${msg.userId}:${msg.messageId}`
-      : `new:${msg.userId}`;
 
-    const target: TargetSnapshot = {
-      type: 'new_session_claim',
-      sessionUuid: undefined,
-      openId: undefined,  // 飞书 alias，企微侧 undefined
-      cwd: undefined,
-    };
+    // 查 user-mapping 看是否有活跃 session
+    const existingEntry = this.userManager.getEntry(msg.userId);
+    const existingSessionUuid = existingEntry?.type === 'session' ? existingEntry.sessionUuid : null;
+    const isCommandHandled = isCommand && existingSessionUuid;  // 命令附在 session 上：serialKey 走 session
+
+    const serialKey = isCommandHandled
+      ? `${existingSessionUuid}:${msg.messageId}`
+      : isCommand
+        ? `cmd:${msg.userId}:${msg.messageId}`
+        : existingSessionUuid
+          ? `${existingSessionUuid}:${msg.messageId}`
+          : `new:${msg.userId}`;
+
+    const target: TargetSnapshot = existingSessionUuid
+      ? { type: 'session', sessionUuid: existingSessionUuid, cwd: existingEntry?.cwd }
+      : { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined };
 
     const spoolMsg: SpoolMessage = {
       messageId: msg.messageId,
-      // openId/text 保留为飞书必填 alias，企微侧空串
+      // PR 2 v1.2.1: openId 保留为飞书必填 alias (string 类型不能改 nullable)
+      // 企微侧写空串，飞书侧 reader 应先判 msg.platform === 'wecom' 走 msg.userId 路径
+      // 而不是误用 openId=''（参见 feishu/bot.ts 大量 msg.openId 使用）
       openId: '',
       text: msg.text,
       // userId/platform: 平台无关真值（spec §3.3）
