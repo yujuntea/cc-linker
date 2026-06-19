@@ -237,8 +237,11 @@ export class WecomBot {
     }
 
     // 推回 (用 sendMessage 不用 WecomStreamUpdater, 因为命令响应是终态文本不走流)
+    // PR 5 (M-1 修复): 群聊场景 metadata.chatId 优先, fallback userId
+    // 历史: 之前硬编码 userId, 群聊场景下 metadata.chatId 不同时, 企微会发错对象
     try {
-      await this.client.sdk.sendMessage(msg.userId, {
+      const receiveId = (msg.metadata as any)?.chatId ?? msg.userId;
+      await this.client.sdk.sendMessage(receiveId, {
         msgtype: 'markdown',
         markdown: { content: responseText },
       });
@@ -321,12 +324,17 @@ export class WecomBot {
    * 区别于 /switch: /switch 切换到指定 sessionUuid, /resume 保持原 session 只刷活跃时间
    */
   private async handleCommandResume(userId: string, _args: string[]): Promise<string> {
-    const entry = this.userManager.getEntry(userId);
-    if (!entry || entry.type !== 'session') {
+    // PR 5 (M-7 修复): 先读 entry 验证 type === 'session', 然后 touchSession, 最后重读 entry
+    // 历史: 只在调用前 getEntry 一次, touchSession 异步更新 lastActiveAt 后,
+    //   返回文本用的是旧 entry.lastActiveAt, 用户看到旧时间
+    // 修法: touchSession 之后重新 getEntry 拿新 entry, 用新 entry.lastActiveAt 拼返回
+    const beforeEntry = this.userManager.getEntry(userId);
+    if (!beforeEntry || beforeEntry.type !== 'session') {
       return '❌ 当前无 active session, 发送任意消息走新建 session 路径';
     }
     await this.userManager.touchSession(userId);
-    return `✅ session 已 touch (lastActiveAt 更新):\n  sessionUuid: ${entry.sessionUuid}\n  cwd: ${entry.cwd ?? '(unknown)'}\n  lastActiveAt: ${entry.lastActiveAt ?? '(unknown)'}`;
+    const afterEntry = this.userManager.getEntry(userId);
+    return `✅ session 已 touch (lastActiveAt 更新):\n  sessionUuid: ${afterEntry?.sessionUuid ?? '(unknown)'}\n  cwd: ${afterEntry?.cwd ?? '(unknown)'}\n  lastActiveAt: ${afterEntry?.lastActiveAt ?? '(unknown)'}`;
   }
 
   /**

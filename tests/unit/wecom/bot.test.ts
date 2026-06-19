@@ -1369,3 +1369,205 @@ describe('WecomBot handleChat owner validation (PR 5: C-1+C-2)', () => {
     expect(mockSpoolQueue.requeueFromProcessing).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PR 5 (M-1 修复): handleCommand 群聊 (metadata.chatId) 路由 — receiveId 优先 chatId, fallback userId
+ *
+ * 历史 bug: sendMessage 硬编码 userId, 群聊场景 (chatId !== userId) 企微会发错对象
+ * 修法: receiveId = msg.metadata?.chatId ?? msg.userId
+ */
+describe('WecomBot handleCommand (PR 5 M-1: 群聊 chatId 路由)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setPending: mock(async () => {}),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr5-m1.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+  });
+
+  /** 辅助: 构造带可选 metadata 的 SpoolMessage */
+  function makeCmdMsgWithMeta(text: string, messageId: string, metadata?: any): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'wmu_user_1',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_user_1:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: metadata ?? { inboundFrame: { headers: { req_id: `inb_${messageId}` } } },
+    };
+  }
+
+  it('M-1: handleCommand 群聊 (metadata.chatId) 用 chatId 而非 userId', async () => {
+    await bot.__test_handleCommand(makeCmdMsgWithMeta('/help', 'msg_m1_group', {
+      chatId: 'chat-group-123',
+      inboundFrame: { headers: { req_id: 'inb_msg_m1_group' } },
+    }));
+
+    // receiveId 应为 chatId, 不是 userId
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('chat-group-123', expect.any(Object));
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalledWith('wmu_user_1', expect.any(Object));
+  });
+
+  it('M-1 fallback: handleCommand 无 metadata.chatId 时用 userId', async () => {
+    await bot.__test_handleCommand(makeCmdMsgWithMeta('/help', 'msg_m1_fallback'));
+
+    // 无 chatId → fallback userId
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('wmu_user_1', expect.any(Object));
+  });
+
+  it('M-1: metadata 存在但 chatId 为 undefined 时 fallback userId', async () => {
+    await bot.__test_handleCommand(makeCmdMsgWithMeta('/list', 'msg_m1_nochat', {
+      // metadata 存在但无 chatId 字段
+      inboundFrame: { headers: { req_id: 'inb_msg_m1_nochat' } },
+    }));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('wmu_user_1', expect.any(Object));
+  });
+});
+
+/**
+ * PR 5 (M-7 修复): handleCommandResume 返回 touch 之后的 lastActiveAt, 不是 touch 之前的旧值
+ *
+ * 历史 bug: 先 getEntry 拿到 lastActiveAt = T1, 然后 touchSession 异步更新到 T2,
+ *   返回文本仍用 entry.lastActiveAt (T1, 旧的), 用户看到旧时间。
+ * 修法: touchSession 后重新 getEntry 拿 afterEntry, 用 afterEntry.lastActiveAt 拼返回。
+ */
+describe('WecomBot handleCommandResume (PR 5 M-7: 返回新 lastActiveAt)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr5-m7.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      // userManager 在每个测试里单独定义 (需要 readCount 控制)
+    });
+  });
+
+  function makeCmdMsg(text: string, messageId: string): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'wmu_user_1',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_user_1:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: `inb_${messageId}` } } },
+    };
+  }
+
+  it('M-7: handleCommandResume 返回新 lastActiveAt (touchSession 之后重读)', async () => {
+    const OLD_TS = '2026-06-19T10:00:00.000Z';
+    const NEW_TS = '2026-06-19T10:00:05.000Z';
+    let readCount = 0;
+    const userManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => {
+        readCount++;
+        return {
+          type: 'session',
+          sessionUuid: 'uuid-m7-1',
+          cwd: '/tmp',
+          createdAt: OLD_TS,
+          // 第一次返回 OLD, 第二次 (touchSession 后) 返回 NEW
+          lastActiveAt: readCount === 1 ? OLD_TS : NEW_TS,
+          casToken: 'token',
+        };
+      }),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    // 重新构造 bot 注入此 userManager
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr5-m7.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: userManager as any,
+    });
+
+    await bot.__test_handleCommand(makeCmdMsg('/resume', 'msg_m7'));
+
+    // 1. touchSession 应被调
+    expect(userManager.touchSession).toHaveBeenCalledWith('wmu_user_1');
+
+    // 2. sendMessage 应被调, 内容含 NEW_TS, 不含 OLD_TS
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const sentContent = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(sentContent).toContain(NEW_TS);
+    expect(sentContent).not.toContain(OLD_TS);
+
+    // 3. getEntry 应至少调 2 次 (validate 之前 + touch 之后重读)
+    expect(readCount).toBeGreaterThanOrEqual(2);
+  });
+});
