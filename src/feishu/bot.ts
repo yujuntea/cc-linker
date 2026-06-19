@@ -18,6 +18,7 @@ import { readJobState } from '../agent-view/job-state';
 import { formatTokenCount } from './card-updater';
 import { StreamChunk } from '../proxy/stream-parser';
 import { CardUpdater, type CardState } from './card-updater';
+import { FeishuStreamUpdater } from './stream-updater';
 import { LiveProgressWatcher, isSessionProcessing, DEFAULT_LIVE_PROGRESS_CONFIG, type LiveProgressConfig } from './live-progress';
 import { PermissionHandler, type PermissionPrompt } from '../proxy/permission-handler';
 import { esc } from './markdown-escape';
@@ -334,6 +335,8 @@ export class FeishuBot {
       messageId: event.message_id,
       openId: event.open_id,
       text,
+      userId: event.open_id,
+      platform: 'feishu',
       target,
       serialKey,
       status: 'pending',
@@ -1416,6 +1419,7 @@ export class FeishuBot {
     let thinking = '';
     let text = '';
     let cardUpdater: CardUpdater | null = null;
+    let feishuUpdater: FeishuStreamUpdater | null = null;
     let cardMessageId: string | null = null;
     let cardInitFailed = false;
 
@@ -1426,7 +1430,8 @@ export class FeishuBot {
           max_card_bytes: config.get<number>('stream.max_card_bytes', 25000),
           show_thinking: config.get<boolean>('stream.show_thinking', true),
         });
-        cardMessageId = await cardUpdater.startProcessing(msg.openId);
+        feishuUpdater = new FeishuStreamUpdater(cardUpdater);
+        cardMessageId = await feishuUpdater.startProcessing(msg.openId);
       }
     } catch (err: any) {
       logger.warn(`Stream: 发送处理中卡片失败: ${err}`);
@@ -1439,11 +1444,11 @@ export class FeishuBot {
       const result = await this.sessionManager.sendStreamingMessage(
         sessionUuid, promptText, cwd,
         (chunk: StreamChunk) => {
-          if (cardInitFailed || !cardUpdater) return;
+          if (cardInitFailed || !feishuUpdater) return;
           if (chunk.type === 'thinking') thinking += chunk.content;
           else if (chunk.type === 'text') text += chunk.content;
           const elapsed = Date.now() - startTime;
-          cardUpdater.updateStream(
+          feishuUpdater.updateStream(
             config.get<boolean>('stream.show_thinking', true) ? thinking : '',
             text, elapsed
           ).catch(e => logger.warn(`Stream: update failed: ${e}`));
@@ -1452,14 +1457,14 @@ export class FeishuBot {
       );
 
       // Finalize card
-      if (cardUpdater) {
+      if (feishuUpdater && cardUpdater) {
         const wasCancelled = this.cancelledMessageIds.has(msg.messageId);
         if (wasCancelled) {
           this.cancelledMessageIds.delete(msg.messageId);
-          await cardUpdater.cancel();
+          await feishuUpdater.cancel();
         } else if (cardUpdater.shouldFallbackToText(text)) {
           const truncated = cardUpdater.truncateContent(text);
-          await cardUpdater.complete(truncated, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+          await feishuUpdater.complete(truncated, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
           const remainder = text.slice(truncated.length);
           if (remainder && config.get<boolean>('stream.fallback_to_text', true)) {
             for (const chunk of splitReplyText(remainder, 3900)) {
@@ -1467,7 +1472,7 @@ export class FeishuBot {
             }
           }
         } else {
-          await cardUpdater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+          await feishuUpdater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
         }
         cardMessageId = cardUpdater.getCardMessageId();
         cardUpdater.dispose();
