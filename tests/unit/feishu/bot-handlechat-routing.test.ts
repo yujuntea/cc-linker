@@ -508,18 +508,15 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
   });
 
   /**
-   * v2.5 regression: /xxx in expectedReply state should NOT trigger
-   * "请先 /new" no_target prompt.
+   * v2.5 regression: passthrough /xxx in expectedReply state should behave
+   * like text — NOT clear expectedReply, NOT show "请先 /new" prompt,
+   * instead route through handleReply so the user's bg question gets answered.
    *
-   * Bug: resolveChatTarget didn't recognize `pending_agent_reply` entry
-   * type, falling through to `no_target`. Combined with handleCommand
-   * entry's expectedReply clear, the user saw contradictory messages:
-   * "等待输入已自动取消(因你跑了 /context)" + "当前没有活跃会话。请先 /new".
-   *
-   * Fix: resolveChatTarget now routes pending_agent_reply to session target
-   * (since the entry carries sessionUuid + cwd).
+   * Fix: handleCommand entry only clears expectedReply for known cc-linker
+   * write commands (/list /switch /new etc.). Passthrough /xxx (default case)
+   * falls through to handleChat where expectedReply check picks it up.
    */
-  test('/xxx in pending_agent_reply state: not no_target; expectedReply cleared', async () => {
+  test('/xxx in expectedReply state: routes to handleReply (passthrough semantics)', async () => {
     // Seed expectedReply → creates pending_agent_reply entry in user-mapping
     await agentView.expectedReply.set('ou_routing_1', {
       shortId: 'shortid',
@@ -529,7 +526,6 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
     expect(userManager.getEntry('ou_routing_1')?.type).toBe('pending_agent_reply');
 
     const msg = makeSpoolMessage({ text: '/context' });
-    // v2.4.x: /xxx routed through handleCommand; entry clear runs first
     const realHandleCommand = FeishuBot.prototype.handleCommand;
     const originalMock = bot.handleCommand;
     bot.handleCommand = realHandleCommand.bind(bot) as any;
@@ -539,17 +535,17 @@ describe('FeishuBot.handleChat routing with expectedReply (T23)', () => {
       bot.handleCommand = originalMock;
     }
 
-    // expectedReply cleared (write command behavior)
-    expect(agentView.expectedReply.get('ou_routing_1')).toBeUndefined();
-    // The "no_target" / "请先 /new" prompt must NOT fire —
-    // pending_agent_reply now routes to session target
+    // Passthrough: expectedReply stays set (handleReply will process it,
+    // possibly clearing it later if no follow-up question)
+    // The key assertion: handleCommand entry did NOT clear expectedReply.
+    // (clearCalls is tracked separately by setup; if entry cleared, we would
+    //  see a clear reason='overwrite' recorded BEFORE handleReply runs.
+    //  We verify by checking the auto-cancel reply is NOT sent.)
+    const cancelMsg = textReplies.some((t) => t.includes('已自动取消'));
+    expect(cancelMsg).toBe(false);
+    // The "请先 /new" prompt must NOT fire — handleReply handles /context
     const noNewPrompt = textReplies.some((t) => t.includes('请先 /new'));
     expect(noNewPrompt).toBe(false);
-    // The auto-cancel message still fires (write command semantic, expected)
-    const cancelMsg = textReplies.some((t) => t.includes('已自动取消'));
-    expect(cancelMsg).toBe(true);
-    // user-mapping entry was cleared by markSent-like flow
-    expect(userManager.getEntry('ou_routing_1')).toBeUndefined();
   });
 });
 

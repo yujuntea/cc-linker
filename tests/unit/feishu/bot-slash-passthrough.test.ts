@@ -231,13 +231,17 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
     expect(callCount).toBe(1);
   });
 
-  // ─── Test 11: expectedReply cleared on /xxx (write command) ───
-  test('T11: /xxx in expectedReply state triggers entry clear + 等待输入已自动取消 reply', async () => {
+  // ─── Test 11: passthrough /xxx does NOT clear expectedReply (behave like text → handleReply) ───
+  test('T11: /xxx (passthrough) in expectedReply state routes to handleReply, NOT entry clear', async () => {
     const clearCalls: { openId: string; reason: string }[] = [];
+    const replyCalls: { openId: string; text: string }[] = [];
     const mockAgentView = {
       deps: {} as any,
       attachedWatchers: { has: () => false, stop: async () => {} },
       handleCancelReply: async () => {},
+      handleReply: async (openId: string, text: string) => {
+        replyCalls.push({ openId, text });
+      },
       expectedReply: {
         get: (openId: string) => ({ sessionUuid: 's', cwd: '/tmp', prompt: 'p' }),
         clear: async (openId: string, reason: string) => {
@@ -250,12 +254,14 @@ describe('FeishuBot slash command passthrough (v2.5)', () => {
 
     await env.bot.handleCommand(buildMsg('/init', 'ou_t11', 'msg_t11', noTarget('ou_t11')));
 
-    // /init is not in [help, status, whoami], so entry should attempt clear
-    expect(clearCalls).toHaveLength(1);
-    expect(clearCalls[0].reason).toBe('overwrite');
-    // And the entry reply mentions "已自动取消"
+    // v2.5 修正: passthrough /xxx 不清 expectedReply (跟普通文本一致,
+    // 由 handleChat 的 expectedReply 检查 → handleReply 处理)。
+    expect(clearCalls).toHaveLength(0);
+    // handleReply called with /init as the prompt text
+    expect(replyCalls).toEqual([{ openId: 'ou_t11', text: '/init' }]);
+    // No "已自动取消" reply — passthrough 不破坏 Agent View 等待状态
     const hasCancelReply = env.textReplies.some(r => r.text.includes('等待输入已自动取消'));
-    expect(hasCancelReply).toBe(true);
+    expect(hasCancelReply).toBe(false);
   });
 
   // ─── Test 12: serialKey preserved as cmd:openId:messageId ───

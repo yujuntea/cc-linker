@@ -940,10 +940,25 @@ export class FeishuBot {
     const parts = msg.text.split(/\s+/);
     const cmd = parts[0]?.replace(/^\/+/, '')?.toLowerCase();
 
-    // v2.4.x: 命令消息入口清 expectedReply (只在写命令)
+    // v2.4.x + v2.5 修正: 命令消息入口清 expectedReply,但仅限 cc-linker 已知写命令
+    // (/list /switch /new /stop /cancel /listdir /model /resume /agents)。
+    //
+    // 透传 /xxx (默认 case,Claude slash 命令如 /init /review /context /cost) 不清:
+    //   - 透传场景下用户期望 /xxx 跟普通文本一样 → 落到 handleChat 的 expectedReply 检查
+    //     → handleReply,作为对 bg 问题的回复被处理
+    //   - 如果在入口清掉 expectedReply,会破坏 Agent View 等待状态的连续性
+    //   - 之前的 [help,status,whoami] read-only 白名单不够 — 只读命令不该清,
+    //     但透传命令同样不该清(它们改变 session 状态的语义不同)
+    //
     // 防御: 旧 mock 可能没装 expectedReply (Field like), 跳过而不是 throw
     const isReadOnly = ['help', 'status', 'whoami'].includes(cmd || '');
-    if (!isReadOnly && this.agentView?.expectedReply) {
+    // 已知 cc-linker 命令全列表 — 透传 /xxx 不在内, 保持 expectedReply
+    const knownCcLinkerCommands = new Set([
+      'help', 'list', 'listdir', 'new', 'switch', 'model',
+      'resume', 'status', 'stop', 'whoami', 'agents', 'cancel',
+    ]);
+    const isPassthrough = !knownCcLinkerCommands.has(cmd || '');
+    if (!isReadOnly && !isPassthrough && this.agentView?.expectedReply) {
       const info = this.agentView.expectedReply.get(msg.openId);
       if (info) {
         await this.agentView.expectedReply.clear(msg.openId, 'overwrite');
@@ -3245,19 +3260,6 @@ export class FeishuBot {
     }
 
     if (entry.type === 'session' && entry.sessionUuid) {
-      return {
-        type: 'session',
-        sessionUuid: entry.sessionUuid,
-        cwd: entry.cwd || this.registry.get(entry.sessionUuid)?.cwd,
-        openId,
-        mappingVersion,
-      };
-    }
-
-    // v2.5 fix: pending_agent_reply 也是 session 目标 (有 sessionUuid + cwd)。
-    // 之前 fallthrough 到 no_target,导致 Agent View 等待状态下 /xxx (如 /context)
-    // 收到矛盾的 "已自动取消" + "请先 /new" 两条消息。
-    if (entry.type === 'pending_agent_reply' && entry.sessionUuid) {
       return {
         type: 'session',
         sessionUuid: entry.sessionUuid,
