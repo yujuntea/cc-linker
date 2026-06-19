@@ -12,6 +12,8 @@ import { WecomStreamUpdater } from './stream-updater';
 import { WecomUserManager } from './mapping';
 import { WecomCardBuilder } from './card';
 import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spool';
+import type { ClaudeSessionManager } from '../proxy/session';
+import type { StreamChunk } from '../proxy/stream-parser';
 
 export type WecomBotConfig = {
   botId: string;
@@ -26,7 +28,15 @@ export type WecomBotConfig = {
    * 默认 new WecomUserManager(userMappingPath)，测试场景可注入 mock
    */
   userManager?: WecomUserManager;
-  // PR 3: 接入 ClaudeSessionManager 之前，handleChat 走 echo back 路径
+  /**
+   * PR 4.1: ClaudeSessionManager 注入点。
+   * - 注入 → handleChat 真接 Claude 流式 (replyStream 流式 patch)
+   * - 未注入 → handleChat 走 PoC echo 路径 (向后兼容单测 / wecom-only staging)
+   *
+   * 仿飞书侧 createSessionFromPromptStreaming 模板
+   * @see src/feishu/bot.ts:2600-2700
+   */
+  sessionManager?: ClaudeSessionManager;
 };
 
 export class WecomBot {
@@ -34,6 +44,10 @@ export class WecomBot {
   private updater: WecomStreamUpdater;
   private userManager: WecomUserManager;
   private spoolQueue: SpoolQueue;
+  /**
+   * PR 4.1: 可选 ClaudeSessionManager 注入。未注入时 handleChat 走 PoC echo 路径。
+   */
+  private sessionManager?: ClaudeSessionManager;
   private running = false;
 
   constructor(config: WecomBotConfig) {
@@ -46,19 +60,22 @@ export class WecomBot {
     });
     this.userManager = config.userManager ?? new WecomUserManager(config.userMappingPath);
     this.spoolQueue = config.spoolQueue ?? new SpoolQueue();
+    this.sessionManager = config.sessionManager;
   }
 
   start(): void {
     if (this.running) return;
     this.running = true;
 
-    // PR 2 v1.2.1 final (C-1 PoC 模式): 启动日志明确标注"框架已就绪，Claude 流式待 PR 4"
-    // 历史: PR 2/3 commit 标题（"完整 CLI 路由"）让 review 同事误以为 wecom 通道
-    //   对真用户功能可用，但 handleChat 仍写死 echo 字符串，没接 ClaudeSessionManager。
-    // 修法: 启动时 WARN 标注 PoC 模式，避免误用。
-    logger.warn('[wecom-bot] ⚠️  PoC MODE: handleChat 当前 echo 硬编码字符串，未接 Claude 流式');
-    logger.warn('[wecom-bot] ⚠️  PoC MODE: 消息可接收、SDK 字段映射、SpoolQueue、dispatch loop 全部 OK');
-    logger.warn('[wecom-bot] ⚠️  PoC MODE: 真实 AI 对话需等 PR 4（修 846605 invalid req_id 根因 + 接入 ClaudeSessionManager）');
+    // PR 4.1: 启动日志 — Claude 流式已接通 (PR 2/3 PoC 模式正式转正)
+    // 历史: PR 2 v1.2.1 final (C-1) 标 3 行 PoC WARN，避免 review 同事误用。
+    //   846605 invalid req_id 根因已在 M-3 + F7 修复（必传 inboundFrame.headers.req_id）。
+    //   handleChat 真接 ClaudeSessionManager.sendStreamingMessage。
+    if (this.sessionManager) {
+      logger.info('[wecom-bot] handleChat → ClaudeSessionManager 流式模式 (replyStream 必传 inboundFrame)');
+    } else {
+      logger.warn('[wecom-bot] sessionManager 未注入，handleChat 走 PoC echo 路径（仅用于 staging/单测）');
+    }
 
     this.client.onMessage((event) => {
       logger.info(`[wecom-bot] onMessage received: ${JSON.stringify(event).slice(0, 300)}`);
@@ -183,34 +200,84 @@ export class WecomBot {
   }
 
   private async handleChat(msg: SpoolMessage): Promise<void> {
-    // PR 2 v1.2.2: 临时绕开 stream 流式 patch, 改用普通 sendMessage 推 markdown
-    // 因为 SDK replyStream 流式 patch 报 errcode=846605 "invalid req_id"
-    // (原因待 PR 3 调查, 可能是 SDK 服务端对 inbound frame.req_id 校验更严)
-    // PR 3 会用 Claude 流式 + replyStream 重新接回
     logger.info(`[wecom-bot] handleChat: userId=${msg.userId}, text=${msg.text.slice(0, 50)}`);
-    try {
-      const responseText = `✅ 收到! 你是 WuYuJun, 我已收到你的消息: "${msg.text}"\n\n_(PR 2 E2E staging: 流式 patch 报 846605 暂用 sendMessage, Claude 集成待 PR 3)_`;
 
-      // PR 2 v1.2.1 final (F13 修复): receive_id 选择
-      // single chat: externalUserId 就是 receive_id
-      // group chat: receive_id 必须是 chatId（群聊标识）而不是群成员 ID
-      // 当前 msg 暂无 chatType 字段（SpoolMessage schema），PR 3 通过 metadata.chatType 传入
-      // 暂用 userId（PR 2 E2E staging 全是 single chat，group chat 暂未支持）
-      const receiveId = (msg.metadata as any)?.chatId ?? msg.userId;
-      await this.client.sdk.sendMessage(receiveId, {
-        msgtype: 'markdown',
-        markdown: { content: responseText },
-      });
-      logger.info(`[wecom-bot] sendMessage success for ${msg.messageId}`);
-      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
-    } catch (err) {
-      logger.error(`[wecom-bot] handleChat error: ${err instanceof Error ? err.message : String(err)}`);
+    // PR 4.1: PoC fallback — sessionManager 未注入时走 sendMessage echo 路径
+    // 用于 staging / 单测 (确保向后兼容未升级的 wecom-only 启动)
+    if (!this.sessionManager) {
+      logger.warn(`[wecom-bot] handleChat: sessionManager 未注入, 走 PoC echo 路径 (messageId=${msg.messageId})`);
+      try {
+        const responseText = `✅ 收到! 你是 WuYuJun, 我已收到你的消息: "${msg.text}"\n\n_(PR 2 E2E staging, sessionManager 未注入)_`;
+        const receiveId = (msg.metadata as any)?.chatId ?? msg.userId;
+        await this.client.sdk.sendMessage(receiveId, {
+          msgtype: 'markdown',
+          markdown: { content: responseText },
+        });
+        this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      } catch (err) {
+        logger.error(`[wecom-bot] handleChat (PoC) error: ${err instanceof Error ? err.message : String(err)}`);
+        try {
+          this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
+        } catch (requeueErr) { /* ignore */ }
+      }
+      return;
+    }
+
+    // PR 4.1: 真接 Claude 流式 (仿飞书侧 createSessionFromPromptStreaming 模板)
+    // @see src/feishu/bot.ts:2600-2700
+    const inboundFrame = msg.metadata?.inboundFrame as any;
+    if (!inboundFrame) {
+      logger.error(`[wecom-bot] handleChat: missing inboundFrame in metadata, cannot stream (messageId=${msg.messageId})`);
       try {
         this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
-        logger.warn(`[wecom-bot] requeued message ${msg.messageId} after error`);
-      } catch (requeueErr) {
-        logger.error(`[wecom-bot] requeue failed: ${requeueErr instanceof Error ? requeueErr.message : String(requeueErr)}`);
+      } catch (requeueErr) { /* ignore */ }
+      return;
+    }
+
+    const startTime = Date.now();
+    let thinking = '';
+    let text = '';
+
+    try {
+      // 1. 启动 replyStream 流（必传 inboundFrame — M-7 修复后 fail-fast）
+      await this.updater.startProcessing(msg.userId, inboundFrame);
+
+      // 2. PR 4.1 简化: cwd 默认用 userId（后续 PR 接 session lookup + userManager.bindSessionToClaim）
+      const cwd = msg.userId;
+      const sessionId: string | null = null;  // 总是新建 session（PR 4.5+ 接续聊）
+
+      // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text + throttle patch
+      const result = await this.sessionManager.sendStreamingMessage(
+        sessionId, msg.text, cwd,
+        (chunk: StreamChunk) => {
+          if (chunk.type === 'thinking') thinking += chunk.content;
+          else if (chunk.type === 'text') text += chunk.content;
+          const elapsed = Date.now() - startTime;
+          this.updater.updateStream(thinking, text, elapsed).catch(e =>
+            logger.warn(`[wecom-bot] updateStream failed: ${e instanceof Error ? e.message : String(e)}`)
+          );
+        },
+        true, `new:${msg.userId}`,
+      );
+
+      // 4. 终态: sessionId 缺失 → error, 成功 → complete
+      if (!result.sessionId) {
+        await this.updater.error(result.error ?? 'Claude 未返回 session_id');
+        this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+        return;
       }
+
+      // PR 4.1 简化: 不接 userMapping.bindSessionToClaim（PR 4.5+ 接 WecomUserManager.bindSessionToClaim）
+      await this.updater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+    } catch (err) {
+      logger.error(`[wecom-bot] handleChat Claude flow error: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        await this.updater.error(err instanceof Error ? err.message : String(err));
+      } catch (e2) { /* ignore */ }
+      try {
+        this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
+      } catch (requeueErr) { /* ignore */ }
     }
   }
 
@@ -357,5 +424,15 @@ export class WecomBot {
       default:
         logger.warn(`[wecom-bot] unknown card action: ${event.actionTag}`);
     }
+  }
+
+  /**
+   * PR 4.1: 测试 seam — 暴露 handleChat 给单测直接调用。
+   * 生产路径是 startDispatchLoop → handleClaimed → handleChat；
+   * 单测里不想跑 2s tick + SpoolQueue 文件 IO 时直接调它。
+   * @internal
+   */
+  public async __test_handleChat(msg: SpoolMessage): Promise<void> {
+    return this.handleChat(msg);
   }
 }

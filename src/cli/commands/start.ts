@@ -252,6 +252,9 @@ interface BotRuntime {
   stateCoordinator: StateCoordinator;
   spoolQueue: SpoolQueue;
   shutdown: (signal: string) => Promise<void>;
+  // PR 4.1: 共享给 WecomBot 的 ClaudeSessionManager 实例
+  // 飞书 + 企微共用同一 sessionManager → 共享 session lock + claude -p 子进程
+  sessionManager?: ClaudeSessionManager;
 }
 
 /**
@@ -628,7 +631,7 @@ async function createBotRuntime(
     stateCoordinator.release();
   };
 
-  return { bot, wsClient, stateCoordinator, spoolQueue, shutdown };
+  return { bot, wsClient, stateCoordinator, spoolQueue, shutdown, sessionManager };
 }
 
 async function startForeground(registry: RegistryManager, opts: StartOptions, parentOpts?: StartOptions): Promise<void> {
@@ -660,6 +663,9 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
   let stateCoordinator: StateCoordinator | null = null;
   let shutdown: ((signal: string) => Promise<void>) | null = null;
   let spoolQueue: SpoolQueue | null = null;
+  // PR 4.1: 共享 sessionManager — 飞书 + 企微 bot 共用同一 ClaudeSessionManager 实例
+  // 避免重复 spawn claude -p 子进程，让双平台的 session lock 互相可见
+  let sharedSessionManager: ClaudeSessionManager | null = null;
 
   if (platforms.includes('feishu')) {
     const runtime = await createBotRuntime(registry, (level, msg) => {
@@ -681,6 +687,8 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
     stateCoordinator = runtime.stateCoordinator;
     shutdown = runtime.shutdown;
     spoolQueue = runtime.spoolQueue;
+    // PR 4.1: 取出共享 sessionManager 供 wecom 侧使用
+    sharedSessionManager = runtime.sessionManager ?? null;
   } else {
     // PR 3.4: wecom-only 路径，飞书没启动。
     // 仍需要一个最小 StateCoordinator 来释放 daemon 锁；但因为不创建
@@ -708,11 +716,13 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
         logger.warn('wecom.owner_external_user_id 未配置');
       }
       // PR 3.4: sharedSpoolQueue 注入 — 双平台共用同一份 spool 状态
+      // PR 4.1: 注入 sharedSessionManager — 飞书 + 企微共用同一 ClaudeSessionManager 实例
       wecomBotInstance = new WecomBot({
         botId,
         secret,
         userMappingPath: WECOM_USER_MAPPING_PATH,
         spoolQueue: spoolQueue ?? undefined,
+        sessionManager: sharedSessionManager ?? undefined,
       });
       wecomBotInstance.start();
       console.log(chalk.green('✅ 企微 Bot 已启动'));
@@ -798,12 +808,15 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
   let bot: FeishuBot | null = null;
   let shutdown: ((signal: string) => Promise<void>) | null = null;
   let spoolQueue: SpoolQueue | null = null;
+  // PR 4.1: 共享 sessionManager — 飞书 + 企微 bot 共用同一 ClaudeSessionManager 实例
+  let sharedSessionManager: ClaudeSessionManager | null = null;
 
   if (platforms.includes('feishu')) {
     const runtime = await createBotRuntime(registry, log, undefined, opts, sharedSpoolQueue);
     bot = runtime.bot;
     shutdown = runtime.shutdown;
     spoolQueue = runtime.spoolQueue;
+    sharedSessionManager = runtime.sessionManager ?? null;
   } else {
     log('WARN', '[startDaemonChild] wecom-only 启动且未走 createBotRuntime: 暂不支持后台 daemon');
     spoolQueue = sharedSpoolQueue ?? new SpoolQueue();
@@ -827,6 +840,7 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
         secret,
         userMappingPath: WECOM_USER_MAPPING_PATH,
         spoolQueue: spoolQueue ?? undefined,
+        sessionManager: sharedSessionManager ?? undefined,
       });
       wecomBotInstance.start();
       log('INFO', `企微 Bot 已启动 (bot_id=${botId})`);
