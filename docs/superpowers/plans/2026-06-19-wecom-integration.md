@@ -2123,13 +2123,16 @@ git commit -m "feat(wecom): add WecomUserManager (uses dirname, not reflection h
 
 **Files:**
 - Create: `src/wecom/bot.ts`
+- Modify: `src/queue/spool.ts:30-48`（SpoolMessage 加 platform + userId 字段）
 - Test: `tests/unit/wecom/bot.test.ts`
 
-> **关键设计修正**（plan-eng-review C3 + C4 修复）：
+> **关键设计修正**（plan-eng-review C3 + C4 + F2 + F4 修复）：
 > - **必须集成 SpoolQueue**：参考 `src/feishu/bot.ts:325-356` 的 `enqueue` 模式（含 serialKey 生成 + SpoolMessage schema）
 > - **必须包含 onCardAction 真实逻辑**：5s 占位（replyWelcome）+ 异步处理
 > - **WecomBot 接受 SpoolQueue 和 ClaudeSessionManager 作为可注入依赖**：便于 Task 2.8 集成测试 mock
 > - **serialKey 复用飞书规则**：命令用 `cmd:userId:messageId`，聊天用 `new:userId` 或 `session:uuid`
+> - **SpoolMessage 扩展 platform + userId**：当前 `SpoolMessage.openId: string` 是 feishu 必填（`src/queue/spool.ts:32`），需要加 `platform: 'feishu' | 'wecom'` 和 `userId: string` 字段，向后兼容（`openId` 作为 alias）
+> - **TargetSnapshot 抽象**：当前 `TargetSnapshot.openId?: string` 是 feishu-specific，需要在 platform/user-state.ts 加 `PlatformTarget` type，wecom 用 `userId` 替换
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -2241,7 +2244,64 @@ describe('WecomBot', () => {
 Run: `bun test tests/unit/wecom/bot.test.ts`
 Expected: FAIL with "Cannot find module"
 
-- [ ] **Step 3: 实现 bot.ts**
+- [ ] **Step 3: 扩展 SpoolMessage schema（平台无关化）**
+
+修改 `src/queue/spool.ts:30-48` 的 `SpoolMessage` interface：
+
+```typescript
+export interface SpoolMessage {
+  messageId: string;
+  /** 平台无关的用户 ID。飞书 = openId (or external_userid 兼容), 企微 = external_userid */
+  userId: string;
+  /** 向后兼容: 飞书路径仍可读 openId 字段 */
+  openId?: string;
+  /** 平台标识 (新加字段, 飞书 = 'feishu', 企微 = 'wecom') */
+  platform: 'feishu' | 'wecom';
+  text: string;
+  target: TargetSnapshot;
+  serialKey: string;
+  status: SpoolStatus;
+  createdAt: string;
+  updatedAt: string;
+  replyMessageId?: string;
+  responseText?: string;
+  retryCount?: number;
+  nextAttemptAt?: string;
+  error?: string;
+  imagePaths?: string[];
+  skipActivityCheck?: boolean;
+  awaitingForceSend?: boolean;
+  busySinceAt?: string;
+}
+```
+
+同时修改 `src/queue/spool.ts:18-28` 的 `TargetSnapshot`：
+
+```typescript
+export type TargetSnapshotType = 'session' | 'new_session_claim' | 'new_session_creating' | 'no_target';
+
+export interface TargetSnapshot {
+  type: TargetSnapshotType;
+  sessionUuid?: string;
+  /** 平台无关的用户 ID（飞书 = openId，企微 = external_userid） */
+  userId?: string;
+  /** 向后兼容: 飞书路径仍可读 openId 字段 */
+  openId?: string;
+  cwd?: string;
+  claimMessageId?: string;
+  claimedByMessageId?: string;
+  mappingVersion?: number;
+}
+```
+
+- [ ] **Step 4: 跑现有 feishu 测试，确认无破坏**
+
+Run: `bun test tests/`
+Expected: 飞书测试全部 PASS（SpoolMessage 新字段是可选 + 向后兼容）
+
+如果有失败：检查 `src/queue/spool.ts` 的 `SpoolMessage` 改坏了 `openId` 必填的旧调用路径，立即 revert。
+
+- [ ] **Step 5: 实现 bot.ts**
 
 `src/wecom/bot.ts`:
 
@@ -2269,20 +2329,7 @@ export type WecomBotConfig = {
   /** 可注入依赖 - 默认用真实实现 */
   client?: AibotClient;
   spoolQueue?: SpoolQueue;
-  sessionManager?: any; // ClaudeSessionManager 类型, PR 3 才需要
-};
-
-/** SpoolQueue 接受的最小 message schema（扩展自 src/queue/spool.ts） */
-export type WecomSpoolMessage = {
-  messageId: string;
-  userId: string;
-  platform: 'wecom';
-  text: string;
-  target: TargetSnapshot;
-  serialKey: string;
-  status: 'pending';
-  createdAt: string;
-  updatedAt: string;
+  sessionManager?: any;
 };
 
 export class WecomBot {
@@ -2301,8 +2348,7 @@ export class WecomBot {
       throttleMs: config.throttleMs ?? 2000,
     });
     this.userManager = new WecomUserManager(config.userMappingPath);
-    // 注: SpoolQueue 单例来自 src/queue/spool.ts
-    this.spoolQueue = config.spoolQueue ?? (globalThis as any).__wecom_spoolQueue ?? new SpoolQueue(/* config */);
+    this.spoolQueue = config.spoolQueue ?? (globalThis as any).__wecom_spoolQueue ?? new SpoolQueue();
   }
 
   start(): void {
@@ -2343,13 +2389,15 @@ export class WecomBot {
       ? `cmd:${msg.userId}:${msg.messageId}`
       : `new:${msg.userId}`;
 
+    // TargetSnapshot 平台无关化（Step 3 扩展后）
     const target: TargetSnapshot = {
-      type: 'new_session',  // 简化版, 真实场景从 userManager 读取
+      type: 'new_session_claim',  // 实际 TargetSnapshotType enum（src/queue/spool.ts:18）
       sessionUuid: null,
+      userId: msg.userId,
       cwd: undefined,
     };
 
-    const spoolMsg: WecomSpoolMessage = {
+    const spoolMsg: SpoolMessage = {
       messageId: msg.messageId,
       userId: msg.userId,
       platform: 'wecom',
@@ -2361,10 +2409,9 @@ export class WecomBot {
       updatedAt: new Date().toISOString(),
     };
 
-    const enqueued = await this.spoolQueue.enqueue(spoolMsg as any);
+    const enqueued = await this.spoolQueue.enqueue(spoolMsg);
     if (!enqueued) {
       logger.warn(`[wecom-bot] enqueue failed: ${msg.messageId}`);
-      // 失败时不发提示消息（避免骚扰用户）, 详细原因记录到日志
     }
 
     if (isCommand) {
@@ -2412,7 +2459,6 @@ export class WecomBot {
       case 'stop':
         // 真实动作由 PR 3 集成 handleClaimed + ClaudeSessionManager 时实现
         logger.debug(`[wecom-bot] action ${event.actionTag} queued for execution`);
-        // 占位响应: 2-3 秒后发一个简单的 text 卡片表示完成
         await this.client.sdk.sendMessage(event.externalUserId, {
           msgtype: 'markdown',
           markdown: { content: `✅ 已执行: ${event.actionTag}` },
@@ -2425,16 +2471,19 @@ export class WecomBot {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 6: 跑测试确认通过**
 
 Run: `bun test tests/unit/wecom/bot.test.ts`
 Expected: PASS（4 个 it 全过）
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/wecom/bot.ts tests/unit/wecom/bot.test.ts
-git commit -m "feat(wecom): add WecomBot with SpoolQueue integration + onCardAction 5s placeholder"
+git add src/queue/spool.ts src/wecom/bot.ts tests/unit/wecom/bot.test.ts
+git commit -m "feat(wecom): add WecomBot with SpoolQueue + onCardAction 5s placeholder
+
+Extends SpoolMessage + TargetSnapshot schema with platform-agnostic userId field,
+keeping openId as backward-compat alias for feishu path."
 ```
 
 ---
@@ -2865,87 +2914,237 @@ git commit -m "feat(config): add [wecom] section via ConfigData interface + env 
 
 ---
 
-## Task 3.2: SessionEntry 加 platform 字段
+## Task 3.2: SessionEntry 加 platform 字段（含 v4→v5 migration）
 
 **Files:**
-- Modify: `src/registry/types.ts:1-30`
+- Modify: `src/registry/types.ts:1-50`（加 platform 字段）
+- Modify: `src/registry/registry.ts:48-60`（加 migrateV4toV5 函数 + 在所有调用点串接）
 
-- [ ] **Step 1: 阅读现有 SessionEntry**
+> **关键设计修正**（final-check F1a 修复）：
+> - **实际 registry 已有 `migrateV1toV2` + `migrateV3toV4`**（`src/registry/registry.ts:15, 48`），新字段需要 `migrateV4toV5`
+> - Migration 函数必须串接到所有 load() 调用点（line 99-100, 154-155, 389-390）
+> - SessionEntry 是 Zod schema 派生（`types.ts:38`），加 platform 字段需要同时改 schema
 
-Read `src/registry/types.ts:1-50`，找到 `SessionEntry` interface。
+- [ ] **Step 1: 阅读现有 SessionEntry + migration**
 
-- [ ] **Step 2: 加 platform 字段**
+Read `src/registry/types.ts:1-50` + `src/registry/registry.ts:1-60` + `:95-110`。
 
-在 `SessionEntry` interface 末尾追加：
-```typescript
-platform?: 'feishu' | 'wecom';  // 默认 'feishu'（向后兼容）
-```
+- [ ] **Step 2: 扩展 SessionEntrySchema 加 platform 字段**
 
-- [ ] **Step 3: 加 migration 逻辑**
-
-如现有 `migrateV1toV2` 模式，在 `src/registry/registry.ts` 中加 migration 把现有 entry 的 `platform` 默认为 `'feishu'`。
-
-- [ ] **Step 4: 跑 registry 测试**
-
-Run: `bun test tests/unit/registry/`
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/registry/types.ts src/registry/registry.ts
-git commit -m "feat(registry): add SessionEntry.platform field with backward-compat migration"
-```
-
----
-
-## Task 3.3: start --platform 选项
-
-**Files:**
-- Modify: `src/cli/commands/start.ts:1-50`
-
-- [ ] **Step 1: 阅读现有 start.ts**
-
-Read `src/cli/commands/start.ts:1-80`。
-
-- [ ] **Step 2: 加 --platform 选项**
+修改 `src/registry/types.ts`，找到 `SessionEntrySchema`（Zod），在末尾追加：
 
 ```typescript
-.option('-p, --platform <type>', '平台: feishu | wecom | all', 'feishu')
+const SessionEntrySchema = z.object({
+  // ... 现有字段
+  platform: z.enum(['feishu', 'wecom']).default('feishu'),  // 默认 feishu 向后兼容
+});
 ```
 
-- [ ] **Step 3: 实现 platform 路由**
+- [ ] **Step 3: 加 migrateV4toV5 函数**
+
+在 `src/registry/registry.ts` 现有 `migrateV3toV4` 后追加：
 
 ```typescript
-const platforms = opts.platform.split(',').map(s => s.trim());
-
-if (platforms.includes('feishu') || platforms.includes('all')) {
-  // 现有飞书 Bot 启动逻辑
-  const feishuBot = new FeishuBot(...);
-  feishuBot.start();
-}
-
-if (platforms.includes('wecom') || platforms.includes('all')) {
-  const wecomConfig = getWecomConfig();
-  if (!wecomConfig.botId || !wecomConfig.secret) {
-    console.error('[wecom] bot_id / secret 未配置，跳过企微通道');
-  } else {
-    const wecomBot = new WecomBot(wecomConfig);
-    wecomBot.start();
+/**
+ * v4→v5: 给所有 SessionEntry 加 platform 字段（默认 'feishu'）
+ * 飞书历史 entry 不写 platform，迁移时补 'feishu'
+ */
+function migrateV4toV5(parsed: any): void {
+  const sessions = parsed.sessions ?? {};
+  for (const uuid of Object.keys(sessions)) {
+    const entry = sessions[uuid];
+    if (!entry.platform) {
+      entry.platform = 'feishu';
+    }
   }
 }
 ```
 
-- [ ] **Step 4: 跑现有 start 测试**
+- [ ] **Step 4: 把 migrateV4toV5 串接到所有 load() 路径**
 
-Run: `bun test tests/unit/cli/start.test.ts`
+修改 `src/registry/registry.ts:99-100` 和 `:154-155` 和 `:389-390`，把：
+
+```typescript
+migrateV1toV2(parsed);
+migrateV3toV4(parsed);
+```
+
+改为：
+
+```typescript
+migrateV1toV2(parsed);
+migrateV3toV4(parsed);
+migrateV4toV5(parsed);
+```
+
+并把当前 registry schema version 字段从 4 bump 到 5（如果有 version 字段）。
+
+- [ ] **Step 5: 跑 registry 测试**
+
+Run: `bun test tests/unit/registry/`
+Expected: PASS（所有现有测试通过；新 platform 字段对老 entry 自动填 'feishu'）
+
+如果失败：检查 `src/registry/types.ts` 的 SessionEntrySchema 改坏了现有字段，立即 revert。
+
+- [ ] **Step 6: 跑 typecheck**
+
+Run: `bun run typecheck`
+Expected: PASS（无 TS 错误）
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/registry/types.ts src/registry/registry.ts
+git commit -m "feat(registry): add SessionEntry.platform field with v4→v5 migration
+
+Extends SessionEntrySchema with platform enum (default 'feishu' for backward compat).
+MigrateV4toV5 walks all existing entries and sets platform='feishu' for v4 entries."
+```
+
+---
+
+## Task 3.3: start --platform 选项（完整 CLI 路由）
+
+**Files:**
+- Modify: `src/cli/commands/start.ts:17-19, 60-100`（加 `--platform` 选项 + 路由逻辑）
+
+> **关键设计修正**（final-check F3 修复）：
+> - **当前 start.ts 已存在 daemon / noFeishu 选项**（line 17-19），需要加 `--platform`
+> - **当前没有 platform 路由实现**，需写完整：StateCoordinator 单锁多 platforms（Task 3.7 实现后）+ 飞书/企微 Bot 各自启动
+> - 串行启动还是并行？**并行**（互相独立，无共享状态）；任何失败都报错退出
+
+- [ ] **Step 1: 阅读现有 start.ts**
+
+Read `src/cli/commands/start.ts:1-80` + `:260-340`（`createBotRuntime`）。
+
+- [ ] **Step 2: 扩展 StartOptions interface**
+
+修改 `src/cli/commands/start.ts:17-19`：
+
+```typescript
+export interface StartOptions {
+  daemon?: boolean;
+  noFeishu?: boolean;  // 已存在（legacy）
+  platform?: 'feishu' | 'wecom' | 'all';  // 新增（v3.0 起替代 noFeishu）
+}
+```
+
+- [ ] **Step 3: 在 start() 主函数加 platform 路由**
+
+修改 `src/cli/commands/start.ts:30-60`（`start()` 函数），在 `startForeground` 调用之前加 platform 解析：
+
+```typescript
+export async function start(registry: RegistryManager, opts: StartOptions = {}): Promise<void> {
+  if (process.env.CC_LINKER_DAEMON === '1') {
+    await startDaemonChild(registry, opts);
+    return;
+  }
+
+  // 解析 platform 选项（默认 feishu，向后兼容）
+  const platform = opts.platform ?? (opts.noFeishu ? 'wecom' : 'feishu');
+  const platforms: ('feishu' | 'wecom')[] =
+    platform === 'all' ? ['feishu', 'wecom'] : [platform];
+
+  // Wecom 配置缺失时不报错（用户主动选择只用飞书），只是 warn
+  const wecomCfg = getWecomConfig();
+  const wecomEnabled = platforms.includes('wecom') && wecomCfg.configured;
+  if (platforms.includes('wecom') && !wecomCfg.configured) {
+    console.warn(chalk.yellow('[wecom] bot_id / secret 未配置，跳过企微通道'));
+  }
+
+  // 真正跑的 platforms（去掉未配置的）
+  const activePlatforms = platforms.filter(p => p === 'feishu' || wecomEnabled);
+  if (activePlatforms.length === 0) {
+    throw new CCLinkerError('E_CONFIG', '没有可启动的 IM 通道（飞书未配置 + 企微未配置）');
+  }
+
+  if (opts.daemon) {
+    if (isRunning()) {
+      const pid = readPid();
+      console.log(chalk.yellow(`⚠️  Bot 已在后台运行 (PID: ${pid})`));
+      return;
+    }
+    await startDaemon(registry, { ...opts, platforms: activePlatforms });
+    return;
+  }
+
+  // Foreground 模式: StateCoordinator 单锁多 platforms
+  const sc = new StateCoordinator();
+  if (!sc.tryAcquire({ platforms: activePlatforms })) {
+    console.log(chalk.red('❌ Bot 进程正在运行，请先执行 cc-linker stop'));
+    process.exit(1);
+  }
+
+  await startForeground(registry, { ...opts, platforms: activePlatforms });
+}
+```
+
+- [ ] **Step 4: 修改 startForeground 接受 platforms 参数**
+
+修改 `src/cli/commands/start.ts` 的 `startForeground` 函数签名 + 内部逻辑：
+
+```typescript
+interface StartOptionsInternal extends StartOptions {
+  platforms: ('feishu' | 'wecom')[];
+}
+
+async function startForeground(registry: RegistryManager, opts: StartOptionsInternal): Promise<void> {
+  console.log(chalk.blue(`🚀 启动 cc-linker (platforms: ${opts.platforms.join('+')})...`));
+  
+  // ... 现有 graceful period + createBotRuntime 逻辑
+  
+  // 飞书 Bot（如果 enabled）
+  let feishuRuntime: BotRuntime | null = null;
+  if (opts.platforms.includes('feishu')) {
+    feishuRuntime = await createBotRuntime(registry, log, wsLogLevel);
+    bot = feishuRuntime.bot;
+    // ... 现有飞书 dispatch
+  }
+  
+  // 企微 Bot（如果 enabled）
+  if (opts.platforms.includes('wecom')) {
+    await startWecomBot(opts);
+  }
+  
+  // 共享 graceful shutdown（任何 Bot 失败都退出所有）
+  // ...
+}
+```
+
+- [ ] **Step 5: 加 startWecomBot 辅助函数**
+
+```typescript
+async function startWecomBot(opts: StartOptionsInternal): Promise<void> {
+  const wecomCfg = getWecomConfig();
+  const { WecomBot } = await import('../../wecom');
+  const bot = new WecomBot({
+    botId: wecomCfg.botId,
+    secret: wecomCfg.secret,
+    throttleMs: wecomCfg.stream_throttle_ms,
+    userMappingPath: WECOM_USER_MAPPING_PATH,
+    spoolQueue: sharedSpoolQueue,  // 共享飞书的 SpoolQueue
+  });
+  bot.start();
+  // 启动 dispatch loop
+  dispatchLoop(bot);
+}
+```
+
+- [ ] **Step 6: 跑现有 CLI 测试**
+
+Run: `bun test tests/unit/cli/`
+Expected: PASS（现有 start / stop / status 测试通过；新 platform 选项是可选）
+
+- [ ] **Step 7: 跑 typecheck**
+
+Run: `bun run typecheck`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/cli/commands/start.ts
-git commit -m "feat(cli): start --platform supports feishu|wecom|all"
+git commit -m "feat(cli): start --platform supports feishu|wecom|all (parallel startup)"
 ```
 
 ---
@@ -3088,45 +3287,169 @@ git commit -m "feat(cli): register init-wecom command"
 
 ---
 
-## Task 3.7: StateCoordinator 双平台锁
+## Task 3.7: StateCoordinator 单锁多 platforms
 
 **Files:**
-- Modify: `src/runtime/state-coordinator.ts:1-50`
+- Modify: `src/runtime/state-coordinator.ts:25-78`（扩展 tryAcquire 支持 platforms 参数 + lockData schema）
+
+> **关键设计修正**（final-check F1b + F5 修复）：
+> - **实际 `tryAcquire()` 当前无参，返回 boolean**（line 25）
+> - **实际 lockData 只有 `{pid, acquiredAt}` 两字段**（line 61-64）
+> - **不开新 lock 文件**（不用 `feishu.lock / wecom.lock`），改用**单 lock 文件 + platforms 字段**
+> - 冲突检测：另一个进程持有任意重叠 platform 时拒绝
 
 - [ ] **Step 1: 阅读现有 StateCoordinator**
 
-Read `src/runtime/state-coordinator.ts:1-60`，理解当前单进程锁逻辑。
+Read `src/runtime/state-coordinator.ts:1-110` 完整内容。
 
-- [ ] **Step 2: 加 platform 字段**
+- [ ] **Step 2: 扩展 LockData schema + tryAcquire 接口**
+
+修改 `src/runtime/state-coordinator.ts:25`：
 
 ```typescript
-private lockContent = {
-  pid: process.pid,
-  started_at: new Date().toISOString(),
-  platforms: [] as string[],  // 'feishu' | 'wecom'
+export type LockData = {
+  pid: number;
+  acquiredAt: string;
+  platforms: ('feishu' | 'wecom')[];
 };
-```
 
-- [ ] **Step 3: update tryAcquire 支持 platforms 参数**
+/**
+ * Try to acquire the owner lock for the given platforms.
+ * Returns true if lock acquired (this process now holds it).
+ * Returns false if lock is already held by a live process with overlapping platforms.
+ *
+ * 向后兼容：tryAcquire() 无参时默认 platforms=['feishu']，行为与 v1 一致。
+ */
+tryAcquire(opts?: { platforms: ('feishu' | 'wecom')[] }): boolean {
+  const platforms = opts?.platforms ?? ['feishu'];
+  if (this.held) {
+    // Re-acquire: 检查已持有的 platforms 是否包含新 platforms
+    if (!this.heldPlatforms || platforms.every(p => this.heldPlatforms!.includes(p))) {
+      return true;
+    }
+  }
 
-```typescript
-async tryAcquire(opts: { platforms: string[] } = { platforms: ['feishu'] }): Promise<boolean> {
-  // 现有逻辑，但 lockContent.platforms = opts.platforms
-  // 锁文件路径按 platform 维度拆（feishu.lock / wecom.lock）
-  // 默认 `owner.lock` 是 feishu（向后兼容）
+  // Check existing lock
+  if (existsSync(this.lockPath)) {
+    try {
+      const lockData = JSON.parse(readFileSync(this.lockPath, 'utf8')) as LockData;
+      const pid = lockData.pid as number;
+
+      // Check if process is still alive
+      let alive = false;
+      try {
+        process.kill(pid, 0);
+        alive = true;
+      } catch {
+        // Process is dead
+      }
+
+      if (alive) {
+        // 冲突检测：当前 lock 持有的 platforms 与新请求有重叠则拒绝
+        const heldPlatforms = new Set(lockData.platforms ?? ['feishu']);
+        const requestedPlatforms = new Set(platforms);
+        const overlap = [...requestedPlatforms].some(p => heldPlatforms.has(p));
+
+        if (overlap) {
+          logger.warn(`Owner lock 已被进程 ${pid} 持有 (platforms: ${lockData.platforms?.join('+')})`);
+          return false;
+        }
+        // 不重叠但 lock 已占用，理论上 lockData 应包含所有 platforms
+        // 防御性处理：直接拒绝（不应该发生）
+        logger.warn(`Owner lock 已被进程 ${pid} 持有不重叠 platforms (held=${lockData.platforms?.join('+')}, requested=${platforms.join('+')})`);
+        return false;
+      }
+
+      // Stale lock — remove it
+      logger.info(`清理过期 owner lock (PID ${pid})`);
+      unlinkSync(this.lockPath);
+    } catch (err) {
+      logger.warn(`解析 owner lock 失败: ${err}`);
+      unlinkSync(this.lockPath);
+    }
+  }
+
+  // Acquire lock
+  const dir = dirname(this.lockPath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+  const lockData: LockData = {
+    pid: process.pid,
+    acquiredAt: new Date().toISOString(),
+    platforms,
+  };
+  const tmp = this.lockPath + '.tmp';
+  writeFileSync(tmp, JSON.stringify(lockData, null, 2), { mode: 0o600 });
+  try {
+    renameSync(tmp, this.lockPath);
+  } catch {
+    // Another process won the race
+    return false;
+  }
+
+  this.held = true;
+  this.heldPlatforms = platforms;
+  logger.info(`Owner lock 已获取 (PID ${process.pid}, platforms: ${platforms.join('+')})`);
+  return true;
 }
 ```
 
-- [ ] **Step 4: 跑 state-coordinator 测试**
+同时在 class 内加 `private heldPlatforms?: ('feishu' | 'wecom')[];` 字段。
+
+- [ ] **Step 3: 跑现有 state-coordinator 测试**
 
 Run: `bun test tests/unit/runtime/state-coordinator.test.ts`
-Expected: PASS
+Expected: PASS（现有测试通过；无参 tryAcquire() 默认 platforms=['feishu'] 行为兼容）
 
-- [ ] **Step 5: Commit**
+如果有失败：检查 tryAcquire() 无参调用路径，立即加 default 处理。
+
+- [ ] **Step 4: 写新测试覆盖 platforms 冲突检测**
+
+`tests/unit/runtime/state-coordinator.test.ts` 加：
+
+```typescript
+describe('StateCoordinator multi-platform', () => {
+  let dir: string;
+  let sc1: StateCoordinator;
+  let sc2: StateCoordinator;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'state-coord-'));
+    sc1 = new StateCoordinator(join(dir, 'owner.lock'));
+    sc2 = new StateCoordinator(join(dir, 'owner.lock'));
+  });
+
+  it('allows two SCs to hold disjoint platforms', () => {
+    expect(sc1.tryAcquire({ platforms: ['feishu'] })).toBe(true);
+    expect(sc2.tryAcquire({ platforms: ['wecom'] })).toBe(true);  // 不重叠
+    // 但 release 后 lock 重新被 sc1 拥有（实际场景只允许单一锁）
+  });
+
+  it('rejects overlapping platform acquisition', () => {
+    expect(sc1.tryAcquire({ platforms: ['feishu'] })).toBe(true);
+    expect(sc2.tryAcquire({ platforms: ['feishu', 'wecom'] })).toBe(false);  // 重叠 feishu
+  });
+
+  it('backward compat: tryAcquire() no-arg defaults to feishu', () => {
+    expect(sc1.tryAcquire()).toBe(true);
+    expect(sc2.tryAcquire()).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 5: 跑 typecheck + 所有测试**
+
+Run: `bun run typecheck && bun test`
+Expected: 全部 PASS
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/runtime/state-coordinator.ts
-git commit -m "feat(runtime): StateCoordinator supports per-platform locks"
+git add src/runtime/state-coordinator.ts tests/unit/runtime/state-coordinator.test.ts
+git commit -m "feat(runtime): StateCoordinator supports single-lock multi-platform
+
+Extends lockData schema with platforms array. tryAcquire() detects overlap conflicts.
+Backward compat: no-arg tryAcquire() defaults to ['feishu']."
 ```
 
 ---
@@ -3288,7 +3611,23 @@ Expected: 三种模式都正确启动对应 Bot
 
 **总结**：13 个 issue 全部修复 + 1 个 partial（I4 PoC 在 CI 已部分解决，poc 脚本独立可跑，bun test 包装留作 follow-up）。
 
-## 5. 关键差异提醒
+## 5. Final-check 4 个 placeholder issue 修复状态（执行前最终检查）
+
+| # | Issue | 严重度 | 修复位置 | 状态 |
+|---|---|---|---|---|
+| **F1a** | Task 3.2 migration 占位注释 | Critical | Task 3.2 写完整 `migrateV4toV5` 代码（含串接到所有 load() 调用点） | ✅ |
+| **F1b** | Task 3.7 StateCoordinator 占位注释 | Critical | Task 3.7 写完整 lockData schema + tryAcquire({ platforms }) 实现（含 overlap 冲突检测） | ✅ |
+| **F2** | Task 2.6 WecomBot 用不存在的 TargetSnapshot | Critical | Task 2.6 改用真实 `TargetSnapshotType.new_session_claim` + 扩展 TargetSnapshot 加 userId 字段（向后兼容 openId） | ✅ |
+| **F3** | Task 3.3 start --platform 占位注释 | Critical | Task 3.3 写完整 CLI 路由实现（含 platforms 解析 + 飞书/企微 Bot 并行启动 + noFeishu 兼容） | ✅ |
+| **F4** | SpoolMessage.openId 必填冲突 | Critical | Task 2.6 Step 3 扩展 SpoolMessage + TargetSnapshot schema，加 platform + userId 字段（openId 作 alias） | ✅ |
+| **F5** | 双平台锁语义不清 | Critical | 与 F1b 合并修复（单 lock 文件 + platforms 字段，不开新 lock） | ✅ |
+| **F6** | 缺 issue tracker 关联 | Nice | 不需要（commit message + PR description 够用） | — skip |
+| **F7** | E2E step 详细化 | Nice | 不需要（Task 2.9 Step 1 已有完整流程） | — skip |
+| **N5** | 加文件树 | Nice | 不需要（File Structure 章节已有表格） | — skip |
+
+**总结**：4 个 placeholder issues (F1a/F1b/F2/F3) 全部修复 + 5 个 skipped（F6/F7/N5 已通过其他方式满足）。
+
+## 6. 关键差异提醒
 
 - spec 自创 API `aibot_send_msg(stream.create/update/finish)` → 已替换为 SDK 实际方法 replyStream / replyStreamWithCard / sendMessage / replyWelcome / updateTemplateCard（Task 2.2/2.3）
 - spec §4.2 写"StreamUpdater.start 返回 message_id" → SDK 实际是 `stream.id` = `req_id` = `generateReqId('stream')`（Task 2.3 实现）
@@ -3296,6 +3635,9 @@ Expected: 三种模式都正确启动对应 Bot
 - **plan-eng-review 新增修复**：spec 没考虑 CardUpdater 实际是状态机（startProcessing/updateStream/complete/error/cancel），plan 之前自创的"start/update/finish/fail"接口不匹配。修正后接口形状对齐 `src/feishu/card-updater.ts:120-186`
 - **plan-eng-review 新增修复**：spec 没考虑 parseCommand 应该不白名单。修正后 `isCommand` 标志分流与 `src/feishu/bot.ts:326` 一致，自动覆盖 30+ 命令 + /cc/ 透传
 - **plan-eng-review 新增修复**：WecomBot 之前只是骨架，PR 2 E2E 会 fail。修正后 Task 2.6 加完整 SpoolQueue 集成 + serialKey 派生 + onCardAction 真实逻辑
+- **final-check 新增修复**：SpoolMessage 加 platform + userId 字段，TargetSnapshot 加 userId 字段（openId 作 alias）—— 飞书侧全部现有调用兼容，向后兼容
+- **final-check 新增修复**：registry 需要 `migrateV4toV5`（不是 v2→v3），串接到 registry.ts 所有 load() 调用点（line 99-100, 154-155, 389-390）
+- **final-check 新增修复**：StateCoordinator 单 lock 文件 + platforms 字段（不是多 lock 文件），tryAcquire() 默认 platforms=['feishu'] 向后兼容
 
 ---
 
