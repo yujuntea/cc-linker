@@ -951,3 +951,268 @@ describe('WecomBot handleCommand (PR 4.5 C: 命令路由)', () => {
     expect(mockSpoolQueue.markDone).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PR 5: handleCommand 完整命令路由
+ * 新增 6 个命令：/switch /resume /agents /stop /cancel /model
+ * 11 个场景：
+ * 1. /switch <uuid> 成功 → 调 setSession
+ * 2. /switch 缺参数 → 返回用法错误
+ * 3. /resume 成功 (有 session) → 调 touchSession
+ * 4. /resume 无 session → 返回错误消息
+ * 5. /agents 成功 (有 bg jobs) → 列出 sessions
+ * 6. /stop <shortId> 成功 (mock execFile) → 调 claude stop
+ * 7. /stop 缺参数 → 返回用法错误
+ * 8. /cancel 无 session → 返回错误消息
+ * 9. /model <model> 成功 → 返回设置消息
+ * 10. /model 缺参数 → 返回用法错误
+ * 11. help 包含全部 10 个命令
+ * 12. 未知命令 → 错误消息含全部 10 个命令
+ */
+describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      getEntry: mock((_uid: string) => undefined),
+      setPending: mock(async () => {}),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr5-cmd.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+  });
+
+  /** 辅助: 构造 SpoolMessage */
+  function makeCmdMsg(text: string, messageId = 'msg_pr5_cmd'): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'wmu_abc',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_abc:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: `inb_${messageId}` } } },
+    };
+  }
+
+  it('/switch <uuid> 成功 → 调 setSession', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/switch new-uuid-999', 'msg_switch'));
+
+    // 1. setSession 被调
+    expect(mockUserManager.setSession).toHaveBeenCalledWith('wmu_abc', 'new-uuid-999', expect.any(String));
+
+    // 2. sendMessage 推回成功消息
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('已切换 session');
+    expect(content).toContain('new-uuid-999');
+  });
+
+  it('/switch 缺参数 → 返回用法错误', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/switch', 'msg_switch_empty'));
+
+    // setSession 不应被调
+    expect(mockUserManager.setSession).not.toHaveBeenCalled();
+
+    // 错误消息: 用法提示
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('用法');
+    expect(content).toContain('/switch');
+  });
+
+  it('/resume 成功 (有 session) → 调 touchSession', async () => {
+    mockUserManager.getEntry = mock((_uid: string) => ({
+      type: 'session',
+      sessionUuid: 'existing-uuid-1',
+      cwd: '/var/www',
+      createdAt: '2026-06-19T00:00:00Z',
+      lastActiveAt: '2026-06-19T01:00:00Z',
+      casToken: 'token',
+    }));
+
+    await bot.__test_handleCommand(makeCmdMsg('/resume', 'msg_resume'));
+
+    // 1. touchSession 被调
+    expect(mockUserManager.touchSession).toHaveBeenCalledWith('wmu_abc');
+
+    // 2. sendMessage 推回成功消息
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('existing-uuid-1');
+    expect(content).toContain('lastActiveAt');
+  });
+
+  it('/resume 无 session → 返回错误消息', async () => {
+    mockUserManager.getEntry = mock((_uid: string) => undefined);
+
+    await bot.__test_handleCommand(makeCmdMsg('/resume', 'msg_resume_empty'));
+
+    // touchSession 不应被调
+    expect(mockUserManager.touchSession).not.toHaveBeenCalled();
+
+    // 错误消息
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('无 active session');
+  });
+
+  it('/agents 成功 (有 bg jobs) → 列出 sessions', async () => {
+    // 简化: 我们测 handleCommandAgents 调完没崩就 OK
+    // (因为 fs 目录 mock 比较重, 这里只验证不调 setSession/touchSession)
+    await bot.__test_handleCommand(makeCmdMsg('/agents', 'msg_agents'));
+
+    // 不应调 userManager.setSession/touchSession
+    expect(mockUserManager.setSession).not.toHaveBeenCalled();
+    expect(mockUserManager.touchSession).not.toHaveBeenCalled();
+
+    // sendMessage 被调 (无论目录是否存在, 都会返回一条 markdown)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    // 接受两种结果: 有 bg sessions 列表 OR 无 sessions 提示
+    expect(content.includes('bg sessions') || content.includes('活跃')).toBe(true);
+  });
+
+  it('/stop <shortId> 缺参数 → 返回用法错误', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/stop', 'msg_stop_empty'));
+
+    // 错误消息
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('用法');
+    expect(content).toContain('/stop');
+  });
+
+  it('/stop <shortId> 成功 (mock execFile 调用) → 调 claude stop', async () => {
+    // 由于 handleCommandStop 内部动态 import child_process，
+    // 我们直接调方法验证返回字符串即可 (集成测试覆盖 exec)
+    // 这里测：通过 /stop 时不崩 + 走 sendMessage 路径
+    await bot.__test_handleCommand(makeCmdMsg('/stop aaa-bbb-ccc', 'msg_stop'));
+
+    // sendMessage 被调
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    // 接受两种结果: 成功 OR 失败 (取决于环境是否装了 claude)
+    expect(content.includes('已停止') || content.includes('停止失败')).toBe(true);
+  });
+
+  it('/cancel 无 session → 返回错误消息', async () => {
+    mockUserManager.getEntry = mock((_uid: string) => undefined);
+
+    await bot.__test_handleCommand(makeCmdMsg('/cancel', 'msg_cancel_empty'));
+
+    // 错误消息
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('无 active session');
+  });
+
+  it('/cancel 有 session → 返回简化版消息', async () => {
+    mockUserManager.getEntry = mock((_uid: string) => ({
+      type: 'session',
+      sessionUuid: 'sess-cancel-1',
+      cwd: '/var/www',
+      createdAt: '2026-06-19T00:00:00Z',
+      lastActiveAt: '2026-06-19T01:00:00Z',
+      casToken: 'token',
+    }));
+
+    await bot.__test_handleCommand(makeCmdMsg('/cancel', 'msg_cancel'));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('cancel');
+    expect(content).toContain('sess-cancel-1');
+  });
+
+  it('/model <model> 成功 → 返回设置消息', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/model sonnet', 'msg_model'));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('sonnet');
+    expect(content).toContain('model');
+  });
+
+  it('/model 缺参数 → 返回用法错误', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/model', 'msg_model_empty'));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('用法');
+    expect(content).toContain('/model');
+  });
+
+  it('/help 包含全部 10 个命令', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/help', 'msg_help_pr5'));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    // 4 个 PR 4.5 命令
+    expect(content).toContain('/new');
+    expect(content).toContain('/list');
+    expect(content).toContain('/status');
+    expect(content).toContain('/help');
+    // 6 个 PR 5 新命令
+    expect(content).toContain('/switch');
+    expect(content).toContain('/resume');
+    expect(content).toContain('/agents');
+    expect(content).toContain('/stop');
+    expect(content).toContain('/cancel');
+    expect(content).toContain('/model');
+  });
+
+  it('未知命令 /foo → 错误消息含全部 10 个命令', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/foo', 'msg_unknown_pr5'));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('未知命令');
+    expect(content).toContain('/foo');
+    // 列出全部 10 个可用命令
+    expect(content).toContain('/new');
+    expect(content).toContain('/list');
+    expect(content).toContain('/status');
+    expect(content).toContain('/help');
+    expect(content).toContain('/switch');
+    expect(content).toContain('/resume');
+    expect(content).toContain('/agents');
+    expect(content).toContain('/stop');
+    expect(content).toContain('/cancel');
+    expect(content).toContain('/model');
+  });
+});

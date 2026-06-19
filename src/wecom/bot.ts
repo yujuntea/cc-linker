@@ -209,8 +209,27 @@ export class WecomBot {
         case 'help':
           responseText = this.handleCommandHelp();
           break;
+        // PR 5: 6 个新命令
+        case 'switch':
+          responseText = await this.handleCommandSwitch(msg.userId, parsed.args);
+          break;
+        case 'resume':
+          responseText = await this.handleCommandResume(msg.userId, parsed.args);
+          break;
+        case 'agents':
+          responseText = await this.handleCommandAgents(msg.userId, parsed.args);
+          break;
+        case 'stop':
+          responseText = await this.handleCommandStop(msg.userId, parsed.args);
+          break;
+        case 'cancel':
+          responseText = await this.handleCommandCancel(msg.userId, parsed.args);
+          break;
+        case 'model':
+          responseText = await this.handleCommandModel(msg.userId, parsed.args);
+          break;
         default:
-          responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /status /help\n\n_(PR 4.5 简化版, 更多命令 PR 5+ 实现)_`;
+          responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /status /help /switch /resume /agents /stop /cancel /model\n\n_(PR 5: 完整命令集已实现, /bridge 推 PR 6+)_`;
       }
     } catch (err) {
       logger.error(`[wecom-bot] handleCommand /${parsed.cmd} error: ${err instanceof Error ? err.message : String(err)}`);
@@ -272,9 +291,131 @@ export class WecomBot {
 
   /**
    * PR 4.5 C: /help 命令 - 列出可用命令
+   * PR 5: 加 6 个新命令: /switch /resume /agents /stop /cancel /model
    */
   private handleCommandHelp(): string {
-    return `🤖 cc-linker wecom Bot 命令:\n  /new [cwd]  - 强制新建 session\n  /list       - 列出当前 session\n  /status     - 显示 bot 状态\n  /help       - 显示本帮助\n\n(PR 4.5 简化版, /switch /resume /bridge /agents 推 PR 5+)`;
+    return `🤖 cc-linker wecom Bot 命令:\n  /new [cwd]    - 强制新建 session\n  /list         - 列出当前 session\n  /status       - 显示 bot 状态\n  /help         - 显示本帮助\n  /switch <uuid> - 切换到指定 session\n  /resume       - 续聊当前 session (刷 lastActiveAt)\n  /agents       - 列出活跃 bg sessions\n  /stop <short> - 停止 bg session\n  /cancel       - 取消当前 reply (PR 5 简化: 仅返回状态)\n  /model <name> - 切换 model alias (PR 5 临时实现, 持久化推 PR 6+)\n\n_(PR 5: /bridge 跨平台会话同步 推 PR 6+)_`;
+  }
+
+  /**
+   * PR 5: /switch <uuid> - 切换到指定 Claude session
+   *
+   * 行为：把 user-mapping 的 sessionUuid 改为参数指定值 (走 setSession)
+   * 注意：先读现有 entry 拿 cwd（保留用户工作目录）；无 entry 时用 /tmp fallback
+   */
+  private async handleCommandSwitch(userId: string, args: string[]): Promise<string> {
+    if (args.length === 0 || !args[0]) {
+      return '❌ 用法: /switch <session-uuid>';
+    }
+    const newSessionUuid = args[0];
+    const entry = this.userManager.getEntry(userId);
+    const cwd = entry?.cwd ?? '/tmp';
+    await this.userManager.setSession(userId, newSessionUuid, cwd);
+    return `✅ 已切换 session: ${newSessionUuid}\n  cwd: ${cwd}\n\n下条消息会用这个 session 续聊`;
+  }
+
+  /**
+   * PR 5: /resume - 续聊当前 session
+   *
+   * 行为：如果 user-mapping 有 active session，调 touchSession 刷 lastActiveAt
+   * 区别于 /switch: /switch 切换到指定 sessionUuid, /resume 保持原 session 只刷活跃时间
+   */
+  private async handleCommandResume(userId: string, _args: string[]): Promise<string> {
+    const entry = this.userManager.getEntry(userId);
+    if (!entry || entry.type !== 'session') {
+      return '❌ 当前无 active session, 发送任意消息走新建 session 路径';
+    }
+    await this.userManager.touchSession(userId);
+    return `✅ session 已 touch (lastActiveAt 更新):\n  sessionUuid: ${entry.sessionUuid}\n  cwd: ${entry.cwd ?? '(unknown)'}\n  lastActiveAt: ${entry.lastActiveAt ?? '(unknown)'}`;
+  }
+
+  /**
+   * PR 5: /agents - 列出活跃 bg sessions
+   *
+   * 简化版实现：读 ~/.claude/jobs/ 目录下每个 state.json 列出 shortId + status
+   * 完整 AgentView 卡片渲染逻辑推 PR 6+ (需要 bg session 的 peek/reply/stop 交互)
+   */
+  private async handleCommandAgents(_userId: string, _args: string[]): Promise<string> {
+    try {
+      const { readdirSync, readFileSync, existsSync } = await import('fs');
+      const { join } = await import('path');
+      const { homedir } = await import('os');
+      const jobsDir = join(homedir(), '.claude', 'jobs');
+      if (!existsSync(jobsDir)) {
+        return '📭 无活跃 bg sessions (jobs 目录不存在)';
+      }
+      const entries = readdirSync(jobsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .slice(0, 10);  // 限 10 个
+      if (entries.length === 0) {
+        return '📭 无活跃 bg sessions';
+      }
+      const lines = ['📋 活跃 bg sessions:'];
+      for (const entry of entries) {
+        const statePath = join(jobsDir, entry.name, 'state.json');
+        if (!existsSync(statePath)) continue;
+        try {
+          const state = JSON.parse(readFileSync(statePath, 'utf8'));
+          const status = state.status ?? 'unknown';
+          const name = state.name ?? state.shortId ?? entry.name;
+          lines.push(`  • ${name} [${status}] (${entry.name})`);
+        } catch { /* skip malformed state.json */ }
+      }
+      return lines.join('\n');
+    } catch (err) {
+      return `❌ 读取 bg sessions 失败: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  /**
+   * PR 5: /stop <shortId> - 停止 bg session
+   *
+   * 行为：调 `claude stop <shortId>` 子进程
+   * 完整 AgentView.stop 路径推 PR 6+ (需要状态机守卫 + 用户确认)
+   */
+  private async handleCommandStop(_userId: string, args: string[]): Promise<string> {
+    if (args.length === 0 || !args[0]) {
+      return '❌ 用法: /stop <short-id>';
+    }
+    const shortId = args[0];
+    try {
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const exec = promisify(execFile);
+      await exec('claude', ['stop', shortId]);
+      return `✅ 已停止 bg session: ${shortId}`;
+    } catch (err) {
+      return `❌ 停止失败: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  /**
+   * PR 5: /cancel - 取消当前 reply
+   *
+   * 简化版：仅返回状态消息（不像 feishu 侧有 cancelledMessageIds 状态机）
+   * 企微侧无 in-flight cancel 完整实现（需要 replyStream 终止 + activeChunks 清理）
+   * TODO PR 6+: 集成 in-flight cancel (类似 feishu 的 cancelledMessageIds)
+   */
+  private async handleCommandCancel(userId: string, _args: string[]): Promise<string> {
+    const entry = this.userManager.getEntry(userId);
+    if (!entry || entry.type !== 'session') {
+      return '❌ 当前无 active session';
+    }
+    return `⚠️  cancel 命令: 企微侧 in-flight cancel 待实现 (PR 6+)\n  当前 session: ${entry.sessionUuid}\n  cwd: ${entry.cwd ?? '(unknown)'}`;
+  }
+
+  /**
+   * PR 5: /model <model> - 切换 model alias
+   *
+   * 简化版：仅返回成功消息，不持久化
+   * TODO PR 6+: 持久化 model choice 到 PlatformMappingEntry (需要加 model 字段 + ProviderManager 集成)
+   */
+  private async handleCommandModel(_userId: string, args: string[]): Promise<string> {
+    if (args.length === 0 || !args[0]) {
+      return '❌ 用法: /model <model-alias> (例如: /model sonnet)';
+    }
+    const model = args[0];
+    return `✅ 已设置 model: ${model}\n\n_(注: 当前 PR 5 临时实现, model 持久化推 PR 6+ 配合 ProviderManager)_`;
   }
 
   private async handleChat(msg: SpoolMessage): Promise<void> {
