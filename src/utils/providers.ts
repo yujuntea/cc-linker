@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, openSync, writeSync, closeSync, fsyncSync, renameSync, rmSync } from 'fs';
 import { join, basename } from 'path';
 import { CC_LINKER_DIR, expandPath } from './paths';
 import { logger } from './logger';
@@ -136,7 +136,18 @@ export class ProviderManager {
           const tmpPath = filePath + '.tmp';
           // Include name for display; Claude CLI ignores unknown fields in settings files
           const configWithName = { ...cleanConfig, name: row.name, alias: cleanConfig.alias };
-          writeFileSync(tmpPath, JSON.stringify(configWithName, null, 2), { mode: 0o600 });
+          // M-3 (0 字节 bug 修复): writeFileSync + renameSync 在 macOS fsync 时序问题下可能留 0 字节
+          //   (daemon SIGKILL 时 write 还没落盘)。改用 openSync + writeSync (sync 写)
+          //   + fsyncSync (强制刷盘) + closeSync + renameSync, 确保 0 字节不出现。
+          //   与 src/queue/spool.ts:586-602 writeAtomic / src/platform/user-state.ts:95-110 saveMapping 修法对称。
+          const configStr = JSON.stringify(configWithName, null, 2);
+          const fd = openSync(tmpPath, 'w', 0o600);
+          try {
+            writeSync(fd, configStr);
+            fsyncSync(fd);
+          } finally {
+            closeSync(fd);
+          }
           renameSync(tmpPath, filePath);
         } catch (err) {
           logger.warn(`Skipping CC Switch provider "${row.name}": ${err}`);
