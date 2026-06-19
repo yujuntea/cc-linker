@@ -85,6 +85,13 @@ interface PipelineRecord {
   totalCostUsd: number;
   parseDegraded?: ParseDegradedEvent[];
   contextResets?: ContextResetEvent[];
+  /** v2.1.2：context overflow 累计触发次数（每次 EXTERNAL_REVIEW.done 超阈值 +1） */
+  contextOverflowCount?: number;
+  /** v2.1.2：EXTERNAL_REVIEW opinions 落盘路径（worker 通过 @file 引用） */
+  contextFiles?: {
+    externalReviewJson?: string;
+    externalReviewMd?: string;
+  };
 }
 
 interface PaneRegistry {
@@ -118,9 +125,12 @@ interface ContextResetEvent {
   ts: string;
   triggerRound: number;
   usageBefore: { used: number; max: number; model: string };
-  strategy: 'reset' | 'abort';
-  checkpointSha: string | null;
+  /** v2.1.2：增加 'compact' 档 */
+  strategy: 'compact' | 'reset' | 'abort';
+  checkpointSha: string | null;   // compact 档为 null（无需 git checkpoint）
   injectedIssueCount?: number;
+  /** v2.1.2：compact 档记录 post-compact usage，用于验证 compact 是否有效 */
+  postUsage?: { used: number; max: number; model: string };
 }
 
 interface HistoryEvent {
@@ -247,11 +257,12 @@ max_concurrent_pipelines = 1
 human_decide_timeout_ms = 14400000   # 4h 默认
 p0_p1_reject_threshold = 0.30
 
-# context overflow 策略
-context_overflow_threshold_1m = 512000
-context_overflow_threshold_default = 200000
-context_overflow_strategy = "reset"          # "reset" | "abort"
-context_overflow_hysteresis_rounds = 1
+# context overflow 策略（v2.1.2 cascade）
+context_overflow_threshold_1m = 460000         # 1M 模型阈值（>512K 模型效率显著下降，故降到 460K）
+context_overflow_threshold_percent = 0.80     # 非 1M 模型：max * 80%（修 128K/200K 模型 bug）
+context_overflow_strategy = "cascade"         # v2.1.2：唯一策略 = cascade（compact → reset → abort）
+max_compact_attempts = 1                      # v2.1.2：compact 档最多尝试次数（n=1 试 compact，n≥2 直接 reset）
+compact_timeout_ms = 30000                    # /compact 单次超时（30s）
 max_injected_issues = 20
 
 # parse retry
@@ -486,49 +497,215 @@ type ExtendedJobStateFile = JobStateFile & {
 
 #### 7.5.7 Context Window 策略化处理
 
-##### 7.5.7.1 触发点
+##### 7.5.7.1 触发点（v2.1.2 cascade 入口）
 
-在 `onExternalReviewComplete` 内同步调用 `checkContextOverflow()`：
+在 `onExternalReviewComplete` 内同步调用 `checkContextOverflow()` + cascade dispatch：
 
 ```typescript
 async function onExternalReviewComplete(pipeline: PipelineRecord): Promise<void> {
-  const contextCheck = await checkContextOverflow(workShortId, profile, pipeline.totalCostUsd);
+  const contextCheck = await checkContextOverflow(pipeline.panes.work!.currentRoundShortId!, profile);
 
   if (!contextCheck.overflow) {
+    // context OK：先写文件（让后续 JUDGE_BY_WORK 可以 @file 引用），再正常推进
+    await writeReviewOpinionsToFile(pipeline, currentReviewOpinions(pipeline));
     await transitionTo(pipeline, 'JUDGE_BY_WORK');
     return;
   }
 
-  switch (profile.guards.context_overflow_strategy) {
-    case 'reset': await executeContextReset(pipeline, contextCheck, profile); break;
-    case 'abort': await executeContextAbort(pipeline, contextCheck); break;
+  // 超阈值：累计 +1，进入 cascade
+  pipeline.contextOverflowCount = (pipeline.contextOverflowCount ?? 0) + 1;
+  const n = pipeline.contextOverflowCount;
+
+  // 无论哪一档，都先写 review opinions 文件（compact/reset 都要用）
+  await writeReviewOpinionsToFile(pipeline, currentReviewOpinions(pipeline));
+
+  // 3 档 cascade dispatch
+  const maxCompact = profile.guards.max_compact_attempts ?? 1;
+  if (n <= maxCompact) {
+    // n=1: 试 compact
+    const compactOk = await executeContextCompact(pipeline, contextCheck, profile);
+    if (!compactOk) {
+      // compact 失败 / 仍超阈值 → 升级到 reset
+      await executeContextReset(pipeline, contextCheck, profile);
+    }
+  } else if (n === maxCompact + 1) {
+    // n=2: 直接 reset（不再试 compact，避免重复失败）
+    await executeContextReset(pipeline, contextCheck, profile);
+  } else {
+    // n≥3: abort（max attempts reached）
+    await executeContextAbort(pipeline, contextCheck);
   }
 }
 ```
 
-##### 7.5.7.2 阈值判断
+**为什么 compact 失败也要 cascade 内升级到 reset？**
+- compact 失败说明 context 已极度饱和（剩余空间不够 summarization）
+- 此时再试 compact 没意义，直接 reset 是唯一出路
+- 这避免"compact → 失败 → 再 compact → 再失败"的循环
+
+##### 7.5.7.2 阈值判断（v2.1.2 修 bug）
+
+**问题**：原版 `maxContext >= 1_000_000` 分支绝对值阈值（512K / 200K）在 128K 模型上**永不会触发**（max < threshold）。
+
+**新规则**：百分比 + 绝对值混合，按模型 context 上限分档：
 
 ```typescript
-async function checkContextOverflow(workShortId, profile, currentCostUsd): Promise<ContextCheckResult> {
+function resolveThreshold(usage: ContextUsage, profile: ReviewProfile): number {
+  const max = profile.contextLimits?.[usage.model] ?? usage.max;
+
+  if (max >= 1_000_000) {
+    // 1M+ 模型：固定 460K（>512K 模型效率显著下降，故降到 460K 提前干预）
+    return profile.guards.context_overflow_threshold_1m ?? 460_000;
+  }
+  // 其他模型：百分比（默认 80%），正确处理 128K / 200K / 256K 模型
+  const percent = profile.guards.context_overflow_threshold_percent ?? 0.80;
+  return Math.floor(max * percent);
+}
+
+async function checkContextOverflow(workShortId, profile): Promise<ContextCheckResult> {
   const usage = await adapter.getContextUsage(workShortId);
   if (!usage) return { overflow: false, reason: 'no_usage_data', ... };
 
-  const maxContext = profile.contextLimits?.[usage.model] ?? usage.max;
-  const threshold = maxContext >= 1_000_000
-    ? profile.guards.context_overflow_threshold_1m ?? 512_000
-    : profile.guards.context_overflow_threshold_default ?? 200_000;
-
+  const threshold = resolveThreshold(usage, profile);
   return { overflow: usage.used >= threshold, usage, threshold, ... };
 }
 ```
 
-##### 7.5.7.3 策略 1：`reset`（默认）
+**修复前后对比**：
 
-杀 work → spawn 新 work → 注入 review issues + history + docs → worker verify+fix → DONE。
+| 模型 | max | v2.1.1 threshold | v2.1.2 threshold | v2.1.2 触发点 | 评估 |
+|------|-----|-----------------|------------------|--------------|------|
+| `MiniMax-M3` | 1M | 512K (50%) | 460K (46%) | used ≥ 460K | ✅ 提前干预 |
+| `claude-sonnet-4-5` | 1M | 512K (50%) | 460K (46%) | used ≥ 460K | ✅ 提前干预 |
+| `claude-sonnet-4` | 200K | 200K (100%) | 160K (80%) | used ≥ 160K | ✅ 修太晚触发 |
+| `kimi-for-coding` | 256K | 200K (78%) | 204K (80%) | used ≥ 204K | ✅ 略晚于原版 |
+| `bailian-qwen3.6` | 128K | 200K (不可能) | 102K (80%) | used ≥ 102K | ✅ 修永不会触发 |
+
+##### 7.5.7.3 策略 1：`compact`（v2.1.2 新增，第 1 档）
+
+**触发**：cascade n=1（首次超阈值）
+
+**做法**：在同 session 内 injectReply `/compact` → 等 compact 完成 → 重新检查 usage → 若降到阈值以下则注入 JUDGE prompt（同 session 继续）。
+
+**前置条件**：work session 必须还活着 + `/compact` CLI 支持（Claude CLI ≥ 2.1.163 满足）。
+
+**4 个不变量**：
+1. work session 仍是唯一修复者（sessionId 跨 compact 不变）
+2. context 缩到阈值以下，但 issue 记忆通过 `writeReviewOpinionsToFile` 保留（worker 用 @file 引用）
+3. verify-first 不变
+4. 同 session 连续，pipeline 不增 round
+
+```typescript
+async function executeContextCompact(
+  pipeline: PipelineRecord,
+  contextCheck: ContextCheckResult,
+  profile: ReviewProfile,
+): Promise<boolean> {  // 返回 true = compact 成功，false = 失败需升级
+  const signal = pipelineState.get(pipeline.pipelineId)?.abortController.signal;
+  const checkAbort = () => {
+    if (signal?.aborted) throw new AbortError('compact aborted by user cancel');
+  };
+
+  const workShortId = pipeline.panes.work!.currentRoundShortId!;
+
+  try {
+    // 1. injectReply /compact（不需要新 prompt template，复用 CLI 内置命令）
+    await adapter.injectReply({
+      shortId: workShortId,
+      text: '/compact',
+    });
+    checkAbort();
+
+    // 2. 等 compact 完成（poll state.json 到 done/blocked）
+    const compactTimeout = profile.guards.compact_timeout_ms ?? 30_000;
+    await adapter.poll(workShortId, compactTimeout);
+    checkAbort();
+
+    // 3. 重新测 usage
+    const postUsage = await adapter.getContextUsage(workShortId);
+    if (!postUsage) {
+      logger.warn(`Compact ${workShortId}: post-compact usage unavailable, escalating to reset`);
+      return false;
+    }
+
+    if (postUsage.used >= contextCheck.threshold) {
+      logger.warn(`Compact ${workShortId}: post-compact usage ${postUsage.used} >= threshold ${contextCheck.threshold}, escalating`);
+      return false;
+    }
+
+    // 4. compact 成功：注入 JUDGE prompt（用 @file 引用 review 文件）
+    const continuePrompt = buildCompactContinuePrompt({
+      pipelineId: pipeline.pipelineId,
+      externalReviewMdPath: pipeline.contextFiles!.externalReviewMd!,
+      externalReviewJsonPath: pipeline.contextFiles!.externalReviewJson!,
+      contextUsageBefore: contextCheck.usage!,
+      contextUsageAfter: postUsage,
+      round: pipeline.state.round,
+    });
+    await adapter.injectReply({
+      shortId: workShortId,
+      text: continuePrompt,
+    });
+    checkAbort();
+
+    // 5. 更新 state：EXTERNAL_REVIEW → JUDGE_BY_WORK（同 session）
+    pipeline.state = {
+      kind: 'JUDGE_BY_WORK',
+      pipelineId: pipeline.pipelineId,
+      round: pipeline.state.round,
+      pane: 'work',
+      contextOverflowApplied: 'compact',
+    };
+
+    // 6. 记录 context overflow 事件（checkpointSha=null 因为同 session 无需 commit）
+    pipeline.contextResets = pipeline.contextResets ?? [];
+    pipeline.contextResets.push({
+      ts: new Date().toISOString(),
+      triggerRound: pipeline.state.round,
+      usageBefore: contextCheck.usage!,
+      strategy: 'compact',
+      checkpointSha: null,
+      injectedIssueCount: countIssuesInReviewOpinions(currentReviewOpinions(pipeline)),
+      postUsage: { used: postUsage.used, max: postUsage.max, model: postUsage.model },
+    });
+
+    await pipelineStore.saveRunning(pipeline);
+    return true;
+  } catch (err) {
+    // compact 失败（超时、CLI error、PANE_LOST 等）→ 升级 reset
+    logger.warn(`Compact ${workShortId} failed: ${err.message}, escalating to reset`);
+    return false;
+  }
+}
+```
+
+**compact prompt 模板**：
+
+```toml
+[prompts.work.compact_continue.system]
+template = """
+你的 context 在前一轮 EXTERNAL_REVIEW 后已 compact：
+- compact 前 usage: {context_usage_before_used} / {context_usage_before_max} tokens
+- compact 后 usage: {context_usage_after_used} / {context_usage_after_max} tokens
+
+外部 review 意见已写入文件（请用 @file 引用，不要 inline 复制）：
+- 可读版: @{external_review_md_path}
+- 结构化: @{external_review_json_path}
+
+请先 cat 可读版了解 review 意见，然后逐条判断 accept / reject / partial。
+输出 JSON: { "per_issue": [...], "reasoning": "..." }
+"""
+```
+
+##### 7.5.7.4 策略 2：`reset`（v2.1.2 第 2 档）
+
+**触发**：cascade n=2（compact 失败或二次超阈值）
+
+**做法**：杀 work → spawn 新 work → 注入 review issues + history + docs → worker verify+fix → DONE。
 
 **3 个不变量**：
-1. work session 仍是唯一修复者
-2. context fresh 但 issue 记忆保留
+1. work session 仍是唯一修复者（新 sessionId）
+2. context fresh + issue 记忆保留（injectedIssues + history + relatedDocs + @file 引用 review opinions）
 3. verify-first 不变
 
 ```typescript
@@ -545,8 +722,8 @@ async function executeContextReset(
   try {
     const workShortId = pipeline.panes.work!.currentRoundShortId!;
 
-    // 1. snapshot cwd
-    const checkpointSha = await snapshotCwd(pipeline.input.cwd, `pre-context-reset for pipeline ${pipeline.pipelineId}`);
+    // 1. snapshot cwd（compact 升级到 reset 时也走这一步）
+    const checkpointSha = await snapshotCwd(pipeline.input.cwd, `pre-context-reset for pipeline ${pipeline.pipelineId} (cascade n=${pipeline.contextOverflowCount})`);
     checkAbort();
 
     // 2. 收集给新 worker 的"外部记忆"
@@ -559,7 +736,7 @@ async function executeContextReset(
     await adapter.stop(workShortId);
     checkAbort();
 
-    // 4. spawn 新 work session with 完整 context
+    // 4. spawn 新 work session with 完整 context（@file 引用 review opinions）
     const newWorkPrompt = buildContextResetPrompt({
       pipelineId: pipeline.pipelineId,
       contextUsage: contextCheck.usage,
@@ -569,6 +746,8 @@ async function executeContextReset(
       relatedDocs,
       truncatedCount,
       nextRound: pipeline.state.round + 1,
+      externalReviewMdPath: pipeline.contextFiles?.externalReviewMd,
+      externalReviewJsonPath: pipeline.contextFiles?.externalReviewJson,
     });
     const newWork = await adapter.startSession({
       role: 'work',
@@ -592,7 +771,7 @@ async function executeContextReset(
       round: pipeline.state.round + 1,
       cycle: 'postfix',
       pane: 'work',
-      contextReset: true,
+      contextOverflowApplied: 'reset',
       injectedIssues,
     };
 
@@ -623,9 +802,224 @@ async function executeContextReset(
 }
 ```
 
-##### 7.5.7.4 策略 2：`abort`
+##### 7.5.7.5 策略 3：`abort`（v2.1.2 第 3 档）
 
-cleanup → ABORTED reason=`context_overflow`。
+**触发**：cascade n≥3（max attempts reached）
+
+cleanup → ABORTED reason=`context_overflow_max_attempts`。
+
+```typescript
+async function executeContextAbort(
+  pipeline: PipelineRecord,
+  contextCheck: ContextCheckResult,
+): Promise<void> {
+  await cleanupPipeline(pipeline.pipelineId, 'context_overflow_max_attempts');
+  pipeline.state = {
+    kind: 'ABORTED',
+    pipelineId: pipeline.pipelineId,
+    round: pipeline.state.round,
+    reason: 'context_overflow_max_attempts',   // v2.1.2：从 'context_overflow' 区分
+    abortedBefore: 'EXTERNAL_REVIEW',
+  };
+  pipeline.contextResets!.push({
+    ts: new Date().toISOString(),
+    triggerRound: pipeline.state.round,
+    usageBefore: contextCheck.usage!,
+    strategy: 'abort',
+    checkpointSha: null,
+  });
+  await pipelineStore.saveRunning(pipeline);
+}
+```
+
+---
+
+#### 7.5.8 Review Opinions 落盘（v2.1.2 新增）
+
+**动机**：EXTERNAL_REVIEW 完成时，review opinions 之前只在内存里，injectReply 时塞进 prompt。问题：
+- prompt 膨胀（review issues >10 条时 prompt 可能超 30K tokens）
+- worker 无法用 `@file` 精确定位
+- 跨崩溃恢复时 Reconciler 拿不到 review 历史
+
+**方案**：EXTERNAL_REVIEW 完成时，把 opinions 写到 `~/.cc-linker/review-pipelines/<pipelineId>/state/external-review-r<N>.{json,md}`，JUDGE/FIXING prompt 改用 `@file` 引用。
+
+##### 7.5.8.1 路径规则
+
+```
+~/.cc-linker/review-pipelines/
+└── <pipelineId>/
+    ├── running.json                    # PipelineRecord 主文件
+    ├── state/                          # v2.1.2 新增：context-related artifacts
+    │   ├── external-review-r1.json     # 第 1 轮 external review 产出（结构化）
+    │   ├── external-review-r1.md       # 第 1 轮（可读）
+    │   ├── external-review-r2.json     # 第 2 轮（如有）
+    │   ├── external-review-r2.md
+    │   └── ...
+    ├── context-reset-r2.json           # 第 2 轮 reset 时的 injected context 快照（可选，便于 debug）
+    └── done.md / failed.md / aborted.md   # 最终报告（既有 §8.4）
+```
+
+##### 7.5.8.2 JSON Schema（结构化版）
+
+```typescript
+interface ReviewOpinionsFile {
+  pipelineId: string;
+  round: number;
+  generatedAt: string;
+  threshold: { used: number; max: number; model: string };
+  reviews: ReviewOpinion[];
+}
+
+interface ReviewOpinion {
+  role: 'review';
+  provider: string;
+  sessionId: string;
+  shortId: string;
+  completedAt: string;
+  issues: Issue[];
+  /** context overflow 触发时，记录 cascade n */
+  cascadeN?: number;
+  /** context overflow 触发时，记录策略 */
+  cascadeStrategy?: 'compact' | 'reset' | 'none';
+}
+```
+
+##### 7.5.8.3 MD 渲染（可读版）
+
+```markdown
+# External Review — Pipeline <pipelineId> Round <N>
+
+**Generated**: <ISO timestamp>
+**Provider**: <kimi-for-coding>
+**Session**: <uuid>
+**Context at trigger**: <used>/<max> tokens
+
+## P0 (Critical) — 3 issues
+
+### P0-1: NPE in auth.ts:42
+- **Location**: src/auth.ts:42
+- **Description**: ...
+- **Suggestion**: ...
+
+### P0-2: ...
+
+## P1 (High) — 2 issues
+
+...
+
+## P2 (Medium) — 1 issue
+
+...
+
+## P3 (Low) — 0 issues
+```
+
+##### 7.5.8.4 写入实现
+
+```typescript
+async function writeReviewOpinionsToFile(
+  pipeline: PipelineRecord,
+  reviews: ReviewOpinion[],
+): Promise<{ jsonPath: string; mdPath: string }> {
+  const dir = path.join(
+    expandPath('~/.cc-linker/review-pipelines'),
+    pipeline.pipelineId,
+    'state',
+  );
+  await fs.mkdir(dir, { recursive: true });
+
+  const round = pipeline.state.round;
+  const baseName = `external-review-r${round}`;
+  const jsonPath = path.join(dir, `${baseName}.json`);
+  const mdPath = path.join(dir, `${baseName}.md`);
+
+  // 收集 context 状态（用于 header）
+  const usage = await adapter.getContextUsage(pipeline.panes.work!.currentRoundShortId!);
+  const threshold = usage ? resolveThreshold(usage, profileOf(pipeline)) : null;
+
+  const file: ReviewOpinionsFile = {
+    pipelineId: pipeline.pipelineId,
+    round,
+    generatedAt: new Date().toISOString(),
+    threshold: usage
+      ? { used: usage.used, max: usage.max, model: usage.model }
+      : { used: 0, max: 0, model: 'unknown' },
+    reviews: reviews.map(r => ({
+      ...r,
+      cascadeN: pipeline.contextOverflowCount,
+      cascadeStrategy: pipeline.contextOverflowCount
+        ? (pipeline.contextOverflowCount === 1 ? 'compact' : 'reset')
+        : 'none',
+    })),
+  };
+
+  // 原子写
+  await Bun.write(`${jsonPath}.tmp`, JSON.stringify(file, null, 2));
+  await fs.rename(`${jsonPath}.tmp`, jsonPath);
+
+  await Bun.write(`${mdPath}.tmp`, renderReviewOpinionsMd(file));
+  await fs.rename(`${mdPath}.tmp`, mdPath);
+
+  // 更新 PipelineRecord 引用
+  pipeline.contextFiles = {
+    externalReviewJson: jsonPath,
+    externalReviewMd: mdPath,
+  };
+
+  return { jsonPath, mdPath };
+}
+```
+
+##### 7.5.8.5 JUDGE/FIXING prompt 改造
+
+**原版 prompt**（v2.1.1）：inline 塞 review opinions JSON
+```
+外部 review issues：{reviews_json_for_each_role}   # 可能 5K-30K tokens
+```
+
+**新版 prompt**（v2.1.2）：@file 引用
+```toml
+[prompts.work.judge.system]
+template = """
+外部 review 意见已写入文件（请用 @file 引用，不要 inline 复制）：
+- 可读版: @{external_review_md_path}
+- 结构化: @{external_review_json_path}
+
+请先 cat 可读版了解每条 issue 的 severity / location / description，
+然后参考结构化版获取 issue_id 用于 per_issue 决策。
+
+工作产物：{artifact}
+
+逐条评估：accept / reject / partial
+输出 JSON: { "per_issue": [...], "reasoning": "..." }
+"""
+
+[prompts.work.fixing.system]   # injectReply 用，引用同一文件
+template = """
+待修复的 issues 已写入文件：
+- 可读版: @{external_review_md_path}
+
+请先 cat 了解要修什么，然后 verify-first 流程：
+1. 重新阅读相关代码，判断 real 还是 hallucination
+2. 修复（仅 real），修改要最小化
+3. 验证修复正确
+
+输出 JSON: { "per_issue": [...], "all_real_fixed": bool, ... }
+"""
+```
+
+##### 7.5.8.6 Reconciler 恢复增强
+
+启动时扫描 `state/external-review-r*.json`，可以直接看到每轮 EXTERNAL_REVIEW 的产出，无需重新 parse review pane。
+
+##### 7.5.8.7 边界 case
+
+| 场景 | 处理 |
+|------|------|
+| 写文件失败（磁盘满 / 权限） | log error，继续 pipeline（fallback 到 inline prompt 注入） |
+| json 文件损坏 | Reconciler 检测 + 跳过 + warn（不影响 pipeline 恢复） |
+| MD 渲染失败（issues 字段缺失） | 降级：只写 json，MD 留 `.md.disabled` 占位 |
+| `external_review_md_path` 不存在（首次写） | prompt 模板降级到 inline 注入 |
 
 ---
 

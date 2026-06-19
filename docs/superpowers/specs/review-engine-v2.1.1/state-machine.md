@@ -116,7 +116,7 @@ type ReviewState =
   | { kind: 'PRODUCING';         pipelineId; round: number; pane: 'work' }
   // === 自查阶段（identify-only，fix 在后续 FIXING 节点）===
   | { kind: 'SELF_REVIEW_R1';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work';
-                                  contextReset?: boolean;
+                                  contextOverflowApplied?: 'reset';   // v2.1.2：从原 contextReset 升级
                                   injectedIssues?: Issue[] }
   | { kind: 'SELF_REVIEW_R2';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
   // === 修复节点（从 R1/R2/JUDGE/HUMAN 4 个调用点统一进入）===
@@ -127,7 +127,8 @@ type ReviewState =
   | { kind: 'EXTERNAL_REVIEW';   pipelineId; round: number; cycle: 'initial' | 'postfix';
                                   pane: { role: 'review'; shortId: string } }
   // === 评判（2 值 verdict）===
-  | { kind: 'JUDGE_BY_WORK';     pipelineId; round: number; pane: 'work' }
+  | { kind: 'JUDGE_BY_WORK';     pipelineId; round: number; pane: 'work';
+                                  contextOverflowApplied?: 'compact' } // v2.1.2：通过 compact 抵达此状态
   // === pane 丢失（用户询问，不直接 FAILED）===
   | { kind: 'PANE_LOST';         pipelineId; round: number;
                                   lostPane?: { role: 'work' | 'review'; shortId: string };
@@ -137,7 +138,7 @@ type ReviewState =
   | { kind: 'HUMAN_DECIDE';      pipelineId; round: number; pending: DecisionContext }
   // === 终态 ===
   | { kind: 'DONE';              pipelineId; round: number; totalCostUsd; issueTrail;
-                                  contextOverflowApplied?: 'reset' | 'abort' }
+                                  contextOverflowApplied?: 'compact' | 'reset' }   // v2.1.2：abort 不进 DONE
   | { kind: 'FAILED';            pipelineId; round: number; reason; totalCostUsd }
   | { kind: 'ABORTED';           pipelineId; round: number; reason; abortedBefore };
 ```
@@ -212,9 +213,10 @@ stateDiagram-v2
     SELF_REVIEW_R2 --> FIXING : R2 found issues
     SELF_REVIEW_R2 --> DONE : R2 clean
     FIXING --> EXTERNAL_REVIEW : verify and fix done (source R2)
-    EXTERNAL_REVIEW --> JUDGE_BY_WORK : context OK
-    EXTERNAL_REVIEW --> SELF_REVIEW_R1 : context overflow, strategy=reset (round+1, new work + injectedIssues)
-    EXTERNAL_REVIEW --> ABORTED : context overflow, strategy=abort
+    EXTERNAL_REVIEW --> JUDGE_BY_WORK : context OK (write review opinions to file)
+    EXTERNAL_REVIEW --> JUDGE_BY_WORK : context overflow, n=1, compact OK (same work session)
+    EXTERNAL_REVIEW --> SELF_REVIEW_R1 : compact 失败 OR n=2, reset (round+1, new work + injectedIssues)
+    EXTERNAL_REVIEW --> ABORTED : context overflow, n≥3, max attempts reached
     JUDGE_BY_WORK --> FIXING : verdict accept (source JUDGE)
     JUDGE_BY_WORK --> HUMAN_DECIDE : verdict reject
     FIXING --> SELF_REVIEW_R1 : fix done (source JUDGE or HUMAN), round plus 1
@@ -237,10 +239,16 @@ stateDiagram-v2
     end note
 
     note right of EXTERNAL_REVIEW
-      v2.1.1 I9 reset 策略（3 路分发）：
+      v2.1.2 I9 cascade 策略（3 档 hysteresis）：
       - context < threshold → JUDGE_BY_WORK
-      - >= threshold, strategy=reset → executeContextReset → SELF_REVIEW_R1
-      - >= threshold, strategy=abort → ABORTED
+      - n=1 (1st overflow): executeContextCompact
+          → 成功 (post-compact < threshold): JUDGE_BY_WORK (同 session，@file 引用 review 文件)
+          → 失败 / 仍超阈值: 升级 → executeContextReset
+      - n=2: executeContextReset → SELF_REVIEW_R1 (round+1, 新 session + injectedIssues)
+      - n≥3: ABORTED reason=context_overflow_max_attempts
+
+      n = pipeline.contextOverflowCount 累计次数（每次 EXTERNAL_REVIEW.done 超阈值 +1）
+      阈值：1M 模型 = 460K（>512K 模型效率下降），其他 = max * 80%
     end note
 ```
 
@@ -265,24 +273,33 @@ stateDiagram-v2
                                                                 │EXTERNAL_REVIEW│
                                                                 │ (1 review)    │
                                                                 └──────┬───────┘
-                                                                       │ done
-                                                          ┌────────────┼────────────┐
-                                                          ▼            ▼            ▼
-                                                   ┌────────────┐ ┌─────────┐ ┌──────────┐
-                                                   │JUDGE_BY_WORK│ │SELF_REV_R1│ │ ABORTED  │
-                                                   │(injectReply)│ │(reset)   │ │(ctx_ovf) │
-                                                   └─────┬───────┘ └─────────┘ └──────────┘
-                                                         │
-                                              ┌──────────┴──────────┐
-                                              ▼ verdict=accept      ▼ verdict=reject
-                                        ┌──────────────┐    ┌──────────────┐
-                                        │    FIXING    │    │ HUMAN_DECIDE │
-                                        │ source=JUDGE │    │  (4h timeout)│
-                                        └──────┬───────┘    └──────┬───────┘
-                                               │                   │
-                                               ▼                   ▼
-                                        SELF_REVIEW_R1         FIXING(source=HUMAN)
-                                        (cycle=postfix)        → SELF_REVIEW_R1(postfix)
+                                                                       │ done + 写 review opinions 到文件
+                                                                       │
+                                                          ┌────────────┴───────────┬─────────────┐
+                                                          ▼ context OK              ▼ n=1          ▼ n≥2
+                                              ┌────────────────┐  ┌─────────────────┐  ┌────────────────┐
+                                              │ JUDGE_BY_WORK  │  │   /compact      │  │  strategy=reset│
+                                              │  (context OK)  │  │  (同 session)   │  │  (新 session) │
+                                              └────────┬───────┘  └────────┬────────┘  └────────┬───────┘
+                                                       │                  │                   │
+                                                       │          ┌───────┴────────┐          │
+                                                       │          ▼ 成功           ▼ 失败     │
+                                                       │   ┌─────────────┐ ┌──────────────┐ │
+                                                       │   │JUDGE_BY_WORK │ │ SELF_REVIEW_R1│ │
+                                                       │   │(contextCom..)│ │ (round+1)    │ │
+                                                       │   └──────┬──────┘ └──────────────┘ │
+                                                       │          │                        │
+                                                       ▼          ▼                        ▼
+                                                ┌──────────────────────┐          ┌──────────┐
+                                                ▼ verdict=accept        ▼ reject   │ ABORTED  │
+                                          ┌──────────────┐    ┌──────────────┐    │(n≥3 ovrf)│
+                                          │    FIXING    │    │ HUMAN_DECIDE │    └──────────┘
+                                          │ source=JUDGE │    │  (4h timeout)│
+                                          └──────┬───────┘    └──────┬───────┘
+                                                 │                   │
+                                                 ▼                   ▼
+                                          SELF_REVIEW_R1       FIXING(source=HUMAN)
+                                          (cycle=postfix)      → SELF_REVIEW_R1(postfix)
 ```
 
 #### 5.3.3 PANE_LOST 决策流程
@@ -318,15 +335,16 @@ stateDiagram-v2
 | **PRODUCING** | work bg state=`done` | SELF_REVIEW_R1 | 记录 `panes.work.sessionId` | work (bg short1) | 0 → 1 |
 | **SELF_REVIEW_R1** | work bg done, issues=[] | DONE | 生成 report + 移到 `done/` | work | 1 |
 | **SELF_REVIEW_R1** | work bg done, issues=[N] | FIXING (source=R1) | 记录 R1 issues 作为 `inputIssues` | work | 1 |
-| **SELF_REVIEW_R1 (contextReset=true)** | work bg done, all fixed | DONE | reset happy path | work (新 session) | round+1 |
-| **SELF_REVIEW_R1 (contextReset=true)** | work bg done, partial fix | SELF_REVIEW_R2 | reset mixed path | work (新 session) | round+1 |
+| **SELF_REVIEW_R1 (contextOverflowApplied='reset')** | work bg done, all fixed | DONE | reset happy path | work (新 session) | round+1 |
+| **SELF_REVIEW_R1 (contextOverflowApplied='reset')** | work bg done, partial fix | SELF_REVIEW_R2 | reset mixed path | work (新 session) | round+1 |
 | **SELF_REVIEW_R2** | work bg done, issues=[] | DONE | 生成 report | work | 不变 |
 | **SELF_REVIEW_R2** | work bg done, issues=[N] | FIXING (source=R2) | 记录 R2 issues | work | 不变 |
 | **FIXING (source=R1)** | done | SELF_REVIEW_R2 | 记录 per_issue | work | 不变 |
 | **FIXING (source=R2)** | done | EXTERNAL_REVIEW | 同上 | work | 不变 |
-| **EXTERNAL_REVIEW** | review state=`done` + context < threshold | JUDGE_BY_WORK | 收集 review opinions + checkContextOverflow | review (×1) | 不变 |
-| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, strategy=`reset` | SELF_REVIEW_R1 | executeContextReset 6 步 + round += 1 | work (新 session) | +1 |
-| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, strategy=`abort` | ABORTED | reason=`context_overflow` | — | 不变 |
+| **EXTERNAL_REVIEW** | review state=`done` + context < threshold | JUDGE_BY_WORK | 收集 review opinions + writeReviewOpinionsToFile | review (×1) | 不变 |
+| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n=1, **compact 成功** | JUDGE_BY_WORK | executeContextCompact + writeReviewOpinionsToFile + @file 引用 | work (同 session) | 不变 |
+| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n=1, **compact 失败** OR n=2 | SELF_REVIEW_R1 | executeContextReset 6 步 + round += 1 | work (新 session) | +1 |
+| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n≥3 | ABORTED | reason=`context_overflow_max_attempts` | — | 不变 |
 | **JUDGE_BY_WORK** | verdict=`accept` | FIXING (source=JUDGE) | 记录 accepted issues | work (injectReply) | 不变 |
 | **JUDGE_BY_WORK** | verdict=`reject` | HUMAN_DECIDE | 移到 `human_pending/` | work (injectReply) | 不变 |
 | **HUMAN_DECIDE** | user accept | FIXING (source=HUMAN) | 移到 `running/` | — | 不变 |
@@ -374,22 +392,43 @@ stateDiagram-v2
 
 **总耗时**：~6 分钟，3 cycles。
 
-#### 5.3.5.1 走查示例 2：context overflow 触发 I9 reset
+#### 5.3.5.1 走查示例 2：context overflow 触发 I9 cascade（compact 成功路径）
 
-**前置**：在 §5.3.5 示例的 round=1 中，假设 work session context 用量到 195K/200K（超阈值）。
+**前置**：在 §5.3.5 示例的 round=1 中，假设 work session context 用量到 195K/200K（超 80% 阈值）。
 
 | t (秒) | 状态 | round | 备注 |
 |--------|------|-------|------|
 | 130 | **EXTERNAL_REVIEW** | 1 | spawn short5 (kimi)；work session context 195K/200K |
 | 170 | EXTERNAL_REVIEW done | 1 | review state=done → onExternalReviewComplete 触发 checkContextOverflow |
-| 170.5 | (3 路分发) | 1 | 195K ≥ threshold → strategy=reset → executeContextReset |
-| 170.5+ | (reset 中) | 1 | 杀 work + 收集 5 issues + history + docs |
-| 175 | **SELF_REVIEW_R1** (postfix, contextReset=true) | **2** | spawn 新 work session |
-| 240 | SELF_REVIEW_R1 | 2 | worker verify+fix 完成，all_real_fixed=true |
-| 240+ | **DONE** | 2 | contextOverflowApplied='reset'，跳过 R2/JUDGE |
-| 175 | **SELF_REVIEW_R1** (postfix, contextReset=true) | **2** | spawn 新 work session |
-| 240 | SELF_REVIEW_R1 | 2 | worker verify+fix 完成，all_real_fixed=true |
-| 240+ | **DONE** | 2 | contextOverflowApplied='reset' |
+| 170.1 | (cascade n=1) | 1 | 195K ≥ threshold(160K) → executeContextCompact |
+| 170.2 | (compact 中) | 1 | injectReply `/compact` → poll → re-check |
+| 175 | (compact 完成) | 1 | post-compact usage 80K < threshold(160K) → compact 成功 |
+| 175.1 | (写文件) | 1 | writeReviewOpinionsToFile → state/external-review-r1.{json,md} |
+| 175.2 | (注入 judge prompt) | 1 | injectReply "读 @external-review-r1.md，judge accept/reject..." |
+| 175.5 | **JUDGE_BY_WORK** (contextOverflowApplied='compact') | 1 | 同 session，worker 继续 |
+| 200 | JUDGE_BY_WORK → **FIXING (source=JUDGE)** | 1 | accept verdict → verify+fix |
+| 240 | **SELF_REVIEW_R1** (cycle=postfix) | **2** | round+1（postfix cycle 触发 +1） |
+| 350 | SELF_REVIEW_R1 | 3 | 0 issues → DONE |
+
+**总耗时**：~6 分钟，3 cycles，1 次 compact。
+
+#### 5.3.5.2 走查示例 3：context overflow cascade 升级（compact 失败 → reset → abort）
+
+**前置**：在 §5.3.5 示例的 round=1 中，假设 work session context 用量到 198K/200K（极度接近上限，compact 无法消化）。
+
+| t (秒) | 状态 | round | n | 备注 |
+|--------|------|-------|---|------|
+| 130 | EXTERNAL_REVIEW | 1 | 0 | spawn short5；work context 198K/200K |
+| 170 | EXTERNAL_REVIEW done | 1 | 1 | 198K ≥ threshold(160K) → cascade n=1 → executeContextCompact |
+| 175 | (compact 失败) | 1 | 1 | /compact 后 usage 仍 180K ≥ threshold → 升级 reset |
+| 175+ | (reset 中) | 1 | 1 | 杀 work + spawn 新 + 注入 issues/history/docs + @file 引用 |
+| 180 | **SELF_REVIEW_R1** (postfix, contextOverflowApplied='reset') | **2** | 1 | 新 work session |
+| 280 | R1 → FIXING → R2 → EXTERNAL_REVIEW | 2 | 1 | 第二个 cycle 开始 |
+| 350 | EXTERNAL_REVIEW done | 2 | 2 | context 又到 190K/200K → cascade n=2 → 直接 reset（不再试 compact） |
+| 360 | SELF_REVIEW_R1 (reset) | **3** | 2 | 新 session again |
+| 460 | R1 → FIXING → R2 → EXTERNAL_REVIEW | 3 | 2 | 第三个 cycle |
+| 540 | EXTERNAL_REVIEW done | 3 | 3 | context 仍超 → n=3 → ABORTED |
+| 540+ | **ABORTED** (context_overflow_max_attempts) | 3 | 3 | max_attempts 触发 |
 
 ### 5.4 Verdict Decision Logic
 
