@@ -7,6 +7,7 @@
 import { aibotMessageToPlatform, type PlatformMessage } from '../platform/types';
 import { isCommandMessage, parseCommand } from '../platform/command-handler';
 import { logger } from '../utils/logger';
+import { config } from '../utils/config';
 import { AibotClient, type AibotMessageHandler } from './aibot-client';
 import { WecomStreamUpdater } from './stream-updater';
 import { WecomUserManager } from './mapping';
@@ -182,21 +183,98 @@ export class WecomBot {
   }
 
   private async handleCommand(msg: SpoolMessage): Promise<void> {
-    // PR 3 集成 handleCommand; 当前 E2E staging 只 echo back
-    // PR 2 v1.2.1 final (F1 修复): 从 msg.metadata.inboundFrame 读取（handleMessage 已在 metadata 存好）
-    // 不能空 — M4 修复要求 startProcessing 必传 inboundFrame，否则 throw → 命令 echo 永远发不出去
-    const inboundFrame = msg.metadata?.inboundFrame as any;
-    if (!inboundFrame) {
-      logger.error(`[wecom-bot] handleCommand: missing inboundFrame in metadata, command ${msg.text} cannot be echoed back`);
+    // PR 4.5 C: 命令路由 — 仿飞书侧命令处理，但用 sendMessage 推回 (没 CardUpdater)
+    // 历史: PR 2/3/4.1 阶段命令只 echo back (set up stub 收命令 E2E), 真实路由 PR 4.5+ 实现
+    // 简化版: 只支持 /new /list /status /help; /switch /resume /bridge /agents 推 PR 5+ 实现
+    const parsed = parseCommand(msg.text);
+    if (!parsed) {
+      logger.warn(`[wecom-bot] handleCommand: parseCommand failed for "${msg.text.slice(0, 50)}", skipping`);
       return;
     }
+
+    logger.info(`[wecom-bot] handleCommand: cmd=/${parsed.cmd} args=${JSON.stringify(parsed.args)} userId=${msg.userId}`);
+
+    let responseText: string;
     try {
-      await this.updater.startProcessing(msg.userId, inboundFrame);
-      await this.updater.updateStream(`[E2E staging] 命令 ${msg.text} 暂未处理 (PR 3 集成)`, '', 100);
-      await this.updater.complete(`✅ 已收到命令: ${msg.text}\n\n_(PR 2 E2E staging, 命令处理 PR 3 实现)_`, 0, 0, 0, 1);
+      switch (parsed.cmd) {
+        case 'new':
+          responseText = await this.handleCommandNew(msg.userId, parsed.args);
+          break;
+        case 'list':
+          responseText = await this.handleCommandList(msg.userId, parsed.args);
+          break;
+        case 'status':
+          responseText = await this.handleCommandStatus(msg.userId);
+          break;
+        case 'help':
+          responseText = this.handleCommandHelp();
+          break;
+        default:
+          responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /status /help\n\n_(PR 4.5 简化版, 更多命令 PR 5+ 实现)_`;
+      }
     } catch (err) {
-      logger.error(`[wecom-bot] handleCommand error: ${err instanceof Error ? err.message : String(err)}`);
+      logger.error(`[wecom-bot] handleCommand /${parsed.cmd} error: ${err instanceof Error ? err.message : String(err)}`);
+      responseText = `❌ 命令执行失败: ${err instanceof Error ? err.message : String(err)}`;
     }
+
+    // 推回 (用 sendMessage 不用 WecomStreamUpdater, 因为命令响应是终态文本不走流)
+    try {
+      await this.client.sdk.sendMessage(msg.userId, {
+        msgtype: 'markdown',
+        markdown: { content: responseText },
+      });
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+    } catch (err) {
+      logger.error(`[wecom-bot] handleCommand sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
+      } catch (requeueErr) { /* ignore */ }
+    }
+  }
+
+  /**
+   * PR 4.5 C: /new 命令 - 强制新建 session (调 setPending, 下条消息走 handleChat 新建路径)
+   */
+  private async handleCommandNew(userId: string, args: string[]): Promise<string> {
+    const cwd = args[0] ?? '/tmp';
+    await this.userManager.setPending(userId, { cwd });
+    return `✅ 已创建 pending session (cwd=${cwd})\n\n下条消息将走新建 session 路径`;
+  }
+
+  /**
+   * PR 4.5 C: /list 命令 - 列出用户当前 session 状态
+   */
+  private handleCommandList(userId: string, _args: string[]): string {
+    const entry = this.userManager.getEntry(userId);
+    if (!entry) {
+      return '📭 当前无 active session, 发送任意消息走新建 session 路径';
+    }
+    if (entry.type === 'session') {
+      return `📋 当前 session:\n  sessionUuid: ${entry.sessionUuid}\n  cwd: ${entry.cwd ?? '(unknown)'}\n  lastActiveAt: ${entry.lastActiveAt ?? '(unknown)'}`;
+    }
+    if (entry.type === 'pending_new_session') {
+      return '⏳ 等待下条消息触发新建 session';
+    }
+    if (entry.type === 'pending_new_session_claimed') {
+      return '⏳ 新 session 创建中 (claimed), 请稍候';
+    }
+    return `📋 当前状态: ${entry.type}`;
+  }
+
+  /**
+   * PR 4.5 C: /status 命令 - 显示 bot 配置状态
+   */
+  private handleCommandStatus(_userId: string): string {
+    const ownerExternalUserId = config.get<string>('wecom.owner_external_user_id', '');
+    const botId = config.get<string>('wecom.bot_id', '');
+    return `📊 Wecom Bot 状态:\n  bot_id: ${botId || '(未配置)'}\n  owner_configured: ${!!ownerExternalUserId}\n  claude_streaming: ${this.sessionManager ? 'enabled' : 'PoC echo'}\n  user_mapping_path: ${this.userManager.path}`;
+  }
+
+  /**
+   * PR 4.5 C: /help 命令 - 列出可用命令
+   */
+  private handleCommandHelp(): string {
+    return `🤖 cc-linker wecom Bot 命令:\n  /new [cwd]  - 强制新建 session\n  /list       - 列出当前 session\n  /status     - 显示 bot 状态\n  /help       - 显示本帮助\n\n(PR 4.5 简化版, /switch /resume /bridge /agents 推 PR 5+)`;
   }
 
   private async handleChat(msg: SpoolMessage): Promise<void> {
@@ -242,9 +320,19 @@ export class WecomBot {
       // 1. 启动 replyStream 流（必传 inboundFrame — M-7 修复后 fail-fast）
       await this.updater.startProcessing(msg.userId, inboundFrame);
 
-      // 2. PR 4.1 简化: cwd 默认用 userId（后续 PR 接 session lookup + userManager.bindSessionToClaim）
-      const cwd = msg.userId;
-      const sessionId: string | null = null;  // 总是新建 session（PR 4.5+ 接续聊）
+      // 2. PR 4.5 B: 接续聊 — 查 user-mapping 拿现有 sessionUuid + cwd
+      // 历史: PR 4.1 简化总是 sessionId=null 新建, 用户续聊失效 (claude 永远开新 session)
+      // 修法: 读 WecomUserManager.getEntry → 有 session 走 resume (sessionId 传 existing-uuid);
+      //        没 session 走新建 (sessionId=null + cwd fallback /tmp)
+      // 防御: sessionUuid 为空串/falsy 视同"无 session", 走新建 (避免 claude -p --resume '' 出错)
+      const existingEntry = this.userManager.getEntry(msg.userId);
+      const existingSessionUuid = existingEntry?.type === 'session' && existingEntry.sessionUuid
+        ? existingEntry.sessionUuid
+        : null;
+      const isNewSession = !existingSessionUuid;
+      const sessionId: string | null = existingSessionUuid;
+      const cwd: string = isNewSession ? '/tmp' : (existingEntry?.cwd ?? '/tmp');
+      const lockKey: string = isNewSession ? `new:${msg.userId}` : existingSessionUuid!;
 
       // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text + throttle patch
       const result = await this.sessionManager.sendStreamingMessage(
@@ -257,7 +345,7 @@ export class WecomBot {
             logger.warn(`[wecom-bot] updateStream failed: ${e instanceof Error ? e.message : String(e)}`)
           );
         },
-        true, `new:${msg.userId}`,
+        isNewSession, lockKey,
       );
 
       // 4. 终态: sessionId 缺失 → error, 成功 → complete
@@ -267,7 +355,16 @@ export class WecomBot {
         return;
       }
 
-      // PR 4.1 简化: 不接 userMapping.bindSessionToClaim（PR 4.5+ 接 WecomUserManager.bindSessionToClaim）
+      // 5. PR 4.5 B: 持久化 session 映射
+      // - 新建场景: 调 setSession 直接 set (跳过 claim 流程, 企微侧简化)
+      // - 续聊场景: session 没变, 调 touchSession 刷 lastActiveAt
+      if (isNewSession) {
+        await this.userManager.setSession(msg.userId, result.sessionId, cwd);
+        logger.info(`[wecom-bot] handleChat: 新建 session 已持久化 userId=${msg.userId} sessionUuid=${result.sessionId}`);
+      } else {
+        await this.userManager.touchSession(msg.userId);
+      }
+
       await this.updater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
     } catch (err) {
@@ -434,5 +531,13 @@ export class WecomBot {
    */
   public async __test_handleChat(msg: SpoolMessage): Promise<void> {
     return this.handleChat(msg);
+  }
+
+  /**
+   * PR 4.5 C: 测试 seam — 暴露 handleCommand 给单测直接调用。
+   * @internal
+   */
+  public async __test_handleCommand(msg: SpoolMessage): Promise<void> {
+    return this.handleCommand(msg);
   }
 }

@@ -100,6 +100,62 @@ export class WecomUserManager extends PlatformUserManager {
 
     return outcome;
   }
+
+  /**
+   * PR 4.5: 简化版 setSession — 跳过 claim 直接 set session 映射
+   *
+   * 历史: bindSessionToClaim 要求先有 claimed 状态 (pending → claimed → session)，
+   *   企微侧 PR 4.5 简化：Claude 流式完成直接 set session（新建场景）。
+   *   飞书侧走 CAS 模式保留 bindSessionToClaim 不动。
+   *
+   * 修法: 写一份新的 entry, type='session', sessionUuid, cwd；保留 createdAt（如果存在），
+   *   更新 lastActiveAt，刷新 casToken。
+   *
+   * @param externalUserId 企微 external_userid
+   * @param sessionUuid Claude session UUID
+   * @param cwd session 工作目录
+   */
+  async setSession(externalUserId: string, sessionUuid: string, cwd: string): Promise<void> {
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const now = new Date().toISOString();
+      const existing = mapping.entries[externalUserId];
+      mapping.entries[externalUserId] = {
+        type: 'session',
+        sessionUuid,
+        cwd,
+        createdAt: existing?.createdAt ?? now,
+        lastActiveAt: now,
+        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      };
+      mapping.version++;
+      this.saveMapping(mapping);
+    });
+  }
+
+  /**
+   * PR 4.5: 续聊时更新 lastActiveAt
+   *
+   * 历史: handleChat 续聊走 sessionManager.sendStreamingMessage 拿到 result.sessionId，
+   *   但 session 没变, 不需要 setSession 整体覆盖；只刷 lastActiveAt 即可。
+   *
+   * 修法: 仅在 entry.type === 'session' 时更新 lastActiveAt + version；其他情况静默 no-op。
+   *
+   * @param externalUserId 企微 external_userid
+   */
+  async touchSession(externalUserId: string): Promise<void> {
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const entry = mapping.entries[externalUserId];
+      if (entry?.type === 'session') {
+        entry.lastActiveAt = new Date().toISOString();
+        mapping.version++;
+        this.saveMapping(mapping);
+      }
+    });
+  }
 }
 
 /** 全局单例 */

@@ -91,4 +91,65 @@ describe('WecomUserManager', () => {
     // 通过 getEntry 验证 loadMapping 自愈
     expect(fresh.getEntry('any-user')).toBeUndefined();
   });
+
+  // PR 4.5: setSession (简化版, 不需 claim) + touchSession
+  describe('PR 4.5: setSession + touchSession', () => {
+    it('setSession: writes session entry directly (no claim required)', async () => {
+      await manager.setSession('ext-new', 'uuid-abc-123', '/tmp');
+      const entry = manager.getEntry('ext-new');
+      expect(entry?.type).toBe('session');
+      expect(entry?.sessionUuid).toBe('uuid-abc-123');
+      expect(entry?.cwd).toBe('/tmp');
+      expect(entry?.createdAt).toBeDefined();
+      expect(entry?.lastActiveAt).toBeDefined();
+      expect(entry?.casToken).toBeDefined();
+    });
+
+    it('setSession: overwrites existing entry (replace mode)', async () => {
+      // 已有 pending 状态, setSession 直接覆盖
+      await manager.setPending('ext-rep', { cwd: '/old' });
+      await manager.setSession('ext-rep', 'uuid-new', '/new');
+      const entry = manager.getEntry('ext-rep');
+      expect(entry?.type).toBe('session');
+      expect(entry?.sessionUuid).toBe('uuid-new');
+      expect(entry?.cwd).toBe('/new');
+    });
+
+    it('setSession: creates entry even when user-mapping file is missing', async () => {
+      const freshDir = mkdtempSync(join(tmpdir(), 'wecom-fresh-'));
+      const fresh = new WecomUserManager(join(freshDir, 'mapping-wecom.json'));
+      await fresh.setSession('ext-fresh', 'uuid-fresh', '/var');
+      expect(fresh.getEntry('ext-fresh')?.sessionUuid).toBe('uuid-fresh');
+      rmSync(freshDir, { recursive: true, force: true });
+    });
+
+    it('touchSession: updates lastActiveAt on existing session', async () => {
+      await manager.setSession('ext-touch', 'uuid-touch', '/tmp');
+      const before = manager.getEntry('ext-touch');
+      const beforeLast = before?.lastActiveAt;
+
+      // 等 10ms 保证时间戳差异
+      await new Promise(r => setTimeout(r, 10));
+      await manager.touchSession('ext-touch');
+
+      const after = manager.getEntry('ext-touch');
+      expect(after?.lastActiveAt).not.toBe(beforeLast);
+      expect(after?.sessionUuid).toBe('uuid-touch');  // sessionUuid 不变
+    });
+
+    it('touchSession: no-op when entry is not a session', async () => {
+      // pending 状态 → touch 不应报错, 也不应变更 entry
+      await manager.setPending('ext-pending', { cwd: '/tmp' });
+      await manager.touchSession('ext-pending');
+      const entry = manager.getEntry('ext-pending');
+      // entry 仍是 pending, lastActiveAt 可能被 setPending 更新了，但 touchSession 不破坏 type
+      expect(entry?.type).toBe('pending_new_session');
+    });
+
+    it('touchSession: no-op when entry does not exist', async () => {
+      // 不存在的用户 → 静默成功
+      await manager.touchSession('nonexistent-user');
+      expect(manager.getEntry('nonexistent-user')).toBeUndefined();
+    });
+  });
 });
