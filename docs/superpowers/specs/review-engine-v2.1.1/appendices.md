@@ -179,10 +179,19 @@
 
 #### C.7.7 未做的事
 
+**主动保留（明确不改）**：
 - ❌ 没用 profile 内 `[context_limits]` 改 max 模型表（保留 v2.1.1 的 KNOWN_CONTEXT_LIMITS 内置表）
 - ❌ 没改 max_rounds 默认值（仍是 code=8 / plan=5 / spec=4 / global=6）
 - ❌ 没动 HUMAN_DECIDE 4h timeout（I10 已在 v2.1.1 调到 4h）
 - ❌ 没动 parse_retry_timeout 15s（I11 已在 v2.1.1 调到 15s）
+
+**已知限制 / 未实现（评审需知）**：
+- ❌ **FIXING 期间 context 增长检测不到**：cascade 只在 `EXTERNAL_REVIEW.done` 触发。FIXING 期间 worker 自己把 context 从 50% 撑到 90% 不会被检测，要等下个 EXTERNAL_REVIEW 才能 cascade。Phase 3 可能加 FIXING 期间的 periodic usage check（每 30s 调 getContextUsage，超阈值提前结束），但本轮不做。
+- ❌ **threshold 没有 per-phase override**：当前阈值只在 `[guards]` 段全局生效。code phase 可能想更激进（60% 提前 cascade），spec phase 想放宽（90%），目前不支持。Phase 3 配置热更新后再考虑加 `[phase_overrides.<phase>] context_overflow_threshold_percent = ...`。
+- ❌ **cascade 档位随配置变化**（已在 §7.5.7.1 顶部明确说明）：默认 `max_compact_attempts=1` 是 3 档；配 N 是 N+2 档。配错会行为不符直觉，需谨慎。
+- ❌ **写文件失败 → abort 而非 inline fallback**（已在 §7.5.8.7 改）：inline 注入会让 context 二次超限（恶性循环），所以写失败直接 ABORTED reason=review_opinions_write_failed，提示用户排查。
+- ❌ **post-compact usage 检查时机 race**：poll done 是等 worker 完成 turn，但 worker 可能 compact 后又自动调 tool（不该发生但理论可能），导致 usage 没降反升。Phase 3 可加 post-compact 强校验。
+- ❌ **cascade 升级路径的 n 语义**：compact 失败升级 reset 时 n 仍是 1（不是 2），避免在 1 次 EXTERNAL_REVIEW 内累计 2 次。已在 §7.5.7.1 cascade dispatch 代码隐含。
 
 ## 附录 D：v2.1.1 评审反馈汇总（2026-06-17）
 
