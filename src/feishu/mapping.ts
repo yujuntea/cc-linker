@@ -6,6 +6,32 @@ import { config } from '../utils/config';
 import { withLock } from '../utils/lock';
 import { logger } from '../utils/logger';
 
+// === platform/ 抽象基类的飞书实现 (v1.2 PR 1 重构) ===
+// PlatformUserManager 在 src/platform/user-state.ts 是抽象基类
+// UserManager 已经满足 PlatformUserManager 所有方法签名
+// 这里用 type-only import 做编译期断言，不重复定义类
+import type { PlatformUserManager } from '../platform/user-state';
+
+// 验证 UserManager 实例满足 PlatformUserManager 契约（编译期断言）
+// 注意：UserManager 的私有字段（mappingPath/initialized）与抽象类的 protected readonly mappingPath
+// 在结构上不兼容（private vs protected + 字段 vs abstract readonly），所以这里逐方法做
+// extends 结构比较，只校验公开方法签名
+type _GetEntryCheck = InstanceType<typeof UserManager>['getEntry'] extends PlatformUserManager['getEntry'] ? true : never;
+type _GetVersionCheck = InstanceType<typeof UserManager>['getVersion'] extends PlatformUserManager['getVersion'] ? true : never;
+type _CASCheck = InstanceType<typeof UserManager>['compareAndSwap'] extends PlatformUserManager['compareAndSwap'] ? true : never;
+type _ClaimCheck = InstanceType<typeof UserManager>['claimPendingNewSession'] extends PlatformUserManager['claimPendingNewSession'] ? true : never;
+type _RollbackCheck = InstanceType<typeof UserManager>['rollbackClaim'] extends PlatformUserManager['rollbackClaim'] ? true : never;
+type _BindCheck = InstanceType<typeof UserManager>['bindSessionToClaim'] extends PlatformUserManager['bindSessionToClaim'] ? true : never;
+type _TimedOutCheck = InstanceType<typeof UserManager>['rollbackTimedOutClaims'] extends PlatformUserManager['rollbackTimedOutClaims'] ? true : never;
+type _ValidateOwnerCheck = InstanceType<typeof UserManager>['validateOwner'] extends PlatformUserManager['validateOwner'] ? true : never;
+type _AllEntriesCheck = InstanceType<typeof UserManager>['allEntries'] extends PlatformUserManager['allEntries'] ? true : never;
+
+type _AssertImplements =
+  [_GetEntryCheck, _GetVersionCheck, _CASCheck, _ClaimCheck, _RollbackCheck, _BindCheck, _TimedOutCheck, _ValidateOwnerCheck, _AllEntriesCheck];
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _assert: _AssertImplements = [true, true, true, true, true, true, true, true, true];
+void _assert; // suppress unused
+
 export type MappingEntryType =
   | 'session'
   | 'pending_new_session'

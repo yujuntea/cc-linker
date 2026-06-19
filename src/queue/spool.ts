@@ -31,6 +31,11 @@ export interface SpoolMessage {
   messageId: string;
   openId: string;
   text: string;
+  // === v1.2 新增字段（平台无关入口）===
+  // userId: 平台无关用户标识（feishu=openId, wecom=userId）
+  // platform: 来源平台标签（用于路由 / 多平台分发）
+  userId: string;
+  platform: 'feishu' | 'wecom';
   target: TargetSnapshot;
   serialKey: string;
   status: SpoolStatus;
@@ -283,6 +288,8 @@ export class SpoolQueue {
           messageId: 'unknown',
           openId: 'unknown',
           text: '',
+          userId: 'unknown',
+          platform: 'feishu',
           target: { type: 'no_target' },
           serialKey: serialKey,
           status: 'failed',
