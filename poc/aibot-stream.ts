@@ -29,7 +29,7 @@ await wsClient.replyStream(mockFrame, streamId, '完成', true);
 
 console.log('[STREAM-3] replyStream calls:', replyStreamCalls.length, '(期望 3)');
 console.log('[STREAM-4] 同 streamId 持续 patch:', replyStreamCalls.every(c => c.args[0] === streamId));
-console.log('[STREAM-5] finish=true 在第 3 次:', replyStreamCalls[2].args[1] === true);
+console.log('[STREAM-5] finish=true 在第 3 次:', replyStreamCalls[2].args[2] === true);
 
 let replyStreamWithCardCalls: any[] = [];
 wsClient.replyStreamWithCard = ((...args: any[]) => {
@@ -42,7 +42,7 @@ await wsClient.replyStreamWithCard(mockFrame, streamId, '收尾', true, {
 });
 
 console.log('[STREAM-6] replyStreamWithCard:', replyStreamWithCardCalls.length, '(期望 1)');
-console.log('[STREAM-7] 传入 templateCard:', !!replyStreamWithCardCalls[0].args[2].templateCard);
+console.log('[STREAM-7] 传入 templateCard:', !!replyStreamWithCardCalls[0].args[3].templateCard);
 
 const overLimit = 'x'.repeat(20481);
 const tooLong = overLimit.length > 20480;
