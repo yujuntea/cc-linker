@@ -22,6 +22,8 @@ import { spawnSync } from 'child_process';
 export interface StartOptions {
   daemon?: boolean;
   noFeishu?: boolean;
+  /** PR 3 v1.2.1 临时加: --platform=feishu|wecom|both (default feishu 兼容老行为) */
+  platform?: 'feishu' | 'wecom' | 'both';
 }
 
 export async function start(registry: RegistryManager, opts: StartOptions = {}): Promise<void> {
@@ -211,6 +213,7 @@ async function createBotRuntime(
   registry: RegistryManager,
   log: (level: string, msg: string) => void,
   wsLogLevel?: number,
+  opts: StartOptions = {},
 ): Promise<BotRuntime> {
   // Step 1: 探测 CLI 进程检测可用性（macOS 权限）
   // 前台和 daemon 模式都需要，确保运行时配置一致
@@ -541,7 +544,7 @@ async function createBotRuntime(
   return { bot, wsClient, stateCoordinator, shutdown };
 }
 
-async function startForeground(registry: RegistryManager, opts: StartOptions): Promise<void> {
+async function startForeground(registry: RegistryManager, opts: StartOptions, parentOpts?: StartOptions): Promise<void> {
   console.log(chalk.blue('🚀 启动 cc-linker...'));
 
   // Step 1 (probe) + Step 2 (cleanup) 已在 createBotRuntime 内执行
@@ -565,9 +568,30 @@ async function startForeground(registry: RegistryManager, opts: StartOptions): P
       console.log(msg);
       logger.info(msg);
     }
-  });
+  }, undefined, opts);
 
   console.log(chalk.green('✅ cc-linker 已启动'));
+
+  // PR 2 v1.2.1 临时: WecomBot 启动分支（--platform=wecom|both 时）
+  // 注意: 这是 E2E 阶段临时方案; PR 3 完整做双平台集成 + StateCoordinator
+  let wecomBotInstance: any = null;
+  if (opts.platform === 'wecom' || opts.platform === 'both') {
+    const { WecomBot, WECOM_USER_MAPPING_PATH } = await import('../../wecom');
+    const botId = config.get<string>('wecom.bot_id', '');
+    const secret = config.get<string>('wecom.secret', '');
+    if (!botId || !secret) {
+      console.log(chalk.red('❌ [wecom] bot_id 或 secret 未配置（检查 config.toml [wecom] 节）'));
+    } else {
+      wecomBotInstance = new WecomBot({
+        botId,
+        secret,
+        userMappingPath: WECOM_USER_MAPPING_PATH,
+      });
+      wecomBotInstance.start();
+      console.log(chalk.green('✅ 企微 Bot 已启动'));
+      logger.info(`企微 Bot 已启动 (bot_id=${botId})`);
+    }
+  }
 
   let shuttingDown = false;
   const gracefulShutdown = async (signal: string) => {
@@ -575,6 +599,7 @@ async function startForeground(registry: RegistryManager, opts: StartOptions): P
     shuttingDown = true;
     console.log(chalk.yellow(`\n收到 ${signal}，优雅停机中...`));
     try { await bot.shutdown(); } catch (err) { logger.error(`bot.shutdown() 失败: ${err}`); }
+    try { wecomBotInstance?.stop(); } catch (err) { logger.error(`wecomBot.stop() 失败: ${err}`); }
     await shutdown(signal);
     logger.info('cc-linker 已停止');
     process.exit(0);

@@ -156,13 +156,15 @@ program
 
 program
   .command('start')
-  .description('启动飞书 Bot 进程')
+  .description('启动 Bot 进程（默认飞书; --platform=wecom 启动企微; --platform=both 双平台）')
   .option('-d, --daemon', '后台运行（写入 PID 文件）')
+  .option('--platform <platform>', 'feishu (default) | wecom | both', 'feishu')
   .action((opts) => withSync(async (registry) => {
     if (!opts.daemon) {
       StateCoordinator.assertNotRunning();
     }
-    await start(registry, { daemon: opts.daemon });
+    const platform = opts.platform as 'feishu' | 'wecom' | 'both';
+    await start(registry, { daemon: opts.daemon, platform });
   }, true));
 
 program
