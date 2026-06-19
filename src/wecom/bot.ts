@@ -325,13 +325,25 @@ export class WecomBot {
       // 修法: 读 WecomUserManager.getEntry → 有 session 走 resume (sessionId 传 existing-uuid);
       //        没 session 走新建 (sessionId=null + cwd fallback /tmp)
       // 防御: sessionUuid 为空串/falsy 视同"无 session", 走新建 (避免 claude -p --resume '' 出错)
+      //
+      // B1 修复: /new 命令 (handleCommandNew) 调 setPending 创建 pending_new_session
+      //   状态，handleChat 这里也检查 pending 状态 — 用 pending.cwd 强制走 new 路径。
+      //   修前: pending 状态被忽略, setSession 立即覆盖 → /new 实际是 no-op
+      //   修后: pending 状态被识别, 用 pending.cwd 走 new + 保留 pending 信息
       const existingEntry = this.userManager.getEntry(msg.userId);
+      const isPending = existingEntry?.type === 'pending_new_session';
       const existingSessionUuid = existingEntry?.type === 'session' && existingEntry.sessionUuid
         ? existingEntry.sessionUuid
         : null;
-      const isNewSession = !existingSessionUuid;
-      const sessionId: string | null = existingSessionUuid;
-      const cwd: string = isNewSession ? '/tmp' : (existingEntry?.cwd ?? '/tmp');
+      // B1: pending 状态强制 new; 有 session 续聊; 都没走 new
+      const isNewSession = !existingSessionUuid || isPending;
+      const sessionId: string | null = isNewSession ? null : existingSessionUuid;
+      // B1: pending 状态用 pending 里的 cwd; 有 session 续聊用 existingCwd; 都没用 /tmp
+      const cwd: string = isPending
+        ? (existingEntry?.cwd ?? '/tmp')
+        : isNewSession
+          ? '/tmp'
+          : (existingEntry?.cwd ?? '/tmp');
       const lockKey: string = isNewSession ? `new:${msg.userId}` : existingSessionUuid!;
 
       // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text + throttle patch

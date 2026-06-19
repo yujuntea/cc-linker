@@ -407,6 +407,10 @@ describe('WecomBot handleChat (PR 4.1)', () => {
  * 2. 新建: getEntry 返回 undefined → sessionId=null (新建) + 调 setSession 持久化
  * 3. 续聊但 sessionId 为空字符串: getEntry 返回 session 但 sessionUuid='' → 走新建路径 (不挂 resume)
  * 4. 续聊失败: sessionManager 抛错 → 不调 setSession/touchSession
+ * 5. PR 4.5 final B1: /new 后续消息用 pending.cwd 走 new 路径
+ *    getEntry 返回 {type:'pending_new_session', cwd:'/var/proj'} → sessionId=null + cwd='/var/proj'
+ *    (修前: pending 状态被忽略, 走 new + cwd='/tmp', /new 实际是 no-op)
+ *    (修后: pending 状态被识别, /new 走指定 cwd)
  */
 describe('WecomBot handleChat (PR 4.5 B: 续聊映射)', () => {
   let mockSpoolQueue: any;
@@ -675,6 +679,76 @@ describe('WecomBot handleChat (PR 4.5 B: 续聊映射)', () => {
     // 错误路径: 不应持久化 (无论是 setSession 还是 touchSession)
     expect(mockUserManager.setSession).not.toHaveBeenCalled();
     expect(mockUserManager.touchSession).not.toHaveBeenCalled();
+  });
+
+  // PR 4.5 final B1: /new 后续消息用 pending.cwd 走 new 路径
+  it('PR 4.5 final B1: pending 状态用 pending.cwd 走 new 路径 (修 /new 简化版 bug)', async () => {
+    // mock userManager: 返回 pending 状态 (模拟 /new 命令后的状态)
+    const b1UserManager = {
+      getEntry: mock((_uid: string) => ({
+        type: 'pending_new_session',
+        sessionUuid: null,
+        cwd: '/var/proj',
+        createdAt: new Date().toISOString(),
+      })),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    const b1SessionManager: any = {
+      sendStreamingMessage: mock(async (
+        _sessionId: string | null,
+        _text: string,
+        _cwd: string,
+        onProgress: any,
+        _isNew?: boolean,
+        _lockKey?: string,
+      ) => {
+        onProgress({ type: 'text', content: 'new' });
+        return {
+          response: 'new',
+          costUsd: 0.001,
+          durationMs: 100,
+          sessionId: 'uuid-after-new',
+          jsonlPath: null,
+          sessionStatus: 'active' as const,
+          tokensIn: 1,
+          tokensOut: 1,
+        };
+      }),
+    };
+    const b1Bot = new WecomBot({
+      botId: 'test', secret: 'test', userMappingPath: '/tmp/test-b1.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: b1UserManager as any,
+      sessionManager: b1SessionManager,
+    });
+
+    const msg: any = {
+      messageId: 'msg-after-new',
+      openId: '',
+      text: 'hi from /new',
+      userId: 'wmu_abc',
+      platform: 'wecom',
+      target: { type: 'new_session_claim' },
+      serialKey: 'new:wmu_abc',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: 'inbound_after_new' } } },
+    };
+
+    await b1Bot.__test_handleChat(msg);
+
+    // 1. 走 new 路径: sessionId=null, isNew=true, cwd='/var/proj' (从 pending 拿)
+    expect(b1SessionManager.sendStreamingMessage.mock.calls[0][0]).toBeNull();
+    expect(b1SessionManager.sendStreamingMessage.mock.calls[0][2]).toBe('/var/proj');
+    expect(b1SessionManager.sendStreamingMessage.mock.calls[0][4]).toBe(true);
+    expect(b1SessionManager.sendStreamingMessage.mock.calls[0][5]).toBe('new:wmu_abc');
+
+    // 2. 调 setSession 持久化 (不是 touchSession)
+    expect(b1UserManager.setSession).toHaveBeenCalledWith('wmu_abc', 'uuid-after-new', '/var/proj');
+    expect(b1UserManager.touchSession).not.toHaveBeenCalled();
   });
 });
 
