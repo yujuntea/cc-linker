@@ -1,96 +1,46 @@
 /**
- * 企微 UserManager — 与 feishu/mapping.ts 并存
- * 独立文件 + 独立 user-mapping-wecom.json + 独立 owner 验证 (读 wecom.owner_external_user_id)
+ * 企微 UserManager — 继承 PlatformUserManager 基类
+ * 独立文件 + 独立 user-mapping-wecom.json + 独立 owner 验证
  *
- * **设计决策（M1 fix 后的选择）**：
- * 不 extend PlatformUserManager 抽象基类——抽象基类需要所有 8 个方法签名匹配，
- * 但 UserManager 的 private 字段与抽象类的 protected abstract readonly 不兼容（PR 1 决定的），
- * wecom 侧同样如此。所以 wecom 侧**直接复制实现**，与 feishu UserManager 平行存在。
- * 这样保持 wecom 侧完全独立（不同 storage path、不同 owner 验证、不同未来扩展性）。
+ * **PR 2 v1.2.1 (C5 修复)**: 6 个公共方法（loadMapping/saveMapping/getEntry/getVersion/
+ * rollbackClaim/bindSession/rollbackTimedOutClaims/allEntries）从 feishu/mapping.ts 复制
+ * 下沉到 PlatformUserManager 基类；本类只保留企微特有的 setPending + claimPending
  *
  * @see docs/superpowers/specs/2026-06-19-wecom-integration-design.md §4.2 + §5.7
  */
 import { dirname, join } from 'path';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
-import { readFile } from 'fs/promises';
 import { withLock } from '../utils/lock';
 import { config } from '../utils/config';
-import { logger } from '../utils/logger';
-import {
-  PLATFORM_PENDING_CLAIMED_TIMEOUT_MS,
-  type PlatformClaimPendingResult,
-  type PlatformMappingEntry,
-  type PlatformUserMapping,
-} from '../platform/mapping-types';
+import { PlatformUserManager } from '../platform/user-state';
+import type { PlatformMappingEntry } from '../platform/mapping-types';
 import { USER_MAPPING_PATH } from '../utils/paths';
 
 /** 企微 user-mapping 文件路径（与飞书 user-mapping.json 同目录） */
 export const WECOM_USER_MAPPING_PATH = join(dirname(USER_MAPPING_PATH), 'user-mapping-wecom.json');
 
-const DEFAULT_WECOM_MAPPING: PlatformUserMapping = {
-  version: 0,
-  entries: {},
-};
-
-export class WecomUserManager {
-  private mappingPath: string;
-  private initialized = false;
+export class WecomUserManager extends PlatformUserManager {
+  protected override readonly mappingPath: string;
 
   constructor(mappingPath: string = WECOM_USER_MAPPING_PATH) {
+    super();
     this.mappingPath = mappingPath;
-  }
-
-  /** Lazy file initialization */
-  private ensureFile(): void {
-    if (this.initialized) return;
-    const dir = join(this.mappingPath, '..');
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    if (!existsSync(this.mappingPath)) {
-      this.saveMapping(DEFAULT_WECOM_MAPPING);
-    }
-    this.initialized = true;
-  }
-
-  private loadMapping(): PlatformUserMapping {
-    try {
-      const raw = readFileSync(this.mappingPath, 'utf8');
-      return JSON.parse(raw) as PlatformUserMapping;
-    } catch (err) {
-      if (existsSync(this.mappingPath)) {
-        logger.warn(`wecom user-mapping 解析失败: ${err}`);
-      }
-      return { ...DEFAULT_WECOM_MAPPING, entries: {} };
-    }
-  }
-
-  private saveMapping(mapping: PlatformUserMapping): void {
-    const tmp = this.mappingPath + '.tmp';
-    writeFileSync(tmp, JSON.stringify(mapping, null, 2), { mode: 0o600 });
-    renameSync(tmp, this.mappingPath);
-  }
-
-  /** 文件路径 getter（用于测试 + bot 层调试） */
-  get path(): string {
-    return this.mappingPath;
-  }
-
-  getEntry(externalUserId: string): PlatformMappingEntry | undefined {
-    this.ensureFile();
-    return this.loadMapping().entries[externalUserId];
   }
 
   /**
    * Validate if an external_userid matches the configured wecom owner.
-   * 飞书侧 UserManager.validateOwner 读 [feishu_bot] owner_open_id
-   * 企微侧读 [wecom] owner_external_user_id
-   * WARNING: 如果 owner_external_user_id 未配置，return true for ALL users（与飞书侧行为一致）
+   * 飞书侧读 [feishu_bot] owner_open_id；企微侧读 [wecom] owner_external_user_id
+   *
+   * **PR 2 v1.2.1 (C6 修复)**: 保留 default true（与飞书侧行为一致，E2E/测试友好）
+   * **启动 WARN**: createBotRuntime 在企微 Bot 启动时检查 owner_external_user_id 未配则 WARN
+   * （与飞书侧 owner_open_id 未配 WARN 对称，spec §5.7 安全策略）
    */
-  validateOwner(externalUserId: string): boolean {
+  override validateOwner(externalUserId: string): boolean {
     const ownerExternalUserId = config.get<string>('wecom.owner_external_user_id', '');
-    if (!ownerExternalUserId) return true;
+    if (!ownerExternalUserId) return true;  // 未配时放行（与飞书侧行为一致）
     return externalUserId === ownerExternalUserId;
   }
 
+  /** 企微特有：setPending 直接写（飞书侧用 CAS 模式无此方法） */
   async setPending(externalUserId: string, opts: { cwd?: string } = {}): Promise<void> {
     await withLock(this.mappingPath, async () => {
       this.ensureFile();
@@ -108,12 +58,16 @@ export class WecomUserManager {
     });
   }
 
-  async claimPending(externalUserId: string, messageId: string): Promise<PlatformClaimPendingResult> {
+  /**
+   * 企微特有 claimPending（与飞书 claimPendingNewSession 行为对齐：
+   * pending → claimed 转换，命中 unauthorized/no_pending/creating/claimed 4 个状态）
+   */
+  async claimPending(externalUserId: string, messageId: string): Promise<import('../platform/mapping-types').PlatformClaimPendingResult> {
     if (!this.validateOwner(externalUserId)) {
       return { status: 'unauthorized', version: this.getVersion() };
     }
 
-    let outcome: PlatformClaimPendingResult = { status: 'no_pending', entry: null, version: this.getVersion() };
+    let outcome: import('../platform/mapping-types').PlatformClaimPendingResult = { status: 'no_pending', entry: null, version: this.getVersion() };
 
     await withLock(this.mappingPath, async () => {
       this.ensureFile();
@@ -147,116 +101,10 @@ export class WecomUserManager {
     return outcome;
   }
 
-  async rollbackClaim(externalUserId: string, messageId: string): Promise<boolean> {
-    let rolledBack = false;
-
-    await withLock(this.mappingPath, async () => {
-      this.ensureFile();
-      const mapping = this.loadMapping();
-      const current = mapping.entries[externalUserId];
-      if (!current || current.type !== 'pending_new_session_claimed') {
-        return;
-      }
-      if (current.claimedByMessageId !== messageId) {
-        return;
-      }
-
-      mapping.entries[externalUserId] = {
-        ...current,
-        type: 'pending_new_session',
-        sessionUuid: null,
-        lastActiveAt: new Date().toISOString(),
-        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-        claimedByMessageId: undefined,
-        claimedAt: undefined,
-      };
-      mapping.version++;
-      this.saveMapping(mapping);
-      rolledBack = true;
-    });
-
-    return rolledBack;
-  }
-
+  /** 企微特有：bindSession 别名（与基类 bindSessionToClaim 行为一致，
+   * 但 feishu/bot.ts 之外的 wecom 测试用 bindSession 调用） */
   async bindSession(externalUserId: string, messageId: string, sessionUuid: string, cwd: string): Promise<boolean> {
-    let bound = false;
-
-    await withLock(this.mappingPath, async () => {
-      this.ensureFile();
-      const mapping = this.loadMapping();
-      const current = mapping.entries[externalUserId];
-      if (!current) return;
-
-      const claimMatches =
-        current.type === 'pending_new_session_claimed' &&
-        current.claimedByMessageId === messageId;
-      if (!claimMatches) return;
-
-      mapping.entries[externalUserId] = {
-        ...current,
-        type: 'session',
-        sessionUuid,
-        cwd,
-        createdAt: current.createdAt,
-        lastActiveAt: new Date().toISOString(),
-        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      };
-      mapping.version++;
-      this.saveMapping(mapping);
-      bound = true;
-    });
-
-    return bound;
-  }
-
-  getVersion(): number {
-    this.ensureFile();
-    return this.loadMapping().version;
-  }
-
-  /** Roll back timed-out pending_new_session_claimed entries (与飞书 UserManager 行为一致) */
-  async rollbackTimedOutClaims(): Promise<number> {
-    let rolledBack = 0;
-
-    await withLock(this.mappingPath, async () => {
-      this.ensureFile();
-      const mapping = this.loadMapping();
-      const now = Date.now();
-
-      for (const [externalUserId, entry] of Object.entries(mapping.entries)) {
-        if (entry.type === 'pending_new_session_claimed') {
-          if (!entry.claimedAt) continue;
-          const elapsed = now - new Date(entry.claimedAt).getTime();
-          if (isNaN(elapsed)) continue;
-          if (elapsed >= PLATFORM_PENDING_CLAIMED_TIMEOUT_MS) {
-            logger.info(`wecom 回滚超时 claim: ${externalUserId} (超时 ${Math.round(elapsed / 1000)}s)`);
-            entry.type = 'pending_new_session';
-            delete entry.claimedByMessageId;
-            delete entry.claimedAt;
-            entry.casToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-            rolledBack++;
-          }
-        }
-      }
-
-      if (rolledBack > 0) {
-        mapping.version++;
-        this.saveMapping(mapping);
-      }
-    });
-
-    return rolledBack;
-  }
-
-  /** Read all entries (for R8 startup recovery). 不 acquire lock — 用于 bot startup 一次性快照读取 */
-  async allEntries(): Promise<Array<[string, PlatformMappingEntry]>> {
-    try {
-      const raw = await readFile(this.mappingPath, 'utf8');
-      const parsed = JSON.parse(raw) as PlatformUserMapping;
-      return Object.entries(parsed.entries || {}) as Array<[string, PlatformMappingEntry]>;
-    } catch {
-      return [];
-    }
+    return this.bindSessionToClaim(externalUserId, messageId, sessionUuid, cwd);
   }
 }
 

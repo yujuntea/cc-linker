@@ -91,6 +91,9 @@ export class WecomBot {
    *
    * **重试机制**：处理失败时 requeueFromProcessing 让消息回 pending
    * 否则下一轮 claimNext(serialKey) 看到 processing 还有 active 就拒绝
+   *
+   * **PR 2 v1.2.1 (M1 修复)**: 轮询周期 500ms → 2000ms，与飞书侧 bot.dispatch 对齐
+   * 减少 fs 全表扫描 IO（每秒 4 次 → 1 次）；PR 3 共享 FeishuBot.dispatch 后会变事件驱动
    */
   private startDispatchLoop(): void {
     let stopped = false;
@@ -120,7 +123,7 @@ export class WecomBot {
         } catch (err) {
           logger.error(`[wecom-bot] dispatch loop error: ${err instanceof Error ? err.message : String(err)}`);
         }
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 2000));
       }
     };
     loop();

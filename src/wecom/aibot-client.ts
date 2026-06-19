@@ -115,13 +115,19 @@ export class AibotClient extends EventEmitter {
     this.wsClient.on('message.image', (msg: any) => {
       defaultLogger.info(`[aibot] message.image received: ${JSON.stringify(msg).slice(0, 500)}`);
       const body = msg.body ?? msg;
+      // PR 2 v1.2.1 (C7 修复): 字段路径未验证，保守 fallback + 探测未知字段
+      // 候选: body.image_list (aibot 文档) / body.image (历史猜测) / body.images / body.attachments
+      const imageArr = body.image_list ?? body.image ?? body.images ?? body.attachments;
+      if (!imageArr && (body.image_list === undefined && body.image === undefined && body.images === undefined && body.attachments === undefined)) {
+        defaultLogger.warn(`[aibot] message.image 字段路径未识别，请上报真实 shape 供 PR 3 PoC 验证: ${JSON.stringify(msg).slice(0, 500)}`);
+      }
       const event = {
         externalUserId: body.from?.userid ?? body.from?.user_id ?? '',
         chatId: body.msgid ?? body.chat_id ?? body.from?.chat_id ?? '',
         chatType: body.chattype === 'group' || body.chat_type === 'group' ? 'group' as const : 'single' as const,
         messageId: body.msgid ?? body.message_id ?? '',
         text: '[图片]',
-        images: body.image?.map((img: any) => ({ fileKey: img.media_id, url: img.url })),
+        images: Array.isArray(imageArr) ? imageArr.map((img: any) => ({ fileKey: img.file_key ?? img.media_id ?? img.fileKey, url: img.url })) : undefined,
         inboundFrame: msg,
       };
       this.messageHandlers.forEach(h => h(event));

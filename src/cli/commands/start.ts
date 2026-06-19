@@ -579,9 +579,15 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
     const { WecomBot, WECOM_USER_MAPPING_PATH } = await import('../../wecom');
     const botId = config.get<string>('wecom.bot_id', '');
     const secret = config.get<string>('wecom.secret', '');
+    const ownerExternalUserId = config.get<string>('wecom.owner_external_user_id', '');
     if (!botId || !secret) {
       console.log(chalk.red('❌ [wecom] bot_id 或 secret 未配置（检查 config.toml [wecom] 节）'));
     } else {
+      // PR 2 v1.2.1 (C6 修复): owner 未配时启动 WARN（与飞书侧 owner_open_id 未配 WARN 对称）
+      if (!ownerExternalUserId) {
+        console.log(chalk.yellow('⚠️  wecom.owner_external_user_id 未配置！任何拿到 bot 凭证的人都可以使用，可能存在严重安全风险'));
+        logger.warn('wecom.owner_external_user_id 未配置');
+      }
       wecomBotInstance = new WecomBot({
         botId,
         secret,
