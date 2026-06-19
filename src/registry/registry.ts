@@ -55,6 +55,22 @@ function migrateV3toV4(parsed: any): void {
   // 其他值让 Zod 抛错（异常路径走 restoreFromBackup）
 }
 
+/**
+ * v4→v5: 给所有 SessionEntry 加 platform 字段（默认 'feishu'）
+ * 飞书历史 v4 entry 不写 platform，迁移时补 'feishu'（向后兼容）。
+ * 已有 platform 字段的 entry 不覆盖（保护 PR 3 期间直接写入 v5 的 wecom entry）。
+ */
+function migrateV4toV5(parsed: any): void {
+  const sessions = parsed.sessions ?? {};
+  for (const uuid of Object.keys(sessions)) {
+    const entry = sessions[uuid];
+    if (entry && !entry.platform) {
+      entry.platform = 'feishu';
+    }
+  }
+  parsed.version = 5;
+}
+
 export class RegistryManager {
   private data: Registry;
   private basePath: string;
@@ -98,6 +114,7 @@ export class RegistryManager {
       const originalVersion = parsed.version;
       migrateV1toV2(parsed);
       migrateV3toV4(parsed);
+      migrateV4toV5(parsed);
       const validated = RegistrySchema.parse(parsed);
 
       // 如果迁移改变了 version，持久化新版本到磁盘（带备份以便回滚）
@@ -153,6 +170,7 @@ export class RegistryManager {
       originalVersion = parsed.version;
       migrateV1toV2(parsed);
       migrateV3toV4(parsed);
+      migrateV4toV5(parsed);
       validated = RegistrySchema.parse(parsed);
 
       // Decide inside read lock, write outside
@@ -190,7 +208,7 @@ export class RegistryManager {
 
   private emptyRegistry(): Registry {
     return {
-      version: 4,
+      version: 5,
       updated_at: new Date().toISOString(),
       sessions: {},
     };
@@ -388,6 +406,7 @@ export class RegistryManager {
       let parsed = JSON.parse(readFileSync(this.registryPath, 'utf8'));
       migrateV1toV2(parsed);
       migrateV3toV4(parsed);
+      migrateV4toV5(parsed);
       return RegistrySchema.parse(parsed);
     } catch {
       return this.restoreFromBackup() ?? this.emptyRegistry();
@@ -407,6 +426,7 @@ export class RegistryManager {
       message_count: 0,
       last_message_preview: '',
       status: 'active',
+      platform: 'feishu',
       ...entry,
     };
   }

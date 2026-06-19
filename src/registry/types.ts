@@ -34,11 +34,14 @@ export const SessionEntrySchema = z.object({
   // Task tool 派生的 subagent sessions。/list 按此过滤(复用 Agent View 的
   // filterUserDispatched 模式)。老 entry 没这个字段 = 视作 false(下次扫描会补)。
   is_subagent: z.boolean().optional(),
+
+  // v5: PR 3 企微通道 — 区分 feishu / wecom 来源（默认 'feishu' 兼容老 entry）
+  platform: z.enum(['feishu', 'wecom']).default('feishu'),
 });
 export type SessionEntry = z.infer<typeof SessionEntrySchema>;
 
 export const RegistrySchema = z.object({
-  version: z.literal(4),
+  version: z.literal(5),
   updated_at: z.string(),
   sessions: z.record(z.string(), SessionEntrySchema),
 });
