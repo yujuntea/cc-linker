@@ -47,6 +47,12 @@ export type FeishuMessageEvent = {
   content: string;
   chat_type: 'p2p' | 'group';
   message_type: 'text' | 'image';
+  /**
+   * PR 3.4: 群聊 chat_id（p2p 模式下为空字符串）。
+   * 在 start.ts:525-531 的 SDK→FeishuMessageEvent 映射中提取；
+   * feishuMessageEventToPlatform 适配器用 event.chat_id ?? event.open_id 兜底。
+   */
+  chat_id?: string;
 };
 
 export type FeishuReplyFn = (

@@ -156,14 +156,16 @@ program
 
 program
   .command('start')
-  .description('启动 Bot 进程（默认飞书; --platform=wecom 启动企微; --platform=both 双平台）')
+  .description('启动 Bot 进程（默认 feishu + wecom 并行; --platform=feishu 仅飞书; --platform=wecom 仅企微）')
   .option('-d, --daemon', '后台运行（写入 PID 文件）')
-  .option('--platform <platform>', 'feishu (default) | wecom | both', 'feishu')
+  .option('--platform <platform>', 'feishu | wecom | all (default) | both (legacy alias)', 'all')
   .action((opts) => withSync(async (registry) => {
     if (!opts.daemon) {
       StateCoordinator.assertNotRunning();
     }
-    const platform = opts.platform as 'feishu' | 'wecom' | 'both';
+    // PR 3.4: 'all' 默认让 FeishuBot + WecomBot 并行启动；
+    // 'both' 保留为 PR 2 v1.2.1 命令别名（内部等价 'all'）。
+    const platform = opts.platform as 'feishu' | 'wecom' | 'all' | 'both';
     await start(registry, { daemon: opts.daemon, platform });
   }, true));
 

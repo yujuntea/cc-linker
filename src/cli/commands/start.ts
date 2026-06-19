@@ -6,6 +6,7 @@ import { StateCoordinator } from '../../runtime/state-coordinator';
 import { startupReconcile } from '../../runtime/reconciler';
 import { logger } from '../../utils/logger';
 import { config } from '../../utils/config';
+import { CCLinkerError } from '../../utils/errors';
 import { ProviderManager } from '../../utils/providers';
 import { ClaudeSessionManager, cleanupOrphanProcesses } from '../../proxy/session';
 import { SessionActivityCache, cleanupOldActivityLogs } from '../../utils/session-activity';
@@ -22,14 +23,33 @@ import { spawnSync } from 'child_process';
 export interface StartOptions {
   daemon?: boolean;
   noFeishu?: boolean;
-  /** PR 3 v1.2.1 临时加: --platform=feishu|wecom|both (default feishu 兼容老行为) */
-  platform?: 'feishu' | 'wecom' | 'both';
+  /**
+   * PR 3.4: 用户传入的 --platform 标记。
+   *  - 'feishu' → 仅启动飞书
+   *  - 'wecom' → 仅启动企微
+   *  - 'all' → 飞书 + 企微并行启动（默认）
+   *  - 'both' → 兼容 PR 2 v1.2.1 旧命令别名，等同 'all'
+   */
+  platform?: 'feishu' | 'wecom' | 'all' | 'both';
+  /**
+   * PR 3.4: 已解析的 platforms 数组，由 start() 主函数填好后传给
+   * startForeground / startDaemonChild。允许单个平台或两个并存。
+   */
+  platforms?: ('feishu' | 'wecom')[];
 }
 
 export async function start(registry: RegistryManager, opts: StartOptions = {}): Promise<void> {
+  // PR 3.4: 在最外层就把 --platform 解析成 platforms 数组，让
+  // startForeground / startDaemonChild 不需要各自重做平台路由判断。
+  // 注意: 这一步必须在 daemon 判断之前，因为 daemon child 也要复用
+  // platforms 字段（fork 后的进程 re-run start()，走到 startDaemonChild 分支时
+  // 已经带上了 platforms，避免重复解析）。
+  const platforms = resolvePlatforms(opts);
+  const optsWithPlatforms: StartOptions = { ...opts, platforms };
+
   // Daemon child process — runs the bot with log file redirection
   if (process.env.CC_LINKER_DAEMON === '1') {
-    await startDaemonChild(registry, opts);
+    await startDaemonChild(registry, optsWithPlatforms);
     return;
   }
 
@@ -52,7 +72,59 @@ export async function start(registry: RegistryManager, opts: StartOptions = {}):
     process.exit(1);
   }
 
-  await startForeground(registry, opts);
+  await startForeground(registry, optsWithPlatforms);
+}
+
+/**
+ * PR 3.4: 把 StartOptions.platform + 配置文件组合成实际启动的平台列表。
+ *
+ * 规则：
+ *  - 'feishu' → ['feishu']
+ *  - 'wecom' → ['wecom']
+ *  - 'all' / 'both' / undefined → ['feishu', 'wecom']（PR 2 行为）
+ *  - 然后按配置剔除未配的平台：
+ *      feishu: app_id + app_secret 必须都非空
+ *      wecom: bot_id + secret 必须都非空
+ *  - 全部被剔除 → throw E_CONFIG
+ */
+function resolvePlatforms(opts: StartOptions): ('feishu' | 'wecom')[] {
+  const requested = (() => {
+    const raw = opts.platform ?? 'all';
+    if (raw === 'feishu') return ['feishu' as const];
+    if (raw === 'wecom') return ['wecom' as const];
+    if (raw === 'all' || raw === 'both') return ['feishu' as const, 'wecom' as const];
+    throw new CCLinkerError('E_CONFIG', `未知的 --platform 取值: ${String(raw)}（期望 feishu / wecom / all）`);
+  })();
+
+  const enabled: ('feishu' | 'wecom')[] = [];
+  for (const p of requested) {
+    if (p === 'feishu') {
+      const appId = config.get<string>('feishu_bot.app_id', '');
+      const appSecret = config.get<string>('feishu_bot.app_secret', '');
+      if (appId && appSecret) {
+        enabled.push('feishu');
+      } else {
+        logger.warn('[start] --platform 含 feishu 但 feishu_bot.app_id/secret 未配置，跳过飞书侧');
+      }
+    } else if (p === 'wecom') {
+      const botId = config.get<string>('wecom.bot_id', '');
+      const secret = config.get<string>('wecom.secret', '');
+      if (botId && secret) {
+        enabled.push('wecom');
+      } else {
+        logger.warn('[start] --platform 含 wecom 但 wecom.bot_id/secret 未配置，跳过企微侧');
+      }
+    }
+  }
+
+  if (enabled.length === 0) {
+    throw new CCLinkerError(
+      'E_CONFIG',
+      '没有任何可用平台：请在 config.toml 中至少配置 [feishu_bot] (app_id + app_secret) 或 [wecom] (bot_id + secret)',
+    );
+  }
+
+  return enabled;
 }
 
 /** Check if daemon is running */
@@ -176,6 +248,7 @@ interface BotRuntime {
   bot: FeishuBot;
   wsClient: any;
   stateCoordinator: StateCoordinator;
+  spoolQueue: SpoolQueue;
   shutdown: (signal: string) => Promise<void>;
 }
 
@@ -214,6 +287,14 @@ async function createBotRuntime(
   log: (level: string, msg: string) => void,
   wsLogLevel?: number,
   opts: StartOptions = {},
+  /**
+   * PR 3.4: 可选外部 SpoolQueue 注入。
+   * startForeground / startDaemonChild 在 platforms=['feishu','wecom'] 时
+   * 自己 new 一个 SpoolQueue，再同时传给 createBotRuntime 和 WecomBot，
+   * 让两个 bot 共用同一份 pending/processing 状态。
+   * 不传 → 内部 new 一个（向后兼容单飞书启动场景）。
+   */
+  externalSpoolQueue?: SpoolQueue,
 ): Promise<BotRuntime> {
   // Step 1: 探测 CLI 进程检测可用性（macOS 权限）
   // 前台和 daemon 模式都需要，确保运行时配置一致
@@ -230,7 +311,8 @@ async function createBotRuntime(
     log('INFO', `清理过期 activity 日志: ${cleaned} 个文件`);
   }
 
-  const spoolQueue = new SpoolQueue();
+  // PR 3.4: 共用 caller 提供的 SpoolQueue；没传则新创建一个（向后兼容旧调用方）
+  const spoolQueue = externalSpoolQueue ?? new SpoolQueue();
   const stateCoordinator = new StateCoordinator();
   let replyFn: FeishuReplyFn = async () => null;
   let cardReplyFn: FeishuBotCardReplyFn = async () => null;
@@ -256,7 +338,7 @@ async function createBotRuntime(
   const activityCache = new SessionActivityCache();
   sessionManager.setActivityCache(activityCache);
 
-  if (!stateCoordinator.tryAcquire()) {
+  if (!stateCoordinator.tryAcquire({ platforms: opts.platforms ?? ['feishu'] })) {
     log('ERROR', '获取 owner.lock 失败，可能有其他实例正在运行');
     process.exit(1);
   }
@@ -443,6 +525,9 @@ async function createBotRuntime(
             content: msg.content ?? '{}',
             chat_type: msg.chat_type,
             message_type: msg.message_type,
+            // PR 3.4: 提取群聊 chat_id（p2p 模式下为空）
+            // feishuMessageEventToPlatform 适配器已用 event.chat_id ?? event.open_id 兜底
+            chat_id: msg.chat_id,
           };
 
           await bot.onMessage(event);
@@ -541,11 +626,15 @@ async function createBotRuntime(
     stateCoordinator.release();
   };
 
-  return { bot, wsClient, stateCoordinator, shutdown };
+  return { bot, wsClient, stateCoordinator, spoolQueue, shutdown };
 }
 
 async function startForeground(registry: RegistryManager, opts: StartOptions, parentOpts?: StartOptions): Promise<void> {
   console.log(chalk.blue('🚀 启动 cc-linker...'));
+
+  // PR 3.4: platforms 已经在 start() 外层解析完毕，opts.platforms 必填
+  const platforms = opts.platforms ?? ['feishu'];
+  logger.info(`启动平台: ${platforms.join(' + ')}`);
 
   // Step 1 (probe) + Step 2 (cleanup) 已在 createBotRuntime 内执行
   // Step 3-5 (cache/sessionManager/bot) 也在 createBotRuntime 内执行
@@ -555,27 +644,55 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
   logger.info('活跃检测 grace period: 30 秒');
   await new Promise<void>(resolve => setTimeout(resolve, 30_000));
 
-  const { bot, stateCoordinator, shutdown } = await createBotRuntime(registry, (level, msg) => {
-    if (level === 'ERROR') {
-      console.error(chalk.red(msg));
-      logger.error(msg);
-    } else if (level === 'WARN') {
-      console.log(chalk.yellow(msg));
-      logger.warn(msg);
-    } else if (level === 'DEBUG') {
-      logger.debug(msg);
-    } else {
-      console.log(msg);
-      logger.info(msg);
-    }
-  }, undefined, opts);
+  // PR 3.4: 双平台启动时构造一个共享 SpoolQueue，让飞书 + 企微 bot 看到同一份
+  // pending/processing 状态。spoolQueue 是底层 fs 目录，每个进程只需要一个实例。
+  const sharedSpoolQueue = platforms.length > 1 ? new SpoolQueue() : undefined;
 
-  console.log(chalk.green('✅ cc-linker 已启动'));
+  // PR 3.4: 仅在要启动飞书时才走 createBotRuntime（它会拉起 WSClient + 回复路径）
+  // 单 wecom 模式不需要创建 FeishuBot，但目前 createBotRuntime 始终 new FeishuBot
+  // 并跑 startupReconcile —— 这部分 IO 对 wecom-only 场景是浪费但无害。
+  // 为保持最小改动，feishu-only 与 all 都走 createBotRuntime；
+  // wecom-only 时也复用，让它创建但不发 WSClient。
+  let bot: FeishuBot | null = null;
+  let wsClient: any = null;
+  let stateCoordinator: StateCoordinator | null = null;
+  let shutdown: ((signal: string) => Promise<void>) | null = null;
+  let spoolQueue: SpoolQueue | null = null;
 
-  // PR 2 v1.2.1 临时: WecomBot 启动分支（--platform=wecom|both 时）
-  // 注意: 这是 E2E 阶段临时方案; PR 3 完整做双平台集成 + StateCoordinator
+  if (platforms.includes('feishu')) {
+    const runtime = await createBotRuntime(registry, (level, msg) => {
+      if (level === 'ERROR') {
+        console.error(chalk.red(msg));
+        logger.error(msg);
+      } else if (level === 'WARN') {
+        console.log(chalk.yellow(msg));
+        logger.warn(msg);
+      } else if (level === 'DEBUG') {
+        logger.debug(msg);
+      } else {
+        console.log(msg);
+        logger.info(msg);
+      }
+    }, undefined, opts, sharedSpoolQueue);
+    bot = runtime.bot;
+    wsClient = runtime.wsClient;
+    stateCoordinator = runtime.stateCoordinator;
+    shutdown = runtime.shutdown;
+    spoolQueue = runtime.spoolQueue;
+  } else {
+    // PR 3.4: wecom-only 路径，飞书没启动。
+    // 仍需要一个最小 StateCoordinator 来释放 daemon 锁；但因为不创建
+    // FeishuBot，tryAcquire/release 都需要自己手动管。
+    // 为避免重复造轮子（且这一路径 PR 2 未实现 daemon 集成），这里只放一个 WARN。
+    logger.warn('[start] wecom-only 启动且未走 createBotRuntime: 暂不支持后台 daemon（前台 OK）');
+    spoolQueue = sharedSpoolQueue ?? new SpoolQueue();
+  }
+
+  console.log(chalk.green(`✅ cc-linker 已启动 (platforms: ${platforms.join('+')})`));
+
+  // PR 3.4: WecomBot 启动分支（platforms 含 wecom 时）
   let wecomBotInstance: any = null;
-  if (opts.platform === 'wecom' || opts.platform === 'both') {
+  if (platforms.includes('wecom')) {
     const { WecomBot, WECOM_USER_MAPPING_PATH } = await import('../../wecom');
     const botId = config.get<string>('wecom.bot_id', '');
     const secret = config.get<string>('wecom.secret', '');
@@ -588,10 +705,12 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
         console.log(chalk.yellow('⚠️  wecom.owner_external_user_id 未配置！任何拿到 bot 凭证的人都可以使用，可能存在严重安全风险'));
         logger.warn('wecom.owner_external_user_id 未配置');
       }
+      // PR 3.4: sharedSpoolQueue 注入 — 双平台共用同一份 spool 状态
       wecomBotInstance = new WecomBot({
         botId,
         secret,
         userMappingPath: WECOM_USER_MAPPING_PATH,
+        spoolQueue: spoolQueue ?? undefined,
       });
       wecomBotInstance.start();
       console.log(chalk.green('✅ 企微 Bot 已启动'));
@@ -604,9 +723,11 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(chalk.yellow(`\n收到 ${signal}，优雅停机中...`));
-    try { await bot.shutdown(); } catch (err) { logger.error(`bot.shutdown() 失败: ${err}`); }
+    try { await bot?.shutdown(); } catch (err) { logger.error(`bot.shutdown() 失败: ${err}`); }
     try { wecomBotInstance?.stop(); } catch (err) { logger.error(`wecomBot.stop() 失败: ${err}`); }
-    await shutdown(signal);
+    if (shutdown) {
+      try { await shutdown(signal); } catch (err) { logger.error(`shutdown 失败: ${err}`); }
+    }
     logger.info('cc-linker 已停止');
     process.exit(0);
   };
@@ -614,9 +735,19 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
+  // PR 3.4: dispatch loop
+  //  - 飞书 bot 自带内部 dispatch loop（FeishuBot.dispatch） + 2s tick
+  //  - 企微 bot 自带 startDispatchLoop（PR 2 实现，2s tick）
+  // 双平台并行：每个 bot 自己跑自己的 loop。这里只驱动飞书侧；
+  // 企微侧由 WecomBot.start() 内部已经启动（不需要再外面包一层）。
   const dispatchLoop = async () => {
     while (!shuttingDown) {
-      await bot.dispatch();
+      if (bot) {
+        try { await bot.dispatch(); } catch (err) { logger.error(`bot.dispatch() 失败: ${err}`); }
+      } else {
+        // wecom-only 路径：没有 FeishuBot，单纯 sleep 等 SIGTERM
+        await new Promise(r => setTimeout(r, 2000));
+      }
       await new Promise(r => setTimeout(r, 2000));
     }
   };
@@ -641,7 +772,9 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
   console.warn = (...args: any[]) => log('WARN', args.join(' '));
   console.debug = (...args: any[]) => log('DEBUG', args.join(' '));
 
-  log('INFO', `Daemon child started (PID: ${pid})`);
+  // PR 3.4: platforms 已由 start() 外层解析填入；这里直接读 + 建共享 SpoolQueue
+  const platforms = opts.platforms ?? ['feishu'];
+  log('INFO', `Daemon child started (PID: ${pid}, platforms: ${platforms.join('+')})`);
   process.on('SIGHUP', () => {});
 
   let shuttingDown = false;
@@ -658,16 +791,57 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
   process.on('SIGTERM', () => baseShutdown('SIGTERM'));
   process.on('SIGINT', () => baseShutdown('SIGINT'));
 
-  const { bot, shutdown } = await createBotRuntime(registry, log);
+  // PR 3.4: 双平台 daemon 时建共享 SpoolQueue，传给 createBotRuntime + WecomBot
+  const sharedSpoolQueue = platforms.length > 1 ? new SpoolQueue() : undefined;
+  let bot: FeishuBot | null = null;
+  let shutdown: ((signal: string) => Promise<void>) | null = null;
+  let spoolQueue: SpoolQueue | null = null;
 
-  log('INFO', 'cc-linker daemon started');
+  if (platforms.includes('feishu')) {
+    const runtime = await createBotRuntime(registry, log, undefined, opts, sharedSpoolQueue);
+    bot = runtime.bot;
+    shutdown = runtime.shutdown;
+    spoolQueue = runtime.spoolQueue;
+  } else {
+    log('WARN', '[startDaemonChild] wecom-only 启动且未走 createBotRuntime: 暂不支持后台 daemon');
+    spoolQueue = sharedSpoolQueue ?? new SpoolQueue();
+  }
+
+  // PR 3.4: 企微 daemon 子进程
+  let wecomBotInstance: any = null;
+  if (platforms.includes('wecom')) {
+    const { WecomBot, WECOM_USER_MAPPING_PATH } = await import('../../wecom');
+    const botId = config.get<string>('wecom.bot_id', '');
+    const secret = config.get<string>('wecom.secret', '');
+    const ownerExternalUserId = config.get<string>('wecom.owner_external_user_id', '');
+    if (!botId || !secret) {
+      log('ERROR', '[wecom] bot_id 或 secret 未配置（检查 config.toml [wecom] 节）');
+    } else {
+      if (!ownerExternalUserId) {
+        log('WARN', 'wecom.owner_external_user_id 未配置！任何拿到 bot 凭证的人都可以使用，可能存在严重安全风险');
+      }
+      wecomBotInstance = new WecomBot({
+        botId,
+        secret,
+        userMappingPath: WECOM_USER_MAPPING_PATH,
+        spoolQueue: spoolQueue ?? undefined,
+      });
+      wecomBotInstance.start();
+      log('INFO', `企微 Bot 已启动 (bot_id=${botId})`);
+    }
+  }
+
+  log('INFO', `cc-linker daemon started (platforms: ${platforms.join('+')})`);
 
   const daemonShutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
     log('INFO', `收到 ${signal}，优雅停机中...`);
-    try { await bot.shutdown(); } catch (err) { log('ERROR', `bot.shutdown() 失败: ${err}`); }
-    await shutdown(signal);
+    try { await bot?.shutdown(); } catch (err) { log('ERROR', `bot.shutdown() 失败: ${err}`); }
+    try { wecomBotInstance?.stop(); } catch (err) { log('ERROR', `wecomBot.stop() 失败: ${err}`); }
+    if (shutdown) {
+      try { await shutdown(signal); } catch (err) { log('ERROR', `shutdown 失败: ${err}`); }
+    }
     try { if (existsSync(RUNTIME_PID_FILE)) unlinkSync(RUNTIME_PID_FILE); } catch {}
     log('INFO', 'cc-linker 已停止');
     process.exit(0);
@@ -680,7 +854,11 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
 
   const dispatchLoop = async () => {
     while (!shuttingDown) {
-      await bot.dispatch();
+      if (bot) {
+        try { await bot.dispatch(); } catch (err) { log('ERROR', `bot.dispatch() 失败: ${err}`); }
+      } else {
+        await new Promise(r => setTimeout(r, 2000));
+      }
       await new Promise(r => setTimeout(r, 2000));
     }
   };
