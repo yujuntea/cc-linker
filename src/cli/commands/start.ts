@@ -696,6 +696,11 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
     // 为避免重复造轮子（且这一路径 PR 2 未实现 daemon 集成），这里只放一个 WARN。
     logger.warn('[start] wecom-only 启动且未走 createBotRuntime: 暂不支持后台 daemon（前台 OK）');
     spoolQueue = sharedSpoolQueue ?? new SpoolQueue();
+    // PR 4.1.1 修复: wecom-only 路径 new ClaudeSessionManager，让 WecomBot 走真流式
+    // 历史: sharedSessionManager 在 wecom-only 路径是 null，WecomBot.handleChat
+    //   走 PoC echo fallback（实测 log: 'sessionManager 未注入, 走 PoC echo 路径'）。
+    // 修法: 单独 new ClaudeSessionManager，settingsPath 缺省（用 global config）
+    sharedSessionManager = new ClaudeSessionManager();
   }
 
   console.log(chalk.green(`✅ cc-linker 已启动 (platforms: ${platforms.join('+')})`));

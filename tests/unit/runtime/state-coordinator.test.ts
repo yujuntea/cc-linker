@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { StateCoordinator } from '../../../src/runtime/state-coordinator';
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -30,26 +30,45 @@ describe('StateCoordinator (per-platform locks v3.3)', () => {
     expect(existsSync(lockPath)).toBe(false); // 默认 owner.lock 未使用
   });
 
-  it('backward-compat: static isLocked() 无参检查默认 owner.lock 路径', () => {
-    // 写入默认 owner.lock（带当前 PID）
-    writeFileSync(lockPath, JSON.stringify({
+  // PR 4.1.1: m-4 final review 修复 — 无参 isLocked/assertNotRunning 检查所有 3 个 lock 路径
+  // (feishu + wecom + all), 不再查默认 owner.lock (PR 3.3 后没人写 owner.lock)
+  it('PR 4.1.1 (m-4): static isLocked() 无参查所有 3 个 lock 路径', () => {
+    // 测试场景：tmpDir 是测试 baseLockPath，传给 isLocked 作 baseLockPath
+    // 写入 owner.feishu.lock + 验证 isLocked() 返回 true
+    const feishuLockPath = join(tmpDir, 'owner.feishu.lock');
+    writeFileSync(feishuLockPath, JSON.stringify({
       pid: process.pid,
       acquiredAt: new Date().toISOString(),
     }));
-    expect(StateCoordinator.isLocked()).toBe(true);
+    expect(StateCoordinator.isLocked(undefined, lockPath)).toBe(true);
+
+    // 清掉 feishu, 写 wecom, 再验证
+    unlinkSync(feishuLockPath);
+    const wecomLockPath = join(tmpDir, 'owner.wecom.lock');
+    writeFileSync(wecomLockPath, JSON.stringify({
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+    }));
+    expect(StateCoordinator.isLocked(undefined, lockPath)).toBe(true);
+
+    // 清掉 wecom, 验证无 lock 时返回 false
+    unlinkSync(wecomLockPath);
+    expect(StateCoordinator.isLocked(undefined, lockPath)).toBe(false);
   });
 
-  it('backward-compat: static assertNotRunning() 无参检查默认 owner.lock 路径', () => {
-    writeFileSync(lockPath, JSON.stringify({
+  it('PR 4.1.1 (m-4): static assertNotRunning() 无参查所有 3 个 lock 路径', () => {
+    const feishuLockPath = join(tmpDir, 'owner.feishu.lock');
+    writeFileSync(feishuLockPath, JSON.stringify({
       pid: process.pid,
       acquiredAt: new Date().toISOString(),
     }));
-    expect(() => StateCoordinator.assertNotRunning()).toThrow();
+    expect(() => StateCoordinator.assertNotRunning(undefined, lockPath)).toThrow();
     try {
-      StateCoordinator.assertNotRunning();
+      StateCoordinator.assertNotRunning(undefined, lockPath);
     } catch (err: any) {
       expect(err.code).toBe('E013');
     }
+    unlinkSync(feishuLockPath);
   });
 
   // ---------- 单平台：feishu ----------

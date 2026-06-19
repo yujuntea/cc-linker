@@ -175,7 +175,7 @@ export class StateCoordinator {
    *  - `isLocked('feishu' | 'wecom', baseLockPath?)` → 检查对应平台锁路径
    */
   static isLocked(platformOrLockPath?: Platform | string, baseLockPath?: string): boolean {
-    let path: string;
+    let pathsToCheck: string[];
 
     if (platformOrLockPath === 'feishu' || platformOrLockPath === 'wecom') {
       // PR 2 v1.2.1 final (M-2): 用 dirname + basename 重组 platform-specific 路径
@@ -183,17 +183,33 @@ export class StateCoordinator {
       //   不以 `owner.lock` 结尾时 replace 不匹配，**返回原字符串**（fallback 失效）。
       // 修法: 永远以 dirname + `owner.${platform}.lock` 重组，与 baseLockPath 文件名解耦。
       const base = baseLockPath ?? RUNTIME_OWNER_LOCK_PATH;
-      path = join(dirname(base), `owner.${platformOrLockPath}.lock`);
+      pathsToCheck = [join(dirname(base), `owner.${platformOrLockPath}.lock`)];
     } else if (typeof platformOrLockPath === 'string') {
       // 旧 API：第一个参数直接是 lockPath
-      path = platformOrLockPath;
+      pathsToCheck = [platformOrLockPath];
     } else {
-      // 未传参数 → 默认 owner.lock
-      path = RUNTIME_OWNER_LOCK_PATH;
+      // PR 3.3 final review (m-4 修复): 未传参 → 检查所有 3 个 lock 路径
+      // 历史: 默认查 RUNTIME_OWNER_LOCK_PATH (owner.lock)，但 PR 3.3 后没人写
+      //   owner.lock，永远 false → CLI write 命令 assertNotRunning() 失效
+      // 修法: 检查 feishu + wecom + all 三个 lock，任一被占就 true
+      const base = baseLockPath ?? RUNTIME_OWNER_LOCK_PATH;
+      const dir = dirname(base);
+      pathsToCheck = [
+        join(dir, 'owner.feishu.lock'),
+        join(dir, 'owner.wecom.lock'),
+        join(dir, 'owner.all.lock'),
+      ];
     }
 
-    if (!existsSync(path)) return false;
+    for (const path of pathsToCheck) {
+      if (StateCoordinator.checkLockPathLive(path)) return true;
+    }
+    return false;
+  }
 
+  /** 检查单个 lockPath 是否被存活进程持有 (isLocked helper) */
+  private static checkLockPathLive(path: string): boolean {
+    if (!existsSync(path)) return false;
     try {
       const lockData = JSON.parse(readFileSync(path, 'utf8')) as LockData;
       const pid = lockData.pid as number;
@@ -210,7 +226,7 @@ export class StateCoordinator {
 
   /**
    * 断言指定平台未被占用，否则抛出 E013。
-   * @param platform - 不传则检查默认 owner.lock（向后兼容旧调用方）。
+   * @param platform - 不传则检查所有 3 个 lock 路径（PR 3.3 final review m-4 修复）
    */
   static assertNotRunning(platformOrLockPath?: Platform | string, baseLockPath?: string): void {
     if (StateCoordinator.isLocked(platformOrLockPath, baseLockPath)) {
