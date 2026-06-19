@@ -1,4 +1,4 @@
-import { writeFileSync, readFileSync, renameSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { openSync, writeSync, closeSync, fsyncSync, readFileSync, renameSync, existsSync, mkdirSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { RUNTIME_OWNER_LOCK_PATH } from '../utils/paths';
 import { CCLinkerError } from '../utils/errors';
@@ -105,7 +105,18 @@ export class StateCoordinator {
       platforms,
     };
     const tmp = targetLockPath + '.tmp';
-    writeFileSync(tmp, JSON.stringify(lockData, null, 2), { mode: 0o600 });
+    // M-3 (0 字节 bug 修复): writeFileSync + renameSync 在 macOS fsync 时序问题下可能留 0 字节
+    //   (daemon SIGKILL 时 write 还没落盘)。改用 openSync + writeSync (sync 写)
+    //   + fsyncSync (强制刷盘) + closeSync + renameSync, 确保 0 字节不出现。
+    //   与 src/queue/spool.ts:586-602 writeAtomic / src/platform/user-state.ts:95-110 saveMapping 修法对称。
+    const lockDataStr = JSON.stringify(lockData, null, 2);
+    const fd = openSync(tmp, 'w', 0o600);
+    try {
+      writeSync(fd, lockDataStr);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     // Atomic rename
     try {
       renameSync(tmp, targetLockPath);
