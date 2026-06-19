@@ -185,7 +185,8 @@ export class WecomBot {
   private async handleCommand(msg: SpoolMessage): Promise<void> {
     // PR 4.5 C: 命令路由 — 仿飞书侧命令处理，但用 sendMessage 推回 (没 CardUpdater)
     // 历史: PR 2/3/4.1 阶段命令只 echo back (set up stub 收命令 E2E), 真实路由 PR 4.5+ 实现
-    // 简化版: 只支持 /new /list /status /help; /switch /resume /bridge /agents 推 PR 5+ 实现
+    // 简化版: 只支持 /new /list /status /help; /switch /resume /agents 推 PR 5+ 实现
+    // /bridge 已废弃 (历史 cc-connect 集成命令, cc-linker 移除 cc-connect 后孤儿, 2026-06-20 决定不复活)
     const parsed = parseCommand(msg.text);
     if (!parsed) {
       logger.warn(`[wecom-bot] handleCommand: parseCommand failed for "${msg.text.slice(0, 50)}", skipping`);
@@ -229,7 +230,7 @@ export class WecomBot {
           responseText = await this.handleCommandModel(msg.userId, parsed.args);
           break;
         default:
-          responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /status /help /switch /resume /agents /stop /cancel /model\n\n_(PR 5: 完整命令集已实现, /bridge 推 PR 6+)_`;
+          responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /status /help /switch /resume /agents /stop /cancel /model\n\n_(/bridge 已废弃, 不再支持)_`;
       }
     } catch (err) {
       logger.error(`[wecom-bot] handleCommand /${parsed.cmd} error: ${err instanceof Error ? err.message : String(err)}`);
@@ -297,7 +298,7 @@ export class WecomBot {
    * PR 5: 加 6 个新命令: /switch /resume /agents /stop /cancel /model
    */
   private handleCommandHelp(): string {
-    return `🤖 cc-linker wecom Bot 命令:\n  /new [cwd]    - 强制新建 session\n  /list         - 列出当前 session\n  /status       - 显示 bot 状态\n  /help         - 显示本帮助\n  /switch <uuid> - 切换到指定 session\n  /resume       - 续聊当前 session (刷 lastActiveAt)\n  /agents       - 列出活跃 bg sessions\n  /stop <short> - 停止 bg session\n  /cancel       - 取消当前 reply (PR 5 简化: 仅返回状态)\n  /model <name> - 切换 model alias (PR 5 临时实现, 持久化推 PR 6+)\n\n_(PR 5: /bridge 跨平台会话同步 推 PR 6+)_`;
+    return `🤖 cc-linker wecom Bot 命令:\n  /new [cwd]    - 强制新建 session\n  /list         - 列出当前 session\n  /status       - 显示 bot 状态\n  /help         - 显示本帮助\n  /switch <uuid> - 切换到指定 session\n  /resume       - 续聊当前 session (刷 lastActiveAt)\n  /agents       - 列出活跃 bg sessions\n  /stop <short> - 停止 bg session\n  /cancel       - 取消当前 reply (PR 5 简化: 仅返回状态)\n  /model <name> - 切换 model alias (PR 5 临时实现, 持久化推 PR 6+)\n\n_(/bridge 已废弃, 不再支持)_`;
   }
 
   /**
