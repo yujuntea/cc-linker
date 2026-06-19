@@ -365,8 +365,9 @@ stateDiagram-v2
 | **ABORTED** | `max_rounds_exceeded` | 进入 SELF_REVIEW_R1 时 round≥max |
 | **ABORTED** | `pane_lost_timeout` | PANE_LOST 24h |
 | **ABORTED** | `human_decision_timeout` | HUMAN_DECIDE 4h |
-| **ABORTED** | `context_overflow` | EXTERNAL_REVIEW strategy=abort |
+| **ABORTED** | `context_overflow_max_attempts` | v2.1.2：cascade n≥3 时触发（从旧 `context_overflow` 改名） |
 | **ABORTED** | `context_reset_spawn_failed` | reset 中 startSession 失败 |
+| **ABORTED** | `review_opinions_write_failed` | v2.1.2 新增：写 review opinions 文件失败（fallback inline 会撑爆 context，所以直接 abort） |
 | **ABORTED** | `work_session_lost_exceeds_max_rounds` | retry PANE_LOST 触发 |
 | **ABORTED** | `user_cancelled` | `cc-linker review cancel` |
 | **ABORTED** | `budget_exceeded` | costUsd > max_cost_usd |

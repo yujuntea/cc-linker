@@ -499,6 +499,8 @@ type ExtendedJobStateFile = JobStateFile & {
 
 ##### 7.5.7.1 触发点（v2.1.2 cascade 入口）
 
+> **档位随配置变化**（重要）：默认 `max_compact_attempts = 1` → **3 档**（compact / reset / abort）；如果配置 `max_compact_attempts = N`，实际档位是 **N + 2**（N 次 compact / 1 次 reset / 1 次 abort）。配错会导致行为不符合直觉：例如 `max_compact_attempts=2` 会在 n=1 和 n=2 都试 compact，n=3 才 reset，n≥4 abort。
+
 在 `onExternalReviewComplete` 内同步调用 `checkContextOverflow()` + cascade dispatch：
 
 ```typescript
@@ -1016,10 +1018,11 @@ template = """
 
 | 场景 | 处理 |
 |------|------|
-| 写文件失败（磁盘满 / 权限） | log error，继续 pipeline（fallback 到 inline prompt 注入） |
+| 写文件失败（磁盘满 / 权限） | **不再 fallback inline**（inline 注入会二次撑爆 context）→ `cleanupPipeline + ABORTED reason=review_opinions_write_failed`，cli-watch 提示用户手动 `cat ~/.cc-linker/review-pipelines/<id>/state/` 排查 |
 | json 文件损坏 | Reconciler 检测 + 跳过 + warn（不影响 pipeline 恢复） |
 | MD 渲染失败（issues 字段缺失） | 降级：只写 json，MD 留 `.md.disabled` 占位 |
-| `external_review_md_path` 不存在（首次写） | prompt 模板降级到 inline 注入 |
+| `external_review_md_path` 不存在（首次写） | prompt 模板降级到 inline 注入（仅首次，cascade 触发的二次 EXTERNAL_REVIEW 仍走写文件路径） |
+| 写文件成功但磁盘随后被清（pipeline 跨崩溃恢复时） | Reconciler 检测 `@file` 路径不存在 → prompt 模板降级到 inline 注入 + warn |
 
 ---
 
@@ -1049,14 +1052,15 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
 | 网络瞬态 503 | retry 3 次 + backoff → FAILED `network_timeout` |
 | JSON parse 失败 | retry 1 次 → parse_degraded |
 | max_rounds 达到 | ABORTED |
-| Context window 超限 | reset / abort 二策略 |
+| Context window 超限 | cascade 三档（compact → reset → abort，详见 §7.5.7） |
+| Review opinions 写文件失败 | v2.1.2 新增：ABORTED `review_opinions_write_failed`（不再 fallback inline 防 context 二次超限） |
 
-### 10.2 reset 模式约束
+### 10.2 cascade 模式约束（v2.1.2：从 reset 扩展为 cascade）
 
-**3 个不变量**：
-1. work session 仍是唯一修复者
-2. context fresh + issue 记忆保留（injectedIssues + history + relatedDocs）
-3. verify-first 不变
+**3 个不变量**（compact / reset 两档共享）：
+1. work session 仍是唯一修复者（compact 同 session、reset 新 session）
+2. context 健康 + issue 记忆保留（compact 靠 `/compact` + @file 引用；reset 靠 injectedIssues + history + relatedDocs + @file）
+3. verify-first 不变（cascade 不绕过 verify-first）
 
 ### 10.3 Graceful degradation vs fail fast
 
