@@ -139,6 +139,7 @@ describe('WecomBot handleChat (PR 4.1)', () => {
     // PR 4.5: 默认 mock userManager (避免读真实文件, 防止测试间状态污染)
     // 单个测试可覆盖 getEntry 返回特定 entry 测续聊
     mockUserManager = {
+      validateOwner: mock((_uid: string) => true),  // PR 5: C-1+C-2 修复, 默认放行让旧测试不挂
       getEntry: mock((_uid: string) => undefined),
       setSession: mock(async () => {}),
       touchSession: mock(async () => {}),
@@ -440,6 +441,7 @@ describe('WecomBot handleChat (PR 4.5 B: 续聊映射)', () => {
     };
     // 默认 mock userManager: getEntry 返回 undefined (覆盖在每个测试里)
     mockUserManager = {
+      validateOwner: mock((_uid: string) => true),  // PR 5: C-1+C-2 修复, 默认放行让旧测试不挂
       getEntry: mock((_uid: string) => undefined),
       setSession: mock(async () => {}),
       touchSession: mock(async () => {}),
@@ -685,6 +687,7 @@ describe('WecomBot handleChat (PR 4.5 B: 续聊映射)', () => {
   it('PR 4.5 final B1: pending 状态用 pending.cwd 走 new 路径 (修 /new 简化版 bug)', async () => {
     // mock userManager: 返回 pending 状态 (模拟 /new 命令后的状态)
     const b1UserManager = {
+      validateOwner: mock((_uid: string) => true),  // PR 5: C-1+C-2 修复, 默认放行
       getEntry: mock((_uid: string) => ({
         type: 'pending_new_session',
         sessionUuid: null,
@@ -791,6 +794,7 @@ describe('WecomBot handleCommand (PR 4.5 C: 命令路由)', () => {
       },
     };
     mockUserManager = {
+      validateOwner: mock((_uid: string) => true),  // PR 5: C-1+C-2 修复, 默认放行让旧测试不挂
       getEntry: mock((_uid: string) => undefined),
       setPending: mock(async () => {}),
       setSession: mock(async () => {}),
@@ -997,6 +1001,7 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
       },
     };
     mockUserManager = {
+      validateOwner: mock((_uid: string) => true),  // PR 5: C-1+C-2 修复, 默认放行让旧测试不挂
       getEntry: mock((_uid: string) => undefined),
       setPending: mock(async () => {}),
       setSession: mock(async () => {}),
@@ -1214,5 +1219,153 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     expect(content).toContain('/stop');
     expect(content).toContain('/cancel');
     expect(content).toContain('/model');
+  });
+});
+
+/**
+ * PR 5: C-1 + C-2 修复 — handleChat 入口加 owner 验证
+ * 历史: PoC echo 路径 (无 sessionManager) + Claude 流式路径 (有 sessionManager)
+ *   都跳过 userManager.validateOwner, 导致未配 owner / owner 不匹配时仍 spawn
+ *   claude 子进程或无差别回复, 浪费配额 + 泄漏用户内容。
+ * 修法: handleChat 入口先验证 msg.userId (外部 userid), 不通过 → 不调任何
+ *   sessionManager/sendMessage, 直接 markDone (不 requeue)。
+ *
+ * 关键断言:
+ * - 不调 sessionManager.sendStreamingMessage
+ * - 不调 client.sdk.sendMessage (PoC 路径)
+ * - 调 spoolQueue.markDone (不 requeue)
+ * - 调 userManager.validateOwner 验证
+ */
+describe('WecomBot handleChat owner validation (PR 5: C-1+C-2)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let validateOwnerCalls: any[];
+
+  beforeEach(() => {
+    validateOwnerCalls = [];
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    // mock userManager: validateOwner 返回 false (未授权)
+    mockUserManager = {
+      validateOwner: mock((uid: string) => {
+        validateOwnerCalls.push(uid);
+        return false;
+      }),
+      getEntry: mock((_uid: string) => undefined),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+  });
+
+  // C-1: PoC 路径 (sessionManager 未注入) — 未授权 userId 应被拒绝
+  it('C-1: PoC echo 路径拒绝未授权 userId (不调 sendMessage, markDone)', async () => {
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr5-c1.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      // 关键: sessionManager 未注入 → 走 PoC echo 路径
+    });
+
+    const msg: any = {
+      messageId: 'msg_unauth_poc',
+      openId: '',
+      text: 'unauthorized message',
+      userId: 'wmu_attacker',  // 未授权 userId
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: 'new:wmu_attacker',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: 'inbound_unauth_poc' } } },
+    };
+
+    await bot.__test_handleChat(msg);
+
+    // 1. 调 validateOwner 验证
+    expect(mockUserManager.validateOwner).toHaveBeenCalledWith('wmu_attacker');
+
+    // 2. 不调 sendMessage (PoC 路径被 owner 验证拦截)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+
+    // 3. 不调 replyStream (Claude 路径未到达)
+    expect(mockClient.sdk.replyStream).not.toHaveBeenCalled();
+
+    // 4. 调 markDone (不 requeue — 未授权消息重试无意义)
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_unauth_poc', 'new:wmu_attacker');
+    expect(mockSpoolQueue.requeueFromProcessing).not.toHaveBeenCalled();
+  });
+
+  // C-2: Claude 流式路径 (sessionManager 注入) — 未授权 userId 应被拒绝
+  it('C-2: Claude 流式路径拒绝未授权 userId (不调 sendStreamingMessage, markDone)', async () => {
+    const mockSessionManager: any = {
+      sendStreamingMessage: mock(async () => {
+        throw new Error('不应被调 — owner 验证应在 Claude 调用前拦截');
+      }),
+    };
+
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr5-c2.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      sessionManager: mockSessionManager,  // 注入 → Claude 流式路径
+      userManager: mockUserManager as any,
+    });
+
+    const msg: any = {
+      messageId: 'msg_unauth_claude',
+      openId: '',
+      text: 'unauthorized claude',
+      userId: 'wmu_attacker',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: 'new:wmu_attacker',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: 'inbound_unauth_claude' } } },
+    };
+
+    await bot.__test_handleChat(msg);
+
+    // 1. 调 validateOwner 验证
+    expect(mockUserManager.validateOwner).toHaveBeenCalledWith('wmu_attacker');
+
+    // 2. 不调 sendStreamingMessage (核心: 不 spawn claude 子进程)
+    expect(mockSessionManager.sendStreamingMessage).not.toHaveBeenCalled();
+
+    // 3. 不调 replyStream (startProcessing 未被调, 不应触发任何流)
+    expect(mockClient.sdk.replyStream).not.toHaveBeenCalled();
+
+    // 4. 不调 sendMessage (PoC 路径也未触发)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+
+    // 5. 调 markDone (不 requeue — 未授权消息重试无意义)
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_unauth_claude', 'new:wmu_attacker');
+    expect(mockSpoolQueue.requeueFromProcessing).not.toHaveBeenCalled();
   });
 });

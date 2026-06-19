@@ -421,6 +421,22 @@ export class WecomBot {
   private async handleChat(msg: SpoolMessage): Promise<void> {
     logger.info(`[wecom-bot] handleChat: userId=${msg.userId}, text=${msg.text.slice(0, 50)}`);
 
+    // PR 5: 合并后 C-1+C-2 修复 — owner 验证统一在 handleChat 入口
+    // 历史: PoC echo 路径和 Claude 流式路径都跳过 validateOwner
+    //   → 未配 owner / owner 不匹配时仍 spawn claude 子进程 + 无差别回复 (C-1 + C-2)
+    // 修法: handleChat 入口先验证 msg.userId (外部 userid), 不通过 → error 卡片 + markDone
+    if (!this.userManager.validateOwner(msg.userId)) {
+      logger.warn(`[wecom-bot] handleChat: unauthorized userId=${msg.userId}, skipping`);
+      try {
+        const inboundFrame = msg.metadata?.inboundFrame as any;
+        if (inboundFrame) {
+          await this.updater.error('未授权用户');
+        }
+      } catch { /* ignore */ }
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      return;
+    }
+
     // PR 4.1: PoC fallback — sessionManager 未注入时走 sendMessage echo 路径
     // 用于 staging / 单测 (确保向后兼容未升级的 wecom-only 启动)
     if (!this.sessionManager) {
