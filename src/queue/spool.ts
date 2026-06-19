@@ -558,7 +558,12 @@ export class SpoolQueue {
 
   private readSpoolMessage(path: string): SpoolMessage | null {
     try {
-      return JSON.parse(readFileSync(path, 'utf8')) as SpoolMessage;
+      const msg = JSON.parse(readFileSync(path, 'utf8')) as SpoolMessage;
+      // v1.2 兜底：老 spool 文件（PR 1 之前生成）没有 userId/platform 字段
+      // 飞书路径 alias：openId → userId；platform 默认 'feishu'
+      if (!msg.userId && msg.openId) msg.userId = msg.openId;
+      if (!msg.platform) msg.platform = 'feishu';
+      return msg;
     } catch {
       logger.warn(`读取 spool 消息失败: ${path}`);
       return null;
