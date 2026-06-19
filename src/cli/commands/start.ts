@@ -65,11 +65,13 @@ export async function start(registry: RegistryManager, opts: StartOptions = {}):
     return;
   }
 
-  // Check owner.lock for foreground mode
-  const sc = new StateCoordinator();
-  if (StateCoordinator.isLocked()) {
-    console.log(chalk.red('❌ Bot 进程正在运行，请先执行 cc-linker stop'));
-    process.exit(1);
+  // PR 3.4 fix: 检查每个 active platform 的锁（不是 default owner.lock）
+  // PR 3.3 后飞书锁在 owner.feishu.lock，企微锁在 owner.wecom.lock
+  for (const p of platforms) {
+    if (StateCoordinator.isLocked(p)) {
+      console.log(chalk.red(`❌ ${p} 平台 Bot 正在运行，请先执行 cc-linker stop`));
+      process.exit(1);
+    }
   }
 
   await startForeground(registry, optsWithPlatforms);
