@@ -335,7 +335,9 @@ describe('FeishuBot doSwitch overview card', () => {
     expect(env.cardReplies.length).toBe(0);
     expect(env.textReplies.length).toBe(1);
     expect(env.textReplies[0].text).toContain('已损坏');
-    expect(env.textReplies[0].text).toContain('不能直接切换');
+    expect(env.textReplies[0].text).toContain('不能直接操作');
+    // v2026-06-18: degraded 消息改用 [sdk] claude_executable 优先配置,真实命令 cc-linker list
+    expect(env.textReplies[0].text).toContain('cc-linker list');
 
     // 验证：mapping 没有变成 'session'（用户没有被绑定到坏会话）
     const entry = env.userManager.getEntry('ou_user1');

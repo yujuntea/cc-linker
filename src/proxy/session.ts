@@ -129,6 +129,26 @@ interface SessionLock {
   release: () => void;
 }
 
+/**
+ * v2026-06-18: 区分 Claude 业务错 (parsed.is_error, 业务层报错, 可恢复)
+ * 与 CLI 进程崩 (exitCode !== 0 且 Claude 没报错, 基础设施错, 不可恢复)。
+ *
+ * 跟 _buildStreamingResult (line 691 修复后) 和 sendSDKMessage (line 893/920/932
+ * 修复后) 保持同样语义: SDK/CLI 已成功启动后任何失败都是可恢复的,
+ * 只有 CLI 进程本身崩了才标 degraded。
+ *
+ * @param parsed - 从 Claude CLI stdout 解析的 JSON 结果 (parse 失败时为 null)
+ * @param exitCode - Claude CLI 进程退出码 (null = 进程未正常退出,例如被 kill)
+ * @returns 'degraded' 仅当 CLI 崩了且 Claude 没报业务错;否则 'active'
+ */
+export function classifyExecutionStatus(
+  parsed: ClaudeJsonOutput | null,
+  exitCode: number | null,
+): 'active' | 'degraded' {
+  const isInfraError = (exitCode !== 0 && exitCode !== null) && !parsed?.is_error;
+  return isInfraError ? 'degraded' : 'active';
+}
+
 export class ClaudeSessionManager {
   private activeProcesses = new Map<string, ClaudeSession>();
   /**
@@ -410,10 +430,13 @@ export class ClaudeSessionManager {
     const resolvedSessionId = parsed?.session_id ?? sessionId ?? '';
     const finalResponse = parsed?.result?.trim() || '';
     const baseError = parsed?.errors?.join('; ') || stderrText.trim();
+    // v2026-06-18: 用 helper 区分 Claude 业务错 (parsed.is_error, 可恢复) vs
+    // CLI 进程崩 (exitCode !== 0 且 Claude 没报错, 基础设施错, 不可恢复)。
+    // 保持 'degraded' 仅用于真正的不可恢复错误,允许 transient 错误后 /switch 不被阻断。
     const hasExecutionError = Boolean(parsed?.is_error) || (exitCode !== 0 && exitCode !== null);
-
     let jsonlPath: string | null = null;
-    let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasExecutionError ? 'degraded' : 'active';
+    let sessionStatus: 'active' | 'provisioning' | 'degraded' =
+      classifyExecutionStatus(parsed, exitCode);
 
     if (isNew && resolvedSessionId) {
       jsonlPath = await resolveJsonlPath(resolvedSessionId);
@@ -688,7 +711,17 @@ export class ClaudeSessionManager {
     if (!response) response = '(空回复)';
 
     let jsonlPath: string | null = null;
-    let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasError ? 'degraded' : 'active';
+    // v2026-06-18: 修复 /switch 阻断 bug —— SDK/Claude 已经正常运行过的路径
+    // 上任何失败都是可恢复的 (context 超限、max_turns、rate_limit),不应锁死 session。
+    // 错误信息走 error 字段,registry upsert 时会写到 last_error。
+    //
+    // v2026-06-18 follow-up: 但 mid-stream crash (lastResult=null, exitCode !== 0)
+    // 表明 CLI 进程崩了,跟 sendMessage 的 classifyExecutionStatus 同样的语义,
+    // 应该标 'degraded' 而不是 'active'。否则用户 /switch 成功但下次发消息又崩。
+    let sessionStatus: 'active' | 'provisioning' | 'degraded' = 'active';
+    if (!lastResult && exitCode !== 0 && exitCode !== null) {
+      sessionStatus = 'degraded';
+    }
 
     if (isNew && resolvedSessionId) {
       jsonlPath = await resolveJsonlPath(resolvedSessionId);
@@ -887,7 +920,7 @@ export class ClaudeSessionManager {
             durationMs: Date.now() - startTime,
             sessionId: sessionId ?? '',
             jsonlPath: null,
-            sessionStatus: 'degraded',
+            sessionStatus: 'active',  // v2026-06-18: 失败可恢复,允许用户换模型重试
             error: errMsg,
           },
           handler,
@@ -914,7 +947,7 @@ export class ClaudeSessionManager {
             durationMs,
             sessionId: sessionId ?? '',
             jsonlPath: null,
-            sessionStatus: hasError ? 'degraded' : 'active',
+            sessionStatus: 'active',  // v2026-06-18: SDK 跑过即视为可恢复
             error: hasError ? 'no_result_returned' : undefined,
           },
           handler,
@@ -923,7 +956,10 @@ export class ClaudeSessionManager {
 
       const resolvedSessionId = (lastResult.session_id as string) || (sessionId ?? '');
       let jsonlPath: string | null = null;
-      let sessionStatus: 'active' | 'provisioning' | 'degraded' = hasError ? 'degraded' : 'active';
+      // v2026-06-18: Claude 正常返回了 result chunk 但 subtype 不是 'success'
+      // (如 error_max_turns、error_during_execution、error_rate_limit) 都是
+      // 业务错误,用户换模型或稍后重试即可恢复。不锁死 session。
+      let sessionStatus: 'active' | 'provisioning' | 'degraded' = 'active';
 
       if (isNew && resolvedSessionId) {
         jsonlPath = await resolveJsonlPath(resolvedSessionId);

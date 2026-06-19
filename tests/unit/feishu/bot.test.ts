@@ -239,7 +239,7 @@ describe('FeishuBot', () => {
     expect(helpText).toContain('硬杀');
   });
 
-  it('rejects unknown commands', async () => {
+  it('v2.5: /unknown no longer rejected — falls through to handleChat as chat text', async () => {
     await bot.onMessage({
       open_id: 'ou_user1',
       message_id: 'msg-1',
@@ -250,7 +250,13 @@ describe('FeishuBot', () => {
 
     await bot.dispatch();
 
-    expect(env.textReplies.some(r => r.text.includes('未知命令'))).toBe(true);
+    // v2.5: cc-linker 不再拒绝未知 /xxx — fallthrough 到 handleChat
+    // 无活跃会话 → 走 case 'no_target' → 提示 /new (跟 chat 文本一致)
+    const hasUnknown = env.textReplies.some(r => r.text.includes('未知命令'));
+    expect(hasUnknown).toBe(false);
+    // And user gets the standard no-session prompt
+    const hasNewPrompt = env.textReplies.some(r => r.text.includes('/new'));
+    expect(hasNewPrompt).toBe(true);
   });
 
   it('deduplicates messages by messageId', async () => {

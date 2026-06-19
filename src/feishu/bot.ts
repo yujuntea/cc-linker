@@ -309,9 +309,8 @@ export class FeishuBot {
     }
 
     const isCommand = isCommandMessage(text);
-    const target = isCommand
-      ? { type: 'no_target' as const, openId: event.open_id, mappingVersion: this.userManager.getVersion() }
-      : await this.resolveChatTarget(event.open_id, event.message_id);
+    // v2.5: 总是解析 target — cc-linker 命令忽略 target, 但 /xxx 透传路径走 handleChat 需要真 target
+    const target = await this.resolveChatTarget(event.open_id, event.message_id);
 
     // command 走独立 serialKey（每个 messageId 独立），避免被 session streaming 阻塞
     // 注意：必须用 isCommand 标志，不按命令白名单——/listdir / 未来新增命令都自动覆盖
@@ -776,8 +775,14 @@ export class FeishuBot {
     }
 
     // 在 processing 目录中查找属于该 session 的消息
+    // v2.5 fix: serialKey 现在有两种 — sessionUuid (普通 chat) 或 cmd:openId:msgId
+    // (slash 命令透传)。两条路径的消息都可能因 busy check 进入 processing/。
+    // 只查 sessionUuid 会漏掉 /xxx 命令,导致 force-send 误返回"消息已被处理"。
     const processingMsgs = this.spoolQueue.listProcessing()
-      .filter(m => m.serialKey === entry.sessionUuid && m.openId === openId);
+      .filter(m => m.openId === openId && (
+        m.serialKey === entry.sessionUuid ||
+        m.serialKey.startsWith('cmd:')
+      ));
 
     if (processingMsgs.length === 0) {
       // User clicked but no message in processing/ for this session.
@@ -927,10 +932,25 @@ export class FeishuBot {
     const parts = msg.text.split(/\s+/);
     const cmd = parts[0]?.replace(/^\/+/, '')?.toLowerCase();
 
-    // v2.4.x: 命令消息入口清 expectedReply (只在写命令)
+    // v2.4.x + v2.5 修正: 命令消息入口清 expectedReply,但仅限 cc-linker 已知写命令
+    // (/list /switch /new /stop /cancel /listdir /model /resume /agents)。
+    //
+    // 透传 /xxx (默认 case,Claude slash 命令如 /init /review /context /cost) 不清:
+    //   - 透传场景下用户期望 /xxx 跟普通文本一样 → 落到 handleChat 的 expectedReply 检查
+    //     → handleReply,作为对 bg 问题的回复被处理
+    //   - 如果在入口清掉 expectedReply,会破坏 Agent View 等待状态的连续性
+    //   - 之前的 [help,status,whoami] read-only 白名单不够 — 只读命令不该清,
+    //     但透传命令同样不该清(它们改变 session 状态的语义不同)
+    //
     // 防御: 旧 mock 可能没装 expectedReply (Field like), 跳过而不是 throw
     const isReadOnly = ['help', 'status', 'whoami'].includes(cmd || '');
-    if (!isReadOnly && this.agentView?.expectedReply) {
+    // 已知 cc-linker 命令全列表 — 透传 /xxx 不在内, 保持 expectedReply
+    const knownCcLinkerCommands = new Set([
+      'help', 'list', 'listdir', 'new', 'switch', 'model',
+      'resume', 'status', 'stop', 'whoami', 'agents', 'cancel',
+    ]);
+    const isPassthrough = !knownCcLinkerCommands.has(cmd || '');
+    if (!isReadOnly && !isPassthrough && this.agentView?.expectedReply) {
       const info = this.agentView.expectedReply.get(msg.openId);
       if (info) {
         await this.agentView.expectedReply.clear(msg.openId, 'overwrite');
@@ -1001,9 +1021,15 @@ export class FeishuBot {
         this.spoolQueue.markDone(msg.messageId, msg.serialKey, cardMessageId ?? undefined);
         return;
 
-      default:
-        await this.replyAndFinalize(msg, `未知命令: /${cmd}\n\n${this.helpText()}`);
+      default: {
+        // v2.5: cc-linker 未识别的 /xxx → 作为 prompt 文本透传给当前会话的 Claude。
+        // - 模型已训练识别 /init /review /cost 等内置 slash 命令
+        // - 自定义命令 ~/.claude/commands/*.md 不展开 (跟 claude -p 模式对齐)
+        // - busy check / rendezvous / 流式 / 错误处理全部复用 handleChat 既有路径
+        // - serialKey 仍是 cmd:openId:messageId (独立锁), 不影响 chat 的 sessionUuid 锁
+        await this.handleChat(msg);
         return;
+      }
     }
   }
 
@@ -1020,27 +1046,10 @@ export class FeishuBot {
         await this.agentView.handleCancelReply(msg.openId, msg.messageId);
         return;
       }
-      // 注意: 这里的 if (msg.text.startsWith('/')) 分支在 v2.4.x 已成死代码 —
-      // 命令消息在 dispatcher (line ~848) 走 isCommandMessage → handleCommand
-      // 不进 handleChat。保留只是为了 safety net (万一某条消息漏过 dispatcher)。
-      if (msg.text.startsWith('/')) {
-        const cmd = msg.text.split(/\s+/)[0]?.replace(/^\/+/, '').toLowerCase();
-        // 只读命令直接转交 (不清 expectedReply)
-        const isReadOnly = ['help', 'status', 'whoami'].includes(cmd || '');
-        if (!isReadOnly) {
-          // 写命令: 防御性清 expectedReply + 提示
-          const info = this.agentView.expectedReply.get(msg.openId);
-          if (info) {
-            await this.agentView.expectedReply.clear(msg.openId, 'overwrite');
-            await this.replyFn(
-              `⏱ 等待输入已自动取消(因你跑了 /${cmd})`,
-              { openId: msg.openId, requestUuid: uniqueUuid() },
-            );
-          }
-        }
-        await this.handleCommand(msg);
-        return;
-      }
+      // v2.5: 移除 v2.4.x 的 /startsWith('/') dead code — 原意图是 safety net,
+      // 现在 fallthrough 路径是 default→handleChat, 这里再分发会无限递归。
+      // 命令消息一律在 dispatcher (line ~848) 通过 isCommandMessage 路由到 handleCommand,
+      // 此处只处理 /cancel (Agent View 专用) 和普通文本。
       // 非 / 开头普通消息:检查 expectedReply
       const info = this.agentView.expectedReply.get(msg.openId);
       if (info) {
@@ -2406,7 +2415,15 @@ export class FeishuBot {
       // I-1 fix: if SDK short-circuited (e.g. E_SDK_NO_CLAUDE), render an error card
       // instead of a green success card. The sessionId is truthy (resume UUID) so we
       // can't rely on `!result.sessionId` like the new-session path does.
-      if (result.sessionStatus === 'degraded' && cardUpdater) {
+      //
+      // v2026-06-18 follow-up: 之前 gate 是 `result.sessionStatus === 'degraded'`。
+      // 但之前的 fix 把 transient 错误 (context 超限 / max_turns / rate_limit) 改成
+      // 返回 'active' + error 字段。这条 if 因此对 transient 错误永远不成立,用户
+      // 看到的是绿色 success 卡片里渲染错误文字,体验差。
+      // 改成 `result.error && cardUpdater` 同时覆盖两种情况:
+      //   - 基础设施错 (sessionStatus='degraded'): error 字段有值,渲染错误卡
+      //   - 业务错 (sessionStatus='active', error 有值): 同样渲染错误卡
+      if (result.error && cardUpdater) {
         await cardUpdater.error(result.error ?? result.response);
         cardMessageId = cardUpdater.getCardMessageId();
         cardUpdater.dispose();
@@ -3224,6 +3241,7 @@ export class FeishuBot {
       '  /status                            - 查看状态',
       '  /whoami                            - 获取你的 open_id',
       '  /agents                            - 查看 agent 列表 (Agent View)',
+      '  /<其他命令>                        - 透传给当前会话的 Claude (如 /init /review /cost)',
     ].join('\n');
   }
 
@@ -3502,11 +3520,11 @@ export class FeishuBot {
       const status = session.status;
       const failReply =
         status === 'corrupted'
-          ? `⚠️ 会话 ${uuid.slice(0, 8)} 已损坏，不能直接切换。建议先在终端运行 \`cc-linker repair\` 修复。`
+          ? this.formatSessionStatusHint(uuid, 'corrupted')
           : status === 'provisioning'
             ? `⚠️ 会话 ${uuid.slice(0, 8)} 正在等待系统自动修复，请稍后再试。`
             : status === 'degraded'
-              ? `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态，建议先保持 cc-linker 运行让系统自动修复。`
+              ? this.formatSessionStatusHint(uuid, 'degraded')
               : status === 'archived'
                 ? `⚠️ 会话 ${uuid.slice(0, 8)} 已归档，不能直接切换。`
                 : `⚠️ 会话 ${uuid.slice(0, 8)} 状态为 ${status}，无法切换。`;
@@ -3742,11 +3760,31 @@ export class FeishuBot {
   private async doResume(openId: string, uuid: string, messageId?: string): Promise<string> {
     const entry = this.registry.get(uuid);
     if (!entry) return '未找到对应会话，请先执行 /list。';
-    if (entry.status === 'corrupted') return `会话 ${uuid.slice(0, 8)} 已损坏，不能直接恢复。`;
-    if (entry.status === 'provisioning' || entry.status === 'degraded') {
-      return `会话 ${uuid.slice(0, 8)} 状态为 ${entry.status}，建议先保持 cc-linker 运行让系统自动修复。`;
+    if (entry.status === 'corrupted') return this.formatSessionStatusHint(uuid, 'corrupted');
+    if (entry.status === 'degraded') return this.formatSessionStatusHint(uuid, 'degraded');
+    if (entry.status === 'provisioning') {
+      return `⚠️ 会话 ${uuid.slice(0, 8)} 状态为 provisioning,正在等待系统自动修复,请稍后再试。`;
     }
     return `在终端执行: cc-linker resume ${uuid.slice(0, 8)}`;
+  }
+
+  /**
+   * v2026-06-18 follow-up: 共享 degraded/corrupted 状态的用户引导文案。
+   * 之前 degraded 引导用户跑 `cc-linker repair` (命令不存在) 和
+   * `general.claude_bin` (优先级低,SDK 实际先读 [sdk] claude_executable)。
+   * 集中在这里确保 doSwitch (line 3511, 3515) 和 doResume (line 3753) 同步更新。
+   *
+   * v2026-06-18 second follow-up: 之前 hint 写 `cc-linker list` 但默认 filter 掉
+   * non-active sessions (list.ts:20),用户按提示运行看不到 degraded/corrupted。
+   * 改用 `cc-linker list --archived` 才显示。
+   * 之前 corrupted hint 说"删除 entry"但无 delete 子命令,改"编辑 registry.json 手动清理"。
+   */
+  private formatSessionStatusHint(uuid: string, kind: 'corrupted' | 'degraded'): string {
+    if (kind === 'corrupted') {
+      return `⚠️ 会话 ${uuid.slice(0, 8)} 已损坏，不能直接操作。\n💡 建议: 在终端运行 \`cc-linker list --archived\` 查看损坏 session 列表,或编辑 \`~/.cc-linker/registry.json\` 手动清理该 entry。`;
+    }
+    // degraded
+    return `⚠️ 会话 ${uuid.slice(0, 8)} 处于降级状态 (可能原因: Claude CLI 缺失 / cwd 不可访问 / 环境配置异常)。\n💡 建议: 在终端运行 \`cc-linker list --archived\` 查看所有 session 状态,或检查 \`~/.cc-linker/config.toml\` 的 [sdk] claude_executable / [general] claude_bin 配置。`;
   }
 
   private async doResumeReply(openId: string, uuid: string, msg: SpoolMessage): Promise<void> {

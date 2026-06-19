@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { ClaudeSessionManager, resolveJsonlPath, terminateProcessTree, cleanupOrphanProcesses } from '../../../src/proxy/session';
+import { ClaudeSessionManager, classifyExecutionStatus, resolveJsonlPath, terminateProcessTree, cleanupOrphanProcesses } from '../../../src/proxy/session';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -66,6 +66,136 @@ describe('ClaudeSessionManager', () => {
     // Create a manager and verify the method runs without error
     manager.cleanupIdleSessions(0); // 0 timeout should kill nothing since no active processes
     expect(manager.listSessions()).toHaveLength(0);
+  });
+
+  // 回归测试:2026-06-18 bug —— context 超限后 session 被错标 degraded,/switch 阻断。
+  //
+  // 范围说明:这些测试覆盖以下 3 个 sessionStatus 写入点:
+  //   - `_buildStreamingResult` (line 694,被 `sendStreamingMessage` 调用,非 SDK 流式路径)
+  //   - `_errorResult` (line 650,基础设施错误的 helper)
+  //   - `classifyExecutionStatus` (顶层 helper,被 `sendMessage` line 416 调用,Fix 1 新增)
+  //
+  // SDK 路径 (`sendSDKMessage`,line 893/920/932 修复后) 的 3 处 return 走相同模式
+  // (三元 'active' hardcode + 错误信息走 error 字段),且:
+  //   - mock `@anthropic-ai/claude-agent-sdk` 的 query() 成本高
+  //   - 与 _buildStreamingResult 改动模式字面相同
+  // 所以测试选择覆盖 _buildStreamingResult + classifyExecutionStatus,通过"代码读 + 模式
+  // 一致"保证 SDK 路径行为。如果未来有人只在 SDK 路径改而忘了非 SDK 路径,本测试会报警。
+  //
+  // ⚠️ test #3 (infrastructure) 不是 red-phase 测试 —— `_errorResult` 不改,它在当前
+  // 代码已经 PASS。它的作用是 regression guard:防止未来误改 _errorResult 绕过 doSwitch
+  // 的 corrupted/CLI 缺失保护。
+
+  describe('_buildStreamingResult sessionStatus classification', () => {
+    // 私有方法,通过 (manager as any) 直接调,覆盖 line 691 (non-SDK streaming 路径)。
+
+    it('returns active (not degraded) when SDK reports subtype=error_max_turns', async () => {
+      // 模拟 SDK 正常返回 result chunk,subtype != 'success' (line 680: hasError=true)
+      const m = manager as any;
+      const lastResult = {
+        type: 'result',
+        subtype: 'error_max_turns',
+        is_error: true,
+        session_id: 'test-uuid-abc',
+        result: 'max turns reached',
+        errors: ['max turns reached'],
+        total_cost_usd: 0.01,
+        duration_ms: 5000,
+        usage: { input_tokens: 100, output_tokens: 50 },
+      };
+      const r = await m._buildStreamingResult(
+        lastResult, 0, '', 'test-uuid-abc', Date.now(), 5000, false,
+      );
+      // 修复前:line 691 hasError ? 'degraded' → 'degraded',测试失败
+      // 修复后:line 691 = 'active' → 'active',测试通过
+      expect(r.sessionStatus).toBe('active');
+      expect(r.error).toContain('max turns');
+    });
+
+    it('returns active when SDK returns lastResult with is_error=true but subtype=success', async () => {
+      // 边缘 case:is_error=true 但 subtype='success' (line 680: hasError=true)
+      const m = manager as any;
+      const lastResult = {
+        type: 'result',
+        subtype: 'success',
+        is_error: true,  // is_error 单独为 true (罕见但合法)
+        session_id: 'test-uuid-def',
+        result: 'partial',
+        errors: ['minor warning'],
+        total_cost_usd: 0.01,
+        duration_ms: 1000,
+        usage: { input_tokens: 50, output_tokens: 20 },
+      };
+      const r = await m._buildStreamingResult(
+        lastResult, 0, '', 'test-uuid-def', Date.now(), 1000, false,
+      );
+      // 修复前:line 691 hasError ? 'degraded' → 'degraded',测试失败
+      // 修复后:line 691 = 'active' → 'active',测试通过
+      expect(r.sessionStatus).toBe('active');
+    });
+
+    it('returns degraded when CLI crashes mid-stream (lastResult=null, exitCode=1)', async () => {
+      // v2026-06-18 follow-up: 之前修复让所有 hasError=true 都返回 'active',
+      // 但 lastResult=null + exitCode !== 0 表示 CLI 进程崩了 (基础设施错),
+      // 应该跟 sendMessage 的 classifyExecutionStatus 一样标 'degraded'。
+      // 否则用户 /switch 成功但下次发消息又崩,陷入循环。
+      const m = manager as any;
+      const r = await m._buildStreamingResult(
+        null, 1, 'SIGKILL', 'test-uuid-mid', Date.now(), 5000, false,
+      );
+      expect(r.sessionStatus).toBe('degraded');
+      expect(r.error).toBeTruthy();
+    });
+
+    it('[regression guard] infrastructure errors (CLI not in PATH) still write degraded via _errorResult', async () => {
+      // ⚠️ 这个测试不是 red-phase —— _errorResult (line 650) 保持不变,本测试在当前
+      // 代码已经 PASS。它的作用是防止后续误改 _errorResult 绕过 doSwitch 的保护。
+      // _errorResult 的 4 个调用点 (line 527/530/550/732) 全部是基础设施错误,
+      // 这些场景必须继续写 degraded。
+      const m = manager as any;
+      const r1 = m._errorResult('cwd is empty', null);
+      const r2 = m._errorResult('Claude CLI 未找到: "claude" 不在 PATH 中', null);
+      const r3 = m._errorResult('Failed to start Claude process: spawn ENOENT', 'sid');
+      expect(r1.sessionStatus).toBe('degraded');
+      expect(r2.sessionStatus).toBe('degraded');
+      expect(r3.sessionStatus).toBe('degraded');
+    });
+  });
+
+  // v2026-06-18: 测试 sendMessage line 416 用的 helper classifyExecutionStatus。
+  // 区分 Claude 业务错 (parsed.is_error, 可恢复) vs CLI 进程崩 (基础设施错)。
+  // 关键 regression 测试: 之前 line 416 会把 Claude 错 (如 context 超限) 误标 degraded,
+  // 导致 /switch 永久阻断。修复后所有 Claude 业务错都保持 'active'。
+
+  describe('classifyExecutionStatus', () => {
+    it('returns active when Claude reports business error (is_error=true, exitCode=0)', () => {
+      // context-exceeded / max_turns / rate_limit 都属于这种情况
+      const parsed = { is_error: true, session_id: 'sid', result: 'too long' } as any;
+      expect(classifyExecutionStatus(parsed, 0)).toBe('active');
+    });
+
+    it('returns degraded when CLI crashes with no parsed output (exitCode != 0, parsed=null)', () => {
+      // CLI 崩了连 JSON 都没输出 → 基础设施错
+      expect(classifyExecutionStatus(null, 1)).toBe('degraded');
+    });
+
+    it('returns degraded when CLI exits non-zero and Claude did not report error', () => {
+      // Claude 跑了但 CLI 崩在 output 之后 → 基础设施错
+      const parsed = { is_error: false, session_id: 'sid', result: 'ok' } as any;
+      expect(classifyExecutionStatus(parsed, 1)).toBe('degraded');
+    });
+
+    it('returns active when Claude succeeds (is_error=false, exitCode=0)', () => {
+      // 正常成功路径,line 416 之前返回 active,保持不变
+      const parsed = { is_error: false, session_id: 'sid', result: 'ok' } as any;
+      expect(classifyExecutionStatus(parsed, 0)).toBe('active');
+    });
+
+    it('returns active when parsed is null but exitCode is also null (process killed before exit)', () => {
+      // 进程被 kill 没正常退出码,但 Claude 也可能根本没机会报 is_error
+      // 这种情况 line 416 之前返回 active (因为 exitCode 是 null)
+      expect(classifyExecutionStatus(null, null)).toBe('active');
+    });
   });
 });
 
