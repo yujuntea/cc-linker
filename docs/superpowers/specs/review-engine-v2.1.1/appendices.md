@@ -60,15 +60,29 @@
 
 **实现**：见 [implementation.md §7.5.4](./implementation.md#754-parse-失败处理)。
 
-### C.4 变更 4：Context Window 策略（I9 重设计）
+### C.4 变更 4：Context Window 策略（I9 重设计 + v2.1.2 cascade 演进）
 
-**动机**：v2.1.1 原始 `review_fix` 策略质量差（review 模型不理解 work 代码上下文）。
+**v2.1.1 动机**：原始 `review_fix` 策略质量差（review 模型不理解 work 代码上下文）。
 
-**I9 重设计**：删 review_fix。reset = 杀 work + spawn 新 work + 注入 review issues + history + docs → worker verify+fix → DONE。
+**v2.1.1 I9 重设计**：删 review_fix。reset = 杀 work + spawn 新 work + 注入 review issues + history + docs → worker verify+fix → DONE。
 
 **3 个不变量**：work 仍是唯一修复者 / context fresh + issue 记忆保留 / verify-first 不变。
 
-**实现**：见 [implementation.md §7.5.7](./implementation.md#757-context-window-策略化处理)。
+**v2.1.2 cascade 演进动机**（2026-06-19）：
+- 现状 reset 直接杀 session 太重 —— 浪费 worker 已建立的代码库"肌肉记忆"
+- 现状 abort 太激进 —— context 80% 没用满就放弃
+- 应该先试 `/compact`（Claude CLI 原生命令），不行再 reset，再不行才 abort
+
+**v2.1.2 三档 cascade**：
+1. **compact**（n=1，1st overflow）：injectReply `/compact` → 同 session 继续
+2. **reset**（n=2 或 compact 失败）：杀 session + spawn 新 + 注入 context
+3. **abort**（n≥3）：reason=`context_overflow_max_attempts`
+
+**配套改进**：
+- 阈值规则修 bug（v2.1.1 对 128K 模型**永不会触发** overflow 检查；200K 模型只在 100% 才触发）
+- 新增 review opinions 落盘（worker 用 @file 引用，避免 prompt 膨胀）
+
+**实现**：见 [implementation.md §7.5.7](./implementation.md#757-context-window-策略化处理)、[§7.5.8](./implementation.md#758-review-opinions-落盘v212-新增)。
 
 ### C.5 变更 5：`adapter.getContextUsage` API
 
@@ -85,6 +99,90 @@
 | 2026-06-14 | v2.1：19 项修正 + 10 项评审修正 |
 | 2026-06-15 | v2.1.1：6 项 patch |
 | 2026-06-17 | 评审反馈 7 P0 + 11 P1 + I9 重设计 |
+| 2026-06-19 | v2.1.2：I9 三档 cascade（compact → reset → abort）+ review opinions 落盘 + 阈值规则修 bug |
+
+### C.7 v2.1.2 变更动机 + 决策（本轮）
+
+#### C.7.1 变更动机
+
+用户提出 3 个问题（2026-06-19 review）：
+
+| # | 问题 | 用户原话 |
+|---|------|---------|
+| Q1 | EXTERNAL_REVIEW 后 context 超阈值，直接 abort 太激进 | "不应该直接abort吧，是不是应该把 worker '/compact' 下，然后再在 work 继续处理" |
+| Q2 | review opinions 是否写到文件供 worker 引用 | "external review的review意见是否可以直接写到文件中，这样worker再进行继续fix时，可以更方便获得review意见" |
+| Q3 | context 检测规则是否正确 | "请你也确认下目前的 context 上下的文判断规则，看看是否合理正确" |
+
+#### C.7.2 决策
+
+| Q | 决策 | 理由 |
+|---|------|------|
+| Q1 | **新增 compact 档，三档 cascade** | `/compact` 是 Claude CLI 原生，轻量（~1s）；比 reset 保留 worker 代码肌肉记忆；cascade 内 compact 失败自动升级 reset，不留悬挂 |
+| Q2 | **写文件（json + md 两份）** | prompt 膨胀问题（>10 条 issues 时 inline JSON 可达 30K tokens）；worker 可 `@file` 精确定位；Reconciler 跨崩溃恢复直接读到；落盘失败可降级 inline |
+| Q3 | **百分比 + 1M 特殊处理，修 128K/200K 模型 bug** | v2.1.1 绝对值阈值在 128K 模型上 `max < threshold` → 永不会触发；200K 模型只在 100% 才触发（太晚）；1M 模型 512K 偏晚（>512K 模型效率下降） |
+
+#### C.7.3 阈值变更明细
+
+| 模型 | max | v2.1.1 threshold | v2.1.2 threshold | 改动 |
+|------|-----|-----------------|------------------|------|
+| `MiniMax-M3` | 1M | 512K | 460K | 提前 52K |
+| `claude-sonnet-4-5` | 1M | 512K | 460K | 提前 52K |
+| `claude-sonnet-4` | 200K | 200K (100%) | 160K (80%) | 提前 40K |
+| `kimi-for-coding` | 256K | 200K (78%) | 204K (80%) | 略晚 4K |
+| `bailian-qwen3.6` | 128K | 200K (不可能) | 102K (80%) | **修 bug** |
+
+#### C.7.4 配置变更
+
+```diff
+- context_overflow_threshold_1m = 512000
+- context_overflow_threshold_default = 200000
+- context_overflow_strategy = "reset"          # "reset" | "abort"
+- context_overflow_hysteresis_rounds = 1
++ context_overflow_threshold_1m = 460000       # 1M 模型阈值（>512K 模型效率下降）
++ context_overflow_threshold_percent = 0.80   # 非 1M 模型：max * 80%
++ context_overflow_strategy = "cascade"        # v2.1.2：唯一策略 = cascade
++ max_compact_attempts = 1                    # compact 档最多尝试次数
++ compact_timeout_ms = 30000                  # /compact 单次超时
+```
+
+#### C.7.5 PipelineRecord 字段变更
+
+```diff
+  interface PipelineRecord {
+    ...
+    contextResets?: ContextResetEvent[];
++   /** v2.1.2：context overflow 累计触发次数 */
++   contextOverflowCount?: number;
++   /** v2.1.2：EXTERNAL_REVIEW opinions 落盘路径 */
++   contextFiles?: {
++     externalReviewJson?: string;
++     externalReviewMd?: string;
++   };
+  }
+```
+
+#### C.7.6 ReviewState enum 变更
+
+```diff
+  | { kind: 'SELF_REVIEW_R1'; ...;
+-     contextReset?: boolean;
++     contextOverflowApplied?: 'reset';   // v2.1.2：从 boolean 升级为枚举
+      injectedIssues?: Issue[] }
+
+  | { kind: 'JUDGE_BY_WORK'; ...;
++     contextOverflowApplied?: 'compact' }   // v2.1.2：通过 compact 抵达此状态
+
+  | { kind: 'DONE'; ...;
+-     contextOverflowApplied?: 'reset' | 'abort' }
++     contextOverflowApplied?: 'compact' | 'reset' }   // v2.1.2：abort 不进 DONE
+```
+
+#### C.7.7 未做的事
+
+- ❌ 没用 profile 内 `[context_limits]` 改 max 模型表（保留 v2.1.1 的 KNOWN_CONTEXT_LIMITS 内置表）
+- ❌ 没改 max_rounds 默认值（仍是 code=8 / plan=5 / spec=4 / global=6）
+- ❌ 没动 HUMAN_DECIDE 4h timeout（I10 已在 v2.1.1 调到 4h）
+- ❌ 没动 parse_retry_timeout 15s（I11 已在 v2.1.1 调到 15s）
 
 ## 附录 D：v2.1.1 评审反馈汇总（2026-06-17）
 

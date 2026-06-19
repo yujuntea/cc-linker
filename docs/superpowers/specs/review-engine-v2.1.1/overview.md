@@ -27,6 +27,7 @@
 | v2.1 | 2026-06-14 | 19 项修正（`claude --bg` 实测 + FIXING 节点 + 删 ARBITRATION）+ 10 项评审修正 |
 | **v2.1.1** | **2026-06-15** | **6 项 patch：单一 review 模型 / commit preamble / parse retry / context overflow / getContextUsage / review_fix 约束** |
 | v2.1.1 评审反馈 | 2026-06-17 | 7 P0 + 11 P1 修复 + I9 重设计（删 review_fix，reset 改为注入 issues + worker verify+fix）+ I10/I11 参数调整 |
+| **v2.1.2 (本轮)** | **2026-06-19** | **I9 三档 cascade（compact → reset → abort）+ review opinions 落盘（worker @file 引用）+ 阈值规则修 bug（128K/200K 模型 + 1M 模型提前干预）** |
 
 > 详细变更动机 + 决策链：见 [appendices.md → 附录 C](./appendices.md#附录-cv21--v211-变更背景动机--决策--章节索引)
 
@@ -73,7 +74,7 @@
 | G6 | **深度复用 Agent View**：实测 `claude --bg` + `--settings` + `--reply-on-resume` + `state.json` + `readJobState` + `RendezvousClient.injectReply` + `claude stop` 全部 0 行重复代码 | P0 |
 | G7 | **1+1** 个 bg session 自动出现在 `~/.claude/jobs/`，飞书 `/agents` 列表**免费**看到（Phase 2 飞书集成） | P1 |
 | G8 | **`cc-linker review doctor`** 启动前健康检查（profile 引用 + CLI 版本 + daemon 健康） | P0 |
-| G9 | **Context window 超限自动处理**：检测 work session 上下文用量，两种可配策略（`reset` 重建 work session + 注入 review issues 让 worker verify+fix / `abort` 终止），避免恶性假收敛 | P0 |
+| G9 | **Context window 超限自动处理**：检测 work session 上下文用量，三档 cascade 策略（`compact` 同 session `/compact` → `reset` 新 session + 注入 review issues 让 worker verify+fix → `abort` 终止），阈值按模型分档（1M=460K / 其他=80%），避免恶性假收敛 | P0 |
 
 ### 2.2 非目标
 
@@ -119,8 +120,10 @@ src/review/
 ├── phase-detect.ts      # 启发式：file path → git ref → 关键词 → 文件后缀/行号 → PhaseUnknownError
 ├── adapter.ts           # ClaudeBGAdapter 暴露 6 个 API（startSession / resumeWorkSession / injectReply / poll / stop / getContextUsage）
 ├── model-parser.ts      # parseModelFromProviderEnv + lookupContextLimit + KNOWN_CONTEXT_LIMITS
-├── context-overflow.ts  # checkContextOverflow + reset/abort 策略
-├── build-context-reset-prompt.ts  # 新 worker prompt 模板（history + injectedIssues + relatedDocs + checkpoint SHA）
+├── context-overflow.ts  # checkContextOverflow + resolveThreshold + cascade dispatch（v2.1.2：compact/reset/abort 三档）
+├── build-context-reset-prompt.ts  # 新 worker prompt 模板（history + injectedIssues + relatedDocs + checkpoint SHA + @file 引用）
+├── build-context-compact-prompt.ts # v2.1.2 新增：compact 成功后注入 JUDGE 提示词模板
+├── review-opinions-writer.ts       # v2.1.2 新增：写 external-review-r<N>.{json,md} 到 state/
 ├── output-contract.ts   # parseBgOutputWithRetry（带 retry 1 次 + timeoutMs）
 ├── cli-watch.ts         # CLI `--watch` 模式（chalk + ANSI）
 ├── review-doctor.ts     # `cc-linker review doctor` 命令
