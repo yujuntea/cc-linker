@@ -39,18 +39,7 @@ import {
   buildPromptWithImages,
   cleanupOldImages,
 } from './image';
-
-/**
- * Detect if a message is a Feishu command (e.g. "/list", "/switch uuid").
- *
- * A command is any text starting with "/" whose second character is not
- * whitespace. We use a /\s/ regex (not just `' ' !==`) so that tabs, NBSP,
- * and other Unicode separators are also treated as non-commands — matching
- * the /\s+/ split used downstream in handleCommand and parseNewCommand.
- */
-export function isCommandMessage(text: string): boolean {
-  return text.startsWith('/') && text.length > 1 && !/\s/.test(text[1] ?? '');
-}
+import { isCommandMessage, parseCommand, type ParsedCommand } from '../platform/command-handler';
 
 export type FeishuMessageEvent = {
   open_id: string;
