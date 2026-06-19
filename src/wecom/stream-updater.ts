@@ -43,8 +43,14 @@ export class WecomStreamUpdater implements StreamUpdater {
   private throttleMs: number;
   private currentStreamId: string | null = null;
   /**
-   * PR 2 v1.2.1 (M4 修复): inboundFrame 改为 startProcessing 必传参数
-   * 避免 bot 忘记 setInboundFrame 后 fallback 成 generated streamId → 846605 bug 复现
+   * PR 2 v1.2.1 final (F2 修复): lastInboundFrame 在 startProcessing 存好
+   * complete/error/cancel/flushBuffer 都用它，不再 fallback 到 currentStreamId
+   * 避免 846605 "invalid req_id" bug 复现
+   */
+  private lastInboundFrame: any = null;
+  /**
+   * 保留 setInboundFrame API 作为 backward-compat
+   * 新代码优先用 startProcessing(userId, inboundFrame)
    */
   private inboundFrame: any = null;
   private buffer: BufferedChunk | null = null;
@@ -63,12 +69,12 @@ export class WecomStreamUpdater implements StreamUpdater {
 
   async startProcessing(userId: string, inboundFrame?: any): Promise<string> {
     this.currentStreamId = generateReqId('stream');
-    // PR 2 v1.2.1 (M4): inboundFrame 必传——优先用 startProcessing 参数，回退到 setInboundFrame
     const frame = inboundFrame ?? this.inboundFrame;
     if (!frame) {
-      // 显式 fail fast: 调用方漏传参数，提示 PR 3 ClaudeSessionManager 接入时必传
       throw new Error('WecomStreamUpdater.startProcessing: inboundFrame is required (SDK replyStream 需要 inbound frame 的 headers.req_id)');
     }
+    // 存下 inboundFrame 供 complete/error/cancel/flushBuffer 复用
+    this.lastInboundFrame = frame;
     const initialMarkdown = '🤔 思考中...';
     await this.sdk.replyStream(frame, this.currentStreamId, this.truncate(initialMarkdown), false);
     this.lastFlushAt = Date.now();
@@ -82,7 +88,6 @@ export class WecomStreamUpdater implements StreamUpdater {
     elapsedMs: number,
     toolUses: StreamUpdateToolUse[] = [],
   ): Promise<void> {
-    // 合并到 buffer（最新一次 update 覆盖 thinking 累积）
     this.buffer = { thinking, text, elapsedMs, toolUses };
 
     const now = Date.now();
@@ -100,11 +105,11 @@ export class WecomStreamUpdater implements StreamUpdater {
 
   private async flushBuffer(): Promise<void> {
     if (!this.buffer || !this.currentStreamId) return;
+    if (!this.lastInboundFrame) return;  // 没 inboundFrame 就别 flush（避免 846605）
     const { thinking, text, elapsedMs, toolUses } = this.buffer;
     const markdown = renderMarkdown(thinking, text, toolUses, elapsedMs);
-    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId } };
     try {
-      await this.sdk.replyStream(frame, this.currentStreamId, this.truncate(markdown), false);
+      await this.sdk.replyStream(this.lastInboundFrame, this.currentStreamId, this.truncate(markdown), false);
       this.lastFlushAt = Date.now();
     } catch (err) {
       // ⚠️ 只吞限频错误 (errcode 45009/45033)，保留 buffer 等下次 flush。
@@ -134,11 +139,19 @@ export class WecomStreamUpdater implements StreamUpdater {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    // flush 残留 buffer（如果还有），失败也继续终态（终态消息更重要）
     if (this.buffer) {
       try { await this.flushBuffer(); } catch { /* ignore */ }
     }
     return true;
+  }
+
+  /**
+   * 终态方法统一前置 — 验证 lastInboundFrame 必须存在
+   * PR 2 v1.2.1 final (F2): 拒绝 fallback 到 generated streamId（846605 根因）
+   */
+  private getTerminalFrame(): { streamId: string; frame: any } | null {
+    if (!this.currentStreamId || !this.lastInboundFrame) return null;
+    return { streamId: this.currentStreamId, frame: this.lastInboundFrame };
   }
 
   async complete(
@@ -149,23 +162,42 @@ export class WecomStreamUpdater implements StreamUpdater {
     _numTurns: number,
   ): Promise<void> {
     if (!(await this.prepareTerminal())) return;
-    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId! } };
-    await this.sdk.replyStream(frame, this.currentStreamId!, this.truncate(response), true);
-    this.currentStreamId = null;
+    const t = this.getTerminalFrame();
+    if (!t) {
+      logger.warn('[wecom-stream] complete skipped: missing inboundFrame (startProcessing never called with frame)');
+      return;
+    }
+    await this.sdk.replyStream(t.frame, t.streamId, this.truncate(response), true);
+    this.clearTerminalState();
   }
 
   async error(message: string): Promise<void> {
     if (!(await this.prepareTerminal())) return;
-    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId! } };
-    await this.sdk.replyStream(frame, this.currentStreamId!, `❌ ${message}`, true);
-    this.currentStreamId = null;
+    const t = this.getTerminalFrame();
+    if (!t) {
+      logger.warn('[wecom-stream] error skipped: missing inboundFrame');
+      return;
+    }
+    await this.sdk.replyStream(t.frame, t.streamId, `❌ ${message}`, true);
+    this.clearTerminalState();
   }
 
   async cancel(reason?: string): Promise<void> {
     if (!(await this.prepareTerminal())) return;
-    const frame = this.inboundFrame ?? { headers: { req_id: this.currentStreamId! } };
-    await this.sdk.replyStream(frame, this.currentStreamId!, `⏹ 已取消${reason ? `: ${reason}` : ''}`, true);
+    const t = this.getTerminalFrame();
+    if (!t) {
+      logger.warn('[wecom-stream] cancel skipped: missing inboundFrame');
+      return;
+    }
+    await this.sdk.replyStream(t.frame, t.streamId, `⏹ 已取消${reason ? `: ${reason}` : ''}`, true);
+    this.clearTerminalState();
+  }
+
+  /** 终态后清理 — 避免下个 startProcessing 复用旧 inboundFrame */
+  private clearTerminalState(): void {
     this.currentStreamId = null;
+    this.lastInboundFrame = null;
+    this.inboundFrame = null;
   }
 
   private truncate(content: string): string {

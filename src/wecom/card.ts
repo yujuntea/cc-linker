@@ -61,13 +61,48 @@ export type ButtonInteractionOpts = z.infer<typeof ButtonInteractionOptsSchema>;
 export type VoteInteractionOpts = z.infer<typeof VoteInteractionOptsSchema>;
 export type MultipleInteractionOpts = z.infer<typeof MultipleInteractionOptsSchema>;
 
-/** 严格类型 TemplateCard (替代 Record<string, any>) */
+/** 严格类型 TemplateCard (替代 Record<string, any>) — PR 2 v1.2.1 final (F8 修复) */
+const ActionTitleSchema = z.object({ tag: z.string().min(1), text: z.string().min(1) });
+const ActionListItemSchema = z.object({ action_tag: z.string(), action_title: ActionTitleSchema });
+const ActionMenuSchema = z.object({ desc: z.string(), action_list: z.array(ActionListItemSchema) });
+const ButtonItemSchema = z.object({ action_tag: z.string(), action_title: ActionTitleSchema, button_type: z.enum(['primary', 'danger', 'default']).optional() });
+const CardSourceSchema = z.object({ desc: z.string().min(1), url: z.string().url() });
+const OptionListItemSchema = z.object({ action_tag: z.string(), action_title: ActionTitleSchema });
+const SubmitButtonSchema = z.object({ action_tag: z.string(), action_title: ActionTitleSchema });
+
+const TextNoticeCardSchema = z.object({
+  card_type: z.literal('text_notice'),
+  main_title: z.object({ title: z.string().min(1), desc: z.string().min(1) }),
+  action_menu: ActionMenuSchema.optional(),
+});
+const NewsNoticeCardSchema = z.object({
+  card_type: z.literal('news_notice'),
+  main_title: z.object({ title: z.string().min(1), desc: z.string().min(1) }),
+  card_source: CardSourceSchema.optional(),
+});
+const ButtonInteractionCardSchema = z.object({
+  card_type: z.literal('button_interaction'),
+  main_title: z.object({ title: z.string().min(1), desc: z.string() }),
+  button_list: z.object({ button: z.array(ButtonItemSchema) }),
+});
+const VoteInteractionCardSchema = z.object({
+  card_type: z.literal('vote_interaction'),
+  main_title: z.object({ title: z.string().min(1), desc: z.string() }),
+  checkbox_list: z.object({ question: z.string(), option_list: z.array(OptionListItemSchema) }),
+});
+const MultipleInteractionCardSchema = z.object({
+  card_type: z.literal('multiple_interaction'),
+  main_title: z.object({ title: z.string().min(1), desc: z.string() }),
+  checkbox_list: z.object({ question: z.string(), option: z.array(OptionListItemSchema) }),
+  submit_button: SubmitButtonSchema,
+});
+
 export type TemplateCard =
-  | { card_type: 'text_notice'; main_title: { title: string; desc: string }; action_menu?: { desc: string; action_list: any[] } }
-  | { card_type: 'news_notice'; main_title: { title: string; desc: string }; card_source?: { desc: string; url: string } }
-  | { card_type: 'button_interaction'; main_title: { title: string; desc: string }; button_list: { button: any[] } }
-  | { card_type: 'vote_interaction'; main_title: { title: string; desc: string }; checkbox_list: { question: string; option_list: any[] } }
-  | { card_type: 'multiple_interaction'; main_title: { title: string; desc: string }; checkbox_list: { question: string; option: any[] }; submit_button: { action_tag: string; action_title: { tag: string; text: string } } };
+  | z.infer<typeof TextNoticeCardSchema>
+  | z.infer<typeof NewsNoticeCardSchema>
+  | z.infer<typeof ButtonInteractionCardSchema>
+  | z.infer<typeof VoteInteractionCardSchema>
+  | z.infer<typeof MultipleInteractionCardSchema>;
 
 export const WecomCardBuilder = {
   textNotice(opts: TextNoticeOpts): TemplateCard {

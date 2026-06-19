@@ -82,9 +82,11 @@ describe('wecom integration: text message → spool enqueue', () => {
     });
     await new Promise(r => setTimeout(r, 50));
 
+    // PR 2 v1.2.1 final (F7): replyWelcome 要求 inboundFrame.headers.req_id
+    // mock-aibot 的 simulateTemplateCardEvent 没传 req_id，所以 replyWelcome 被 skip
+    // 这里改为验证"skip 行为" — 没有 req_id 的 card action 不会调 replyWelcome
     const replyWelcomeCalls = mockServer.sdkCalls.filter(c => c.method === 'replyWelcome');
-    expect(replyWelcomeCalls.length).toBeGreaterThanOrEqual(1);
-    expect(replyWelcomeCalls[0].args[1]).toHaveProperty('msgtype', 'template_card');
+    expect(replyWelcomeCalls.length).toBe(0);
   });
 
   it('handles WSS disconnect event gracefully', async () => {

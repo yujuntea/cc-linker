@@ -45,11 +45,6 @@ export abstract class PlatformUserManager {
   /** 子类提供 owner 验证 — 不同平台读不同 config key */
   abstract validateOwner(userId: string): boolean;
 
-  /** 子类是否启用 owner 验证（默认 true，wecom 侧可覆盖为 false 等 PR 3 配置） */
-  protected get ownerValidationEnabled(): boolean {
-    return true;
-  }
-
   // ======== 文件 IO 工具方法（子类可访问以支持 CAS 模式特例）========
 
   private initialized = false;

@@ -35,8 +35,12 @@ export type AibotMessageHandler = (event: {
   messageId: string;
   text: string;
   images?: Array<{ fileKey: string; url?: string }>;
-  /** inbound frame — replyStream 需要用它的 headers.req_id */
-  inboundFrame: any;
+  /**
+   * PR 2 v1.2.1 final (F5 修复): inboundFrame 改为 optional
+   * 历史: 必填但 SDK 上游偶发会发空 frame，现在与 CardActionHandler 一致
+   * 防御性编程 — 调用方在用之前应 null check
+   */
+  inboundFrame?: any;
 }) => void;
 
 export type AibotCardActionHandler = (event: {

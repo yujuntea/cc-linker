@@ -92,6 +92,8 @@ describe('WecomBot', () => {
       messageId: 'msg_card_xyz',
       actionTag: 'retry',
       actionValue: { sessionUuid: 'abc' },
+      // PR 2 v1.2.1 final (F7): replyWelcome 要求 inboundFrame.headers.req_id
+      inboundFrame: { headers: { req_id: 'inbound_card_xyz' } },
     });
     expect(mockClient.sdk.replyWelcome).toHaveBeenCalled();
   });

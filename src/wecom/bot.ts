@@ -21,6 +21,11 @@ export type WecomBotConfig = {
   /** 可注入依赖 - 默认用真实实现 */
   client?: AibotClient;
   spoolQueue?: SpoolQueue;
+  /**
+   * PR 2 v1.2.1 final (F9 修复): 可选 userManager 注入点
+   * 默认 new WecomUserManager(userMappingPath)，测试场景可注入 mock
+   */
+  userManager?: WecomUserManager;
   // PR 3: 接入 ClaudeSessionManager 之前，handleChat 走 echo back 路径
 };
 
@@ -39,7 +44,7 @@ export class WecomBot {
     this.updater = new WecomStreamUpdater(this.client.sdk, {
       throttleMs: config.throttleMs ?? 2000,
     });
-    this.userManager = new WecomUserManager(config.userMappingPath);
+    this.userManager = config.userManager ?? new WecomUserManager(config.userMappingPath);
     this.spoolQueue = config.spoolQueue ?? new SpoolQueue();
   }
 
@@ -76,10 +81,6 @@ export class WecomBot {
     this.client.disconnect();
     logger.info('[wecom-bot] stopped');
   }
-
-  /** 暴露内部组件（用于集成测试 + 调试） */
-  get updater_(): WecomStreamUpdater { return this.updater; }
-  get userManager_(): WecomUserManager { return this.userManager; }
 
   /**
    * PR 2 v1.2.1 E2E staging: dispatch worker loop
@@ -147,8 +148,15 @@ export class WecomBot {
 
   private async handleCommand(msg: SpoolMessage): Promise<void> {
     // PR 3 集成 handleCommand; 当前 E2E staging 只 echo back
+    // PR 2 v1.2.1 final (F1 修复): 从 msg.metadata.inboundFrame 读取（handleMessage 已在 metadata 存好）
+    // 不能空 — M4 修复要求 startProcessing 必传 inboundFrame，否则 throw → 命令 echo 永远发不出去
+    const inboundFrame = msg.metadata?.inboundFrame as any;
+    if (!inboundFrame) {
+      logger.error(`[wecom-bot] handleCommand: missing inboundFrame in metadata, command ${msg.text} cannot be echoed back`);
+      return;
+    }
     try {
-      await this.updater.startProcessing(msg.userId);
+      await this.updater.startProcessing(msg.userId, inboundFrame);
       await this.updater.updateStream(`[E2E staging] 命令 ${msg.text} 暂未处理 (PR 3 集成)`, '', 100);
       await this.updater.complete(`✅ 已收到命令: ${msg.text}\n\n_(PR 2 E2E staging, 命令处理 PR 3 实现)_`, 0, 0, 0, 1);
     } catch (err) {
@@ -165,9 +173,13 @@ export class WecomBot {
     try {
       const responseText = `✅ 收到! 你是 WuYuJun, 我已收到你的消息: "${msg.text}"\n\n_(PR 2 E2E staging: 流式 patch 报 846605 暂用 sendMessage, Claude 集成待 PR 3)_`;
 
-      // 用 SDK sendMessage 直接发（不走 stream 流式 patch）
-      // 企微 single chat 时 chatId == externalUserId == msg.userId
-      await this.client.sdk.sendMessage(msg.userId, {
+      // PR 2 v1.2.1 final (F13 修复): receive_id 选择
+      // single chat: externalUserId 就是 receive_id
+      // group chat: receive_id 必须是 chatId（群聊标识）而不是群成员 ID
+      // 当前 msg 暂无 chatType 字段（SpoolMessage schema），PR 3 通过 metadata.chatType 传入
+      // 暂用 userId（PR 2 E2E staging 全是 single chat，group chat 暂未支持）
+      const receiveId = (msg.metadata as any)?.chatId ?? msg.userId;
+      await this.client.sdk.sendMessage(receiveId, {
         msgtype: 'markdown',
         markdown: { content: responseText },
       });
@@ -175,8 +187,6 @@ export class WecomBot {
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
     } catch (err) {
       logger.error(`[wecom-bot] handleChat error: ${err instanceof Error ? err.message : String(err)}`);
-      // 关键修复: 处理失败时把消息 requeueFromProcessing
-      // 否则下一轮 claimNext(serialKey) 看 processing 有 active 就拒绝, 永远卡死
       try {
         this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
         logger.warn(`[wecom-bot] requeued message ${msg.messageId} after error`);
@@ -194,7 +204,7 @@ export class WecomBot {
    * 动态选 existing_session vs new_session_claim，避免续聊消息被强制走新会话路径
    *
    * **SpoolMessage 字段策略（PR 1 v1.2 兼容）**：
-   * - openId / text: 写空串（企微侧永远不读这两个字段，但保留必填约束以兼容 46 个飞书调用方）
+   * - openId / text: 写空串（企微侧永远不读这两个字段，但保留必填约束以兼容 ~30 个飞书调用方）
    * - userId / platform: 写 wecom 真值（spec §3.3 兼容策略）
    */
   private async handleMessage(msg: PlatformMessage & { inboundFrame?: any }): Promise<void> {
@@ -204,16 +214,9 @@ export class WecomBot {
     // 查 user-mapping 看是否有活跃 session
     const existingEntry = this.userManager.getEntry(msg.userId);
     const existingSessionUuid = existingEntry?.type === 'session' ? existingEntry.sessionUuid : null;
-    const isCommandHandled = isCommand && existingSessionUuid;  // 命令附在 session 上：serialKey 走 session
 
-    const serialKey = isCommandHandled
-      ? `${existingSessionUuid}:${msg.messageId}`
-      : isCommand
-        ? `cmd:${msg.userId}:${msg.messageId}`
-        : existingSessionUuid
-          ? `${existingSessionUuid}:${msg.messageId}`
-          : `new:${msg.userId}`;
-
+    // PR 2 v1.2.1 final (F10 修复): serialKey 决策表 — 重构掉嵌套三元
+    const serialKey = this.deriveSerialKey(msg, isCommand, existingSessionUuid);
     const target: TargetSnapshot = existingSessionUuid
       ? { type: 'session', sessionUuid: existingSessionUuid, cwd: existingEntry?.cwd }
       : { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined };
@@ -253,6 +256,25 @@ export class WecomBot {
   }
 
   /**
+   * PR 2 v1.2.1 final (F10 修复): serialKey 决策表
+   * 4 种 case：
+   * 1. 有 session + 命令 → session serialKey（命令附在 session 上）
+   * 2. 有 session + 聊天 → session serialKey（续聊）
+   * 3. 无 session + 命令 → cmd: serialKey
+   * 4. 无 session + 聊天 → new: serialKey
+   */
+  private deriveSerialKey(msg: PlatformMessage, isCommand: boolean, existingSessionUuid: string | null): string {
+    if (existingSessionUuid) {
+      // 有 session: 无论命令/聊天都走 session serialKey
+      return `${existingSessionUuid}:${msg.messageId}`;
+    }
+    if (isCommand) {
+      return `cmd:${msg.userId}:${msg.messageId}`;
+    }
+    return `new:${msg.userId}`;
+  }
+
+  /**
    * 卡片按钮回调: 5s 占位 + 异步处理
    * 参考 spec §5.4 + sdk replyWelcome 5s 窗口约束
    */
@@ -271,10 +293,13 @@ export class WecomBot {
       content: `执行 ${event.actionTag}...`,
     });
     try {
-      // PR 2 v1.2.1 修复: 必须用 inboundFrame.headers.req_id（SDK 内部流标识）
-      // 不能用 messageId（那是发给用户的原消息 ID），否则 SDK 服务端会拒收
-      // 与 WecomStreamUpdater.setInboundFrame 同样的 846605 根因
-      const reqId = event.inboundFrame?.headers?.req_id ?? event.messageId;
+      // PR 2 v1.2.1 final (F7 修复): 拒绝 fallback 到 messageId（那是发给用户的原消息 ID，
+      // 不是 SDK 内部流标识 — fallback 复现 846605 "invalid req_id" 根因）
+      const reqId = event.inboundFrame?.headers?.req_id;
+      if (!reqId) {
+        logger.error(`[wecom-bot] handleCardAction: missing inboundFrame.headers.req_id, cannot replyWelcome`);
+        return;
+      }
       await this.client.sdk.replyWelcome(
         { headers: { req_id: reqId } } as any,
         { msgtype: 'template_card', template_card: placeholderCard as any },
