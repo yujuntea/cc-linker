@@ -32,51 +32,30 @@ type _AssertImplements =
 const _assert: _AssertImplements = [true, true, true, true, true, true, true, true, true];
 void _assert; // suppress unused
 
-export type MappingEntryType =
-  | 'session'
-  | 'pending_new_session'
-  | 'pending_new_session_claimed'
-  | 'pending_agent_reply'         // 新增 — Agent View reply 等待输入
-  | 'last_agent_list_card';       // 新增 — Agent View 最新列表卡
+// === 类型定义委托给 platform/mapping-types.ts (M1 修复 v1.2.1) ===
+// 历史原因 ~30 个文件 import 本文件的 MappingEntry/MappingEntryType/UserMapping/ClaimPendingResult
+// 这里用 type alias 保留老名字，避免 ~30 个 import 方级联改
+import {
+  PLATFORM_PENDING_CLAIMED_TIMEOUT_MS,
+  type PlatformMappingEntryType,
+  type PlatformMappingEntry,
+  type PlatformUserMapping,
+  type PlatformClaimPendingResult,
+} from '../platform/mapping-types';
 
-export interface MappingEntry {
-  type: MappingEntryType;
-  sessionUuid: string | null;
-  createdAt: string;
-  casToken?: string; // I3: Unique CAS token to prevent ABA race (auto-generated)
-  cwd?: string; // I4: Working directory for new sessions (set by /new)
-  lastActiveAt?: string;
-  claimedByMessageId?: string;
-  claimedAt?: string;
-  defaultProvider?: string; // User's default model alias (user-level config)
-  // ===== Agent View 新增字段 =====
-  shortId?: string;          // pending_agent_reply: background session short hash
-  startedAt?: string;        // pending_agent_reply: ISO 启动时间
-  timeoutMs?: number;        // pending_agent_reply: 超时毫秒
-  cardMessageId?: string;    // last_agent_list_card: 飞书卡片 message_id
-  updatedAt?: string;        // last_agent_list_card: ISO 更新时间
-  // v2.4.x (Attach path): 标识 entry 是通过 handleAttach 写入的,后续发消息走 rendezvous
-  attachedAt?: string;       // ISO 时间;null/undefined = 普通 session(非 attached)
-}
+export type MappingEntryType = PlatformMappingEntryType;
+export type MappingEntry = PlatformMappingEntry;
+export type UserMapping = PlatformUserMapping;
+export type ClaimPendingResult = PlatformClaimPendingResult;
 
-export interface UserMapping {
-  version: number;
-  ownerOpenId?: string;
-  entries: Record<string, MappingEntry>;
-}
+// re-export 常量保持原名（~5 个文件 import 这个常量）
+export const PENDING_CLAIMED_TIMEOUT_MS = PLATFORM_PENDING_CLAIMED_TIMEOUT_MS;
 
-const DEFAULT_MAPPING: UserMapping = {
+// DEFAULT_MAPPING 保留在 feishu/mapping.ts（它是 UserMapping 实例，不属于纯类型）
+const DEFAULT_MAPPING: PlatformUserMapping = {
   version: 0,
   entries: {},
 };
-
-export const PENDING_CLAIMED_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-
-export type ClaimPendingResult =
-  | { status: 'claimed'; entry: MappingEntry; version: number }
-  | { status: 'creating'; entry: MappingEntry; version: number }
-  | { status: 'no_pending'; entry: MappingEntry | null; version: number }
-  | { status: 'unauthorized'; version: number };
 
 export class UserManager {
   private mappingPath: string;

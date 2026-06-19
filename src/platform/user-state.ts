@@ -3,16 +3,25 @@
  * 抽象基类 PlatformUserManager 声明所有方法签名；具体实现在 feishu/mapping.ts 与 wecom/mapping.ts
  * @see docs/superpowers/specs/2026-06-19-wecom-integration-design.md §3.2 v1.1 + §4.1
  *
- * 为什么用抽象基类而不是从零实现：feishu/mapping.ts:55 UserManager 已有 8 个方法 + 30 个 import 方
- * 重写代价远高于抽象；本文件只承担"跨平台契约"职责
+ * **类型定义位置（M1 修复 v1.2.1）**：
+ * 物理定义在 `./mapping-types.ts`，feishu/mapping.ts 通过 type alias 保留老名字（~30 import 方零改动）
+ * 这样 platform/ 不再反向依赖 feishu/，PR 2 wecom/mapping.ts 可以直接 import 本文件
  */
-import type { UserMapping, MappingEntry, MappingEntryType, ClaimPendingResult as FeishuClaimResult } from '../feishu/mapping';
+import type {
+  PlatformMappingEntry,
+  PlatformMappingEntryType,
+  PlatformUserMapping,
+  PlatformClaimPendingResult,
+} from './mapping-types';
 
-// === 类型 re-export（保持 feishu/mapping.ts 单一来源）===
-export type PlatformMappingEntry = MappingEntry;
-export type PlatformMappingEntryType = MappingEntryType;
-export type PlatformUserMapping = UserMapping;
-export type ClaimPendingResult = FeishuClaimResult;
+// === 类型 re-export（保持 feishu/mapping.ts alias 兼容 + 单一来源在 mapping-types.ts）===
+export type {
+  PlatformMappingEntry,
+  PlatformMappingEntryType,
+  PlatformUserMapping,
+} from './mapping-types';
+
+export type ClaimPendingResult = PlatformClaimPendingResult;
 
 /** 平台无关用户身份 */
 export interface PlatformUserId {
