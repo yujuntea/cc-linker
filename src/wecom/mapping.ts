@@ -61,6 +61,12 @@ export class WecomUserManager extends PlatformUserManager {
   /**
    * 企微特有 claimPending（与飞书 claimPendingNewSession 行为对齐：
    * pending → claimed 转换，命中 unauthorized/no_pending/creating/claimed 4 个状态）
+   *
+   * @deprecated 当前 PoC/E2E 简化版（PR 4.5+ 走 setSession 直写），
+   *   handleChat 不调本方法，dispatch loop 不调本方法，
+   *   全仓 0 生产调用点（验证: grep claimPending src/ 排除 test 后仅返回本定义）。
+   *   保留 4 个测试 + 完整实现，PR 6+ 接通飞书侧 claimPendingNewSession 等价流程时
+   *   重新启用（届时去掉 @deprecated 并在 handleChat 调 claimPending 取代直接读 pending 状态）。
    */
   async claimPending(externalUserId: string, messageId: string): Promise<import('../platform/mapping-types').PlatformClaimPendingResult> {
     if (!this.validateOwner(externalUserId)) {
@@ -121,6 +127,8 @@ export class WecomUserManager extends PlatformUserManager {
       const mapping = this.loadMapping();
       const now = new Date().toISOString();
       const existing = mapping.entries[externalUserId];
+      // PR 5 合并后 (C-4 修复): explicit 清理 claimed 字段, 防 claimPending 未来接通后
+      //   setSession 接管 claimed 状态时这两个字段残留导致 rollbackTimedOutClaims 误判超时
       mapping.entries[externalUserId] = {
         type: 'session',
         sessionUuid,
@@ -128,6 +136,8 @@ export class WecomUserManager extends PlatformUserManager {
         createdAt: existing?.createdAt ?? now,
         lastActiveAt: now,
         casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        claimedByMessageId: undefined,
+        claimedAt: undefined,
       };
       mapping.version++;
       this.saveMapping(mapping);

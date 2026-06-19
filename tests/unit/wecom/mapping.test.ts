@@ -123,6 +123,33 @@ describe('WecomUserManager', () => {
       rmSync(freshDir, { recursive: true, force: true });
     });
 
+    it('setSession: 显式清理 claimedByMessageId + claimedAt (C-4 修复)', async () => {
+      // 模拟历史 daemon 异常退出后, entry 带 claimed 残留
+      const mappingPath = join(dir, 'mapping-wecom-c4.json');
+      writeFileSync(mappingPath, JSON.stringify({
+        version: 1,
+        entries: {
+          'ext-c4': {
+            type: 'pending_new_session_claimed',
+            sessionUuid: null,
+            cwd: '/old',
+            claimedByMessageId: 'orphan-msg',
+            claimedAt: new Date(Date.now() - 600_000).toISOString(),  // 10 min ago
+            lastActiveAt: new Date(Date.now() - 600_000).toISOString(),
+            casToken: 'old',
+          },
+        },
+      }));
+      const fresh = new WecomUserManager(mappingPath);
+      await fresh.setSession('ext-c4', 'uuid-new', '/new');
+      const entry = fresh.getEntry('ext-c4');
+      expect(entry?.type).toBe('session');
+      expect(entry?.sessionUuid).toBe('uuid-new');
+      // 关键断言: claimed 字段必须清掉
+      expect((entry as any)?.claimedByMessageId).toBeUndefined();
+      expect((entry as any)?.claimedAt).toBeUndefined();
+    });
+
     it('touchSession: updates lastActiveAt on existing session', async () => {
       await manager.setSession('ext-touch', 'uuid-touch', '/tmp');
       const before = manager.getEntry('ext-touch');
