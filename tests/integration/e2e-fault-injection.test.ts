@@ -206,21 +206,21 @@ describe('Round 6: E2E + Fault Injection', () => {
   // ============================================================
   // 6. Lock conflict: CLI commands rejected when bot is running
   // ============================================================
-  it('锁冲突: 服务运行时执行 init/sync/clean/resume → 被 owner.lock 拒绝', async () => {
+  it('锁冲突: 服务运行时执行 init/sync/clean/resume → 被 owner.feishu.lock 拒绝', async () => {
     const lockPath = join(tmpDir, 'owner.lock');
     const coordinator = new StateCoordinator(lockPath);
 
-    // Acquire lock (simulating bot running)
+    // Acquire lock (simulating bot running) — 默认 feishu 平台锁
     expect(coordinator.tryAcquire()).toBe(true);
 
-    // CLI should reject writes
-    expect(() => StateCoordinator.assertNotRunning(lockPath)).toThrow('Bot 进程正在运行');
+    // CLI should reject writes (默认检查 feishu 平台锁)
+    expect(() => StateCoordinator.assertNotRunning('feishu', lockPath)).toThrow('Bot 进程正在运行');
 
     // Release lock
     coordinator.release();
 
     // CLI should now allow writes
-    expect(() => StateCoordinator.assertNotRunning(lockPath)).not.toThrow();
+    expect(() => StateCoordinator.assertNotRunning('feishu', lockPath)).not.toThrow();
   });
 
   // ============================================================
