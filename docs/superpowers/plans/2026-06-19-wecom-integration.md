@@ -3012,14 +3012,18 @@ MigrateV4toV5 walks all existing entries and sets platform='feishu' for v4 entri
 
 ---
 
-## Task 3.3: start --platform 选项（完整 CLI 路由）
+## Task 3.4: start --platform 选项（完整 CLI 路由）
+
+> **⚠️ C6 关键依赖**：依赖 Task 3.3（StateCoordinator 单锁多 platforms）已 commit。
+> Step 1 (读现有 start.ts) 可以先做；Step 2 起必须 Task 3.3 完成后。
 
 **Files:**
 - Modify: `src/cli/commands/start.ts:17-19, 60-100`（加 `--platform` 选项 + 路由逻辑）
 
-> **关键设计修正**（final-check F3 修复）：
+> **关键设计修正**（final-check F3 + C6 修复）：
 > - **当前 start.ts 已存在 daemon / noFeishu 选项**（line 17-19），需要加 `--platform`
-> - **当前没有 platform 路由实现**，需写完整：StateCoordinator 单锁多 platforms（Task 3.7 实现后）+ 飞书/企微 Bot 各自启动
+> - **当前没有 platform 路由实现**，需写完整：StateCoordinator 单锁多 platforms（**Task 3.3 已实现后**）+ 飞书/企微 Bot 各自启动
+> - **C6 关键依赖**：Task 3.4 调 `stateCoordinator.tryAcquire({ platforms: activePlatforms })` 依赖 Task 3.3 的 StateCoordinator 扩展。Task 顺序：3.3 → 3.4（已重排）
 > - 串行启动还是并行？**并行**（互相独立，无共享状态）；任何失败都报错退出
 
 - [ ] **Step 1: 阅读现有 start.ts**
@@ -3158,7 +3162,7 @@ git commit -m "feat(cli): start --platform supports feishu|wecom|all (parallel s
 
 ---
 
-## Task 3.4: init-wecom 交互式命令
+## Task 3.5: init-wecom 交互式命令
 
 **Files:**
 - Create: `src/cli/commands/init-wecom.ts`
@@ -3234,7 +3238,7 @@ git commit -m "feat(cli): add init-wecom interactive config command"
 
 ---
 
-## Task 3.5: index.ts 注册 init-wecom
+## Task 3.6: index.ts 注册 init-wecom
 
 **Files:**
 - Modify: `src/index.ts:195-210`
@@ -3265,7 +3269,13 @@ git commit -m "feat(cli): register init-wecom command"
 
 ---
 
-## Task 3.6: StateCoordinator 单锁多 platforms
+## Task 3.3: StateCoordinator 单锁多 platforms
+
+> **⚠️ C6 关键依赖**：此 task **必须在 Task 3.4 之前完成**。
+> Task 3.4 (start --platform) 调 `stateCoordinator.tryAcquire({ platforms: activePlatforms })`，
+> 若 Task 3.4 先 commit，TypeScript 检查会失败（tryAcquire 还不接受 platforms 参数）。
+> 物理位置靠后（line ~3269）只是文档组织，不影响实施顺序。
+> 实际执行 PR 3 的命令顺序是：**3.1 → 3.2 → 3.3 → 3.4 → 3.5 → 3.6 → 3.7 → 3.8**。
 
 **Files:**
 - Modify: `src/runtime/state-coordinator.ts:25-78`（扩展 tryAcquire 支持 platforms 参数 + lockData schema）
@@ -4158,7 +4168,12 @@ import { RegistryManager } from '../../registry';
 import { syncBeforeCommand } from '../../scanner';
 import { CLAUDE_SETTINGS_PATH } from '../../utils/paths';
 import { existsSync, readFileSync } from 'fs';
-import { loadExistingConfig, saveConfig, savePermissionMode, isHookInstalled } from './init-feishu';  // C4 修正: 这些 helper init-feishu.ts 已 export, 不另建 setup-helpers.ts
+// C5 修正 (执行前 final check):
+// - loadExistingConfig / saveConfig / maskSecret / isDaemonRunning 在 init-feishu.ts:142-198 export
+// - savePermissionMode / isHookInstalled 在 setup.ts 自己定义（line 17, 27）— 内部直接调用, 不需要 import
+//   (Task 3.5.4 setup.ts 是 setup.ts 自身, 内部函数直接可用)
+import { loadExistingConfig, saveConfig, maskSecret, isDaemonRunning } from './init-feishu';
+// savePermissionMode / isHookInstalled 在本文件 setup.ts 内部定义, 无需 import
 import { runChannelWizard } from './channel-configurator';
 
 interface SetupOptions {
@@ -4306,7 +4321,14 @@ Run: `bun test tests/unit/cli/setup.test.ts`（如存在）
 Run: `bun test tests/`
 Expected: PASS
 
-> **C4 修正说明**：plan 早期版本提到"提取公共 helper 到 setup-helpers.ts"，但 `init-feishu.ts:17-23` 已经 export 了 `loadExistingConfig / saveConfig / maskSecret / isDaemonRunning` 等 helper。`FeishuConfigurator` / setup.ts 改用 `import { ... } from './init-feishu'` 复用这些 helper，不另建 setup-helpers.ts（避免重复定义）。
+> **C5 修正说明**：plan 早期版本（final-check #8a689d1）声称"init-feishu.ts:17-23 export 了 loadExistingConfig / saveConfig / maskSecret / isDaemonRunning 等 helper"。**执行前验证发现这是错的**：
+> - init-feishu.ts 实际 export 的只有: `maskSecret / isDaemonRunning / getTenantToken / getBotName / captureOpenId / loadExistingConfig / saveConfig / initFeishu`
+> - `savePermissionMode / isHookInstalled` 是 **setup.ts 自己定义的**（line 17, 27），不在 init-feishu
+> 
+> 修正：Task 3.5.4 setup.ts 改为：
+> - `loadExistingConfig / saveConfig / maskSecret / isDaemonRunning` 从 init-feishu import（已 export）
+> - `savePermissionMode / isHookInstalled` 内部直接调用（不跨文件 import）
+> - 不另建 setup-helpers.ts（保持原状）
 
 - [ ] **Step 5: 跑 typecheck**
 
