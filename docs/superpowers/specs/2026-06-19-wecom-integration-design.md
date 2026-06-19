@@ -295,7 +295,7 @@ wsClient.on('event.feedback_event', (evt) => ...);
 | `src/registry/types.ts` | `SessionEntry.platform` 字段（默认 `feishu`） | +15 | 3 |
 | `src/runtime/state-coordinator.ts` | `tryAcquire({ platforms })` 单锁多平台 | +50 | 3 |
 | `src/queue/spool.ts` | `SpoolMessage` + `TargetSnapshot` 加 `platform` / `userId` 字段（openId alias） | +10 | 3 |
-| `src/cli/commands/setup.ts` | 重构为渠道多选 + ChannelConfigurator 调度 | +180 | 3.5 |
+| `src/cli/commands/setup.ts` | **全量重构**：从 4 步 hardcoded 改造为渠道多选 + ChannelConfigurator 调度（净增 ~150 行） | 重构 | 3.5 |
 | `src/cli/commands/init-feishu.ts` | 提取 `runFeishuWizard()` export（setup 复用） | +30 | 3.5 |
 | `src/cli/commands/channel-configurator.ts` | **新增**：统一接口 + registry | +120 | 3.5 |
 | `src/index.ts` | `start` 命令注册 `init-wecom` + `init-feishu` 不变 | +20 | 3 + 3.5 |
@@ -324,7 +324,7 @@ src/utils/config.ts                         (+30)   ← PR 3
 src/registry/types.ts                       (+15)   ← PR 3
 src/runtime/state-coordinator.ts           (+50)   ← PR 3
 src/queue/spool.ts                          (+10)   ← PR 3
-src/cli/commands/setup.ts                   (+180)  ← PR 3.5 重构
+src/cli/commands/setup.ts                   (重构 ~150 行净增)  ← PR 3.5
 src/cli/commands/init-feishu.ts             (+30)   ← PR 3.5 提取 wizard
 src/index.ts                                (+20)   ← PR 3+3.5
 
@@ -443,6 +443,8 @@ cc-linker setup --skip-feishu --skip-hook   # 旧选项仍可用（兼容）
 - **可行的"准一键"**：CLI 引导 + 自动捕获 external_user_id（类比飞书 captureOpenId）
 
 **init-wecom.ts 完整 wizard（7-step，与 init-feishu 镜像对齐）**：
+
+> **架构决策（N1）**：init-wecom 的 step 数量与命名与 init-feishu 对齐（虽然 init-feishu 是 9 step 含 manual/skipCapture 分支，init-wecom 7 step 更紧凑），保证两个渠道的用户体验一致——用户切换渠道时不需要重新学习交互流程。
 
 ```
 Step 1: 检测 daemon 运行 → 询问（与 feishu 同）
@@ -916,6 +918,8 @@ WSReconnectExhaustedError // 重连耗尽 → CCError
 | SDK 抛 `WSAuthFailureError` 误显示 | 配置错时 user 看不懂 | 映射到 CCError + 一次性 error 日志 | 🔄 已识别，PR 2 处理 |
 | 跨平台 userId 隔离导致"无法跨平台继续会话" | 用户体验缺陷 | **v1 显式 YAGNI**，未来用 mobile/email 做 identity 关联 | 🔄 已知约束，v1 不解决 |
 | 用户接入需扫"联系我"二维码 | 自用 0 摩擦，团队 1 次性 | README 写清流程 | 🟢 可控 |
+| **PR 3.5 setup 重构破坏飞书 E2E** | setup.ts 是用户首次安装接触的核心，重写引入新 wizard 调度可能引入回归 | Task 3.5.7 强制飞书 5 case E2E 回归；Step 0 默认勾选飞书（向后兼容）；ChannelConfigurator 抽象 feishu/wecom 行为对齐 init-feishu | 🔄 PR 3.5 风险 |
+| **FeishuConfigurator 与 runFeishuWizard 重复逻辑 / owner_id 丢失** | Task 3.5.2 promptCredentials 必须委托 runFeishuWizard 完整流程（含 captureOpenId），不能分步执行否则 saveConfig 阶段会覆盖 owner_open_id | Task 3.5.2 Step 2 实现细节明确；Task 3.5.7 飞书 E2E 跑通验证 owner_id 正确写入 | 🔄 PR 3.5 风险 |
 
 ### 9.2 未决问题（生产观测）
 

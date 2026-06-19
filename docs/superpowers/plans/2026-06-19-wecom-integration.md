@@ -3234,14 +3234,7 @@ git commit -m "feat(cli): add init-wecom interactive config command"
 
 ---
 
-## Task 3.5: setup --wecom 选项（**推迟到 PR 3.5**）
-
-> 此 task 在 PR 3.5 重新实现。setup 改造为 ChannelConfigurator 多渠道调度，不是简单加 `--wecom` flag。
-> 详见 PR 3.5 - Task 3.5.1 "setup 渠道多选"。
-
----
-
-## Task 3.6: index.ts 注册 init-wecom
+## Task 3.5: index.ts 注册 init-wecom
 
 **Files:**
 - Modify: `src/index.ts:195-210`
@@ -3272,7 +3265,7 @@ git commit -m "feat(cli): register init-wecom command"
 
 ---
 
-## Task 3.7: StateCoordinator 单锁多 platforms
+## Task 3.6: StateCoordinator 单锁多 platforms
 
 **Files:**
 - Modify: `src/runtime/state-coordinator.ts:25-78`（扩展 tryAcquire 支持 platforms 参数 + lockData schema）
@@ -3439,7 +3432,7 @@ Backward compat: no-arg tryAcquire() defaults to ['feishu']."
 
 ---
 
-## Task 3.8: --platform=all 跨平台 E2E
+## Task 3.7: --platform=all 跨平台 E2E
 
 **Files:**
 - Manual: 跑双平台 1 小时
@@ -3471,7 +3464,7 @@ git commit -m "test(wecom): record --platform=all cross-platform 1-hour stabilit
 
 ---
 
-## Task 3.9: PR 3 验收
+## Task 3.8: PR 3 验收
 
 - [ ] **Step 1: 跑所有测试**
 
@@ -3511,7 +3504,12 @@ Expected: 三种模式都正确启动对应 Bot
 
 **风险**：setup.ts 是用户首次安装接触的核心，改造必须零回归（飞书路径 5 case E2E 全过）。
 
-## Task 3.5.1: `ChannelConfigurator` 统一接口
+## Task 3.5.1: `ChannelConfigurator` 统一接口（lazy require 实现）
+
+> **关键设计修正**（critical-review I2 修复）：
+> ChannelConfigurator interface 改用 **lazy require** 而非 top-level import FeishuConfigurator / WecomConfigurator，
+> 避免 Task 3.5.1 commit 时 3.5.2/3.5.3 文件还未创建的 import 错误。
+> 详见 Task 3.5.4 runChannelWizard 处的 lazy require 模式。
 
 **Files:**
 - Create: `src/cli/commands/channel-configurator.ts`
@@ -3596,12 +3594,29 @@ export type ChannelConfigurator = {
   postInstall(config: any): Promise<{ started: boolean; autoStart: boolean }>;
 };
 
-import { FeishuConfigurator } from './feishu-configurator';
-import { WecomConfigurator } from './wecom-configurator';
+import type { FeishuConfigurator } from './feishu-configurator';
+import type { WecomConfigurator } from './wecom-configurator';
+
+// 用 getter 延迟 require，避免 Task 3.5.1 commit 时 3.5.2/3.5.3 文件未创建
+// 触发 "Cannot find module" 错误。Task 3.5.4 runChannelWizard 调用时才真正加载
+let _feishuCfg: ChannelConfigurator | null = null;
+let _wecomCfg: ChannelConfigurator | null = null;
 
 export const configurators: Record<'feishu' | 'wecom', ChannelConfigurator> = {
-  feishu: new FeishuConfigurator(),
-  wecom: new WecomConfigurator(),
+  get feishu(): ChannelConfigurator {
+    if (!_feishuCfg) {
+      const { FeishuConfigurator } = require('./feishu-configurator');
+      _feishuCfg = new FeishuConfigurator();
+    }
+    return _feishuCfg;
+  },
+  get wecom(): ChannelConfigurator {
+    if (!_wecomCfg) {
+      const { WecomConfigurator } = require('./wecom-configurator');
+      _wecomCfg = new WecomConfigurator();
+    }
+    return _wecomCfg;
+  },
 };
 
 export async function runChannelWizard(platform: 'feishu' | 'wecom'): Promise<{
@@ -3717,7 +3732,7 @@ import { CONFIG_PATH } from '../utils/paths';
 import { parse } from '@iarna/toml';
 import {
   getTenantToken, getBotName, captureOpenId,
-  loadExistingConfig, saveConfig, maskSecret, runFeishuWizard,
+  isDaemonRunning, loadExistingConfig, saveConfig, maskSecret, runFeishuWizard,
 } from './init-feishu';
 import type { ChannelConfigurator } from './channel-configurator';
 
@@ -3730,8 +3745,7 @@ export class FeishuConfigurator implements ChannelConfigurator {
   }
 
   async checkDaemonConflict(): Promise<'ok' | 'conflict' | 'no-config'> {
-    // 复用 init-feishu.ts 的 isDaemonRunning + WSS slot check
-    const { isDaemonRunning } = await import('./init-feishu');
+    // N2 修正: top-level import 替代 dynamic import（init-feishu 已 export isDaemonRunning）
     if (isDaemonRunning()) return 'conflict';
     return 'ok';
   }
@@ -3746,30 +3760,45 @@ export class FeishuConfigurator implements ChannelConfigurator {
   }
 
   async promptCredentials(existing?: Record<string, any>): Promise<{ config: any; skip?: boolean }> {
-    // 复用 init-feishu.ts 的 runFeishuWizard 流程的 prompt 部分
-    // 实际实现: 委托 runFeishuWizard, 从其 return 拿 config
+    // C2 修正: 委托 runFeishuWizard 完整 9-step 流程（prompt → verify → capture → save → start），
+    // 返回完整 config 含 owner_open_id + 已启动状态。
+    // runChannelWizard 后续步骤用此 config, 不再调 captureOwnerUserId/saveConfig/postInstall。
     const result = await runFeishuWizard(existing?.app_id, existing?.app_secret);
-    return { config: { app_id: result.appId }, skip: !result.configured };
+    if (!result.configured) {
+      return { config: {}, skip: true };
+    }
+    // 把 runFeishuWizard 的结果平摊成完整 config (含 owner_open_id)
+    return {
+      config: {
+        app_id: result.appId,
+        app_secret: existing?.app_secret,  // 没法从 result 反推, 留作 caller 重新 load
+        owner_open_id: '',  // 由 saveConfig 从 config.toml 读取, 不在此处手动传
+        __runResult: { started: result.started, autoStart: result.autoStart },
+      },
+      skip: false,
+    };
   }
 
   async verifyCredentials(config: any): Promise<boolean> {
-    // init-feishu.ts 内部已 verify, 这里只确认 config 完整
-    return !!(config.app_id && config.app_secret);
+    // 已在 promptCredentials 内部 verify, 此处只确认 config 完整
+    return !!(config.app_id);
   }
 
   async captureOwnerUserId(config: any, timeoutMs = 120_000): Promise<string | null> {
-    // 已由 runFeishuWizard 内部处理 (init-feishu.ts:268-301)
-    // 这里返回 null 表示 owner_id 已通过 runFeishuWizard 写入
+    // 已在 promptCredentials 内部通过 runFeishuWizard 捕获 owner_open_id 并写入 config.toml
+    // 此处返回 null 表示无需重复执行
     return null;
   }
 
   saveConfig(config: any): void {
-    // 已由 runFeishuWizard 内部 saveConfig 处理
+    // 已在 promptCredentials 内部通过 runFeishuWizard 写入 config.toml
+    // 此处 no-op, 避免覆盖 owner_open_id
   }
 
   async postInstall(config: any): Promise<{ started: boolean; autoStart: boolean }> {
-    // 已由 runFeishuWizard 内部处理启动 + autoStart
-    return { started: false, autoStart: false };
+    // C2 修正: runFeishuWizard 已经处理了启动 + autoStart 并写入结果，
+    // 此处直接返回，避免重复执行（重复会导致 PID file 异常）
+    return config.__runResult ?? { started: false, autoStart: false };
   }
 }
 ```
@@ -3783,7 +3812,11 @@ Expected: PASS（init-feishu.ts 行为不变；feishu-configurator.ts 是新增 
 
 ```bash
 git add src/cli/commands/init-feishu.ts src/cli/commands/feishu-configurator.ts
-git commit -m "refactor(feishu): extract FeishuConfigurator implementing ChannelConfigurator"
+git commit -m "refactor(feishu): extract FeishuConfigurator implementing ChannelConfigurator
+
+C2 fix: FeishuConfigurator.promptCredentials 委托 runFeishuWizard 完整流程，
+返回 { config, __runResult } 含已捕获的 owner_open_id。
+后续 captureOwnerUserId/saveConfig/postInstall 都用此 config, 避免 owner_id 丢失。"
 ```
 
 ---
@@ -3858,25 +3891,18 @@ Expected: FAIL with "Cannot find module"
  */
 import inquirer from 'inquirer';
 import chalk from 'chalk';
-import { WSClient, type AibotMessageEvent } from '@wecom/aibot-node-sdk';
+import { WSClient } from '@wecom/aibot-node-sdk';
 import { CONFIG_PATH } from '../utils/paths';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { parse } from '@iarna/toml';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { logger } from '../utils/logger';
+import { isDaemonRunning, installDaemon } from './init-feishu';
 import type { ChannelConfigurator } from './channel-configurator';
 
 export class WecomConfigurator implements ChannelConfigurator {
   platform = 'wecom' as const;
-  private sdk: WSClient;
-  private mockSDK: WSClient | null;
-
-  constructor(opts?: { sdk?: WSClient }) {
-    this.mockSDK = opts?.sdk ?? null;
-    // 真实 sdk 由 captureOwnerUserId 时创建
-    this.sdk = opts?.sdk as any;
-  }
 
   isConfigured(): boolean {
     if (!existsSync(CONFIG_PATH)) return false;
@@ -3889,8 +3915,6 @@ export class WecomConfigurator implements ChannelConfigurator {
   }
 
   async checkDaemonConflict(): Promise<'ok' | 'conflict' | 'no-config'> {
-    // 复用 init-feishu.ts 的 isDaemonRunning 检查
-    const { isDaemonRunning } = await import('./init-feishu');
     if (isDaemonRunning()) return 'conflict';
     return 'ok';
   }
@@ -3956,9 +3980,11 @@ export class WecomConfigurator implements ChannelConfigurator {
 
     return new Promise<string | null>((resolve) => {
       let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;  // C3 修正: 保存 timer 句柄以便清理
       const settle = (id: string | null) => {
         if (settled) return;
         settled = true;
+        if (timer) clearTimeout(timer);  // C3 修正: 清理 timer 防止泄漏
         try { client.disconnect(); } catch {}
         resolve(id);
       };
@@ -3981,7 +4007,7 @@ export class WecomConfigurator implements ChannelConfigurator {
         settle(null);
       }
 
-      setTimeout(() => {
+      timer = setTimeout(() => {
         console.log(chalk.yellow('  ⏰ 超时未收到 enter_chat'));
         settle(null);
       }, timeoutMs);
@@ -4046,7 +4072,7 @@ export class WecomConfigurator implements ChannelConfigurator {
     }]);
 
     if (autoStart) {
-      const { installDaemon } = await import('./daemon');
+      // N2 修正: 顶部已 import { installDaemon } from './init-feishu'
       await installDaemon();
     }
 
@@ -4132,7 +4158,7 @@ import { RegistryManager } from '../../registry';
 import { syncBeforeCommand } from '../../scanner';
 import { CLAUDE_SETTINGS_PATH } from '../../utils/paths';
 import { existsSync, readFileSync } from 'fs';
-import { loadExistingConfig, saveConfig, savePermissionMode, isHookInstalled } from './setup-helpers';  // 拆出公共 helper
+import { loadExistingConfig, saveConfig, savePermissionMode, isHookInstalled } from './init-feishu';  // C4 修正: 这些 helper init-feishu.ts 已 export, 不另建 setup-helpers.ts
 import { runChannelWizard } from './channel-configurator';
 
 interface SetupOptions {
@@ -4274,22 +4300,20 @@ function printMultiChannelSummary(
 }
 ```
 
-- [ ] **Step 4: 提取公共 helper 到 setup-helpers.ts（可选）**
-
-如果 `loadExistingConfig` / `savePermissionMode` / `isHookInstalled` 等已经在 setup.ts 内部，把它们 export 出去，channel-configurator.ts 复用。
-
-- [ ] **Step 5: 跑现有 setup 测试，确认零回归**
+- [ ] **Step 4: 跑现有 setup 测试，确认零回归**
 
 Run: `bun test tests/unit/cli/setup.test.ts`（如存在）
 Run: `bun test tests/`
 Expected: PASS
 
-- [ ] **Step 6: 跑 typecheck**
+> **C4 修正说明**：plan 早期版本提到"提取公共 helper 到 setup-helpers.ts"，但 `init-feishu.ts:17-23` 已经 export 了 `loadExistingConfig / saveConfig / maskSecret / isDaemonRunning` 等 helper。`FeishuConfigurator` / setup.ts 改用 `import { ... } from './init-feishu'` 复用这些 helper，不另建 setup-helpers.ts（避免重复定义）。
+
+- [ ] **Step 5: 跑 typecheck**
 
 Run: `bun run typecheck`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/cli/commands/setup.ts tests/unit/setup/run-channel-wizard.test.ts
