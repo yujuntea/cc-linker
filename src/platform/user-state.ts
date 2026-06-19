@@ -11,7 +11,7 @@
  * 飞书 UserManager 仅保留 compareAndSwap + claimPendingNewSession（CAS 模式特有）
  * 企微 WecomUserManager 仅保留 setPending + claimPending（企微 setPending 特有）
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, openSync, writeSync, closeSync, fsyncSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { withLock } from '../utils/lock';
@@ -55,6 +55,22 @@ export abstract class PlatformUserManager {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (!existsSync(this.mappingPath)) {
       this.saveMapping({ version: 0, entries: {} });
+    } else {
+      // PR 4.1 final (0 字节 user-mapping bug 修复): 自愈 0 字节文件
+      // 历史: 之前 daemon 异常退出后, ensureFile 走 saveMapping 写 tmp + rename,
+      //   但 writeFileSync + renameSync 在 macOS fsync 时序问题下可能留 0 字节文件
+      //   (PR 4.1 E2E 验证发现: 反复 `user-mapping 解析失败: Unexpected EOF`)。
+      // 修法: loadMapping 已经能自愈 0 字节 (return empty), 这里确保 initialized
+      //   之后 dispatch loop 不会再 trigger ensureFile 写。
+      try {
+        const stat = readFileSync(this.mappingPath, 'utf8');
+        if (stat.length === 0) {
+          logger.warn(`user-mapping 文件是 0 字节, 自愈写默认值: ${this.mappingPath}`);
+          this.saveMapping({ version: 0, entries: {} });
+        }
+      } catch {
+        // 解析失败由 loadMapping 处理, ensureFile 这里不重复
+      }
     }
     this.initialized = true;
   }
@@ -62,6 +78,11 @@ export abstract class PlatformUserManager {
   protected loadMapping(): PlatformUserMapping {
     try {
       const raw = readFileSync(this.mappingPath, 'utf8');
+      if (raw.length === 0) {
+        // 0 字节文件自愈: 之前 daemon 异常退出可能留 0 字节 (PR 4.1 验证发现)
+        logger.warn(`user-mapping 0 字节, 自愈默认空 mapping: ${this.mappingPath}`);
+        return { version: 0, entries: {} };
+      }
       return JSON.parse(raw) as PlatformUserMapping;
     } catch (err) {
       if (existsSync(this.mappingPath)) {
@@ -73,7 +94,18 @@ export abstract class PlatformUserManager {
 
   protected saveMapping(mapping: PlatformUserMapping): void {
     const tmp = this.mappingPath + '.tmp';
-    writeFileSync(tmp, JSON.stringify(mapping, null, 2), { mode: 0o600 });
+    const data = JSON.stringify(mapping, null, 2);
+    // PR 4.1 final (0 字节 bug 修复): explicit fd + writeSync + fsync + close + rename
+    // 历史: writeFileSync + renameSync 在 macOS fsync 时序问题下可能留 0 字节
+    //   (daemon SIGKILL 时 write 还没落盘)。改用 openSync + writeSync (sync 写)
+    //   + fsyncSync (强制刷盘) + closeSync + renameSync, 确保 0 字节不出现。
+    const fd = openSync(tmp, 'w', 0o600);
+    try {
+      writeSync(fd, data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, this.mappingPath);
   }
 

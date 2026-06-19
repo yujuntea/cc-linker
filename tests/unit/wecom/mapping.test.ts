@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { WecomUserManager, WECOM_USER_MAPPING_PATH } from '../../../src/wecom/mapping';
@@ -63,5 +63,32 @@ describe('WecomUserManager', () => {
     expect(rolled).toBe(true);
     const entry = manager.getEntry('ext-3');
     expect(entry?.type).toBe('pending_new_session');
+  });
+
+  // PR 4.1 final: 0 字节 user-mapping 文件自愈测试
+  it('PR 4.1 final: 0 字节 user-mapping 文件自愈', async () => {
+    // 模拟历史 daemon 异常退出留 0 字节文件
+    const mappingPath = join(dir, 'mapping-wecom.json');
+    writeFileSync(mappingPath, '');  // 0 字节
+    expect(readFileSync(mappingPath, 'utf8')).toBe('');
+
+    // 触发 ensureFile → 应自愈写默认值
+    const fresh = new WecomUserManager(mappingPath);
+    const entry = fresh.getEntry('ext-selfheal');
+    expect(entry).toBeUndefined();
+
+    // 文件不再是 0 字节, 内容是合法 JSON
+    const content = readFileSync(mappingPath, 'utf8');
+    expect(content.length).toBeGreaterThan(0);
+    expect(() => JSON.parse(content)).not.toThrow();
+  });
+
+  it('PR 4.1 final: loadMapping 直接读 0 字节返回空 mapping', () => {
+    // 直接测 loadMapping (用 access protected method via cast)
+    const mappingPath = join(dir, 'mapping-wecom.json');
+    writeFileSync(mappingPath, '');
+    const fresh = new WecomUserManager(mappingPath);
+    // 通过 getEntry 验证 loadMapping 自愈
+    expect(fresh.getEntry('any-user')).toBeUndefined();
   });
 });
