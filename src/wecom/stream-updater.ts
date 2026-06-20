@@ -10,7 +10,7 @@ import type { StreamUpdater, StreamUpdateToolUse } from '../platform/stream-upda
 import { logger } from '../utils/logger';
 
 const STREAM_CONTENT_MAX_BYTES = 20480; // SDK 硬限制
-const DEFAULT_THROTTLE_MS = 2000;
+const DEFAULT_THROTTLE_MS = WecomStreamUpdater.THROTTLE_MS;
 
 type BufferedChunk = {
   thinking: string;
@@ -39,6 +39,11 @@ function renderMarkdown(thinking: string, text: string, toolUses: StreamUpdateTo
 }
 
 export class WecomStreamUpdater implements StreamUpdater {
+  /**
+   * PR 7 m-3: 限频窗口常量 (毫秒). 跟 DEFAULT_THROTTLE_MS 保持同值 (2000),
+   * 对外暴露为 class constant, 允许测试和上层代码引用而不依赖魔法数。
+   */
+  static readonly THROTTLE_MS = 2000;
   private sdk: WSClient;
   private throttleMs: number;
   private currentStreamId: string | null = null;
