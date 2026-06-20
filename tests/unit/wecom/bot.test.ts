@@ -418,7 +418,8 @@ describe('WecomBot handleChat (PR 4.1)', () => {
     expect(completeCall[2]).toContain('⏱ 已用时');
   });
 
-  it('error path: sessionManager throws → updater.error + requeue', async () => {
+  it('PR 6.21 P0#2: error path: sessionManager throws → updater.error + markDone (no requeue)', async () => {
+    // 错误已是终态 (updater.error 已推), 不应 requeue 触发重复 dispatch 死循环
     const mockSessionManager: any = {
       sendStreamingMessage: mock(async () => {
         throw new Error('claude -p crashed');
@@ -459,8 +460,9 @@ describe('WecomBot handleChat (PR 4.1)', () => {
     const errorContent = lastCall[2] as string;
     expect(errorContent.startsWith('❌')).toBe(true);
 
-    // 3. requeueFromProcessing 被调
-    expect(mockSpoolQueue.requeueFromProcessing).toHaveBeenCalledWith('msg_err_001', 'new:wmu_abc');
+    // 3. PR 6.21 P0#2: 错误路径 markDone, 不 requeue
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_err_001', 'new:wmu_abc');
+    expect(mockSpoolQueue.requeueFromProcessing).not.toHaveBeenCalled();
   });
 
   it('error path: Claude returns no sessionId → updater.error + markDone', async () => {
@@ -2265,7 +2267,10 @@ describe('WecomBot executeCardAction (PR 6 Task 6.4: retry)', () => {
     });
   });
 
-  it('retry: 调 spoolQueue.requeueFromProcessing 重新入队 + 确认 sendMessage', async () => {
+  it('PR 6.21 P1#4: retry → sendMessage 提示用户重新发消息 (不调 requeue)', async () => {
+    // 旧版用错的 serialKey 'retry:user' 调 requeueFromProcessing, 但卡片回调本身不在
+    // SpoolQueue, messageId 通常已 done/failed. requeue 不生效, 用户点 retry 没效果.
+    // PR 6.21 P1#4: 直接 sendMessage 提示用户重新发送消息
     await bot.__test_executeCardAction({
       externalUserId: 'ext-1',
       messageId: 'msg-retry-1',
@@ -2274,17 +2279,15 @@ describe('WecomBot executeCardAction (PR 6 Task 6.4: retry)', () => {
       inboundFrame: { headers: { req_id: 'req-1' } },
     });
 
-    // 1. spoolQueue.requeueFromProcessing 被调, 参数含 messageId + 标识用户
-    expect(mockSpoolQueue.requeueFromProcessing).toHaveBeenCalledTimes(1);
-    const rqCall = mockSpoolQueue.requeueFromProcessing.mock.calls[0];
-    expect(rqCall[0]).toBe('msg-retry-1');
-    expect(String(rqCall[1])).toContain('ext-1');
+    // 1. 不调 spoolQueue.requeueFromProcessing (卡片回调不在 SpoolQueue 中)
+    expect(mockSpoolQueue.requeueFromProcessing).not.toHaveBeenCalled();
 
-    // 2. sendMessage 发了 markdown 确认
+    // 2. sendMessage 发了 markdown 提示用户重新发送消息 + 显示原 msgId
     expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
     const smCall = mockClient.sdk.sendMessage.mock.calls[0];
     expect(smCall[0]).toBe('ext-1');
     expect(smCall[1].msgtype).toBe('markdown');
+    expect(smCall[1].markdown.content).toContain('重新发送');
     expect(smCall[1].markdown.content).toContain('msg-retry-1');
   });
 });

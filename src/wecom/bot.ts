@@ -19,35 +19,53 @@ import type { StreamChunk } from '../proxy/stream-parser';
 import { RegistryManager } from '../registry/registry';
 
 /**
- * PR 7 m-2 + PR 6.20: appendChunk 累加器 — 把 handleChat onProgress 闭包里的累加逻辑
- * 提到独立函数, 让单测直接验证分支 (chunk.type === 'thinking' / 'text')。
+ * PR 7 m-2 + PR 6.20 + PR 6.21: appendChunk 累加器 — 把 handleChat onProgress 闭包里的累加逻辑
+ * 提到独立函数, 让单测直接验证分支。
  *
- * PR 6.20 修法: 返回新 state 对象 (不变异入参), 因为 JS 字符串 immutable:
- *   旧版 mutate state.thinking += content 是给 state 对象属性赋值, 但 caller 在
- *   onProgress 闭包里 `appendChunk({ thinking, text }, chunk)` 创建新对象 — 闭包
- *   里的 thinking/text 局部变量仍是旧字符串引用, 永远不变.
- *   真实验收 17:30-17:32: SDK emit 5 个 chunks (1 text 4758 chars), 但
- *   state.text 是 0 字符. 思考过程 + 回复内容都丢 — 用户截图看不到思考过程.
- *
- * 新版: appendChunk 返回新 state 对象, caller 必须 re-assign 闭包变量:
- *   const next = appendChunk(state, chunk);
- *   thinking = next.thinking;
- *   text = next.text;
+ * PR 6.20: 返回新 state 对象 (不变异入参), 因为 JS 字符串 immutable。
+ * PR 6.21: 加 toolUses 累积 — tool_use chunk 累加到 state.toolUses 数组。
+ *   之后 handleChat 把累积的 toolUses 透传给 stream-updater complete()
+ *   让用户看到工具调用过程 (Bash/Read/Grep 等)。
  *
  * 行为约定:
- * - thinking chunk → new.thinking = state.thinking + chunk.content
- * - text chunk → new.text = state.text + chunk.content
- * - 返回新对象 (不 mutate 入参), 其他 chunk.type 返回原 state
+ * - thinking chunk → state.thinking += chunk.content
+ * - text chunk → state.text += chunk.content
+ * - tool_use chunk → state.toolUses.push({ name, inputSummary })
+ * - 返回新 state 对象 (不 mutate 入参)
  */
+export type AccumulatedChunk = {
+  thinking: string;
+  text: string;
+  toolUses: Array<{ name: string; inputSummary: string }>;
+};
+
 export function appendChunk(
-  state: { thinking: string; text: string },
+  state: AccumulatedChunk,
   chunk: StreamChunk,
-): { thinking: string; text: string } {
+): AccumulatedChunk {
   if (chunk.type === 'thinking') {
-    return { thinking: state.thinking + chunk.content, text: state.text };
+    return {
+      thinking: state.thinking + chunk.content,
+      text: state.text,
+      toolUses: state.toolUses,
+    };
   }
   if (chunk.type === 'text') {
-    return { thinking: state.thinking, text: state.text + chunk.content };
+    return {
+      thinking: state.thinking,
+      text: state.text + chunk.content,
+      toolUses: state.toolUses,
+    };
+  }
+  if (chunk.type === 'tool_use') {
+    // PR 6.21: tool_use chunk 累加 toolUses 数组
+    // input 是 object, 摘要前 80 字符 (避免 markdown 卡片过长)
+    const inputJson = JSON.stringify(chunk.input).slice(0, 80);
+    return {
+      thinking: state.thinking,
+      text: state.text,
+      toolUses: [...state.toolUses, { name: chunk.name, inputSummary: inputJson }],
+    };
   }
   return state;
 }
@@ -577,9 +595,13 @@ export class WecomBot {
       logger.info(`[wecom-bot] handleCommandListCard: sent markdown to ${receiveId}`);
     } catch (err) {
       logger.error(`[wecom-bot] handleCommandListCard: sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+      // PR 6.21 P1#6: 异常路径 markDone 兜底, 跟 P0#2 一样不 requeue
+      // 命令响应已是终态 (sendMessage 失败但消息已处理), requeue 触发重复 dispatch 死循环
       try {
-        this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
-      } catch (requeueErr) { /* ignore */ }
+        this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      } catch (markDoneErr) {
+        logger.warn(`[wecom-bot] handleCommandListCard markDone failed: ${markDoneErr instanceof Error ? markDoneErr.message : String(markDoneErr)}`);
+      }
     }
   }
 
@@ -598,9 +620,12 @@ export class WecomBot {
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
     } catch (err) {
       logger.error(`[wecom-bot] fallbackListMarkdown: sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+      // PR 6.21 P1#6: 异常路径 markDone 兜底 (跟 P0#2 一致)
       try {
-        this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
-      } catch (requeueErr) { /* ignore */ }
+        this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      } catch (markDoneErr) {
+        logger.warn(`[wecom-bot] fallbackListMarkdown markDone failed: ${markDoneErr instanceof Error ? markDoneErr.message : String(markDoneErr)}`);
+      }
     }
   }
 
@@ -887,6 +912,8 @@ export class WecomBot {
     const startTime = Date.now();
     let thinking = '';
     let text = '';
+    // PR 6.21: toolUses 累加器 (appendChunk 返回新对象, caller re-assign 闭包变量)
+    let toolUses: Array<{ name: string; inputSummary: string }> = [];
 
     try {
       // 1. 启动 replyStream 流（必传 inboundFrame — M-7 修复后 fail-fast）
@@ -918,15 +945,16 @@ export class WecomBot {
           : (existingEntry?.cwd ?? '/tmp');
       const lockKey: string = isNewSession ? `new:${msg.userId}` : existingSessionUuid!;
 
-      // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text + throttle patch
-      // PR 7 m-2 + PR 6.20: appendChunk 返回新 state 对象, caller 必须 re-assign
+      // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text/toolUses + throttle patch
+      // PR 7 m-2 + PR 6.20 + PR 6.21: appendChunk 返回新 state 对象, caller 必须 re-assign
       //   (JS 字符串 immutable, 旧版 mutate 新对象属性但闭包变量不变)
       const result = await this.sessionManager.sendStreamingMessage(
         sessionId, msg.text, cwd,
         (chunk: StreamChunk) => {
-          const next = appendChunk({ thinking, text }, chunk);
+          const next = appendChunk({ thinking, text, toolUses }, chunk);
           thinking = next.thinking;
           text = next.text;
+          toolUses = next.toolUses;
           const elapsed = Date.now() - startTime;
           this.updater.updateStream(thinking, text, elapsed).catch(e =>
             logger.warn(`[wecom-bot] updateStream failed: ${e instanceof Error ? e.message : String(e)}`)
@@ -945,9 +973,27 @@ export class WecomBot {
       // 5. PR 4.5 B: 持久化 session 映射
       // - 新建场景: 调 setSession 直接 set (跳过 claim 流程, 企微侧简化)
       // - 续聊场景: session 没变, 调 touchSession 刷 lastActiveAt
+      //
+      // PR 6.21 P1#5: CAS 保护 - 处理期间用户可能新发 /new 覆盖 pending
+      // 旧版直接 setSession 无 CAS, 会覆盖用户的最新 /new. 修法:
+      //   pending 场景先 CAS 验证 entry.cwd 没变; 其他场景直接 setSession.
       if (isNewSession) {
-        await this.userManager.setSession(msg.userId, result.sessionId, cwd);
-        logger.info(`[wecom-bot] handleChat: 新建 session 已持久化 userId=${msg.userId} sessionUuid=${result.sessionId}`);
+        if (isPending) {
+          // 验证原 pending cwd 没被新 /new 覆盖
+          const currentEntry = this.userManager.getEntry(msg.userId);
+          const currentCwd = currentEntry?.cwd ?? '/tmp';
+          if (currentCwd === cwd && currentEntry?.type === 'pending_new_session') {
+            await this.userManager.setSession(msg.userId, result.sessionId, cwd);
+            logger.info(`[wecom-bot] handleChat: 新建 session 已持久化 (pending CAS 验证) userId=${msg.userId} sessionUuid=${result.sessionId}`);
+          } else {
+            // CAS 失败: 用户在 spawn 期间发了新 /new, 不覆盖, 让用户后续消息触发新 session
+            logger.warn(`[wecom-bot] handleChat: pending CAS 失败 (cwd 变化 或类型已变), 跳过 setSession. userId=${msg.userId}`);
+          }
+        } else {
+          // 非 pending 场景 (例如用户发了消息但没 /new, 走 fallback /tmp new path)
+          await this.userManager.setSession(msg.userId, result.sessionId, cwd);
+          logger.info(`[wecom-bot] handleChat: 新建 session 已持久化 (fallback /tmp) userId=${msg.userId} sessionUuid=${result.sessionId}`);
+        }
       } else {
         await this.userManager.touchSession(msg.userId);
       }
@@ -976,18 +1022,28 @@ export class WecomBot {
             markdown: { content: markdown },
           });
         },
-        // PR 6.13 新增参数: 思考过程 + 工具过程
-        thinking, [],  // toolUses 暂未传到 updater (需要更新 appendChunk + proxy 层)
+        // PR 6.21: thinking + toolUses 都传给 complete, renderMarkdown 显示完整 "当前操作：" 段
+        thinking, toolUses,
       );
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
     } catch (err) {
+      // PR 6.21 P0#2: 错误路径 markDone, 不 requeue
+      // 历史: 旧版 catch 调 requeueFromProcessing, 但错误已经是终态 (updater.error 已推送),
+      //   requeue 触发新一轮 handleClaimed + spawn Claude (同 serialKey 锁冲突), 导致消息
+      //   卡 processing 死循环 + 用户看到重复 '思考中...' 卡片。
+      // 修法: 错误已是终态, markDone 收尾。updater.error 失败 swallow (不可控)。
       logger.error(`[wecom-bot] handleChat Claude flow error: ${err instanceof Error ? err.message : String(err)}`);
       try {
         await this.updater.error(err instanceof Error ? err.message : String(err));
-      } catch (e2) { /* ignore */ }
+      } catch (e2) {
+        logger.warn(`[wecom-bot] updater.error failed: ${e2 instanceof Error ? e2.message : String(e2)}`);
+      }
+      // 兜底: 如果 markDone 失败 (消息已不在 processing), 不要再 requeue (避免死循环)
       try {
-        this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
-      } catch (requeueErr) { /* ignore */ }
+        this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      } catch (markDoneErr) {
+        logger.warn(`[wecom-bot] markDone in catch failed: ${markDoneErr instanceof Error ? markDoneErr.message : String(markDoneErr)}`);
+      }
     }
   }
 
@@ -1094,25 +1150,49 @@ export class WecomBot {
     logger.info(`[wecom-bot] card action: userId=${event.externalUserId}, actionTag=${event.actionTag}`);
 
     // 1. 5s 内 replyWelcome 发占位卡片
+    // PR 6.11 警告: textNotice 必须带 card_action, 但 replyWelcome 是 SDK 内置欢迎语通道
+    //   (走不同 SDK 内部路径), textNotice 在这可能仍然 42045. 先试 markdown (errcode 0 已知 OK)
     const placeholderCard = WecomCardBuilder.textNotice({
       title: '处理中...',
       content: `执行 ${event.actionTag}...`,
     });
+    let replyWelcomeOk = false;
     try {
       // PR 2 v1.2.1 final (F7 修复): 拒绝 fallback 到 messageId（那是发给用户的原消息 ID，
       // 不是 SDK 内部流标识 — fallback 复现 846605 "invalid req_id" 根因）
       const reqId = event.inboundFrame?.headers?.req_id;
       if (!reqId) {
         logger.error(`[wecom-bot] handleCardAction: missing inboundFrame.headers.req_id, cannot replyWelcome`);
-        return;
+        // P1#3: 继续走 setImmediate (executeCardAction 不依赖 replyWelcome),
+        //   但用户看不到占位, 需要 fallback 通知
+      } else {
+        // replyWelcome 类型只支持 text/template_card. text 最稳.
+        await this.client.sdk.replyWelcome(
+          { headers: { req_id: reqId } } as any,
+          { msgtype: 'text', text: { content: `⏳ 处理中... (执行 ${event.actionTag})` } },
+        );
+        replyWelcomeOk = true;
       }
-      await this.client.sdk.replyWelcome(
-        { headers: { req_id: reqId } } as any,
-        { msgtype: 'template_card', template_card: placeholderCard as any },
-      );
     } catch (err) {
-      logger.warn(`[wecom-bot] replyWelcome failed (5s window may have passed): ${err instanceof Error ? err.message : String(err)}`);
-      return;
+      // P1#3: replyWelcome 失败 (5s 窗口已过, 企微 SDK errcode 42045, etc.) 不静默
+      //   直接 return — 用户看不到反馈。改成: 异步 sendMessage 告诉用户操作触发
+      //   (executeCardAction 还会执行, 但用户先看到提示)
+      logger.warn(`[wecom-bot] replyWelcome failed (5s window may have passed or template_card unsupported): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (!replyWelcomeOk) {
+      // P1#3: replyWelcome 失败 → 异步 sendMessage 通知用户 (5s 后, 用户已离开键盘)
+      //   executeCardAction 同步执行, 用户可能没看到提示, 但比静默失败好
+      setImmediate(async () => {
+        try {
+          await this.client.sdk.sendMessage(event.externalUserId, {
+            msgtype: 'markdown',
+            markdown: { content: `⏳ 处理中... (执行 ${event.actionTag})` },
+          });
+        } catch (sendErr) {
+          logger.warn(`[wecom-bot] replyWelcome fallback sendMessage failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+        }
+      });
     }
 
     // 2. 异步执行实际动作
@@ -1132,14 +1212,15 @@ export class WecomBot {
   }): Promise<void> {
     switch (event.actionTag) {
       case 'retry': {
-        // PR 6 Task 6.4: 重发原消息 — 从 processing 重新入队 pending
-        // 历史: 旧代码只 log + 通用 markdown 确认, 实际没重新入队, 用户点 retry 没效果
-        // serialKey 用 `retry:<user>` 标识来源 (跟 pending 的 `chat:wmu_xxx:<msg>` 不同)
-        await this.spoolQueue.requeueFromProcessing(event.messageId, `retry:${event.externalUserId}`);
-        logger.info(`[wecom-bot] card action retry: requeued ${event.messageId}`);
+        // PR 6.21 P1#4: 重试 — 旧版用错的 serialKey `retry:${user}` 调 requeueFromProcessing,
+        //   但卡片回调本身不在 SpoolQueue 中 (来自 SDK onCardAction), messageId 通常已是
+        //   done/failed 状态, requeue 不生效。用户点 retry 没效果。
+        // 修法: 提示用户重新发送消息 (wecom 端卡片回调无法触发完整 handleClaimed 路径,
+        //   因为 dispatch loop 处理 SpoolQueue, 不处理卡片回调).
+        logger.info(`[wecom-bot] card action retry: user=${event.externalUserId}, msgId=${event.messageId}`);
         await this.client.sdk.sendMessage(event.externalUserId, {
           msgtype: 'markdown',
-          markdown: { content: `✅ 已重试: ${event.messageId}` },
+          markdown: { content: `🔁 **重试提示**: 请**重新发送您的消息**（当前会话重新触发 Claude 处理）\n\n💡 历史消息 ID \`${event.messageId}\` 已存档无法重试` },
         });
         break;
       }
