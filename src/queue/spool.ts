@@ -505,8 +505,12 @@ export class SpoolQueue {
     return { cleaned, failed, receipts: receiptCleaned, deliveries: deliveryCleaned };
   }
 
-  /** Recover processing → pending on startup */
-  recoverProcessing(): number {
+  /**
+   * Recover processing → pending on startup.
+   * PR 7 Task 7.2 (M-4): 可选 platform 过滤, 双平台共享 SpoolQueue 时只动自己平台的消息。
+   * 不传 platform = 处理全部 (向后兼容单平台启动场景)。
+   */
+  recoverProcessing(platform?: 'feishu' | 'wecom'): number {
     const files = readdirSync(this.processingDir);
     let recovered = 0;
 
@@ -514,6 +518,9 @@ export class SpoolQueue {
       const srcPath = join(this.processingDir, file);
       const msg = this.readSpoolMessage(srcPath);
       if (!msg) continue;
+
+      // PR 7 M-4: platform 过滤
+      if (platform && msg.platform !== platform) continue;
 
       msg.status = 'pending';
       msg.updatedAt = new Date().toISOString();
@@ -532,7 +539,11 @@ export class SpoolQueue {
     }
 
     if (recovered > 0) {
-      logger.info(`恢复 ${recovered} 条 processing → pending 消息`);
+      logger.info(
+        platform
+          ? `恢复 ${recovered} 条 ${platform} processing → pending 消息`
+          : `恢复 ${recovered} 条 processing → pending 消息`,
+      );
     }
     return recovered;
   }

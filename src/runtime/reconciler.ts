@@ -37,6 +37,10 @@ export interface ReconcileResult {
 /**
  * Startup reconciler: runs after acquiring owner.lock.
  * Recovers from crashes, cleans up stale state, merges events.
+ *
+ * PR 7 Task 7.2 (M-4): 加 platform 过滤 — 双平台共享 SpoolQueue 场景下, 每个 bot
+ *   启动时只 recover 自己的 processing 消息 (避免跨平台误动对方的状态)。
+ *   不传 platform = 处理全部 (向后兼容单平台启动场景)。
  */
 export async function startupReconcile(opts: {
   registry: RegistryManager;
@@ -44,6 +48,7 @@ export async function startupReconcile(opts: {
   listSnapshotManager: ListSnapshotManager;
   spoolQueue: SpoolQueue;
   eventsDir?: string; // injectable for testing
+  platform?: 'feishu' | 'wecom';  // PR 7 M-4: 可选平台过滤
 }): Promise<ReconcileResult> {
   const result: ReconcileResult = {
     recoveredProcessing: 0,
@@ -54,7 +59,11 @@ export async function startupReconcile(opts: {
     repairedSessions: 0,
   };
 
-  logger.info('启动协调器开始...');
+  logger.info(
+    opts.platform
+      ? `启动协调器开始 (platform=${opts.platform})...`
+      : '启动协调器开始...',
+  );
 
   // 0. Clean stray .tmp files from crashed atomic writes
   result.expiredFiles += cleanupTmpFiles(opts.spoolQueue.getSpoolDirs());
@@ -63,7 +72,8 @@ export async function startupReconcile(opts: {
   result.expiredFiles += opts.spoolQueue.finalizeDeliveredMessages();
 
   // 2. Recover processing → pending
-  result.recoveredProcessing = opts.spoolQueue.recoverProcessing();
+  // PR 7 M-4: 传 platform 过滤, 双平台共享 SpoolQueue 时只动自己平台的消息
+  result.recoveredProcessing = opts.spoolQueue.recoverProcessing(opts.platform);
 
   // 3. Roll back timed-out pending_new_session_claimed
   result.rolledBackClaims = await opts.userManager.rollbackTimedOutClaims();

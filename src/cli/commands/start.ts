@@ -350,11 +350,18 @@ async function createBotRuntime(
   }
 
   try {
+    // PR 7 Task 7.2 (M-4): 传 platform 给 startupReconcile
+    // - 单平台启动 (feishu-only 或 wecom-only) → 只动自己平台的消息
+    // - 双平台 (all) → 不传 platform = 处理全部 (向后兼容 PR 3 行为)
+    const platformForReconcile = (opts.platforms?.length === 1)
+      ? opts.platforms[0]
+      : undefined;
     const result = await startupReconcile({
       registry,
       userManager,
       listSnapshotManager,
       spoolQueue,
+      platform: platformForReconcile,
     });
     log('INFO', `启动协调: ${result.recoveredProcessing} 恢复, ${result.rolledBackClaims} 回滚, ${result.mergedEvents} 事件归并`);
   } catch (err) {
