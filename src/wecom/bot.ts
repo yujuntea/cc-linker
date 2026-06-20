@@ -760,9 +760,13 @@ export class WecomBot {
       const { readdirSync, existsSync } = await import('fs');
       const { dirname } = await import('path');
 
-      // cwd 优先级: user-mapping entry.cwd → /tmp fallback (跟 handleChat 续聊 cwd 一致)
+      // PR 6.15: cwd 优先级 — user-mapping entry.cwd → config 'wecom.default_cwd' → /tmp fallback
+      // 历史 (PR 6.13): 只读 user-mapping entry.cwd, 缺则 /tmp fallback → 用户反馈
+      //   "默认目录应该是配置文件中指定的目录, 为什么是 /tmp"
+      // 修法: 仿飞书 feishu/bot.ts:498-505 getCwdForUser(), 加 wecom.default_cwd 配置项
+      //   注意: 飞书叫 [feishu_bot] default_cwd, wecom 叫 [wecom] default_cwd
       const entry = this.userManager.getEntry(userId);
-      const cwd = entry?.cwd ?? '/tmp';
+      const cwd = entry?.cwd ?? config.get<string>('wecom.default_cwd', '') ?? '/tmp';
 
       if (!existsSync(cwd)) {
         return `❌ 目录不存在: ${cwd}\n\n使用 \`/new <路径>\` 切换到有效目录`;

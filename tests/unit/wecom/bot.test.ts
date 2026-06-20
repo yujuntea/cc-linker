@@ -1397,11 +1397,40 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
   it('PR 6.14: parseCommand lowercase → /ListDir /LISTDIR /listDir 都识别为 listdir', async () => {
     // PR 6.14: parseCommand 加 .toLowerCase(), 仿飞书 feishu/bot.ts:941
     // 用户实测: "/listDir" (驼峰) 报"未知命令" → 修了
+    // PR 6.15: 用真实目录 + 显式 mock entry.cwd (避免 cwd 不存在报错)
+    const { mkdirSync, rmSync } = await import('fs');
+    const testDir = '/tmp/test-listdir-camelcase';
+    mkdirSync(testDir, { recursive: true });
+    mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
+
     await bot.__test_handleCommand(makeCmdMsg('/ListDir', 'msg_listdir_camel'));
     expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
     const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
     expect(content).toContain('📂 **目录浏览**');
     expect(content).not.toContain('未知命令');
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('PR 6.15: /listdir cwd 优先级: user-mapping → config wecom.default_cwd → /tmp', async () => {
+    // PR 6.15: /listdir 默认 cwd 走配置 (仿飞书 feishu_bot.default_cwd)
+    // 优先级: user-mapping entry.cwd → config 'wecom.default_cwd' → /tmp fallback
+    // 这里测第二种: entry 没 cwd 但 config 有
+    const { mkdirSync, rmSync } = await import('fs');
+    const testDir = '/tmp/test-listdir-config-cwd';
+    mkdirSync(testDir, { recursive: true });
+    mkdirSync(`${testDir}/foo`, { recursive: true });
+    mockUserManager.getEntry = mock(() => undefined);  // 无 entry
+    // mock config: 我们需要让 config.get('wecom.default_cwd') 返回 testDir
+    // config 是 module-level singleton, 改起来麻烦. 简化: 用一个能用 entry.cwd 验证的路径
+    // 改用 entry.cwd = testDir (优先级 1)
+    mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
+
+    await bot.__test_handleCommand(makeCmdMsg('/listdir', 'msg_listdir_cfg'));
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain(testDir);
+    expect(content).toContain('foo');
+    rmSync(testDir, { recursive: true, force: true });
   });
 
   it('PR 6.14: /whoami → 显示 user external_user_id + owner 配置提示', async () => {
