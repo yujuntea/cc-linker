@@ -754,12 +754,10 @@ export class WecomBot {
         break;
       }
       case 'stop': {
-        // 见 Task 6.5
-        logger.debug(`[wecom-bot] action ${event.actionTag} queued for execution`);
-        await this.client.sdk.sendMessage(event.externalUserId, {
-          msgtype: 'markdown',
-          markdown: { content: `✅ 已执行: ${event.actionTag}` },
-        });
+        // PR 6 Task 6.5: 触发 in-flight cancel
+        // 注: 现有 stream-updater.cancel() 方法 (line 190-203) 含 prepareTerminal 防御性逻辑
+        //   不重写, 直接接 case
+        await this.updater.cancel('用户从卡片点击停止');
         break;
       }
       case 'confirm-stop': {

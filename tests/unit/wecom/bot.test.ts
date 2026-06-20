@@ -1963,3 +1963,104 @@ describe('WecomBot executeCardAction (PR 6 Task 6.4: retry)', () => {
     expect(smCall[1].markdown.content).toContain('msg-retry-1');
   });
 });
+
+/**
+ * PR 6 Task 6.5: card action 'stop' → existing WecomStreamUpdater.cancel()
+ *
+ * 背景: PR 5 stub 把 stop 用 default log + 通用 markdown "✅ 已执行: stop" 兜底,
+ *   实际没调 updater.cancel()。PR 6 Task 6.5 接 case 'stop' 到现有
+ *   WecomStreamUpdater.cancel(reason) 方法（含 prepareTerminal 防御性逻辑）。
+ *
+ * 不重写 cancel()，本 Task 只接 case。
+ *
+ * 关键不变量:
+ * - stop action 必调 sdk.replyStream 走 in-flight cancel 路径
+ *   (WecomStreamUpdater.cancel 通过 replyStream 发 "⏹ 已取消: <reason>" 终态消息)
+ * - 必传 user-facing reason (说明是从卡片触发的取消)
+ * - 不依赖 sendMessage 通用 markdown 兜底 (那是 stub 行为)
+ *
+ * 验证策略: 由于 WecomBot 的 updater 字段是 private 且没有暴露给测试,
+ *   无法直接 mock 验证 cancel() 被调。但 WecomStreamUpdater 是真实实现,
+ *   可以通过 mock sdk.replyStream 验证 replyStream 路径被触发。
+ *   这是间接但唯一的 seam (cancel() 唯一副作用就是 replyStream)。
+ *
+ * 注: 单测里 updater 没经过 startProcessing, currentStreamId 为 null,
+ *   cancel() 走 prepareTerminal() → return false, 不调 replyStream。
+ *   所以这个测试实际上会验证 "stop action 不抛错" — 因为 stub 默认 no-op。
+ *   真正的契约验证 (cancel 调用 replyStream) 在 stream-updater.test.ts 里。
+ */
+describe('WecomBot executeCardAction (PR 6 Task 6.5: stop)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setPending: mock(async () => {}),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t65.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+  });
+
+  it('stop: 调 updater.cancel 触发 in-flight cancel 路径 (不抛错, 走 cancel seam)', async () => {
+    // PR 6 Task 6.5: 不调 sendMessage 兜底, 改调 updater.cancel(reason)
+    // 由于 updater 字段是 private 且 cancel 路径走 replyStream,
+    // 这里验证:
+    //   1. 不抛错 (case 'stop' 已接到 updater.cancel)
+    //   2. 单测场景下 updater 没 startProcessing, prepareTerminal() return false,
+    //      cancel() 走 no-op 路径 — replyStream 不被调
+    //   3. sendMessage 不被调 (因为 stop 不应发通用 markdown 兜底)
+    let threw = false;
+    try {
+      await bot.__test_executeCardAction({
+        externalUserId: 'ext-1',
+        messageId: 'msg-stop-1',
+        actionTag: 'stop',
+        actionValue: {},
+        inboundFrame: { headers: { req_id: 'req-stop' } },
+      });
+    } catch (err) {
+      threw = true;
+      throw new Error(`executeCardAction(stop) should not throw: ${err}`);
+    }
+    expect(threw).toBe(false);
+
+    // 关键不变量: stop 不发 sendMessage 兜底 (PR 5 stub 行为被替换)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+
+    // 单测无 startProcessing, replyStream 不被调 (cancel 幂等 no-op)
+    // 真正的 replyStream 调用契约在 stream-updater.test.ts:93 'cancel emits cancel notice'
+    expect(mockClient.sdk.replyStream).not.toHaveBeenCalled();
+  });
+});
