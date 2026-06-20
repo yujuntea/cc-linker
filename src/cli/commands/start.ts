@@ -39,6 +39,17 @@ export interface StartOptions {
   platforms?: ('feishu' | 'wecom')[];
 }
 
+/**
+ * PR 7 m-12: 启动 grace period 常量 (毫秒).
+ *
+ * 历史: startForeground 在创建共享 SpoolQueue / bot 前 hardcoded `await sleep(30_000)`,
+ *   防止老 daemon 残留误判 (spec §3.4 grace period 设计).
+ *   30_000 散在 setTimeout 调用里, 调 grace 长度要 grep 全文 + 跟 logger.info 文案
+ *   同步改两处 (容易漏改 → log 文案跟实际值不一致).
+ * 修法: 提常量 GRACE_PERIOD_MS = 30_000, logger.info 用同一常量拼文案.
+ */
+export const GRACE_PERIOD_MS = 30_000;
+
 export async function start(registry: RegistryManager, opts: StartOptions = {}): Promise<void> {
   // PR 3.4: 在最外层就把 --platform 解析成 platforms 数组，让
   // startForeground / startDaemonChild 不需要各自重做平台路由判断。
@@ -654,8 +665,9 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
 
   // Step 6: Grace period（避免升级期间老 daemon 残留导致误判）
   // 只在 foreground 模式下执行；daemon 模式不阻塞启动
-  logger.info('活跃检测 grace period: 30 秒');
-  await new Promise<void>(resolve => setTimeout(resolve, 30_000));
+  // PR 7 m-12: 用 GRACE_PERIOD_MS 常量, 日志文案从常量派生 (单点修改, 不漏改)
+  logger.info(`活跃检测 grace period: ${GRACE_PERIOD_MS / 1000} 秒`);
+  await new Promise<void>(resolve => setTimeout(resolve, GRACE_PERIOD_MS));
 
   // PR 3.4: 双平台启动时构造一个共享 SpoolQueue，让飞书 + 企微 bot 看到同一份
   // pending/processing 状态。spoolQueue 是底层 fs 目录，每个进程只需要一个实例。
