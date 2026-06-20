@@ -36,6 +36,28 @@ export function appendChunk(
   else if (chunk.type === 'text') state.text += chunk.content;
 }
 
+/**
+ * PR 6.8.1: 按 chatType 决定 sendMessage receiveId
+ *
+ * 历史: PR 6 M-1 fix (commit 33968ae) 用 `metadata.chatId ?? userId` 错方向 —
+ *   私聊 (chatType=p2p/single) 场景下 chatId 是 msgid 而非 chatid,
+ *   企微 sendMessage 拒收, errcode=93006 invalid chatid, 持续重试。
+ *   (12:09:45+ production 真实失败案例, /list p2p 场景)
+ *
+ * 修法:
+ * - chatType='group' + 有 chatId → chatId (群发到群)
+ * - chatType='p2p' | 'single' | undefined → userId (私聊发给用户, 不论 chatId 是什么)
+ * - chatType='group' 但无 chatId → userId (防御性 fallback)
+ */
+export function resolveReceiveId(msg: SpoolMessage): string {
+  const meta = msg.metadata as any;
+  const chatType = meta?.chatType;
+  if (chatType === 'group' && meta?.chatId) {
+    return meta.chatId;
+  }
+  return msg.userId;
+}
+
 export type WecomBotConfig = {
   botId: string;
   secret: string;
@@ -366,8 +388,10 @@ export class WecomBot {
     // 推回 (用 sendMessage 不用 WecomStreamUpdater, 因为命令响应是终态文本不走流)
     // PR 5 (M-1 修复): 群聊场景 metadata.chatId 优先, fallback userId
     // 历史: 之前硬编码 userId, 群聊场景下 metadata.chatId 不同时, 企微会发错对象
+    // PR 6.8.1: M-1 fix 方向错 (chatId 优先) — 私聊场景下 chatId 是 msgid, 企微 errcode=93006
+    //   修法: 按 chatType 决定 receiveId (group→chatId, p2p/single/undefined→userId)
     try {
-      const receiveId = (msg.metadata as any)?.chatId ?? msg.userId;
+      const receiveId = resolveReceiveId(msg);
       await this.client.sdk.sendMessage(receiveId, {
         msgtype: 'markdown',
         markdown: { content: responseText },
@@ -581,11 +605,12 @@ export class WecomBot {
 
     // PR 4.1: PoC fallback — sessionManager 未注入时走 sendMessage echo 路径
     // 用于 staging / 单测 (确保向后兼容未升级的 wecom-only 启动)
+    // PR 6.8.1: receiveId 按 chatType 路由 (group→chatId, p2p/single→userId)
     if (!this.sessionManager) {
       logger.warn(`[wecom-bot] handleChat: sessionManager 未注入, 走 PoC echo 路径 (messageId=${msg.messageId})`);
       try {
         const responseText = `✅ 收到! 你是 WuYuJun, 我已收到你的消息: "${msg.text}"\n\n_(PR 2 E2E staging, sessionManager 未注入)_`;
-        const receiveId = (msg.metadata as any)?.chatId ?? msg.userId;
+        const receiveId = resolveReceiveId(msg);
         await this.client.sdk.sendMessage(receiveId, {
           msgtype: 'markdown',
           markdown: { content: responseText },

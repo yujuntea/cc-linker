@@ -1525,9 +1525,12 @@ describe('WecomBot handleCommand (PR 5 M-1: 群聊 chatId 路由)', () => {
     };
   }
 
-  it('M-1: handleCommand 群聊 (metadata.chatId) 用 chatId 而非 userId', async () => {
+  it('M-1: handleCommand 群聊 (metadata.chatId + chatType=group) 用 chatId 而非 userId', async () => {
+    // PR 6.8.1: 群聊场景需要同时设置 chatId + chatType=group
+    // (修前: chatId 优先; 修后: 按 chatType 路由)
     await bot.__test_handleCommand(makeCmdMsgWithMeta('/help', 'msg_m1_group', {
       chatId: 'chat-group-123',
+      chatType: 'group',
       inboundFrame: { headers: { req_id: 'inb_msg_m1_group' } },
     }));
 
@@ -1550,6 +1553,131 @@ describe('WecomBot handleCommand (PR 5 M-1: 群聊 chatId 路由)', () => {
     }));
 
     expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('wmu_user_1', expect.any(Object));
+  });
+});
+
+/**
+ * PR 6.8.1: sendMessage chatType-based routing
+ *
+ * 历史: PR 6 M-1 fix (commit 33968ae) 方向错 — `metadata.chatId ?? userId` (chatId 优先)
+ *   → 私聊场景下 chatId 是 msgid, 企微 errcode=93006 invalid chatid 持续重试
+ *   (12:09:45+ production 真实失败案例, /list p2p 场景)
+ * 修法: 按 chatType 决定 receiveId
+ *   - chatType='group' → metadata.chatId (群发到群)
+ *   - chatType='p2p'/'single'/undefined → userId (私聊发给用户)
+ */
+describe('WecomBot handleCommand (PR 6.8.1: chatType-based sendMessage routing)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setPending: mock(async () => {}),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-8-1.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+  });
+
+  function makeMsg(text: string, messageId: string, metadata: any): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'WuYuJun',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:WuYuJun:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata,
+    };
+  }
+
+  it('group chat (chatType=group): sendMessage 用 metadata.chatId', async () => {
+    await bot.__test_handleCommand(makeMsg('/list', 'msg-group-1', {
+      chatId: 'chat-group-123',
+      chatType: 'group',
+      inboundFrame: { headers: { req_id: 'inb_group' } },
+    }));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('chat-group-123', expect.any(Object));
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalledWith('WuYuJun', expect.any(Object));
+  });
+
+  it('p2p chat (chatType=p2p): sendMessage 用 msg.userId (NOT chatId)', async () => {
+    // 模拟 production 失败案例: msgId 误用为 chatId
+    await bot.__test_handleCommand(makeMsg('/list', 'msg-p2p-1', {
+      chatId: 'msgid-16db8cd931dba0ee43ce251489113c98',  // 这是 msgid 不是 chatid
+      chatType: 'p2p',
+      inboundFrame: { headers: { req_id: 'inb_p2p' } },
+    }));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('WuYuJun', expect.any(Object));
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalledWith('msgid-16db8cd931dba0ee43ce251489113c98', expect.any(Object));
+  });
+
+  it('single chat (chatType=single): sendMessage 用 msg.userId (single == p2p)', async () => {
+    await bot.__test_handleCommand(makeMsg('/help', 'msg-single-1', {
+      chatId: 'chat-room-xyz',
+      chatType: 'single',
+      inboundFrame: { headers: { req_id: 'inb_single' } },
+    }));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('WuYuJun', expect.any(Object));
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalledWith('chat-room-xyz', expect.any(Object));
+  });
+
+  it('undefined chatType (defensive): sendMessage 用 msg.userId', async () => {
+    // 历史遗留: 老消息可能没 chatType 字段, 应默认按私聊处理
+    await bot.__test_handleCommand(makeMsg('/status', 'msg-nochattype', {
+      chatId: 'some-chat-id',
+      inboundFrame: { headers: { req_id: 'inb_nochattype' } },
+    }));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('WuYuJun', expect.any(Object));
+  });
+
+  it('group chat with no chatId: fall back to userId (defensive)', async () => {
+    // chatType=group 但 chatId 缺失 → 不应崩溃, 用 userId
+    await bot.__test_handleCommand(makeMsg('/help', 'msg-group-nochat', {
+      chatType: 'group',
+      inboundFrame: { headers: { req_id: 'inb_group_nochat' } },
+    }));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledWith('WuYuJun', expect.any(Object));
   });
 });
 
