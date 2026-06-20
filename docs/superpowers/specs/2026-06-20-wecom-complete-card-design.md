@@ -133,7 +133,9 @@ cc-linker 企微侧当前体验：
 ```typescript
 function genTaskId(userId: string): string {
   // aibot SDK: 数字、字母、_-@，最长 128 字节
-  return `ccdone-${Date.now()}-${userId.slice(0, 12)}`;
+  // 实施时为避免同毫秒冲突加了 6 字符 Math.random() 后缀（PR 7.1 I-1 stateless 改造）
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `ccdone-${Date.now()}-${rand}-${userId.slice(0, 12)}`;
 }
 ```
 

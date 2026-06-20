@@ -98,14 +98,12 @@ export class WecomStreamUpdater implements StreamUpdater {
    */
   private lastInboundFrame: any = null;
   /**
-   * PR 7.2: 流式上下文, complete() 末尾用作完成卡片 ctx
-   * - lastUserId: startProcessing 时记录
-   * - lastSessionTitle/UUID/Cwd: complete() 时由 completeCtx 可选参数注入
+   * PR 7.2 + PR 7.3 + PR 7 final cleanup: 流式上下文, complete() 末尾用作完成卡片 ctx
+   * - lastUserId: startProcessing 时记录 (complete() 末尾唯一需要的 ctx 字段)
+   * - sessionTitle/UUID/cwd: 不再由 stream-updater 持有 — 由 caller 通过 completeCtx 完整传
+   *   (历史: PR 7.3 fix #1 删了 setLastSessionMeta 写入路径, 字段永远 undefined → 删掉)
    */
   private lastUserId: string | null = null;
-  private lastSessionTitle: string | undefined = undefined;
-  private lastSessionUuid: string | undefined = undefined;
-  private lastCwd: string | undefined = undefined;
   private buffer: BufferedChunk | null = null;
   private lastFlushAt = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -296,8 +294,8 @@ export class WecomStreamUpdater implements StreamUpdater {
     //   '**思考过程：**\n{thinking}\n\n**当前操作：**\n...\n\n**回复：**\n{response}'
     thinking?: string,
     toolUses?: StreamUpdateToolUse[],
-    // PR 7.2: 上下文传给完成卡片 (sessionTitle/UUID/cwd)
-    completeCtx?: { sessionTitle?: string; sessionUuid?: string; cwd?: string },
+    // PR 7.2: 上下文传给完成卡片 (sessionTitle/UUID/cwd + PR 7 final chatId for group chat)
+    completeCtx?: { sessionTitle?: string; sessionUuid?: string; cwd?: string; chatId?: string },
   ): Promise<void> {
     if (!(await this.prepareTerminal())) return;
     const t = this.getTerminalFrame();
@@ -335,9 +333,10 @@ export class WecomStreamUpdater implements StreamUpdater {
       try {
         await this.completeCardSender.send({
           userId: this.lastUserId,
-          sessionTitle: completeCtx?.sessionTitle ?? this.lastSessionTitle,
-          sessionUuid: completeCtx?.sessionUuid ?? this.lastSessionUuid,
-          cwd: completeCtx?.cwd ?? this.lastCwd,
+          sessionTitle: completeCtx?.sessionTitle,
+          sessionUuid: completeCtx?.sessionUuid,
+          cwd: completeCtx?.cwd,
+          chatId: completeCtx?.chatId,
           durationMs: _durationMs,
         });
       } catch (cardErr) {
@@ -383,9 +382,6 @@ export class WecomStreamUpdater implements StreamUpdater {
     this.lastInboundFrame = null;
     // PR 7.2: 清理流式上下文, 避免下次 complete 误用上次的 userId
     this.lastUserId = null;
-    this.lastSessionTitle = undefined;
-    this.lastSessionUuid = undefined;
-    this.lastCwd = undefined;
   }
 
   private truncate(content: string): string {

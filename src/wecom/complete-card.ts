@@ -10,6 +10,9 @@ import { logger } from '../utils/logger';
 
 export type CompleteCardContext = {
   userId: string;
+  /** PR 7 final cleanup: 群聊 chatId, 优先于 userId。
+   * 单聊 chatId === userId, 群聊 chatId !== userId — 群聊场景必须用 chatId 否则用户收不到卡片。*/
+  chatId?: string;
   sessionTitle?: string;
   sessionUuid?: string;
   cwd?: string;
@@ -58,6 +61,7 @@ function genCompleteCardTaskId(userId: string): string {
  * - task_id 用于 updateTemplateCard 关联 (本 PR 不调 updateTemplateCard, 留扩展点)
  */
 export function buildCompleteCard(ctx: CompleteCardContext): WecomTemplateCard {
+  // 18 字符是主标题留 8 字符 'Claude 处理完成:' 前缀 + 18 字符 session 名（共 26 字符, 跟 SDK main_title.title 26 字上限对齐）
   const titleSuffix = ctx.sessionTitle ? `: ${ctx.sessionTitle.slice(0, 18)}` : '';
   const title = `✅ Claude 处理完成${titleSuffix}`;
   const elapsed = ctx.durationMs ? ` (耗时 ${Math.floor(ctx.durationMs / 1000)}s)` : '';
@@ -105,6 +109,17 @@ type CompleteCardPayload = TemplateCard;
 export class WecomCompleteCardSender {
   constructor(private readonly sdk: WSClient) {}
 
+  /**
+   * 发送完成卡片到用户/群。
+   *
+   * @param ctx 卡片上下文,字段说明:
+   *   - userId: 必填。用户 ID,日志用 + 单聊场景 sendMessage 接收方。
+   *   - chatId: 可选,优先于 userId。群聊 chatId,群聊场景必须传 (单聊 chatId === userId,可不传)。
+   *   - sessionTitle: 可选。主标题 ": {title}" 后缀,见 §3.1.1。
+   *   - sessionUuid: 可选。卡片 button 后续 callback 用,目前未消费 (PR 7 留扩展点)。
+   *   - cwd: 可选。卡片 button 后续 callback 用,目前未消费 (PR 7 留扩展点)。
+   *   - durationMs: 可选。desc "耗时 Xs" 段。
+   */
   async send(ctx: CompleteCardContext): Promise<void> {
     const card = buildCompleteCard(ctx);
     // PR 7.1 I-3: 单次 cast 到 SDK wire-shape (WecomTemplateCard → TemplateCard),
@@ -114,8 +129,10 @@ export class WecomCompleteCardSender {
       msgtype: 'template_card' as const,
       template_card: card as unknown as CompleteCardPayload,
     };
-    await this.sdk.sendMessage(ctx.userId, payload);
+    // PR 7 final cleanup: 群聊场景下 chatId 优先 — 单聊 chatId === userId 无影响
+    const receiveId = ctx.chatId ?? ctx.userId;
+    await this.sdk.sendMessage(receiveId, payload);
     const taskId = (card as unknown as CompleteCardPayload).task_id;
-    logger.info(`[wecom-complete-card] sent: userId=${ctx.userId.slice(0, 12)}... taskId=${taskId}`);
+    logger.info(`[wecom-complete-card] sent: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId}`);
   }
 }

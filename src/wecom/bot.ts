@@ -1076,12 +1076,14 @@ export class WecomBot {
         },
         // PR 6.21: thinking + toolUses 都传给 complete, renderMarkdown 显示完整 "当前操作：" 段
         thinking, toolUses,
-        // PR 7.3: 完成卡片 ctx — sessionTitle 暂不传 (handleChat 拿不到, 由 stream-updater
-        //   own lastSessionTitle 兜底, 都是 undefined → 主标题不显示 session 名)
-        //   未来扩展: handleChat 拿到 Claude 第一段响应后可 setLastSessionMeta 记录
+        // PR 7.3 + PR 7 final cleanup: 完成卡片 ctx
+        //   - sessionTitle 暂不传 (handleChat 拿不到, 主标题不显示 session 名, 未来扩展)
+        //   - chatId: 群聊场景必须传, 群用户才能收到完成卡片 (单聊 chatId === userId 无影响)
+        //   - 复用 receiveIdForFallback (resolveReceiveId): 已经按 chatType 路由 group→chatId, p2p→userId
         {
           sessionUuid: result.sessionId,  // ClaudeSessionManager 返回值里有 sessionId 字段
           cwd: cwd,
+          chatId: receiveIdForFallback,
         },
       );
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
