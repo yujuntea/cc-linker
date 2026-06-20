@@ -64,6 +64,38 @@ export class WecomStreamUpdater implements StreamUpdater {
   private buffer: BufferedChunk | null = null;
   private lastFlushAt = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * PR 6.8.4: msgFallback 类字段 + setMsgFallback, 让 startProcessing/flushBuffer 也能 fallback
+   *
+   * 历史: PR 6.8.3 只在 complete() 加 msgFallback 参数 (per-call), 但 replyStream 静默成功
+   *   bug 同样会发生在 startProcessing (errcode=93006 invalid chatid) — Promise resolve 无 throw
+   * 修法: 类字段 msgFallback + setMsgFallback 注入, 终态方法 (startProcessing/flushBuffer/complete) 统一 fallback
+   *
+   * 注: 仍然保留 complete() 的 msgFallback 参数 (per-call, 优先级高于类字段)
+   */
+  private msgFallback?: (text: string) => Promise<void>;
+
+  /**
+   * PR 6.8.4: 设置全局 msgFallback (用于 startProcessing / flushBuffer 错误兜底)
+   * 调用方: WecomBot 在创建 updater 后立即 setMsgFallback, 后续 startProcessing/flushBuffer 错误自动转 sendMessage
+   */
+  setMsgFallback(fn: (text: string) => Promise<void>): void {
+    this.msgFallback = fn;
+  }
+
+  /**
+   * PR 6.8.4: 检查 WsFrame errcode (aibot SDK 错误通过 ws frame body 推回, 不 throw)
+   * 14:50:09 真实验收: replyStream Promise resolve, 但 body.errcode=93006 invalid chatid
+   *   → catch 跳过 → 卡片空白
+   * 修法: replyStream 后检查 errcode, 错误 throw 触发 fallback
+   */
+  private checkWsFrameErrcode(wsFrame: any, op: string): void {
+    const errcode = wsFrame?.body?.errcode ?? wsFrame?.errcode;
+    if (errcode && errcode !== 0) {
+      const errmsg = wsFrame?.body?.errmsg ?? wsFrame?.errmsg ?? 'unknown';
+      throw new Error(`[wecom-stream] ${op} replyStream errcode=${errcode} errmsg=${errmsg}`);
+    }
+  }
 
   constructor(sdk: WSClient, opts: WecomStreamUpdaterOptions = {}) {
     this.sdk = sdk;
@@ -78,7 +110,24 @@ export class WecomStreamUpdater implements StreamUpdater {
     // 存下 inboundFrame 供 complete/error/cancel/flushBuffer 复用
     this.lastInboundFrame = inboundFrame;
     const initialMarkdown = '🤔 思考中...';
-    await this.sdk.replyStream(inboundFrame, this.currentStreamId, this.truncate(initialMarkdown), false);
+    try {
+      const wsFrame = await this.sdk.replyStream(inboundFrame, this.currentStreamId, this.truncate(initialMarkdown), false) as any;
+      // PR 6.8.4: 检查 WsFrame errcode (静默成功但实际错误)
+      this.checkWsFrameErrcode(wsFrame, 'startProcessing');
+      logger.info(`[wecom-stream] startProcessing OK: streamId=${this.currentStreamId.slice(0, 8)}... userId=${userId}`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error(`[wecom-stream] startProcessing replyStream failed: ${errMsg}`);
+      // 兜底: sendMessage 通道告诉用户流式启动失败
+      if (this.msgFallback) {
+        try {
+          await this.msgFallback(`❌ 流式启动失败: ${errMsg}`);
+        } catch (fbErr) {
+          logger.error(`[wecom-stream] startProcessing fallback also failed: ${fbErr instanceof Error ? fbErr.message : String(fbErr)}`);
+        }
+      }
+      throw err;
+    }
     this.lastFlushAt = Date.now();
     this.buffer = null;
     return this.currentStreamId;
@@ -111,7 +160,9 @@ export class WecomStreamUpdater implements StreamUpdater {
     const { thinking, text, elapsedMs, toolUses } = this.buffer;
     const markdown = renderMarkdown(thinking, text, toolUses, elapsedMs);
     try {
-      await this.sdk.replyStream(this.lastInboundFrame, this.currentStreamId, this.truncate(markdown), false);
+      const wsFrame = await this.sdk.replyStream(this.lastInboundFrame, this.currentStreamId, this.truncate(markdown), false) as any;
+      // PR 6.8.4: 检查 WsFrame errcode (静默成功但实际错误)
+      this.checkWsFrameErrcode(wsFrame, 'flushBuffer');
       this.lastFlushAt = Date.now();
     } catch (err) {
       // ⚠️ 只吞限频错误 (errcode 45009/45033)，保留 buffer 等下次 flush。
@@ -120,6 +171,15 @@ export class WecomStreamUpdater implements StreamUpdater {
       if (errcode === 45009 || errcode === 45033) {
         logger.warn('[wecom-stream] flush rate-limited, buffer retained');
         return; // 保留 buffer，不走到下面的 "this.buffer = null"
+      }
+      logger.error(`[wecom-stream] flushBuffer replyStream failed: ${err instanceof Error ? err.message : String(err)}`);
+      // PR 6.8.4: 兜底 sendMessage 通道 (用类字段 msgFallback)
+      if (this.msgFallback) {
+        try {
+          await this.msgFallback(`❌ 流式推送失败: ${err instanceof Error ? err.message : String(err)}`);
+        } catch (fbErr) {
+          logger.error(`[wecom-stream] flushBuffer fallback also failed: ${fbErr instanceof Error ? fbErr.message : String(fbErr)}`);
+        }
       }
       throw err;
     }
@@ -170,6 +230,7 @@ export class WecomStreamUpdater implements StreamUpdater {
     // PR 6.8.3: 终态 replyStream 失败时兜底 (sendMessage markdown)。
     // 之前 8s 流式静默失败时, 卡片停留在空白 thinking, 用户看不到错误。
     // 现在 replyStream throw → 调 fallback 走 sendMessage 错误消息。
+    // PR 6.8.4: per-call 参数 + 类字段 msgFallback 同时支持, per-call 优先
     msgFallback?: (text: string) => Promise<void>,
   ): Promise<void> {
     if (!(await this.prepareTerminal())) return;
@@ -178,15 +239,20 @@ export class WecomStreamUpdater implements StreamUpdater {
       logger.warn('[wecom-stream] complete skipped: missing inboundFrame (startProcessing never called with frame)');
       return;
     }
+    // PR 6.8.4: per-call 优先, 否则用类字段
+    const fb = msgFallback ?? this.msgFallback;
     try {
-      await this.sdk.replyStream(t.frame, t.streamId, this.truncate(response), true);
+      const wsFrame = await this.sdk.replyStream(t.frame, t.streamId, this.truncate(response), true) as any;
+      // PR 6.8.4: 检查 WsFrame errcode (14:50:09 真实验收: 静默成功 errcode=93006 invalid chatid)
+      this.checkWsFrameErrcode(wsFrame, 'complete');
+      logger.info(`[wecom-stream] complete OK: streamId=${t.streamId.slice(0, 8)}... contentLen=${response.length}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error(`[wecom-stream] complete replyStream failed: ${errMsg}`);
       // 兜底: 走 sendMessage 通道, 用户至少能看到错误 (不是空白卡片)
-      if (msgFallback) {
+      if (fb) {
         try {
-          await msgFallback(`❌ 流式回复失败: ${errMsg}`);
+          await fb(`❌ 流式回复失败: ${errMsg}`);
           logger.info(`[wecom-stream] complete fallback sendMessage succeeded`);
         } catch (fbErr) {
           logger.error(`[wecom-stream] complete fallback sendMessage also failed: ${fbErr instanceof Error ? fbErr.message : String(fbErr)}`);

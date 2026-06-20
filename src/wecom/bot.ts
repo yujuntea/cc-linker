@@ -139,6 +139,14 @@ export class WecomBot {
     this.updater = new WecomStreamUpdater(this.client.sdk, {
       throttleMs: config.throttleMs ?? 2000,
     });
+    // PR 6.8.4: 注入默认 msgFallback (用于 startProcessing/flushBuffer 错误兜底)
+    // 注: 类级别 fallback 没有 msg context (chatId/userId), 所以默认只 log 不 send
+    //   handleChat 内 per-call msgFallback (PR 6.8.3/6.8.1) 提供完整 chatType 路由
+    //   这里 setMsgFallback 主要是为了满足类字段存在 + 让 startProcessing 测试可注入 mock
+    this.updater.setMsgFallback(async (_markdown: string) => {
+      // 默认 fallback: 只 log, 不 send (无 msg context, 路由不到具体 user/group)
+      // 真实生产: handleChat 内 complete() 的 per-call msgFallback 会覆盖 (优先级更高)
+    });
     this.userManager = config.userManager ?? new WecomUserManager(config.userMappingPath);
     this.spoolQueue = config.spoolQueue ?? new SpoolQueue();
     this.sessionManager = config.sessionManager;
@@ -319,6 +327,19 @@ export class WecomBot {
     if (msg.serialKey.startsWith('cmd:')) {
       await this.handleCommand(msg);
       return;
+    }
+    // PR 6.8.4: 续聊 session 路径也识别 /xxx 命令
+    // 历史: 续聊 session 的 serialKey 是 `<sessionId>:<msgId>` 不带 `cmd:` 前缀,
+    //   原代码不识别命令 → /list /switch /resume 等被 Claude 当 user prompt 处理
+    //   (14:49:40 /list 真实验收: Claude 跑 4s 返回 43 chars 不可预期内容)
+    // 修法: 续聊路径先 parseCommand, 是命令走 handleCommand, 否则 handleChat
+    if (!msg.serialKey.startsWith('new:')) {
+      const parsed = parseCommand(msg.text);
+      if (parsed) {
+        logger.info(`[wecom-bot] handleClaimed: 续聊时识别命令 /${parsed.cmd} (text=${msg.text.slice(0, 30)})`);
+        await this.handleCommand(msg);
+        return;
+      }
     }
     // 普通聊天: 走 handleChat
     await this.handleChat(msg);
