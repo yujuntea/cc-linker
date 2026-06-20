@@ -19,21 +19,37 @@ import type { StreamChunk } from '../proxy/stream-parser';
 import { RegistryManager } from '../registry/registry';
 
 /**
- * PR 7 m-2: appendChunk 累加器 — 把 handleChat onProgress 闭包里的累加逻辑
+ * PR 7 m-2 + PR 6.20: appendChunk 累加器 — 把 handleChat onProgress 闭包里的累加逻辑
  * 提到独立函数, 让单测直接验证分支 (chunk.type === 'thinking' / 'text')。
  *
+ * PR 6.20 修法: 返回新 state 对象 (不变异入参), 因为 JS 字符串 immutable:
+ *   旧版 mutate state.thinking += content 是给 state 对象属性赋值, 但 caller 在
+ *   onProgress 闭包里 `appendChunk({ thinking, text }, chunk)` 创建新对象 — 闭包
+ *   里的 thinking/text 局部变量仍是旧字符串引用, 永远不变.
+ *   真实验收 17:30-17:32: SDK emit 5 个 chunks (1 text 4758 chars), 但
+ *   state.text 是 0 字符. 思考过程 + 回复内容都丢 — 用户截图看不到思考过程.
+ *
+ * 新版: appendChunk 返回新 state 对象, caller 必须 re-assign 闭包变量:
+ *   const next = appendChunk(state, chunk);
+ *   thinking = next.thinking;
+ *   text = next.text;
+ *
  * 行为约定:
- * - thinking chunk → state.thinking += chunk.content
- * - text chunk → state.text += chunk.content
- * - mutate state in place (跟原闭包一致), 返回 void
- * - 其他 chunk.type 静默忽略 (跟原逻辑一致)
+ * - thinking chunk → new.thinking = state.thinking + chunk.content
+ * - text chunk → new.text = state.text + chunk.content
+ * - 返回新对象 (不 mutate 入参), 其他 chunk.type 返回原 state
  */
 export function appendChunk(
   state: { thinking: string; text: string },
   chunk: StreamChunk,
-): void {
-  if (chunk.type === 'thinking') state.thinking += chunk.content;
-  else if (chunk.type === 'text') state.text += chunk.content;
+): { thinking: string; text: string } {
+  if (chunk.type === 'thinking') {
+    return { thinking: state.thinking + chunk.content, text: state.text };
+  }
+  if (chunk.type === 'text') {
+    return { thinking: state.thinking, text: state.text + chunk.content };
+  }
+  return state;
 }
 
 /**
@@ -903,11 +919,14 @@ export class WecomBot {
       const lockKey: string = isNewSession ? `new:${msg.userId}` : existingSessionUuid!;
 
       // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text + throttle patch
-      // PR 7 m-2: 累加逻辑提取为 appendChunk, 让单测直接验证分支
+      // PR 7 m-2 + PR 6.20: appendChunk 返回新 state 对象, caller 必须 re-assign
+      //   (JS 字符串 immutable, 旧版 mutate 新对象属性但闭包变量不变)
       const result = await this.sessionManager.sendStreamingMessage(
         sessionId, msg.text, cwd,
         (chunk: StreamChunk) => {
-          appendChunk({ thinking, text }, chunk);
+          const next = appendChunk({ thinking, text }, chunk);
+          thinking = next.thinking;
+          text = next.text;
           const elapsed = Date.now() - startTime;
           this.updater.updateStream(thinking, text, elapsed).catch(e =>
             logger.warn(`[wecom-bot] updateStream failed: ${e instanceof Error ? e.message : String(e)}`)
