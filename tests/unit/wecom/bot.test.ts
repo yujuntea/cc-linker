@@ -2476,6 +2476,232 @@ describe('WecomBot executeCardAction (PR 6 Task 6.6: confirm-stop)', () => {
 });
 
 /**
+ * PR 6.9: /list 命令新实现 — 推 multi-session template_card
+ *
+ * 背景: PR 4.5 C 旧 handleCommandList 只显示当前 user 关联的 session 详情,
+ *   用户期望看到 "会话列表" (multi-session 可选), 跟飞书侧 /list 行为对齐。
+ *
+ * 修法:
+ * - 读 registryManager.sessions (Record<uuid, SessionEntry>) 拿全部 active + uuid
+ * - 按 last_active 倒序取前 10 条
+ * - 标 current session (跟 user-mapping 比对)
+ * - WecomCardBuilder.textNotice 渲染 template_card
+ * - registryManager 未注入 → 退到老 handleCommandList 返回 markdown
+ *
+ * 关键不变量:
+ * - 有 active sessions → 推 template_card 含 session title + uuid 前 8 字符
+ * - 空 → 卡片 desc 含 "无 active session"
+ * - registryManager 未注入 → fallback sendMessage markdown (向后兼容)
+ * - 当前 user 的 session → 标 👉 (便于一眼识别)
+ */
+describe('WecomBot /list command (PR 6.9: multi-session template_card)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async (_id: string, _sk: string, _cardId?: string) => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+      updateProcessingMessage: mock(async () => {}),
+      listPending: mock(() => []),
+      listProcessing: mock(() => []),
+      claimNext: mock(() => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+  });
+
+  it('/list: 有 active sessions → 推 template_card 含 session 列表 + uuid 前 8 字符', async () => {
+    const registryManager = {
+      sessions: {
+        'uuid-aaaa-bbbb-cccc-dddd-1111': {
+          status: 'active',
+          title: 'PR 6.9 /list',
+          cwd: '/tmp',
+          last_active: '2026-06-20T15:00:00Z',
+          message_count: 5,
+        },
+        'uuid-eeee-ffff-gggg-hhhh-2222': {
+          status: 'active',
+          title: 'PR 6.8.5 defensive',
+          cwd: '/Users/x/proj',
+          last_active: '2026-06-20T14:00:00Z',
+          message_count: 12,
+        },
+        'uuid-archived-3333': {
+          status: 'archived',  // 过滤掉
+          title: 'archived session',
+          cwd: '/tmp',
+          last_active: '2026-01-01T00:00:00Z',
+          message_count: 0,
+        },
+      },
+    };
+    mockUserManager.getEntry = mock(() => ({
+      type: 'session',
+      sessionUuid: 'uuid-aaaa-bbbb-cccc-dddd-1111',  // 当前 user 的 session
+    }));
+
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr69-list.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      registryManager: registryManager as any,
+    });
+
+    const msg: any = {
+      messageId: 'msg-list-001',
+      openId: '',
+      text: '/list',
+      userId: 'WuYuJun',
+      platform: 'wecom',
+      target: { type: 'session', sessionUuid: 'uuid-aaaa-bbbb-cccc-dddd-1111', cwd: '/tmp' },
+      serialKey: 'uuid-aaaa-bbbb-cccc-dddd-1111:msg-list-001',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { chatId: 'abc', chatType: 'p2p' },
+    };
+
+    await bot.__test_handleCommand(msg);
+
+    // 1. sendMessage 推了 template_card (非 markdown 兜底)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[0]).toBe('WuYuJun');  // PR 6.8.1: p2p → userId
+    expect(smCall[1].msgtype).toBe('template_card');
+    const card = smCall[1].template_card;
+    expect(card.card_type).toBe('text_notice');
+
+    // 2. 卡片 title 含 active session 数量 (2 个 active, 1 archived)
+    expect(card.main_title.title).toContain('2');
+    expect(card.main_title.title).toContain('活跃 sessions');
+
+    // 3. 卡片 desc 含两个 active session title + uuid 前 8 字符
+    expect(card.main_title.desc).toContain('PR 6.9 /list');
+    expect(card.main_title.desc).toContain('PR 6.8.5 defensive');
+    expect(card.main_title.desc).toContain('uuid-aaa');  // uuid 前 8 字符
+    expect(card.main_title.desc).toContain('uuid-eee');
+
+    // 4. archived 不应出现
+    expect(card.main_title.desc).not.toContain('archived session');
+
+    // 5. 当前 user 的 session 标 👉
+    expect(card.main_title.desc).toContain('👉');
+
+    // 6. markDone 被调
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg-list-001', 'uuid-aaaa-bbbb-cccc-dddd-1111:msg-list-001');
+  });
+
+  it('/list: 0 active session → 卡片 desc 含 "无 active session"', async () => {
+    const registryManager = {
+      sessions: {
+        'archived-1': { status: 'archived', title: 'old', cwd: '/tmp', last_active: '2026-01-01T00:00:00Z', message_count: 0 },
+      },
+    };
+    mockUserManager.getEntry = mock(() => undefined);  // 当前 user 无 session
+
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr69-list-empty.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      registryManager: registryManager as any,
+    });
+
+    const msg: any = {
+      messageId: 'msg-list-empty',
+      openId: '',
+      text: '/list',
+      userId: 'wmu_abc',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: 'cmd:wmu_abc:msg-list-empty',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { chatId: 'abc', chatType: 'p2p' },
+    };
+
+    await bot.__test_handleCommand(msg);
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[1].msgtype).toBe('template_card');
+    const card = smCall[1].template_card;
+    expect(card.main_title.desc).toContain('无 active session');
+  });
+
+  it('/list: registryManager 未注入 → fallback 老 markdown 路径', async () => {
+    // 无 registryManager 注入 (wecom-only staging / 旧测试)
+    mockUserManager.getEntry = mock(() => ({
+      type: 'session',
+      sessionUuid: 'test-uuid',
+      cwd: '/tmp',
+      lastActiveAt: '2026-06-20T15:00:00Z',
+    }));
+
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr69-list-fallback.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      // registryManager 未注入
+    });
+
+    const msg: any = {
+      messageId: 'msg-list-fb',
+      openId: '',
+      text: '/list',
+      userId: 'wmu_abc',
+      platform: 'wecom',
+      target: { type: 'session', sessionUuid: 'test-uuid', cwd: '/tmp' },
+      serialKey: 'test-uuid:msg-list-fb',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { chatId: 'abc', chatType: 'p2p' },
+    };
+
+    await bot.__test_handleCommand(msg);
+
+    // fallback: sendMessage 用 markdown (非 template_card)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[1].msgtype).toBe('markdown');
+    expect(smCall[1].markdown.content).toContain('当前 session');
+  });
+});
+
+/**
  * PR 6 Task 6.7: card action 'list-refresh' → RegistryManager.listActive + template_card
  *
  * 背景: PR 5 stub 把 list-refresh 用通用 log + markdown "✅ 已执行: list-refresh" 兜底,

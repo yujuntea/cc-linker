@@ -11,7 +11,7 @@ import { config } from '../utils/config';
 import { AibotClient, type AibotMessageHandler } from './aibot-client';
 import { WecomStreamUpdater } from './stream-updater';
 import { WecomUserManager } from './mapping';
-import { WecomCardBuilder } from './card';
+import { WecomCardBuilder, type TemplateCard } from './card';
 import { WecomImageHandler } from './image-handler';
 import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spool';
 import type { ClaudeSessionManager } from '../proxy/session';
@@ -358,6 +358,15 @@ export class WecomBot {
 
     logger.info(`[wecom-bot] handleCommand: cmd=/${parsed.cmd} args=${JSON.stringify(parsed.args)} userId=${msg.userId}`);
 
+    // PR 6.9: /list 改 template_card 列表 (推回逻辑不统一, 直接走 handleCommandListCard)
+    // 历史: case 'list' 走 handleCommandList 返回 markdown, 但用户期望 multi-session list 卡片
+    // 修法: case 'list' 直接 await handleCommandListCard (内部 sendMessage template_card + markDone),
+    //   跳过后续统一 sendMessage 推送路径 (return 跳出 handleCommand)
+    if (parsed.cmd === 'list') {
+      await this.handleCommandListCard(msg);
+      return;
+    }
+
     let responseText: string;
     try {
       switch (parsed.cmd) {
@@ -365,7 +374,8 @@ export class WecomBot {
           responseText = await this.handleCommandNew(msg.userId, parsed.args);
           break;
         case 'list':
-          responseText = await this.handleCommandList(msg.userId, parsed.args);
+          // PR 6.9: unreachable — 上面 if (parsed.cmd === 'list') 已拦截走 handleCommandListCard
+          responseText = 'unreachable';
           break;
         case 'status':
           responseText = await this.handleCommandStatus(msg.userId);
@@ -436,7 +446,7 @@ export class WecomBot {
   }
 
   /**
-   * PR 4.5 C: /list 命令 - 列出用户当前 session 状态
+   * PR 4.5 C: /list 命令 - 列出用户当前 session 状态 (旧版, 返回 markdown 文本, 给 handleCommandListCard fallback 用)
    */
   private handleCommandList(userId: string, _args: string[]): string {
     const entry = this.userManager.getEntry(userId);
@@ -453,6 +463,105 @@ export class WecomBot {
       return '⏳ 新 session 创建中 (claimed), 请稍候';
     }
     return `📋 当前状态: ${entry.type}`;
+  }
+
+  /**
+   * PR 6.9: /list 命令新实现 — 推 multi-session template_card
+   *
+   * 历史: PR 4.5 C 旧 handleCommandList 只显示当前 user 关联的 session 详情,
+   *   用户期望看到 "会话列表" (multi-session 可选), 跟飞书侧 /list 行为对齐
+   *   (飞书 /list 调 registryManager.listActive() 渲染 interactive card 列表)。
+   *
+   * 修法:
+   * - 拉 registryManager.listActive() 拿全部 active sessions
+   * - WecomCardBuilder.textNotice 渲染成 template_card (跟 list-refresh action 共用渲染逻辑)
+   * - sendMessage template_card 推回
+   * - markDone 收尾
+   *
+   * 防御:
+   * - registryManager 未注入 → 退到 handleCommandList 老 markdown 路径 (向后兼容 wecom-only staging)
+   * - sendMessage throw → requeueFromProcessing (跟统一推送路径一致)
+   */
+  private async handleCommandListCard(msg: SpoolMessage): Promise<void> {
+    logger.info(`[wecom-bot] handleCommandListCard: userId=${msg.userId}`);
+
+    // 1. 渲染列表 card
+    let card: TemplateCard;
+    if (this.registryManager) {
+      try {
+        // PR 6.9: 用 registryManager.sessions (Record<uuid, SessionEntry>) 拿完整 uuid
+        // listActive() 返回 SessionEntry[] 没 uuid, 反查 O(n²) 不好
+        // 注意: sessions 是 in-memory cache (start.ts syncBeforeCommand 已 flush 最新数据)
+        const allActive = this.registryManager.sessions;
+        const activeEntries = Object.entries(allActive)
+          .filter(([_, s]) => s.status === 'active')
+          .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
+          .slice(0, 10);
+        const currentEntry = this.userManager.getEntry(msg.userId);
+        const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
+        const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
+        const contentLines = activeEntries.length === 0
+          ? ['📭 当前无 active session']
+          : activeEntries.map(([uuid, s]) => {
+              const marker = uuid === currentUuid ? '👉 ' : '   ';
+              const title = s.title ?? '(无标题)';
+              const cwd = s.cwd ? ` \`${s.cwd}\`` : '';
+              const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
+              return `${marker}**${title}**${msgs}${cwd}\n   \`${uuid.slice(0, 8)}…\``;
+            });
+        card = WecomCardBuilder.textNotice({
+          title: `📋 活跃 sessions (${activeEntries.length}${totalActive > 10 ? '+' : ''})`,
+          content: contentLines.join('\n\n'),
+        });
+        logger.info(`[wecom-bot] handleCommandListCard: rendering ${activeEntries.length}/${totalActive} sessions for userId=${msg.userId}`);
+      } catch (err) {
+        logger.error(`[wecom-bot] handleCommandListCard: registry access failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
+        await this.fallbackListMarkdown(msg);
+        return;
+      }
+    } else {
+      // registryManager 未注入 (wecom-only staging / 旧测试) → 走老 markdown 路径
+      logger.warn('[wecom-bot] handleCommandListCard: registryManager not injected, fallback to markdown');
+      await this.fallbackListMarkdown(msg);
+      return;
+    }
+
+    // 2. sendMessage template_card
+    try {
+      const receiveId = resolveReceiveId(msg);
+      await this.client.sdk.sendMessage(receiveId, {
+        msgtype: 'template_card',
+        template_card: card as any,
+      });
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      logger.info(`[wecom-bot] handleCommandListCard: sent template_card to ${receiveId}`);
+    } catch (err) {
+      logger.error(`[wecom-bot] handleCommandListCard: sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
+      } catch (requeueErr) { /* ignore */ }
+    }
+  }
+
+  /**
+   * PR 6.9: handleCommandListCard 的 markdown 兜底 — registryManager 缺失/出错时调用
+   * 复用老 handleCommandList 返回 markdown, 走统一 sendMessage 推送路径
+   */
+  private async fallbackListMarkdown(msg: SpoolMessage): Promise<void> {
+    const text = this.handleCommandList(msg.userId, []);
+    try {
+      const receiveId = resolveReceiveId(msg);
+      await this.client.sdk.sendMessage(receiveId, {
+        msgtype: 'markdown',
+        markdown: { content: text },
+      });
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+    } catch (err) {
+      logger.error(`[wecom-bot] fallbackListMarkdown: sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
+      } catch (requeueErr) { /* ignore */ }
+    }
   }
 
   /**
