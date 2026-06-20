@@ -296,6 +296,122 @@ describe('WecomBot handleChat (PR 4.1)', () => {
     expect(onProgressCalls.length).toBeGreaterThanOrEqual(0);  // 检查路径未崩即可
   });
 
+  it('PR 6.8.5 defensive fallback: text=空但 result.response 有内容 → complete 用 result.response', async () => {
+    // 真实验收 15:09:50 复现: Claude 返回 17 字符 (纯 thinking 风格),
+    //   SDK 不 emit text chunk, text 累加器留空, complete 传 0 长 → 空白方框
+    // 仿飞书 feishu/bot.ts:2441-2443: text || result.response || '(空回复)'
+    const mockSessionManager: any = {
+      sendStreamingMessage: mock(async (
+        _sessionId, _text, _cwd, onProgress,
+      ) => {
+        // 只有 thinking chunk, 无 text
+        onProgress({ type: 'thinking', content: '思考中...' });
+        return {
+          response: 'Hi! How can I help?',  // 17 字符真实回复
+          costUsd: 0.001,
+          durationMs: 7000,
+          sessionId: 'sess_defensive',
+          jsonlPath: null,
+          sessionStatus: 'active' as const,
+          tokensIn: 10,
+          tokensOut: 5,
+        };
+      }),
+    };
+
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-mapping-pr685.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      sessionManager: mockSessionManager,
+      userManager: mockUserManager as any,
+    });
+
+    const msg: any = {
+      messageId: 'msg_defensive_001',
+      openId: '',
+      text: 'hi',
+      userId: 'wmu_abc',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: 'new:wmu_abc',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: 'inbound_defensive' } } },
+    };
+
+    await bot.__test_handleChat(msg);
+
+    // complete 调用: replyStream 最后一次 (final=true), content 应该是 result.response
+    const calls = mockClient.sdk.replyStream.mock.calls;
+    const completeCall = calls[calls.length - 1];
+    expect(completeCall[3]).toBe(true);  // final=true
+    expect(completeCall[2]).toBe('Hi! How can I help?');  // 不是 0 长
+
+    // 不应发送空串
+    const allContents = calls.map((c: any[]) => c[2]).join('|');
+    expect(allContents).not.toMatch(/^[\s|]*$/);  // 不应全空
+    expect(allContents).toContain('Hi! How can I help?');
+
+    // markDone 仍然被调
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_defensive_001', 'new:wmu_abc');
+  });
+
+  it('PR 6.8.5 triple fallback: text=空 + result.response=空 → "(空回复)"', async () => {
+    // 极端 case: Claude 静默无任何输出, result.response 也为空
+    const mockSessionManager: any = {
+      sendStreamingMessage: mock(async (
+        _sessionId, _text, _cwd, onProgress,
+      ) => {
+        // 不 emit 任何 chunk
+        return {
+          response: '',  // 空 response
+          costUsd: 0,
+          durationMs: 100,
+          sessionId: 'sess_empty',
+          jsonlPath: null,
+          sessionStatus: 'active' as const,
+          tokensIn: 0,
+          tokensOut: 0,
+        };
+      }),
+    };
+
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-mapping-pr685-empty.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      sessionManager: mockSessionManager,
+      userManager: mockUserManager as any,
+    });
+
+    const msg: any = {
+      messageId: 'msg_empty_001',
+      openId: '',
+      text: 'silent test',
+      userId: 'wmu_abc',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: 'new:wmu_abc',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: 'inbound_empty' } } },
+    };
+
+    await bot.__test_handleChat(msg);
+
+    const calls = mockClient.sdk.replyStream.mock.calls;
+    const completeCall = calls[calls.length - 1];
+    expect(completeCall[3]).toBe(true);
+    expect(completeCall[2]).toBe('(空回复)');
+  });
+
   it('error path: sessionManager throws → updater.error + requeue', async () => {
     const mockSessionManager: any = {
       sendStreamingMessage: mock(async () => {

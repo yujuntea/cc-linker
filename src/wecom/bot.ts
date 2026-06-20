@@ -722,12 +722,19 @@ export class WecomBot {
         await this.userManager.touchSession(msg.userId);
       }
 
+      // PR 6.8.5: 防御性 fallback — text 累加器只收到 thinking 没 text chunk 时
+      //   (e.g. Claude 只输出 thinking 没 text, 或 SDK 不 emit partial text),
+      //   complete 传 0 长字符串导致 replyStream 显示空白方框 (15:09:50 真实验收).
+      // 仿飞书侧 feishu/bot.ts:2441-2443 同款模式: text || result.response || '(空回复)'
+      const finalText = text || result.response || '(空回复)';
+      logger.info(`[wecom-bot] handleChat finalize: textLen=${text.length} responseLen=${result.response?.length ?? 0} finalTextLen=${finalText.length}`);
+
       // PR 6.8.3: 兜底 sendMessage 通道 — replyStream 静默失败时用户至少能看到错误
       // 之前 8s 真实企微 E2E: 卡片始终空白, replyStream 调了但 WSS 没真发送
       // 现在 replyStream throw → 调 sendMessage 走 markdown 错误, 路由用 resolveReceiveId (PR 6.8.1)
       const receiveIdForFallback = resolveReceiveId(msg);
       await this.updater.complete(
-        text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1,
+        finalText, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1,
         async (markdown: string) => {
           await this.client.sdk.sendMessage(receiveIdForFallback, {
             msgtype: 'markdown',
