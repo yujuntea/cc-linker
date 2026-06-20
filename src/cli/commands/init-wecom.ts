@@ -19,6 +19,52 @@ export function maskSecret(secret: string): string {
 }
 
 /**
+ * PR 7 m-5: 企微 token 校验结果 (验证 bot_id + secret 组合有效).
+ */
+export type WecomVerifyResult = {
+  ok: boolean;
+  accessToken?: string;
+  expiresIn?: number;
+};
+
+/**
+ * PR 7 m-5: 企微 bot_id + secret verify 工具.
+ *
+ * 历史: 用户配 bot_id + secret 后写到 config.toml, 没 verify 直接保存.
+ *   → 启动时 WSClient.connect 才报错 (WSAuthFailureError), 用户排查时要
+ *     重启 bot + 看 daemon log, 体验差.
+ * 修法: 写 config 前调 verifyWecomCredentials(botId, secret), 失败 throw
+ *   出可读错误 ("❌ bot_id 或 secret 无效"), 用户立即看到, 不用等到 bot 启动.
+ *
+ * 实现策略: 用 Wecom HTTP gettoken endpoint (`https://qyapi.weixin.qq.com/cgi-bin/gettoken`)
+ *   + 注入 fetcher (单测 mock 掉, 避免真实网络).
+ *   返回 { ok: true, accessToken } 或 throw Error.
+ */
+export async function verifyWecomCredentials(
+  botId: string,
+  secret: string,
+  opts: { fetcher?: typeof fetch } = {},
+): Promise<WecomVerifyResult> {
+  const doFetch = opts.fetcher ?? fetch;
+  const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(botId)}&corpsecret=${encodeURIComponent(secret)}`;
+  const resp = await doFetch(url);
+  const data = (await resp.json()) as {
+    errcode: number;
+    errmsg: string;
+    access_token?: string;
+    expires_in?: number;
+  };
+  if (data.errcode !== 0) {
+    throw new Error(`❌ bot_id 或 secret 无效 (errcode=${data.errcode}, errmsg=${data.errmsg})`);
+  }
+  return {
+    ok: true,
+    accessToken: data.access_token,
+    expiresIn: data.expires_in,
+  };
+}
+
+/**
  * 交互式配置企业微信集成（bot_id + secret + owner_external_user_id）
  * 写入 [wecom] 节到 config.toml。后续手动 `cc-linker start --platform=wecom` 启动。
  *
@@ -66,6 +112,18 @@ export async function initWecom(): Promise<void> {
     message: 'Owner external_user_id（留空允许所有用户）:',
     default: wecom.owner_external_user_id || '',
   }]);
+
+  // PR 7 m-5: 写 config 前 verify bot_id + secret, 避免配置错误要等启动才看到
+  // 失败 throw (含 errcode), 用户立即看到, 不写脏 config
+  try {
+    console.log(chalk.cyan('\n验证 bot_id + secret ...'));
+    await verifyWecomCredentials(botId.trim(), resolvedSecret);
+    console.log(chalk.green('✅ 验证通过'));
+  } catch (verifyErr) {
+    const msg = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+    console.log(chalk.red(`\n${msg}\n`));
+    throw verifyErr;
+  }
 
   // Save to existing config (preserves other sections)
   const existingOwner = typeof wecom.owner_external_user_id === 'string' ? wecom.owner_external_user_id : '';

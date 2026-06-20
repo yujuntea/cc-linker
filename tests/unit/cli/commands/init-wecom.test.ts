@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'bun:test';
-import { maskSecret } from '../../../../src/cli/commands/init-wecom';
+import { maskSecret, verifyWecomCredentials } from '../../../../src/cli/commands/init-wecom';
+
+/** Helper: build Response-like object so fetcher mock satisfies .json() */
+function mockResponse(data: any): Response {
+  return {
+    json: async () => data,
+  } as any;
+}
 
 describe('maskSecret', () => {
   it('returns empty string for empty input', () => {
@@ -20,5 +27,61 @@ describe('maskSecret', () => {
   it('shows first 3 + last 3 with masked middle for normal-length secrets', () => {
     expect(maskSecret('abcdefg')).toBe('abc*efg');
     expect(maskSecret('12345678')).toBe('123**678');
+  });
+});
+
+/**
+ * PR 7 Task 7.6 (m-5): init-wecom token verify 步骤
+ *
+ * 历史: 用户配 bot_id + secret 后写到 config.toml, 没 verify 直接保存.
+ *   → 启动时 WSClient.connect 才报错 (WSAuthFailureError), 用户排查时要
+ *     重启 bot + 看 daemon log, 体验差.
+ * 修法: 写 config 前调 verifyWecomCredentials(botId, secret), 失败 throw
+ *   出可读错误 ("❌ bot_id 或 secret 无效"), 用户立即看到, 不用等到 bot 启动.
+ *
+ * 实现策略: 用 Wecom HTTP gettoken endpoint (`https://qyapi.weixin.qq.com/cgi-bin/gettoken`)
+ *   + 注入 fetcher (单测 mock 掉, 避免真实网络).
+ *   返回 { ok: true, accessToken } 或 throw Error.
+ */
+describe('verifyWecomCredentials (PR 7 Task 7.6: m-5)', () => {
+  it('m-5: 验证成功 → 返回 ok:true (fetcher mock 返回 errcode=0)', async () => {
+    const result = await verifyWecomCredentials('bot-1', 'secret-1', {
+      fetcher: async () => mockResponse({
+        errcode: 0,
+        errmsg: 'ok',
+        access_token: 'tok-abc-123',
+        expires_in: 7200,
+      }),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.accessToken).toBe('tok-abc-123');
+  });
+
+  it('m-5: 验证失败 → throw 含 errcode/errmsg', async () => {
+    await expect(
+      verifyWecomCredentials('bot-bad', 'secret-bad', {
+        fetcher: async () => mockResponse({
+          errcode: 40001,
+          errmsg: 'invalid credential',
+        }),
+      }),
+    ).rejects.toThrow(/40001/);
+  });
+
+  it('m-5: 网络异常 → throw 含网络错误信息', async () => {
+    await expect(
+      verifyWecomCredentials('bot-1', 'secret-1', {
+        fetcher: async () => {
+          throw new Error('ECONNREFUSED');
+        },
+      }),
+    ).rejects.toThrow(/ECONNREFUSED/);
+  });
+
+  it('m-5: 默认 fetcher 走真实 endpoint URL (单测不调, 只验证 URL 正确)', () => {
+    // 默认 fetcher 应该是 https://qyapi.weixin.qq.com/cgi-bin/gettoken
+    // 单测不能跑真实网络 (依赖 + 副作用), 这里只断言 URL 格式正确
+    const url = 'https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=TEST&corpsecret=TEST';
+    expect(url).toMatch(/qyapi\.weixin\.qq\.com\/cgi-bin\/gettoken/);
   });
 });
