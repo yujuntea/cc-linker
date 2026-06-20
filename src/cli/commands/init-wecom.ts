@@ -65,6 +65,29 @@ export async function verifyWecomCredentials(
 }
 
 /**
+ * PR 7 m-13: overwrite 确认 prompt.
+ *
+ * 历史: init-wecom 写入 [wecom] 节时, 如果 config.toml 已存在 [wecom] 配置 (含 bot_id),
+ *   会直接覆盖而不通知用户. → 用户以为没生效, 或多个 wecom bot 共用同一 config 时互相覆盖.
+ * 修法: 写 config 前检测 wecom 节是否已存在, 弹 "config 已存在, 覆盖? (y/N)" 确认.
+ *   默认 N (跟 rm -i / mv -i 一致: 拒绝破坏性操作要显式 yes).
+ *
+ * @returns true = 继续覆盖, false = 取消写入 (initWecom 中止, 不抛错)
+ */
+export async function confirmWecomOverwrite(
+  promptFn: typeof inquirer.prompt = inquirer.prompt,
+): Promise<boolean> {
+  // PR 7 m-13: 用 type: 'confirm' + default: false, 跟 init-feishu / git 类似 UX
+  const { overwrite } = await promptFn([{
+    type: 'confirm',
+    name: 'overwrite',
+    message: 'config 已存在 wecom 节, 是否覆盖? (y/N)',
+    default: false,
+  }]);
+  return overwrite;
+}
+
+/**
  * 交互式配置企业微信集成（bot_id + secret + owner_external_user_id）
  * 写入 [wecom] 节到 config.toml。后续手动 `cc-linker start --platform=wecom` 启动。
  *
@@ -82,6 +105,17 @@ export async function initWecom(): Promise<void> {
 
   const existing = loadExistingConfig();
   const wecom = existing.wecom ?? {};
+
+  // PR 7 m-13: 检测 [wecom] 节是否已存在, 存在则先确认是否覆盖 (默认 N)
+  const hasExistingWecom = !!(wecom.bot_id || wecom.secret);
+  if (hasExistingWecom) {
+    console.log(chalk.yellow(`⚠️  检测到现有 wecom 配置 (bot_id=${wecom.bot_id})`));
+    const overwrite = await confirmWecomOverwrite();
+    if (!overwrite) {
+      console.log(chalk.gray('\n已取消, 未修改配置。'));
+      return;
+    }
+  }
 
   // Step 1: bot_id
   const { botId } = await inquirer.prompt([{

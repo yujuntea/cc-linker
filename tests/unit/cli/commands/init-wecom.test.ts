@@ -85,3 +85,38 @@ describe('verifyWecomCredentials (PR 7 Task 7.6: m-5)', () => {
     expect(url).toMatch(/qyapi\.weixin\.qq\.com\/cgi-bin\/gettoken/);
   });
 });
+
+/**
+ * PR 7 Task 7.6 (m-13): init-wecom 覆盖确认 prompt
+ *
+ * 历史: init-wecom 写入 [wecom] 节时, 如果 config.toml 已存在 [wecom] 配置 (含 bot_id),
+ *   会直接覆盖而不通知用户. → 用户以为没生效, 或多个 wecom bot 共用同一 config 时互相覆盖.
+ * 修法: 写 config 前调 confirmWecomOverwrite(promptFn), 接受 confirmFn 注入
+ *   (单测 mock 掉, 避免真实 inquirer 阻塞 stdin).
+ */
+describe('confirmWecomOverwrite (PR 7 Task 7.6: m-13)', () => {
+  it('m-13: promptFn 返回 true → confirmWecomOverwrite 返回 true', async () => {
+    const { confirmWecomOverwrite } = await import('../../../../src/cli/commands/init-wecom');
+    const result = await confirmWecomOverwrite(async () => ({ overwrite: true }));
+    expect(result).toBe(true);
+  });
+
+  it('m-13: promptFn 返回 false → confirmWecomOverwrite 返回 false', async () => {
+    const { confirmWecomOverwrite } = await import('../../../../src/cli/commands/init-wecom');
+    const result = await confirmWecomOverwrite(async () => ({ overwrite: false }));
+    expect(result).toBe(false);
+  });
+
+  it('m-13: prompt 调用包含 confirm type 和 default false (防止意外默认 yes)', async () => {
+    const { confirmWecomOverwrite } = await import('../../../../src/cli/commands/init-wecom');
+    let captured: any = null;
+    await confirmWecomOverwrite(async (q: any) => {
+      captured = q;
+      return { overwrite: true };
+    });
+    expect(Array.isArray(captured)).toBe(true);
+    expect(captured[0].type).toBe('confirm');
+    expect(captured[0].default).toBe(false);  // 默认 N, 拒绝破坏性操作要显式 yes
+    expect(captured[0].message).toMatch(/覆盖/);
+  });
+});
