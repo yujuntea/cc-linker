@@ -111,7 +111,19 @@ export type TemplateCard =
  */
 export type WecomTemplateCard = TemplateCard;
 
+/**
+ * PR 7 m-9: action_menu 的 desc 默认文案。
+ * 历史: textNotice 硬编码 desc: '操作', 单测/i18n/未来 UI 文案调整要 grep 全文,
+ *   提常量让定位/改动都集中。
+ */
+const ACTION_MENU_DESC = '操作';
+
 export const WecomCardBuilder = {
+  /**
+   * PR 7 m-9: 暴露 ACTION_MENU_DESC, 让单测 / 未来 i18n 集中引用,
+   *   替代散落在 textNotice 里的硬编码 '操作'。
+   */
+  ACTION_MENU_DESC,
   textNotice(opts: TextNoticeOpts): TemplateCard {
     const validated = TextNoticeOptsSchema.parse(opts);
     // PR 7 m-4: 直接构造完整 TextNoticeCard, 不再用 `(card as any).action_menu = ...`
@@ -123,7 +135,7 @@ export const WecomCardBuilder = {
       ...(hasActionMenu
         ? {
             action_menu: {
-              desc: '操作',
+              desc: ACTION_MENU_DESC,
               action_list: validated.actionMenu!.map(a => ({
                 action_tag: a.tag,
                 action_title: { tag: a.tag, text: a.text },

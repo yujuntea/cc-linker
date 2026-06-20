@@ -81,4 +81,20 @@ describe('WecomCardBuilder', () => {
       expect(_typed.card_source?.url).toBe('https://example.com');
     }
   });
+
+  it('m-9: action_menu uses ACTION_MENU_DESC constant (no hardcoded "操作" string)', () => {
+    // PR 7 m-9 修法: textNotice 的 action_menu.desc 硬编码 '操作',
+    //   单测/i18n/未来 UI 文案调整都要 grep 全文, 提常量让定位 / 改动都集中
+    const card = WecomCardBuilder.textNotice({
+      title: 't',
+      content: 'c',
+      actionMenu: [{ tag: 'retry', text: '重试' }],
+    });
+    if (card.card_type !== 'text_notice' || !card.action_menu) {
+      throw new Error('expected text_notice with action_menu');
+    }
+    // 验证 desc 跟常量一致 (而非另一个魔法字符串)
+    expect((WecomCardBuilder as any).ACTION_MENU_DESC).toBeDefined();
+    expect(card.action_menu.desc).toBe((WecomCardBuilder as any).ACTION_MENU_DESC);
+  });
 });
