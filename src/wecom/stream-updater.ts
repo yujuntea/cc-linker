@@ -49,6 +49,11 @@ export class WecomStreamUpdater implements StreamUpdater {
    *
    * 历史: M-7 删了 setInboundFrame / inboundFrame alias（field 多了容易混用），
    * 强制调用方传 startProcessing(userId, inboundFrame)
+   *
+   * PR 7 Task 7.4 (M-6): 单 user 设计 (有意为之, spec §5.6 "企微 userId 不区分 p2p/group")
+   * 企微单 user 同时只能有 1 个 in-flight 流；与飞书 CardUpdater 不同 (飞书支持 p2p + group 多流)。
+   * 因此 lastInboundFrame / currentStreamId 是单字段, 不按 userId key。
+   * 若未来需多 user 并发, 改为 Map<userId, {streamId, frame}> 并同步 startProcessing/complete/error/cancel。
    */
   private lastInboundFrame: any = null;
   private buffer: BufferedChunk | null = null;
