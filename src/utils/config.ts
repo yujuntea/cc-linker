@@ -10,6 +10,9 @@ interface ConfigData {
     log_level: string;
     log_path: string | null;
     claude_bin: string;
+    // PR 6.16: 平台无关 default_cwd, 飞书 + 微信共用 (避免用户各配一遍)
+    // 优先级: 平台级 default_cwd (feishu_bot.default_cwd / wecom.default_cwd) > 通用 default_cwd
+    default_cwd: string;
   };
   scanner: {
     max_file_size: number;
@@ -80,6 +83,9 @@ interface ConfigData {
     bot_id: string;
     secret: string;
     owner_external_user_id: string;
+    // PR 6.16: 平台级 default_cwd (跟飞书 feishu_bot.default_cwd 对齐)
+    // 公共 fallback 在 [general] default_cwd (避免用户各配一遍)
+    default_cwd: string;
   };
   images: {
     enabled: boolean;
@@ -110,6 +116,7 @@ const DEFAULTS: ConfigData = {
     log_level: 'info',
     log_path: null,
     claude_bin: 'claude',
+    default_cwd: '',
   },
   scanner: {
     max_file_size: 100 * 1024 * 1024,
@@ -182,6 +189,9 @@ const DEFAULTS: ConfigData = {
     bot_id: '',
     secret: '',
     owner_external_user_id: '',
+    // PR 6.16: 平台级 default_cwd (跟飞书 feishu_bot.default_cwd 对齐)
+    // 公共 fallback 在 [general] default_cwd
+    default_cwd: '',
   },
   images: {
     enabled: true,
@@ -276,6 +286,8 @@ export class ConfigManager {
       ['CC_LINKER_REGISTRY_PATH', 'general', 'registry_path'],
       ['CC_LINKER_LOG_LEVEL', 'general', 'log_level'],
       ['CC_LINKER_LOG_PATH', 'general', 'log_path'],
+      // PR 6.16: 通用 default_cwd env var (跨平台共享)
+      ['CC_LINKER_DEFAULT_CWD', 'general', 'default_cwd'],
       ['CC_LINKER_FEISHU_APP_ID', 'feishu_bot', 'app_id'],
       ['CC_LINKER_FEISHU_APP_SECRET', 'feishu_bot', 'app_secret'],
       ['CC_LINKER_FEISHU_OWNER_OPEN_ID', 'feishu_bot', 'owner_open_id'],

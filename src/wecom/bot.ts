@@ -760,13 +760,16 @@ export class WecomBot {
       const { readdirSync, existsSync } = await import('fs');
       const { dirname } = await import('path');
 
-      // PR 6.15: cwd 优先级 — user-mapping entry.cwd → config 'wecom.default_cwd' → /tmp fallback
-      // 历史 (PR 6.13): 只读 user-mapping entry.cwd, 缺则 /tmp fallback → 用户反馈
-      //   "默认目录应该是配置文件中指定的目录, 为什么是 /tmp"
-      // 修法: 仿飞书 feishu/bot.ts:498-505 getCwdForUser(), 加 wecom.default_cwd 配置项
-      //   注意: 飞书叫 [feishu_bot] default_cwd, wecom 叫 [wecom] default_cwd
+      // PR 6.15 + PR 6.16: cwd 优先级 — user-mapping entry.cwd → 平台 config → 通用 config → /tmp fallback
+      // 历史:
+      //   PR 6.13: 只读 user-mapping entry.cwd, 缺则 /tmp fallback → 用户反馈
+      //   PR 6.15: 加 wecom.default_cwd 平台配置 (仿飞书 feishu_bot.default_cwd)
+      //   PR 6.16: 用户提意"飞书微信不必各配一遍" → 加通用 [general] default_cwd 公共 fallback
       const entry = this.userManager.getEntry(userId);
-      const cwd = entry?.cwd ?? config.get<string>('wecom.default_cwd', '') ?? '/tmp';
+      const cwd = entry?.cwd
+        ?? config.get<string>('wecom.default_cwd', '')
+        ?? config.get<string>('general.default_cwd', '')
+        ?? '/tmp';
 
       if (!existsSync(cwd)) {
         return `❌ 目录不存在: ${cwd}\n\n使用 \`/new <路径>\` 切换到有效目录`;
@@ -932,7 +935,7 @@ export class WecomBot {
       // 仿飞书侧 feishu/bot.ts:2441-2443 同款模式: text || result.response || '(空回复)'
       // PR 6.13: 同步 finalText 变量到前面赋值声明, 因为 let → const 后续不能修改
       const finalText = text || result.response || '(空回复)';
-      logger.info(`[wecom-bot] handleChat finalize: textLen=${text.length} responseLen=${result.response?.length ?? 0} finalTextLen=${finalText.length}`);
+      logger.info(`[wecom-bot] handleChat finalize: textLen=${text.length} thinkingLen=${thinking.length} responseLen=${result.response?.length ?? 0} finalTextLen=${finalText.length}`);
 
       // PR 6.8.3: 兜底 sendMessage 通道 — replyStream 静默失败时用户至少能看到错误
       // 之前 8s 真实企微 E2E: 卡片始终空白, replyStream 调了但 WSS 没真发送

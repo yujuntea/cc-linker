@@ -501,7 +501,8 @@ export class FeishuBot {
       return entry.cwd || this.registry.get(entry.sessionUuid)?.cwd || '';
     }
     if (entry?.cwd) return entry.cwd;
-    return config.get<string>('feishu_bot.default_cwd', '');
+    // PR 6.16: 公共 fallback — 平台级 [feishu_bot].default_cwd → 通用 [general].default_cwd
+    return config.get<string>('feishu_bot.default_cwd', '') || config.get<string>('general.default_cwd', '');
   }
 
   /** Handle card action callback from Feishu (card.action.trigger via WSClient) */
