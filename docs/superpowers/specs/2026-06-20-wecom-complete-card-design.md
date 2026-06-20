@@ -1,10 +1,20 @@
 # cc-linker 企微侧"流式 markdown + 终态完成卡片"设计
 
 **日期：** 2026-06-20
-**版本：** v1.0
+**版本：** v1.1（review 6 处修正）
 **状态：** 待评审
-**作者：** Claude Code（brainstorming + 用户拍板）
+**作者：** Claude Code（brainstorming + 用户拍板 + Claude review 修复）
 **范围：** 企微智能机器人通道终态体验增强——流式输出结束时发一张带按钮的"完成卡片"，复用现有 4 个 case + 新增 3 个 case
+
+### v1.1 修订（review 后 7 处修正）
+
+- **§3.3.1 case 'continue'**：补幂等保护 — 已有 active session / pending session 时提示不覆盖（跟 §3.3.3 表格承诺对齐，避免覆盖用户未保存的状态）
+- **§4.1 WecomTemplateCard 类型**：从新定义改为 `import type { WecomTemplateCard } from './card'`（`card.ts:112` 已定义），避免类型冲突
+- **§4.2.1 lastSession 字段声明**：补 `lastSessionTitle` / `lastSessionUuid` / `lastCwd` 三个字段（不只是 lastUserId）
+- **§4.2.3 complete() 末尾**：修正 send 调用为 `completeCardSender.send(ctx)`（旧写法 `completeCardSender(ctx)` 错） + 字段 fallback `completeCtx?.x ?? this.lastX`
+- **§4.2.2.1（新增）setCompleteCardSender 调用时机**：文档化为"WecomBot 构造后立即调一次"，跟现有 `setMsgFallback` 同模式
+- **§6.3 引用修正**："spec §3.4" → "§1.2 非目标"（引用错）
+- **§4.3.1 删重复**：移除重复的 `setCompleteCardSender` 代码（已在 §4.2.2.1 文档化），只保留 `completeCtx` 传参
 
 ---
 
@@ -166,6 +176,15 @@ async complete(response, tokensIn, tokensOut, durationMs, numTurns,
 ```typescript
 case 'continue': {
   // 等价 /new: setPending + 提示用户发新消息
+  // PR 7.X review fix #1: 幂等保护 — 已有 active session 时不覆盖 (跟 §3.3.3 承诺对齐)
+  const current = await this.userManager.getEntry(event.externalUserId);
+  if (current?.type === 'session' || current?.type === 'pending_new_session') {
+    await this.client.sdk.sendMessage(event.externalUserId, {
+      msgtype: 'markdown',
+      markdown: { content: `⚠️ 已有 ${current.type === 'session' ? '活跃 session' : '待创建 session'}, 不创建新会话\n\n💡 如要新建, 请先 \`/cancel\` 或 \`/stop\`` },
+    });
+    break;
+  }
   await this.userManager.setPending(event.externalUserId, {});
   await this.client.sdk.sendMessage(event.externalUserId, {
     msgtype: 'markdown',
@@ -231,7 +250,9 @@ export type CompleteCardContext = {
   durationMs?: number;
 };
 
-export type WecomTemplateCard = ReturnType<typeof WecomCardBuilder.buttonInteraction>;
+// PR 7.X review fix #2: 不要重新定义 WecomTemplateCard (card.ts:112 已定义),
+//   直接 import 复用, 避免类型冲突 / drift
+import type { WecomTemplateCard } from './card';
 
 export const COMPLETE_CARD_MAIN_BUTTONS: Array<{ key: string; text: string }> = [
   { key: 'continue', text: '🔁 继续' },
@@ -294,8 +315,13 @@ function genCompleteCardTaskId(userId: string): string {
 #### 4.2.1 新增 `lastUserId` 字段 + `setCompleteCardSender` 方法
 
 ```typescript
-private lastUserId: string | null = null;  // PR 7 Task 7.X 新增
-private completeCardSender?: WecomCompleteCardSender;  // PR 7 Task 7.X 新增
+// PR 7.X review fix #3: lastUserId / lastSessionTitle / lastSessionUuid / lastCwd
+//   4 个字段配套声明, 不是只有 lastUserId — complete() 末尾要用全
+private lastUserId: string | null = null;
+private lastSessionTitle: string | undefined = undefined;
+private lastSessionUuid: string | undefined = undefined;
+private lastCwd: string | undefined = undefined;
+private completeCardSender?: WecomCompleteCardSender;
 
 setCompleteCardSender(sender: WecomCompleteCardSender): void {
   this.completeCardSender = sender;
@@ -308,9 +334,23 @@ setCompleteCardSender(sender: WecomCompleteCardSender): void {
 async startProcessing(userId: string, inboundFrame?: any): Promise<string> {
   this.currentStreamId = generateReqId('stream');
   this.lastUserId = userId;  // PR 7 Task 7.X 新增
+  // lastSessionTitle / lastSessionUuid / lastCwd 在 complete() 阶段由 completeCtx 参数注入
+  //   (而不是 startProcessing 阶段, 因为那时还不知道 session 是否创建成功)
   // ... 现有逻辑不变 ...
 }
 ```
+
+#### 4.2.2.1 setCompleteCardSender 调用时机
+
+**PR 7.X review fix #5**: 跟现有 `setMsgFallback` 同模式，在 WecomBot 构造后立即调一次（不每次 handleChat 调一次）。
+
+```typescript
+// src/wecom/bot.ts 构造 / connect 入口:
+this.updater.setMsgFallback(this.sendMarkdownFallback.bind(this));  // 已有
+this.updater.setCompleteCardSender(new WecomCompleteCardSender(this.client.sdk));  // PR 7.X 新增
+```
+
+**生命周期**：sender 是 stateless（每次 send 都新建 card），不持有 per-stream 状态。setter 一次即可，complete 多次调用复用。
 
 #### 4.2.3 `complete` 末尾触发完成卡片
 
@@ -320,11 +360,13 @@ async startProcessing(userId: string, inboundFrame?: any): Promise<string> {
 // PR 7 Task 7.X: 流式关闭后, 主动 sendMessage 完成卡片
 if (this.completeCardSender && this.lastUserId) {
   try {
+    // PR 7.X review fix #4: 修正调用 — completeCardSender 是对象, 调 .send(ctx)
+    //   不是把对象当函数调 (旧 spec §3.2 写法是 this.completeCardSender({...}), 错)
     await this.completeCardSender.send({
       userId: this.lastUserId,
-      sessionTitle: this.lastSessionTitle,
-      sessionUuid: this.lastSessionUuid,
-      cwd: this.lastCwd,
+      sessionTitle: completeCtx?.sessionTitle ?? this.lastSessionTitle,
+      sessionUuid: completeCtx?.sessionUuid ?? this.lastSessionUuid,
+      cwd: completeCtx?.cwd ?? this.lastCwd,
       durationMs: _durationMs,
     });
   } catch (cardErr) {
@@ -353,12 +395,12 @@ async complete(
 
 ### 4.3 改动 `src/wecom/bot.ts`
 
-#### 4.3.1 `handleChat` 注入 `setCompleteCardSender` + 传 completeCtx
+#### 4.3.1 `handleChat` 调 updater.complete 时传 completeCtx
+
+> PR 7.X review fix #7: sender set 已在 §4.2.2.1 文档化（构造后立即调一次），
+> 本节只关注 handleChat 调 complete() 时传 completeCtx。
 
 ```typescript
-// WecomBot 构造或 handleChat 入口:
-this.updater.setCompleteCardSender(new WecomCompleteCardSender(this.client.sdk));
-
 // handleChat 调用 updater.complete 时传 completeCtx:
 await this.updater.complete(
   resultText,
@@ -452,7 +494,7 @@ private async renderActiveSessionsList(userId: string): Promise<void> {
 
 ### 6.3 不测的场景（YAGNI）
 
-- ❌ 多 user 并发完成卡片管理（spec §3.4 单 user 决策）
+- ❌ 多 user 并发完成卡片管理（见 §1.2 非目标，"WecomStreamUpdater 单 user 设计"）
 - ❌ updateTemplateCard 主动 patch（不在本 PR 范围）
 - ❌ 卡片样式 pixel-perfect 验证（视觉验收）
 
