@@ -101,4 +101,38 @@ describe('aibotMessageToPlatform', () => {
     expect(result.chatType).toBe('group');
     expect(result.chatId).toBe('wrg_group456');
   });
+
+  // PR 6.8.2 followup: aibotMessageToPlatform 必须透传 inboundFrame
+  // 历史 bug: aibot-client.ts:122 已写入 inboundFrame: msg (ws 整包, 含 headers.req_id),
+  //   但 aibotMessageToPlatform 不传 → handleMessage.bot.ts:765 拿到 msg.inboundFrame=undefined
+  //   → spool metadata 缺 inboundFrame → handleChat 永远 missing inboundFrame, requeue 60s 循环
+  it('透传 event.inboundFrame 到 PlatformMessage.inboundFrame (PR 6.8.2)', () => {
+    const inboundFrame = {
+      headers: { req_id: 'test-req-123' },
+      body: { msgid: 'm1', chattype: 'single' },
+    };
+    const aibotEvent: AibotMessageEvent = {
+      externalUserId: 'WuYuJun',
+      chatId: 'm1',
+      chatType: 'single',
+      messageId: 'm1',
+      text: 'hi',
+      inboundFrame,
+    };
+    const result = aibotMessageToPlatform(aibotEvent);
+    expect(result.inboundFrame).toBe(inboundFrame);
+    expect(result.inboundFrame?.headers?.req_id).toBe('test-req-123');
+  });
+
+  it('缺 event.inboundFrame 时, result.inboundFrame undefined (向后兼容)', () => {
+    const aibotEvent: AibotMessageEvent = {
+      externalUserId: 'WuYuJun',
+      chatId: 'm1',
+      chatType: 'single',
+      messageId: 'm1',
+      text: 'hi',
+    };
+    const result = aibotMessageToPlatform(aibotEvent);
+    expect(result.inboundFrame).toBeUndefined();
+  });
 });

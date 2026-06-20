@@ -23,6 +23,12 @@ export type AibotMessageEvent = {
   messageId: string;
   text: string;
   images?: Array<{ fileKey: string; url?: string }>;
+  /**
+   * PR 6.8.2: 企微 ws 原始消息整包 (含 headers.req_id 给 replyStream)
+   * aibot-client.ts:122 / 158 / 169 已写入, 但类型之前漏声明 → aibotMessageToPlatform
+   * 无法透传到 PlatformMessage → handleChat 永远 missing inboundFrame.
+   */
+  inboundFrame?: any;
 };
 
 // === 平台无关消息 ===
@@ -36,6 +42,14 @@ export type PlatformMessage = {
   images?: Array<{ fileKey: string; url?: string }>;
   timestamp: number;
   raw: unknown;
+  /**
+   * PR 6.8.2: 企微原始 ws 消息 (含 headers.req_id 给 replyStream)
+   * 历史: aibotMessageToPlatform (PR 5.1 f1b5cbd 时代) 没透传 inboundFrame,
+   *   handleMessage (bot.ts:728) 拿不到, handleChat 永远 missing inboundFrame,
+   *   requeue 60s 循环. 生产 12:38 "hi" 消息复现.
+   * 飞书侧不传 (CardUpdater 用 messageId, 不依赖 inboundFrame).
+   */
+  inboundFrame?: any;
 };
 
 // === 平台无关回复回调 ===
@@ -87,5 +101,7 @@ export function aibotMessageToPlatform(event: AibotMessageEvent): PlatformMessag
     images: event.images,
     timestamp: Date.now(),
     raw: event,
+    // PR 6.8.2: 透传 inboundFrame (aibot ws msg, 含 headers.req_id 供 replyStream)
+    inboundFrame: event.inboundFrame,
   };
 }
