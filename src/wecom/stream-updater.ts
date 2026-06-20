@@ -61,6 +61,11 @@ function renderMarkdown(thinking: string, text: string, toolUses: StreamUpdateTo
   }
   if (text) {
     lines.push(`**回复：**\n${text}`);
+  } else if (!thinking && !toolUses.length) {
+    // PR 6.18: thinking 空时占位提示 (MiniMax-M3 适配 Claude SDK 不全, emit 空 thinking)
+    // 17:25 GLM session 真实验收: thinkingLen=0 但有 response → 用户以为 SDK bug
+    // 修法: 显示占位 '本次回复较快, 未输出思考过程' 让用户知道是模型行为
+    lines.push(`**回复：**\n${text || '_本次回复较快, 模型未输出思考过程_'}`);
   }
   // 末尾加 "⏱ 已用时 Xs" 跟飞书一致 (飞书: ⏱ 已用时 ${elapsedSec}s)
   const elapsedSec = Math.floor(elapsedMs / 1000);
