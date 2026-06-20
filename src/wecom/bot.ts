@@ -165,15 +165,6 @@ export class WecomBot {
   private _dispatchTimer: ReturnType<typeof setTimeout> | null = null;
   private _dispatchSleepResolve: (() => void) | null = null;
   private _dispatchLoopPromise: Promise<void> | null = null;
-  /**
-   * PR 7.3: 缓存最近 session 信息, complete() 末尾用作完成卡片 ctx
-   * setPending 后调用 setLastSessionMeta 记录, complete 时读
-   */
-  private lastSessionTitle: string | undefined = undefined;
-
-  private setLastSessionMeta(meta: { sessionTitle?: string; sessionUuid?: string; cwd?: string }): void {
-    this.lastSessionTitle = meta.sessionTitle;
-  }
 
   constructor(config: WecomBotConfig) {
     this.client = config.client ?? new AibotClient({
@@ -457,6 +448,9 @@ export class WecomBot {
           break;
         // PR 6.13: /listdir 命令 — 列 cwd 下子目录 (仿飞书 doListDir 但简化无 CardKit)
         // 历史: 飞书 /listdir 渲染 CardKit 模板卡片 (buildDirListCard); wecom 推 markdown 列表
+        // PR 7.3 fix #7: 保持原样 (responseText 由 handleCommandListDir 返回)
+        //   走外层 sendMessage (bot.ts:478-483), 避免双推送
+        //   按钮路径 (executeCardAction case 'listdir') 走 renderListDir
         case 'listdir':
           responseText = await this.handleCommandListDir(msg.userId);
           break;
@@ -1082,10 +1076,10 @@ export class WecomBot {
         },
         // PR 6.21: thinking + toolUses 都传给 complete, renderMarkdown 显示完整 "当前操作：" 段
         thinking, toolUses,
-        // PR 7.3: 完成卡片 ctx
-        // 来源: this.lastSessionTitle (setPending 后由 setLastSessionMeta 记录) + result.sessionId + cwd
+        // PR 7.3: 完成卡片 ctx — sessionTitle 暂不传 (handleChat 拿不到, 由 stream-updater
+        //   own lastSessionTitle 兜底, 都是 undefined → 主标题不显示 session 名)
+        //   未来扩展: handleChat 拿到 Claude 第一段响应后可 setLastSessionMeta 记录
         {
-          sessionTitle: this.lastSessionTitle,
           sessionUuid: result.sessionId,  // ClaudeSessionManager 返回值里有 sessionId 字段
           cwd: cwd,
         },
