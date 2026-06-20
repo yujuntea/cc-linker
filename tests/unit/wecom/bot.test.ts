@@ -1,5 +1,53 @@
 import { describe, it, expect, mock, beforeEach } from 'bun:test';
+import { promisify } from 'util';
 import { WecomBot } from '../../../src/wecom/bot';
+
+// ── PR 6 Task 6.3: mock node:child_process (bot.ts handleCommandStop 动态 import) ──
+// Rationale: handleCommandStop 调 `await import('child_process')` + promisify(execFile),
+// 不 mock 的话测试会真去跑 `claude stop <short>` (环境依赖 + 副作用)。
+// 必须在文件顶部声明 mock.module — bun 的 mock 在模块解析前生效。
+//
+// [promisify.custom] 必需: 没这个 symbol 时, promisify(execFile) 走 generic 包装,
+// 拿不到 { stdout, stderr } 而是单个值, 跟生产路径不一致。
+const execFileMock = Object.assign(
+  mock(
+    (
+      _cmd: string,
+      _args: string[],
+      cb: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      // 默认: 成功 + 空 stdout/stderr (覆盖现有 /stop 测试的"环境依赖"分支)
+      cb(null, '', '');
+    },
+  ),
+  {
+    [promisify.custom]: (
+      cmd: string,
+      args: string[],
+    ): Promise<{ stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        execFileMock(cmd, args, (err: Error | null, stdout: string, stderr: string) => {
+          if (err) reject(err);
+          else resolve({ stdout, stderr });
+        });
+      }),
+  },
+);
+
+mock.module('node:child_process', () => {
+  const real = require('node:child_process');
+  return {
+    ...real,
+    execFile: execFileMock,
+  };
+});
+mock.module('child_process', () => {
+  const real = require('node:child_process');
+  return {
+    ...real,
+    execFile: execFileMock,
+  };
+});
 
 describe('WecomBot', () => {
   let mockSpoolQueue: any;
@@ -1694,5 +1742,144 @@ describe('WecomBot handleChat images (PR 6 Task 6.1)', () => {
     const smCall = mockSessionManager.sendStreamingMessage.mock.calls[0];
     expect(smCall[1]).toContain('[图片: fileKey=media-1');
     expect(smCall[1]).toContain('看这张图');
+  });
+});
+
+/**
+ * PR 6 Task 6.3: /stop <shortId> 边界测试
+ *
+ * 背景: PR 5 已在 handleCommandStop 实现 `claude stop <short>` 调用, 但单测只覆盖
+ *   1) 缺参数 (用法错误) + 2) live env 成功/失败 (环境依赖)
+ * 缺: claude 退出码非 0 + 含 stderr 的 deterministic 边界。
+ *
+ * 修法: 在文件顶部 mock node:child_process.execFile (见 imports 段), 此处用
+ *   mockImplementation 注入特定错误场景。
+ *
+ * 关键不变量:
+ * - 缺参数: 永远不走 execFile, 永远返回用法提示 (deterministic)
+ * - claude 退出码非 0: handleCommandStop 走 catch, 返回 `❌ 停止失败: <err.message>`
+ *   err.message 来自 node child_process 错误, 通常含 stderr 内容 (e.g. "Command failed: ...")
+ */
+describe('WecomBot handleCommandStop (PR 6 Task 6.3: edge cases)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setPending: mock(async () => {}),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t63.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+
+    // 每个 case 重置 execFile mock (基线: 成功, 跟生产 promisify custom 行为对齐)
+    execFileMock.mockReset();
+    execFileMock.mockImplementation(
+      (_cmd: string, _args: string[], cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+        cb(null, '', '');
+      },
+    );
+  });
+
+  function makeCmdMsg(text: string, messageId = 'msg_pr6_t63'): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'wmu_abc',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_abc:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: `inb_${messageId}` } } },
+    };
+  }
+
+  it('/stop <shortId> claude 退出码非 0 + stderr "session not found" → 返回错误消息含 stderr', async () => {
+    // mock: claude stop exit 1, stderr 包含 "No job matching 'xxx'"
+    const err = new Error('Command failed: claude stop xxx-bad\nNo job matching \'xxx-bad\'. Run \'claude agents\' to list running sessions.\n') as any;
+    err.code = 1;
+    err.cmd = 'claude stop xxx-bad';
+    err.stderr = 'No job matching \'xxx-bad\'. Run \'claude agents\' to list running sessions.\n';
+    err.killed = false;
+    err.signal = null;
+    execFileMock.mockImplementation(
+      (_cmd, _args, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+        cb(err, '', err.stderr);
+      },
+    );
+
+    await bot.__test_handleCommand(makeCmdMsg('/stop xxx-bad', 'msg_stop_exit_nonzero'));
+
+    // 1. sendMessage 被调 (markdown 错误消息)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    const content = smCall[1].markdown.content;
+
+    // 2. 错误前缀 `❌ 停止失败:`
+    expect(content).toContain('停止失败');
+
+    // 3. err.message 含 cmd + stderr
+    expect(content).toContain('No job matching');
+    expect(content).toContain('xxx-bad');
+
+    // 4. 调 markDone (终态响应, 不 requeue)
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_stop_exit_nonzero', 'cmd:wmu_abc:msg_stop_exit_nonzero');
+  });
+
+  it('/stop <shortId> 成功 (mock execFile 0 退出) → 返回成功消息含 shortId', async () => {
+    // 默认 mock (cb(null, '', '')) 就是成功路径 — 显式重置一次保证独立性
+    execFileMock.mockImplementation(
+      (_cmd, _args, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+        cb(null, 'Stopped background task xxx-ok\n', '');
+      },
+    );
+
+    await bot.__test_handleCommand(makeCmdMsg('/stop xxx-ok', 'msg_stop_success'));
+
+    // 1. sendMessage 被调
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    const content = smCall[1].markdown.content;
+
+    // 2. 成功前缀
+    expect(content).toContain('已停止');
+    expect(content).toContain('xxx-ok');
+
+    // 3. markDone 终态
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_stop_success', 'cmd:wmu_abc:msg_stop_success');
   });
 });
