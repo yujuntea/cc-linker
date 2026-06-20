@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'bun:test';
 import { WecomStreamUpdater } from '../../../src/wecom/stream-updater';
+import { WecomCompleteCardSender } from '../../../src/wecom/complete-card';
 
 const mockInboundFrame = (id = 'inbound_1') => ({ headers: { req_id: id } });
 
@@ -156,5 +157,78 @@ describe('WecomStreamUpdater', () => {
     // 修法: 改用 this.throttleMs (per-instance) 替代 hardcoded 2000
     // PR 6.10: 2000 → 1500, 跟飞书侧 CardUpdater throttle_ms=1500 对齐, 流式增量刷新更快
     expect((WecomStreamUpdater as any).THROTTLE_MS).toBe(1500);
+  });
+});
+
+describe('PR 7.2: complete() 触发 completeCardSender.send', () => {
+  let mockSdk: any;
+  let mockSender: any;
+  let updater: WecomStreamUpdater;
+
+  beforeEach(() => {
+    mockSdk = {
+      replyStream: (...args: any[]) => Promise.resolve({}),
+    };
+    mockSender = {
+      sendCalls: [] as any[],
+      send: (ctx: any) => {
+        mockSender.sendCalls.push(ctx);
+        return Promise.resolve();
+      },
+    };
+    updater = new WecomStreamUpdater(mockSdk, { throttleMs: 100 });
+    updater.setCompleteCardSender(mockSender as any);
+  });
+
+  it('does NOT call sender.send when not injected', async () => {
+    // 验证默认行为: 不注入 sender → 不发卡片 (向后兼容)
+    const updater2 = new WecomStreamUpdater(mockSdk, { throttleMs: 100 });
+    await updater2.startProcessing('user-1', mockInboundFrame());
+    await updater2.complete('完成内容', 100, 200, 5000, 1);
+    // 不抛错, 不调 mockSender (没注入)
+    expect(true).toBe(true);
+  });
+
+  it('calls sender.send with userId/duration after complete() success', async () => {
+    await updater.startProcessing('user_42', mockInboundFrame());
+    await updater.complete('完成内容', 100, 200, 5500, 1, undefined, '思考内容', [], {
+      sessionTitle: '测试 session',
+      sessionUuid: 'uuid-abc',
+      cwd: '/tmp',
+    });
+    expect(mockSender.sendCalls.length).toBe(1);
+    const sent = mockSender.sendCalls[0];
+    expect(sent.userId).toBe('user_42');
+    expect(sent.durationMs).toBe(5500);
+    expect(sent.sessionTitle).toBe('测试 session');
+    expect(sent.sessionUuid).toBe('uuid-abc');
+    expect(sent.cwd).toBe('/tmp');
+  });
+
+  it('PR 7.2 review: sender.send failure does NOT break complete()', async () => {
+    // sender.send 抛错 → complete() 不应 reject (流式输出已成功, 不能让卡片失败冒泡)
+    mockSender.send = () => Promise.reject(new Error('mock sendMessage fail'));
+    await updater.startProcessing('user_x', mockInboundFrame());
+    // 不应 reject
+    await updater.complete('done', 1, 2, 3000, 1);
+    // 验证: 没有 propagate error
+    expect(true).toBe(true);
+  });
+
+  it('PR 7.2 review: sender.send is called AFTER replyStream(finish=true) completes', async () => {
+    const order: string[] = [];
+    mockSdk.replyStream = (...args: any[]) => {
+      order.push(`replyStream(finish=${args[3]})`);
+      return Promise.resolve({});
+    };
+    mockSender.send = (ctx: any) => {
+      order.push('sender.send');
+      return Promise.resolve();
+    };
+    await updater.startProcessing('user_y', mockInboundFrame());
+    // 跳过 startProcessing 自身的 replyStream(false), 只断言 complete() 末尾两步顺序
+    order.length = 0;
+    await updater.complete('done', 1, 2, 3000, 1);
+    expect(order).toEqual(['replyStream(finish=true)', 'sender.send']);
   });
 });

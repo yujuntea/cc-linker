@@ -7,6 +7,7 @@
 import type { WSClient, WsFrame } from '@wecom/aibot-node-sdk';
 import { generateReqId } from '@wecom/aibot-node-sdk';
 import type { StreamUpdater, StreamUpdateToolUse } from '../platform/stream-updater';
+import type { WecomCompleteCardSender } from './complete-card';
 import { logger } from '../utils/logger';
 
 const STREAM_CONTENT_MAX_BYTES = 20480; // SDK 硬限制
@@ -96,6 +97,15 @@ export class WecomStreamUpdater implements StreamUpdater {
    * 若未来需多 user 并发, 改为 Map<userId, {streamId, frame}> 并同步 startProcessing/complete/error/cancel。
    */
   private lastInboundFrame: any = null;
+  /**
+   * PR 7.2: 流式上下文, complete() 末尾用作完成卡片 ctx
+   * - lastUserId: startProcessing 时记录
+   * - lastSessionTitle/UUID/Cwd: complete() 时由 completeCtx 可选参数注入
+   */
+  private lastUserId: string | null = null;
+  private lastSessionTitle: string | undefined = undefined;
+  private lastSessionUuid: string | undefined = undefined;
+  private lastCwd: string | undefined = undefined;
   private buffer: BufferedChunk | null = null;
   private lastFlushAt = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -116,6 +126,16 @@ export class WecomStreamUpdater implements StreamUpdater {
    */
   setMsgFallback(fn: (text: string) => Promise<void>): void {
     this.msgFallback = fn;
+  }
+
+  /**
+   * PR 7.2: 注入完成卡片 sender (跟现有 setMsgFallback 同模式)
+   * 调用方: WecomBot 构造后立即调一次 (stateless, 多次 complete 复用)
+   */
+  private completeCardSender?: WecomCompleteCardSender;
+
+  setCompleteCardSender(sender: WecomCompleteCardSender): void {
+    this.completeCardSender = sender;
   }
 
   /**
@@ -144,6 +164,8 @@ export class WecomStreamUpdater implements StreamUpdater {
     }
     // 存下 inboundFrame 供 complete/error/cancel/flushBuffer 复用
     this.lastInboundFrame = inboundFrame;
+    // PR 7.2: 记录 userId, complete() 末尾用作完成卡片 ctx
+    this.lastUserId = userId;
     const initialMarkdown = '🤔 思考中...';
     try {
       const wsFrame = await this.sdk.replyStream(inboundFrame, this.currentStreamId, this.truncate(initialMarkdown), false) as any;
@@ -274,6 +296,8 @@ export class WecomStreamUpdater implements StreamUpdater {
     //   '**思考过程：**\n{thinking}\n\n**当前操作：**\n...\n\n**回复：**\n{response}'
     thinking?: string,
     toolUses?: StreamUpdateToolUse[],
+    // PR 7.2: 上下文传给完成卡片 (sessionTitle/UUID/cwd)
+    completeCtx?: { sessionTitle?: string; sessionUuid?: string; cwd?: string },
   ): Promise<void> {
     if (!(await this.prepareTerminal())) return;
     const t = this.getTerminalFrame();
@@ -303,6 +327,21 @@ export class WecomStreamUpdater implements StreamUpdater {
         } catch (fbErr) {
           logger.error(`[wecom-stream] complete fallback sendMessage also failed: ${fbErr instanceof Error ? fbErr.message : String(fbErr)}`);
         }
+      }
+    }
+    // PR 7.2: 流式关闭后, 主动 sendMessage 完成卡片
+    // 防御: sendMessage 失败不能影响已发流式 (用户已看到 finalMarkdown)
+    if (this.completeCardSender && this.lastUserId) {
+      try {
+        await this.completeCardSender.send({
+          userId: this.lastUserId,
+          sessionTitle: completeCtx?.sessionTitle ?? this.lastSessionTitle,
+          sessionUuid: completeCtx?.sessionUuid ?? this.lastSessionUuid,
+          cwd: completeCtx?.cwd ?? this.lastCwd,
+          durationMs: _durationMs,
+        });
+      } catch (cardErr) {
+        logger.warn(`[wecom-stream] complete card send failed: ${cardErr instanceof Error ? cardErr.message : String(cardErr)}`);
       }
     }
     this.clearTerminalState();
@@ -342,6 +381,11 @@ export class WecomStreamUpdater implements StreamUpdater {
   private clearTerminalState(): void {
     this.currentStreamId = null;
     this.lastInboundFrame = null;
+    // PR 7.2: 清理流式上下文, 避免下次 complete 误用上次的 userId
+    this.lastUserId = null;
+    this.lastSessionTitle = undefined;
+    this.lastSessionUuid = undefined;
+    this.lastCwd = undefined;
   }
 
   private truncate(content: string): string {
