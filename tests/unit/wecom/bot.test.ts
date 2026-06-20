@@ -2428,3 +2428,35 @@ describe('WecomBot stop (PR 7 Task 7.5: M-2 立即中断 dispatch loop)', () => 
     expect(m2Client.disconnect).toHaveBeenCalled();
   });
 });
+
+/**
+ * PR 7 Task 7.6 (m-2): handleChat onProgress 闭包提取独立函数
+ *
+ * 历史: bot.ts handleChat 内的 onProgress 闭包用 let thinking='', let text='' 累加,
+ *   闭包逻辑 (chunk.type === 'thinking' / 'text' 累加) 没复用性、单测覆盖差。
+ * 修法: 提独立函数 appendChunk(state, chunk), 让单测直接验证逻辑分支
+ *   (不再依赖 mock sessionManager.sendStreamingMessage 路径)
+ */
+describe('WecomBot handleChat appendChunk (PR 7 Task 7.6: m-2 闭包提取)', () => {
+  // m-2 测试要点: appendChunk 必须导出, 接受 {thinking, text} state + StreamChunk,
+  //   按 chunk.type 累加对应字段, 不返回新对象 (mutate state, 跟生产路径一致)
+  it('m-2: appendChunk 导出且累加 thinking chunk', async () => {
+    const mod = await import('../../../src/wecom/bot');
+    expect(typeof (mod as any).appendChunk).toBe('function');
+
+    const state = { thinking: '', text: '' };
+    (mod as any).appendChunk(state, { type: 'thinking', content: 'A' });
+    (mod as any).appendChunk(state, { type: 'thinking', content: 'B' });
+    expect(state.thinking).toBe('AB');
+    expect(state.text).toBe('');
+  });
+
+  it('m-2: appendChunk 累加 text chunk', async () => {
+    const mod = await import('../../../src/wecom/bot');
+    const state = { thinking: '', text: '' };
+    (mod as any).appendChunk(state, { type: 'text', content: 'hello' });
+    (mod as any).appendChunk(state, { type: 'text', content: ' world' });
+    expect(state.text).toBe('hello world');
+    expect(state.thinking).toBe('');
+  });
+});

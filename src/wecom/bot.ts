@@ -18,6 +18,24 @@ import type { ClaudeSessionManager } from '../proxy/session';
 import type { StreamChunk } from '../proxy/stream-parser';
 import { RegistryManager } from '../registry/registry';
 
+/**
+ * PR 7 m-2: appendChunk 累加器 — 把 handleChat onProgress 闭包里的累加逻辑
+ * 提到独立函数, 让单测直接验证分支 (chunk.type === 'thinking' / 'text')。
+ *
+ * 行为约定:
+ * - thinking chunk → state.thinking += chunk.content
+ * - text chunk → state.text += chunk.content
+ * - mutate state in place (跟原闭包一致), 返回 void
+ * - 其他 chunk.type 静默忽略 (跟原逻辑一致)
+ */
+export function appendChunk(
+  state: { thinking: string; text: string },
+  chunk: StreamChunk,
+): void {
+  if (chunk.type === 'thinking') state.thinking += chunk.content;
+  else if (chunk.type === 'text') state.text += chunk.content;
+}
+
 export type WecomBotConfig = {
   botId: string;
   secret: string;
@@ -628,11 +646,11 @@ export class WecomBot {
       const lockKey: string = isNewSession ? `new:${msg.userId}` : existingSessionUuid!;
 
       // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text + throttle patch
+      // PR 7 m-2: 累加逻辑提取为 appendChunk, 让单测直接验证分支
       const result = await this.sessionManager.sendStreamingMessage(
         sessionId, msg.text, cwd,
         (chunk: StreamChunk) => {
-          if (chunk.type === 'thinking') thinking += chunk.content;
-          else if (chunk.type === 'text') text += chunk.content;
+          appendChunk({ thinking, text }, chunk);
           const elapsed = Date.now() - startTime;
           this.updater.updateStream(thinking, text, elapsed).catch(e =>
             logger.warn(`[wecom-bot] updateStream failed: ${e instanceof Error ? e.message : String(e)}`)
