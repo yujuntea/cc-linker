@@ -811,7 +811,7 @@ export class WecomBot {
         }
         const sessions = await this.registryManager.listActive();
         const card = WecomCardBuilder.textNotice({
-          title: `飞书 sessions (${sessions.length})`,
+          title: `活跃 sessions (${sessions.length})`,
           content: sessions.length === 0
             ? '无 active session'
             : sessions.slice(0, 5).map(s => `• ${s.title ?? '(无标题)'} (${s.message_count ?? 0} msgs)`).join('\n'),
