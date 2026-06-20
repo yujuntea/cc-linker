@@ -653,6 +653,69 @@ describe('PR 7.3: executeCardAction 已有 4 case (从 action_menu 进) 仍 work
     expect(true).toBe(true);  // 不抛错
   });
 });
+
+/**
+ * PR 7.4 review fix C: 集成测试 — handleChat 调 updater.complete 时是否传 completeCtx
+ * 这个测试覆盖 PR 7.2 + PR 7.3 的连接处: complete() 末尾应触发 sender.send(ctx)
+ *
+ * 覆盖 spec §3.2 (完成卡片发送时机) + §4.2 (stream-updater 改动)
+ */
+describe('PR 7.3 集成: handleChat → updater.complete → completeCardSender.send', () => {
+  it('handleChat 流式完成后, sender.send 被调一次 + ctx 含 sessionTitle/UUID/cwd', async () => {
+    // 构造最小可工作 WecomBot: 只 mock 必要依赖 (updater + sender + sdk)
+    const sentMessages: any[] = [];
+    const senderCalls: any[] = [];
+    const mockSdk = {
+      sendMessage: (chatid: string, body: any) => { sentMessages.push({ chatid, body }); return Promise.resolve({}); },
+      replyWelcome: () => Promise.resolve({}),
+      replyStream: () => Promise.resolve({}),
+    };
+    const mockClient = {
+      sdk: mockSdk,
+      onCardAction: () => {},
+      onMessage: () => {},
+      connect: () => {},
+      disconnect: () => {},
+    };
+    const mockSpoolQueue = {
+      enqueue: () => Promise.resolve(),
+      markDone: () => Promise.resolve(),
+    };
+    const bot = new WecomBot({
+      botId: 'test', secret: 'test',
+      userMappingPath: '/tmp/test-mapping-pr74-integration.json',
+      client: mockClient as any,
+      spoolQueue: mockSpoolQueue as any,
+    });
+    // 替换 updater: 真实 complete() 逻辑, 但 mock SDK replyStream + record sender call
+    const { WecomCompleteCardSender } = await import('../../../src/wecom/complete-card');
+    bot.updater.setCompleteCardSender({
+      send: async (ctx: any) => { senderCalls.push(ctx); },
+    } as any);
+
+    // 模拟 handleChat 流式完成后调 complete(...)
+    await bot.updater.startProcessing('wmu_test_user', { headers: { req_id: 'req_integration' } });
+    await bot.updater.complete(
+      'final response', 100, 200, 5000, 1,
+      undefined,  // msgFallback
+      'thinking content',  // thinking
+      [],  // toolUses
+      // completeCtx (PR 7.3 关键: 这里传, 看是否传到 sender.send)
+      {
+        sessionTitle: '集成测试 session',
+        sessionUuid: 'uuid-integration',
+        cwd: '/tmp',
+      },
+    );
+
+    // 验证 sender.send 被调一次 + ctx 含 sessionTitle
+    expect(senderCalls.length).toBe(1);
+    expect(senderCalls[0].userId).toBe('wmu_test_user');
+    expect(senderCalls[0].sessionTitle).toBe('集成测试 session');
+    expect(senderCalls[0].sessionUuid).toBe('uuid-integration');
+    expect(senderCalls[0].cwd).toBe('/tmp');
+  });
+});
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -948,6 +1011,26 @@ bun run deploy
 ```
 
 **绝不**绕过 Step 7.5 恢复 config — 会导致生产 daemon 持续故障。
+
+- [ ] **Step 7.0 (前置): 验证当前发送者是 owner external_userid**
+
+**PR 7.4 review fix D**: handleClaimed 入口有 validateOwner 检查（bot.ts:handleClaimed），
+非 owner userId 的消息会被拒绝（"❌ 未授权用户"）。
+点按钮触发的卡片回调也走 handleCardAction → executeCardAction，
+但不走 handleClaimed — **直接执行按钮逻辑**，不需要 owner 校验。
+但**发消息触发流式输出**（Step 2/3）必须是 owner，否则 handleChat 拒绝。
+
+```bash
+# 查看当前 owner 配置
+grep "owner_external_user_id" ~/.cc-linker/config.toml
+
+# 如果未配置, 临时加你自己的 external_userid (从企业微信 App 找):
+# 我的 external_userid 是: wmu_xxxxxx (从 app "我"页面看)
+sed -i '' 's/^# owner_external_user_id = ""/owner_external_user_id = "wmu_xxxxxx"/' ~/.cc-linker/config.toml
+bun run deploy
+```
+
+> 真机测试时**只用 owner user** 跟 bot 对话, 不要用其他同事的账号 — 会被 owner 校验拒绝。
 
 - [ ] **Step 8: 跑最后一遍全套测试 + typecheck**
 
