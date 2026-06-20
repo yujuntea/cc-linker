@@ -132,6 +132,24 @@ describe('WecomBot', () => {
     expect(enqueuedMsg.serialKey).toBe('new:wmu_abc');
   });
 
+  // PR 7 Task 7.6 (m-15): 锁住 chatId 持久化行为 (PR 5.1 f1b5cbd 已加, 写测试锁住避免回归)
+  it('m-15: handleMessage 写入 metadata.chatId + chatType (PR 5.1 f1b5cbd 锁行为)', async () => {
+    bot.start();
+    await messageHandlers[0]({
+      externalUserId: 'wmu_abc',
+      // 群聊场景: chatId (群id) ≠ userId (发送者id), 历史上 hardcoded userId 会导致
+      //   sendMessage 发错对象
+      chatId: 'wroup_xyz',
+      chatType: 'group',
+      messageId: 'msg_group_001',
+      text: 'hello',
+    });
+    await new Promise(r => setTimeout(r, 50));
+    const enqueuedMsg = mockSpoolQueue.enqueue.mock.calls[0][0];
+    expect(enqueuedMsg.metadata.chatId).toBe('wroup_xyz');
+    expect(enqueuedMsg.metadata.chatType).toBe('group');
+  });
+
   it('card action handler calls replyWelcome within 5s', async () => {
     bot.start();
     expect(cardHandlers).toHaveLength(1);
