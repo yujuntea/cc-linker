@@ -161,6 +161,52 @@ export class WecomUserManager extends PlatformUserManager {
   }
 
   /**
+   * PR 6.22: 真 CAS 修 TOCTOU bug (review Issue #4)
+   *
+   * 历史: handleChat spawn Claude 期间用户可能新发 /new 覆盖 pending, 老版 setSession
+   *   无 CAS 检查直接覆盖 entry, 会冲掉用户的最新 /new. 旧版简单 cwd 比较有 race:
+   *   getEntry 和 setSession 之间还有时间窗, 多次 /new cwd 相同时假阳性.
+   * 修法: 用 entry.casToken 做严格 CAS — spawn 时记 token, setSession 前再读一次
+   *   entry 验证 token 没变才 set. 失败返回 false (caller 跳过 setSession).
+   *
+   * 防御: 当 expectedCasToken 不匹配时, 跳过 setSession — 让用户后续消息走最新 mapping,
+   *   而不是覆盖最新 /new.
+   */
+  async trySetSession(
+    externalUserId: string,
+    expectedCasToken: string,
+    sessionUuid: string,
+    cwd: string,
+  ): Promise<boolean> {
+    let ok = false;
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const current = mapping.entries[externalUserId];
+      // CAS: 当前 entry casToken 必须 === expected, 否则 race (用户并发 /new)
+      if (!current || current.casToken !== expectedCasToken) {
+        ok = false;
+        return;
+      }
+      const now = new Date().toISOString();
+      mapping.entries[externalUserId] = {
+        type: 'session',
+        sessionUuid,
+        cwd,
+        createdAt: current.createdAt ?? now,
+        lastActiveAt: now,
+        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        claimedByMessageId: undefined,
+        claimedAt: undefined,
+      };
+      mapping.version++;
+      this.saveMapping(mapping);
+      ok = true;
+    });
+    return ok;
+  }
+
+  /**
    * PR 4.5: 续聊时更新 lastActiveAt
    *
    * 历史: handleChat 续聊走 sessionManager.sendStreamingMessage 拿到 result.sessionId，

@@ -632,39 +632,34 @@ export class ClaudeSessionManager {
           const lines = stdoutBuffer.split('\n');
           stdoutBuffer = lines.pop() ?? '';
           for (const line of lines) {
-            const parsed = parser.parseLine(line);
-            if (parsed) {
-              if (parsed.type === 'result') {
-                lastResult = parsed as ResultChunk;
+            const parsed = parser.parseLine(line);  // PR 6.22: 返回数组
+            for (const chunk of parsed) {
+              if (chunk.type === 'result') {
+                lastResult = chunk as ResultChunk;
                 // PR 6.19: 把 result.result 内容也 emit 为 text chunk 让 state.text 累积
-                // 历史: MiniMax-M3 不 emit thinking chunks (空内容), 但 result.result 字段
-                //   含详细分析内容 (用户截图 17:25 显示 "要不要再深挖?" 详细列表就是
-                //   result.result 内容). 不派发 → handleChat 拿不到 → renderMarkdown 看不到.
-                // 修法: result.result 有内容时也 emit 一个 text chunk, 跟 assistant text 一样累积
-                // 注意: result 一定是最后 emit, 不会跟前面的 assistant text 重复
-                const resultText = (parsed as ResultChunk).result;
+                const resultText = (chunk as ResultChunk).result;
                 if (resultText) {
                   wrappedOnProgress({ type: 'text', content: resultText });
                 }
               } else {
-                wrappedOnProgress(parsed);
+                wrappedOnProgress(chunk);
               }
             }
           }
         }
         // Handle remaining buffer
         if (stdoutBuffer.trim()) {
-          const parsed = parser.parseLine(stdoutBuffer);
-          if (parsed) {
-            if (parsed.type === 'result') {
-              lastResult = parsed as ResultChunk;
+          const parsed = parser.parseLine(stdoutBuffer);  // PR 6.22: 返回数组
+          for (const chunk of parsed) {
+            if (chunk.type === 'result') {
+              lastResult = chunk as ResultChunk;
               // PR 6.19: 同上, 派发 result.result 到 text chunk
-              const resultText = (parsed as ResultChunk).result;
+              const resultText = (chunk as ResultChunk).result;
               if (resultText) {
                 wrappedOnProgress({ type: 'text', content: resultText });
               }
             } else {
-              wrappedOnProgress(parsed);
+              wrappedOnProgress(chunk);
             }
           }
         }

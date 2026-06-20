@@ -944,6 +944,8 @@ export class WecomBot {
           ? '/tmp'
           : (existingEntry?.cwd ?? '/tmp');
       const lockKey: string = isNewSession ? `new:${msg.userId}` : existingSessionUuid!;
+      // PR 6.22: spawn 时记 entry.casToken, setSession 前 CAS 验证 (P1#5 真 CAS 修 TOCTOU)
+      const spawnEntryCasToken = isPending ? (existingEntry?.casToken ?? null) : null;
 
       // 3. 调 ClaudeSessionManager 流式 — onProgress 累加 thinking/text/toolUses + throttle patch
       // PR 7 m-2 + PR 6.20 + PR 6.21: appendChunk 返回新 state 对象, caller 必须 re-assign
@@ -974,20 +976,18 @@ export class WecomBot {
       // - 新建场景: 调 setSession 直接 set (跳过 claim 流程, 企微侧简化)
       // - 续聊场景: session 没变, 调 touchSession 刷 lastActiveAt
       //
-      // PR 6.21 P1#5: CAS 保护 - 处理期间用户可能新发 /new 覆盖 pending
-      // 旧版直接 setSession 无 CAS, 会覆盖用户的最新 /new. 修法:
-      //   pending 场景先 CAS 验证 entry.cwd 没变; 其他场景直接 setSession.
+      // PR 6.21 P1#5 + PR 6.22 真 CAS 修 TOCTOU:
+      // 历史: 旧版用 cwd 比较 (PR 6.21 P1#5), 但 getEntry 和 setSession 之间有时间窗,
+      //   多次 /new cwd 相同时假阳性. 修法: spawn 时记 entry.casToken, setSession 前
+      //   验证 casToken 没变 (真 CAS). 失败跳过 setSession — 让用户后续消息走最新 mapping.
       if (isNewSession) {
-        if (isPending) {
-          // 验证原 pending cwd 没被新 /new 覆盖
-          const currentEntry = this.userManager.getEntry(msg.userId);
-          const currentCwd = currentEntry?.cwd ?? '/tmp';
-          if (currentCwd === cwd && currentEntry?.type === 'pending_new_session') {
-            await this.userManager.setSession(msg.userId, result.sessionId, cwd);
-            logger.info(`[wecom-bot] handleChat: 新建 session 已持久化 (pending CAS 验证) userId=${msg.userId} sessionUuid=${result.sessionId}`);
+        if (isPending && spawnEntryCasToken) {
+          // CAS: 验证 spawn 时的 casToken 跟当前一致 (没被并发 /new 改写)
+          const ok = await this.userManager.trySetSession(msg.userId, spawnEntryCasToken, result.sessionId, cwd);
+          if (ok) {
+            logger.info(`[wecom-bot] handleChat: 新建 session 已持久化 (pending CAS 成功) userId=${msg.userId} sessionUuid=${result.sessionId}`);
           } else {
-            // CAS 失败: 用户在 spawn 期间发了新 /new, 不覆盖, 让用户后续消息触发新 session
-            logger.warn(`[wecom-bot] handleChat: pending CAS 失败 (cwd 变化 或类型已变), 跳过 setSession. userId=${msg.userId}`);
+            logger.warn(`[wecom-bot] handleChat: pending CAS 失败 (casToken 变化, 用户并发 /new), 跳过 setSession. userId=${msg.userId}`);
           }
         } else {
           // 非 pending 场景 (例如用户发了消息但没 /new, 走 fallback /tmp new path)
@@ -1150,12 +1150,7 @@ export class WecomBot {
     logger.info(`[wecom-bot] card action: userId=${event.externalUserId}, actionTag=${event.actionTag}`);
 
     // 1. 5s 内 replyWelcome 发占位卡片
-    // PR 6.11 警告: textNotice 必须带 card_action, 但 replyWelcome 是 SDK 内置欢迎语通道
-    //   (走不同 SDK 内部路径), textNotice 在这可能仍然 42045. 先试 markdown (errcode 0 已知 OK)
-    const placeholderCard = WecomCardBuilder.textNotice({
-      title: '处理中...',
-      content: `执行 ${event.actionTag}...`,
-    });
+    // PR 6.22 修复 #3: 删 placeholderCard 死代码 (PR 6.11 改用 text msgtype 后未使用)
     let replyWelcomeOk = false;
     try {
       // PR 2 v1.2.1 final (F7 修复): 拒绝 fallback 到 messageId（那是发给用户的原消息 ID，

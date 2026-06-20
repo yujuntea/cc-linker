@@ -3173,4 +3173,56 @@ describe('WecomBot handleChat appendChunk (PR 7 Task 7.6: m-2 + PR 6.20 修复)'
     expect(state.thinking).toBe('thinking1 thinking2');
     expect(state.text).toBe('text1 text2');
   });
+
+  it('PR 6.21: tool_use chunk 累加到 toolUses 数组 (含 input 摘要)', async () => {
+    // 模拟 Claude 用 Bash 工具: 累积 toolUses 让 stream-updater renderMarkdown 显示 "当前操作："
+    const mod = await import('../../../src/wecom/bot');
+    let state = { thinking: '', text: '', toolUses: [] };
+    state = (mod as any).appendChunk(state, {
+      type: 'tool_use',
+      id: 'toolu_abc',
+      name: 'Bash',
+      input: { command: 'ls -la /tmp' },
+    });
+    state = (mod as any).appendChunk(state, {
+      type: 'tool_use',
+      id: 'toolu_def',
+      name: 'Read',
+      input: { file_path: '/etc/hostname' },
+    });
+    expect(state.toolUses).toHaveLength(2);
+    expect(state.toolUses[0].name).toBe('Bash');
+    expect(state.toolUses[0].inputSummary).toContain('ls -la /tmp');
+    expect(state.toolUses[1].name).toBe('Read');
+    expect(state.toolUses[1].inputSummary).toContain('/etc/hostname');
+  });
+
+  it('PR 6.21: tool_use chunk 不影响 thinking/text 累积', async () => {
+    // 工具调用期间 thinking/text 也可能 emit, 应独立累积
+    const mod = await import('../../../src/wecom/bot');
+    let state = { thinking: '', text: '', toolUses: [] };
+    state = (mod as any).appendChunk(state, { type: 'thinking', content: '思考中...' });
+    state = (mod as any).appendChunk(state, {
+      type: 'tool_use', id: 'x', name: 'Grep',
+      input: { pattern: 'foo' },
+    });
+    state = (mod as any).appendChunk(state, { type: 'text', content: '完成' });
+    expect(state.thinking).toBe('思考中...');
+    expect(state.text).toBe('完成');
+    expect(state.toolUses).toHaveLength(1);
+    expect(state.toolUses[0].name).toBe('Grep');
+  });
+
+  it('PR 6.21: tool_use input 摘要截断 (避免 markdown 卡片过长)', async () => {
+    // input 大对象 → inputSummary 截断到 80 字符
+    const mod = await import('../../../src/wecom/bot');
+    let state = { thinking: '', text: '', toolUses: [] };
+    const hugeInput = { data: 'x'.repeat(500) };
+    state = (mod as any).appendChunk(state, {
+      type: 'tool_use', id: 'x', name: 'Write',
+      input: hugeInput,
+    });
+    expect(state.toolUses[0].inputSummary.length).toBeLessThanOrEqual(80);
+    expect(state.toolUses[0].inputSummary).toContain('x');
+  });
 });
