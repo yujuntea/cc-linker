@@ -358,9 +358,12 @@ export class WecomBot {
 
     logger.info(`[wecom-bot] handleCommand: cmd=/${parsed.cmd} args=${JSON.stringify(parsed.args)} userId=${msg.userId}`);
 
-    // PR 6.9: /list 改 template_card 列表 (推回逻辑不统一, 直接走 handleCommandListCard)
-    // 历史: case 'list' 走 handleCommandList 返回 markdown, 但用户期望 multi-session list 卡片
-    // 修法: case 'list' 直接 await handleCommandListCard (内部 sendMessage template_card + markDone),
+    // PR 6.9 + PR 6.11: /list 改 multi-session markdown 列表 (推回逻辑不统一, 直接走 handleCommandListCard)
+    // 历史: case 'list' 走 handleCommandList 返回 markdown, 但用户期望 multi-session 列表
+    // PR 6.9 改成 template_card (textNotice), 但 aibot 服务端 textNotice 类型必须带 card_action,
+    //   errcode=42045 "Template_Card card_action Missing or Invalid"
+    // PR 6.11: 改成 markdown 消息, 保留多 session 渲染逻辑
+    // 修法: case 'list' 直接 await handleCommandListCard (内部 sendMessage markdown + markDone),
     //   跳过后续统一 sendMessage 推送路径 (return 跳出 handleCommand)
     if (parsed.cmd === 'list') {
       await this.handleCommandListCard(msg);
@@ -466,32 +469,37 @@ export class WecomBot {
   }
 
   /**
-   * PR 6.9: /list 命令新实现 — 推 multi-session template_card
+   * PR 6.9 + PR 6.11: /list 命令新实现 — 推 multi-session markdown 列表
    *
-   * 历史: PR 4.5 C 旧 handleCommandList 只显示当前 user 关联的 session 详情,
-   *   用户期望看到 "会话列表" (multi-session 可选), 跟飞书侧 /list 行为对齐
-   *   (飞书 /list 调 registryManager.listActive() 渲染 interactive card 列表)。
+   * 历史:
+   * - PR 4.5 C 旧 handleCommandList 只显示当前 user 关联的 session 详情, 用户期望 multi-session 列表
+   * - PR 6.9 改成 template_card (textNotice), 但 textNotice 类型必须带 card_action.type=1/2,
+   *   没 action_menu 时 aibot 服务端 errcode=42045 "Template_Card card_action Missing or Invalid"
+   *   (微信开放社区: 文本通知型卡片字段取值范围是1.2,不能设置为0)
+   * - PR 6.11 改成 markdown 消息, 保留多 session 渲染逻辑
    *
    * 修法:
-   * - 拉 registryManager.listActive() 拿全部 active sessions
-   * - WecomCardBuilder.textNotice 渲染成 template_card (跟 list-refresh action 共用渲染逻辑)
-   * - sendMessage template_card 推回
+   * - 拉 registryManager.sessions (Record<uuid, SessionEntry>) 拿完整 uuid + metadata
+   * - 按 last_active 倒序取前 10 条
+   * - 标当前 user session 为 👉
+   * - 渲染成 markdown (title 加重 / uuid 标 code block)
+   * - sendMessage markdown 推回
    * - markDone 收尾
    *
    * 防御:
-   * - registryManager 未注入 → 退到 handleCommandList 老 markdown 路径 (向后兼容 wecom-only staging)
+   * - registryManager 未注入 → 退到老 handleCommandList (向后兼容 wecom-only staging)
    * - sendMessage throw → requeueFromProcessing (跟统一推送路径一致)
    */
   private async handleCommandListCard(msg: SpoolMessage): Promise<void> {
     logger.info(`[wecom-bot] handleCommandListCard: userId=${msg.userId}`);
 
-    // 1. 渲染列表 card
-    let card: TemplateCard;
+    // 1. 渲染列表 markdown
+    let markdown: string;
     if (this.registryManager) {
       try {
         // PR 6.9: 用 registryManager.sessions (Record<uuid, SessionEntry>) 拿完整 uuid
         // listActive() 返回 SessionEntry[] 没 uuid, 反查 O(n²) 不好
-        // 注意: sessions 是 in-memory cache (start.ts syncBeforeCommand 已 flush 最新数据)
+        // sessions 是 in-memory cache (start.ts syncBeforeCommand 已 flush 最新数据)
         const allActive = this.registryManager.sessions;
         const activeEntries = Object.entries(allActive)
           .filter(([_, s]) => s.status === 'active')
@@ -500,19 +508,21 @@ export class WecomBot {
         const currentEntry = this.userManager.getEntry(msg.userId);
         const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
         const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
-        const contentLines = activeEntries.length === 0
-          ? ['📭 当前无 active session']
-          : activeEntries.map(([uuid, s]) => {
-              const marker = uuid === currentUuid ? '👉 ' : '   ';
-              const title = s.title ?? '(无标题)';
-              const cwd = s.cwd ? ` \`${s.cwd}\`` : '';
-              const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
-              return `${marker}**${title}**${msgs}${cwd}\n   \`${uuid.slice(0, 8)}…\``;
-            });
-        card = WecomCardBuilder.textNotice({
-          title: `📋 活跃 sessions (${activeEntries.length}${totalActive > 10 ? '+' : ''})`,
-          content: contentLines.join('\n\n'),
-        });
+        if (activeEntries.length === 0) {
+          markdown = '📭 当前无 active session';
+        } else {
+          const header = `📋 **活跃 sessions (${activeEntries.length}${totalActive > 10 ? '+' : ''})**\n\n`;
+          const lines = activeEntries.map(([uuid, s]) => {
+            const marker = uuid === currentUuid ? '👉' : '　';
+            const title = s.title ?? '(无标题)';
+            const cwd = s.cwd ? ` \`${s.cwd}\`` : '';
+            const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
+            const lastActive = s.last_active ? ` _${s.last_active.slice(0, 16)}_` : '';
+            return `${marker} **${title}**${msgs}${cwd}${lastActive}\n   \`${uuid.slice(0, 8)}…\``;
+          });
+          markdown = header + lines.join('\n\n') +
+            `\n\n_(共 ${totalActive} 个, 只显示前 ${activeEntries.length}; 续聊用 \`/switch <uuid>\`)_`;
+        }
         logger.info(`[wecom-bot] handleCommandListCard: rendering ${activeEntries.length}/${totalActive} sessions for userId=${msg.userId}`);
       } catch (err) {
         logger.error(`[wecom-bot] handleCommandListCard: registry access failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
@@ -526,15 +536,15 @@ export class WecomBot {
       return;
     }
 
-    // 2. sendMessage template_card
+    // 2. sendMessage markdown
     try {
       const receiveId = resolveReceiveId(msg);
       await this.client.sdk.sendMessage(receiveId, {
-        msgtype: 'template_card',
-        template_card: card as any,
+        msgtype: 'markdown',
+        markdown: { content: markdown },
       });
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
-      logger.info(`[wecom-bot] handleCommandListCard: sent template_card to ${receiveId}`);
+      logger.info(`[wecom-bot] handleCommandListCard: sent markdown to ${receiveId}`);
     } catch (err) {
       logger.error(`[wecom-bot] handleCommandListCard: sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
       try {
@@ -1045,25 +1055,37 @@ export class WecomBot {
         break;
       }
       case 'list-refresh': {
-        // PR 6 Task 6.7: 重新拉 active sessions 列表 + 推 template_card
+        // PR 6 Task 6.7 + PR 6.11: 重新拉 active sessions 列表 + 推 markdown
         // 历史: PR 5 stub 只发 sendMessage 兜底, 实际不拉列表, 用户点刷新看不到新活跃 session
-        // 修法: 调 registryManager.listActive + WecomCardBuilder.textNotice 推卡片
+        // PR 6 Task 6.7 改成 template_card (textNotice)
+        // PR 6.11: textNotice 没 action_menu 时 aibot 报 errcode=42045 'card_action Missing or Invalid'
+        //   (微信开放社区: 文本通知型卡片字段取值范围是1.2,不能设置为0)
+        // 修法: 改成 markdown 消息, 跟 /list 命令共用渲染风格 (uuid + title + last_active)
         // 防御: registryManager 未注入 → 静默 (logger.warn, 不发通用 markdown 兜底),
         //   跟 confirm-stop 一致 — 不让 bot 因为缺依赖崩
         if (!this.registryManager) {
           logger.warn(`[wecom-bot] list-refresh: registryManager not available`);
           break;
         }
-        const sessions = await this.registryManager.listActive();
-        const card = WecomCardBuilder.textNotice({
-          title: `活跃 sessions (${sessions.length})`,
-          content: sessions.length === 0
-            ? '无 active session'
-            : sessions.slice(0, 5).map(s => `• ${s.title ?? '(无标题)'} (${s.message_count ?? 0} msgs)`).join('\n'),
-        });
+        const allActive = this.registryManager.sessions;
+        const activeEntries = Object.entries(allActive)
+          .filter(([_, s]) => s.status === 'active')
+          .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
+          .slice(0, 5);
+        const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
+        const markdown = activeEntries.length === 0
+          ? '📭 当前无 active session'
+          : `📋 **活跃 sessions (${activeEntries.length}${totalActive > 5 ? '+' : ''})**\n\n` +
+            activeEntries.map(([uuid, s]) => {
+              const title = s.title ?? '(无标题)';
+              const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
+              const lastActive = s.last_active ? ` _${s.last_active.slice(0, 16)}_` : '';
+              return `• **${title}**${msgs}${lastActive}\n   \`${uuid.slice(0, 8)}…\``;
+            }).join('\n\n') +
+            `\n\n_(共 ${totalActive} 个; 用 \`/list\` 看全部)_`;
         await this.client.sdk.sendMessage(event.externalUserId, {
-          msgtype: 'template_card',
-          template_card: card as any,
+          msgtype: 'markdown',
+          markdown: { content: markdown },
         });
         break;
       }

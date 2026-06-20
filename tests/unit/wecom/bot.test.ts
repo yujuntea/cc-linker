@@ -2476,25 +2476,29 @@ describe('WecomBot executeCardAction (PR 6 Task 6.6: confirm-stop)', () => {
 });
 
 /**
- * PR 6.9: /list 命令新实现 — 推 multi-session template_card
+ * PR 6.9 + PR 6.11: /list 命令新实现 — 推 multi-session markdown 列表
  *
  * 背景: PR 4.5 C 旧 handleCommandList 只显示当前 user 关联的 session 详情,
  *   用户期望看到 "会话列表" (multi-session 可选), 跟飞书侧 /list 行为对齐。
+ *
+ * PR 6.9 用 template_card (textNotice), PR 6.11 改成 markdown — 因为
+ *   textNotice 类型 aibot 服务端要求 card_action.type=1/2, 不带 action_menu 时
+ *   errcode=42045 "Template_Card card_action Missing or Invalid"
  *
  * 修法:
  * - 读 registryManager.sessions (Record<uuid, SessionEntry>) 拿全部 active + uuid
  * - 按 last_active 倒序取前 10 条
  * - 标 current session (跟 user-mapping 比对)
- * - WecomCardBuilder.textNotice 渲染 template_card
+ * - 渲染成 markdown 推回 (包含 title + cwd + msgs + uuid + last_active)
  * - registryManager 未注入 → 退到老 handleCommandList 返回 markdown
  *
  * 关键不变量:
- * - 有 active sessions → 推 template_card 含 session title + uuid 前 8 字符
- * - 空 → 卡片 desc 含 "无 active session"
+ * - 有 active sessions → 推 markdown 含 session title + uuid 前 8 字符
+ * - 空 → 推 "无 active session"
  * - registryManager 未注入 → fallback sendMessage markdown (向后兼容)
  * - 当前 user 的 session → 标 👉 (便于一眼识别)
  */
-describe('WecomBot /list command (PR 6.9: multi-session template_card)', () => {
+describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', () => {
   let mockSpoolQueue: any;
   let mockClient: any;
   let mockUserManager: any;
@@ -2589,35 +2593,34 @@ describe('WecomBot /list command (PR 6.9: multi-session template_card)', () => {
 
     await bot.__test_handleCommand(msg);
 
-    // 1. sendMessage 推了 template_card (非 markdown 兜底)
+    // 1. sendMessage 推了 markdown (PR 6.11: 改用 markdown 因为 textNotice errcode=42045)
     expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
     const smCall = mockClient.sdk.sendMessage.mock.calls[0];
     expect(smCall[0]).toBe('WuYuJun');  // PR 6.8.1: p2p → userId
-    expect(smCall[1].msgtype).toBe('template_card');
-    const card = smCall[1].template_card;
-    expect(card.card_type).toBe('text_notice');
+    expect(smCall[1].msgtype).toBe('markdown');
+    const content = smCall[1].markdown.content;
 
-    // 2. 卡片 title 含 active session 数量 (2 个 active, 1 archived)
-    expect(card.main_title.title).toContain('2');
-    expect(card.main_title.title).toContain('活跃 sessions');
+    // 2. markdown 含 active session 数量 (2 个 active, 1 archived)
+    expect(content).toContain('活跃 sessions');
+    expect(content).toContain('2');
 
-    // 3. 卡片 desc 含两个 active session title + uuid 前 8 字符
-    expect(card.main_title.desc).toContain('PR 6.9 /list');
-    expect(card.main_title.desc).toContain('PR 6.8.5 defensive');
-    expect(card.main_title.desc).toContain('uuid-aaa');  // uuid 前 8 字符
-    expect(card.main_title.desc).toContain('uuid-eee');
+    // 3. markdown 含两个 active session title + uuid 前 8 字符
+    expect(content).toContain('PR 6.9 /list');
+    expect(content).toContain('PR 6.8.5 defensive');
+    expect(content).toContain('uuid-aaa');  // uuid 前 8 字符
+    expect(content).toContain('uuid-eee');
 
     // 4. archived 不应出现
-    expect(card.main_title.desc).not.toContain('archived session');
+    expect(content).not.toContain('archived session');
 
     // 5. 当前 user 的 session 标 👉
-    expect(card.main_title.desc).toContain('👉');
+    expect(content).toContain('👉');
 
     // 6. markDone 被调
     expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg-list-001', 'uuid-aaaa-bbbb-cccc-dddd-1111:msg-list-001');
   });
 
-  it('/list: 0 active session → 卡片 desc 含 "无 active session"', async () => {
+  it('/list: 0 active session → markdown 含 "无 active session"', async () => {
     const registryManager = {
       sessions: {
         'archived-1': { status: 'archived', title: 'old', cwd: '/tmp', last_active: '2026-01-01T00:00:00Z', message_count: 0 },
@@ -2653,9 +2656,8 @@ describe('WecomBot /list command (PR 6.9: multi-session template_card)', () => {
 
     expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
     const smCall = mockClient.sdk.sendMessage.mock.calls[0];
-    expect(smCall[1].msgtype).toBe('template_card');
-    const card = smCall[1].template_card;
-    expect(card.main_title.desc).toContain('无 active session');
+    expect(smCall[1].msgtype).toBe('markdown');
+    expect(smCall[1].markdown.content).toContain('无 active session');
   });
 
   it('/list: registryManager 未注入 → fallback 老 markdown 路径', async () => {
@@ -2751,12 +2753,19 @@ describe('WecomBot executeCardAction (PR 6 Task 6.7: list-refresh)', () => {
     };
   });
 
-  it('list-refresh: 调 registryManager.listActive + 推 template_card 含 session 列表', async () => {
+  it('list-refresh: 调 registryManager.sessions + 推 markdown 含 session 列表 (PR 6.11)', async () => {
+    // PR 6.11: 改成 markdown 消息 (之前 textNotice template_card errcode=42045)
     const registryManager = {
-      listActive: mock(async () => [
-        { sessionUuid: 's-1', title: 'PR 2 review', cwd: '/Users/x/proj', messageCount: 42 } as any,
-        { sessionUuid: 's-2', title: 'Bug fix dashboard', cwd: '/Users/x/bugs', messageCount: 7 } as any,
-      ]),
+      sessions: {
+        'uuid-s1-aaaa-bbbb-cccc-dddd-1111': {
+          status: 'active', title: 'PR 2 review', cwd: '/Users/x/proj',
+          last_active: '2026-06-20T15:00:00Z', message_count: 42,
+        },
+        'uuid-s2-eeee-ffff-gggg-hhhh-2222': {
+          status: 'active', title: 'Bug fix dashboard', cwd: '/Users/x/bugs',
+          last_active: '2026-06-20T14:00:00Z', message_count: 7,
+        },
+      },
     };
     bot = new WecomBot({
       botId: 'test',
@@ -2776,26 +2785,25 @@ describe('WecomBot executeCardAction (PR 6 Task 6.7: list-refresh)', () => {
       inboundFrame: { headers: { req_id: 'req-lr' } },
     });
 
-    // 1. registryManager.listActive 被调
-    expect(registryManager.listActive).toHaveBeenCalledTimes(1);
-
-    // 2. sendMessage 发了 template_card (非通用 markdown 兜底)
+    // 1. sendMessage 推 markdown (非 template_card)
     expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
     const smCall = mockClient.sdk.sendMessage.mock.calls[0];
     expect(smCall[0]).toBe('ext-1');
-    expect(smCall[1].msgtype).toBe('template_card');
-    const card = smCall[1].template_card;
-    expect(card.card_type).toBe('text_notice');
-    // desc 含 session title 列表
-    expect(card.main_title.desc).toContain('PR 2 review');
-    expect(card.main_title.desc).toContain('Bug fix dashboard');
-    // title 含数量
-    expect(card.main_title.title).toContain('2');
+    expect(smCall[1].msgtype).toBe('markdown');
+    const content = smCall[1].markdown.content;
+    // content 含 session title + uuid 前 8 字符
+    expect(content).toContain('PR 2 review');
+    expect(content).toContain('Bug fix dashboard');
+    expect(content).toContain('uuid-s1');
+    expect(content).toContain('uuid-s2');
+    expect(content).toContain('2');  // 数量
   });
 
-  it('list-refresh: 0 active session → 卡片 desc 含 "无 active session"', async () => {
+  it('list-refresh: 0 active session → 推 markdown 含 "无 active session"', async () => {
     const registryManager = {
-      listActive: mock(async () => []),
+      sessions: {
+        'archived-1': { status: 'archived', title: 'old', cwd: '/tmp', last_active: '2026-01-01T00:00:00Z', message_count: 0 },
+      },
     };
     bot = new WecomBot({
       botId: 'test',
@@ -2815,10 +2823,9 @@ describe('WecomBot executeCardAction (PR 6 Task 6.7: list-refresh)', () => {
       inboundFrame: { headers: { req_id: 'req-lr-empty' } },
     });
 
-    expect(registryManager.listActive).toHaveBeenCalledTimes(1);
     expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
-    const card = mockClient.sdk.sendMessage.mock.calls[0][1].template_card;
-    expect(card.main_title.desc).toContain('无 active session');
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('无 active session');
   });
 
   it('list-refresh: registryManager 未注入 → 静默 (logger.warn, 不发 sendMessage)', async () => {
