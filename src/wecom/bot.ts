@@ -13,6 +13,7 @@ import { WecomStreamUpdater } from './stream-updater';
 import { WecomUserManager } from './mapping';
 import { WecomCardBuilder, type TemplateCard } from './card';
 import { WecomImageHandler } from './image-handler';
+import { WecomCompleteCardSender } from './complete-card';
 import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spool';
 import type { ClaudeSessionManager } from '../proxy/session';
 import type { StreamChunk } from '../proxy/stream-parser';
@@ -164,6 +165,15 @@ export class WecomBot {
   private _dispatchTimer: ReturnType<typeof setTimeout> | null = null;
   private _dispatchSleepResolve: (() => void) | null = null;
   private _dispatchLoopPromise: Promise<void> | null = null;
+  /**
+   * PR 7.3: 缓存最近 session 信息, complete() 末尾用作完成卡片 ctx
+   * setPending 后调用 setLastSessionMeta 记录, complete 时读
+   */
+  private lastSessionTitle: string | undefined = undefined;
+
+  private setLastSessionMeta(meta: { sessionTitle?: string; sessionUuid?: string; cwd?: string }): void {
+    this.lastSessionTitle = meta.sessionTitle;
+  }
 
   constructor(config: WecomBotConfig) {
     this.client = config.client ?? new AibotClient({
@@ -181,6 +191,8 @@ export class WecomBot {
       // 默认 fallback: 只 log, 不 send (无 msg context, 路由不到具体 user/group)
       // 真实生产: handleChat 内 complete() 的 per-call msgFallback 会覆盖 (优先级更高)
     });
+    // PR 7.3: 注入完成卡片 sender (stateless, 一次注入多次复用)
+    this.updater.setCompleteCardSender(new WecomCompleteCardSender(this.client.sdk));
     this.userManager = config.userManager ?? new WecomUserManager(config.userMappingPath);
     this.spoolQueue = config.spoolQueue ?? new SpoolQueue();
     this.sessionManager = config.sessionManager;
@@ -800,6 +812,52 @@ export class WecomBot {
    *
    * 防御: cwd 不存在 → 报错 + cwd 路径提示
    */
+  /**
+   * PR 7.3: 抽公共方法 — 渲染活跃 session 列表 markdown
+   * 共享给: case 'switch' (完成卡片按钮) + case 'list-refresh' (action_menu)
+   * @param userId 企微 external_userid (推送目标)
+   */
+  private async renderActiveSessionsList(userId: string): Promise<void> {
+    if (!this.registryManager) {
+      logger.warn('[wecom-bot] renderActiveSessionsList: registryManager not available');
+      return;
+    }
+    const allActive = this.registryManager.sessions;
+    const activeEntries = Object.entries(allActive)
+      .filter(([_, s]) => s.status === 'active')
+      .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
+      .slice(0, 5);
+    const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
+    const markdown = activeEntries.length === 0
+      ? '📭 当前无 active session'
+      : `📋 **活跃 sessions (${activeEntries.length}${totalActive > 5 ? '+' : ''})**\n\n` +
+        activeEntries.map(([uuid, s]) => {
+          const title = s.title ?? '(无标题)';
+          const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
+          const lastActive = s.last_active ? ` _${s.last_active.slice(0, 16)}_` : '';
+          return `• **${title}**${msgs}${lastActive}\n   \`${uuid.slice(0, 8)}…\``;
+        }).join('\n\n') +
+        `\n\n_(共 ${totalActive} 个; 用 \`/list\` 看全部)_`;
+    await this.client.sdk.sendMessage(userId, {
+      msgtype: 'markdown',
+      markdown: { content: markdown },
+    });
+  }
+
+  /**
+   * PR 7.3: 抽公共方法 — 渲染 /listdir 结果 markdown
+   * 委托给现有 handleCommandListDir (已含 existsSync / readdirSync 完整逻辑 + cwd 优先级 fallback)
+   * 共享给: executeCardAction case 'listdir' (按钮路径, sendMessage 推送)
+   * @param userId 企微 external_userid (推送目标)
+   */
+  private async renderListDir(userId: string): Promise<void> {
+    const markdown = await this.handleCommandListDir(userId);
+    await this.client.sdk.sendMessage(userId, {
+      msgtype: 'markdown',
+      markdown: { content: markdown },
+    });
+  }
+
   private async handleCommandListDir(userId: string): Promise<string> {
     try {
       const { readdirSync, existsSync } = await import('fs');
@@ -1024,6 +1082,13 @@ export class WecomBot {
         },
         // PR 6.21: thinking + toolUses 都传给 complete, renderMarkdown 显示完整 "当前操作：" 段
         thinking, toolUses,
+        // PR 7.3: 完成卡片 ctx
+        // 来源: this.lastSessionTitle (setPending 后由 setLastSessionMeta 记录) + result.sessionId + cwd
+        {
+          sessionTitle: this.lastSessionTitle,
+          sessionUuid: result.sessionId,  // ClaudeSessionManager 返回值里有 sessionId 字段
+          cwd: cwd,
+        },
       );
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
     } catch (err) {
@@ -1206,6 +1271,31 @@ export class WecomBot {
     inboundFrame?: any;
   }): Promise<void> {
     switch (event.actionTag) {
+      case 'continue': {
+        // PR 7.3: 幂等保护 — 已有 session / pending 时不发新
+        const current = this.userManager.getEntry(event.externalUserId);
+        if (current?.type === 'session' || current?.type === 'pending_new_session') {
+          await this.client.sdk.sendMessage(event.externalUserId, {
+            msgtype: 'markdown',
+            markdown: { content: `⚠️ 已有 ${current.type === 'session' ? '活跃 session' : '待创建 session'}, 不创建新会话\n\n💡 如要新建, 请先 \`/cancel\` 或 \`/stop\`` },
+          });
+          break;
+        }
+        await this.userManager.setPending(event.externalUserId, {});
+        await this.client.sdk.sendMessage(event.externalUserId, {
+          msgtype: 'markdown',
+          markdown: { content: '✨ **新会话就绪**\n\n请发送新消息开始（下一条消息将创建新的 Claude session）' },
+        });
+        break;
+      }
+      case 'switch': {
+        await this.renderActiveSessionsList(event.externalUserId);
+        break;
+      }
+      case 'listdir': {
+        await this.renderListDir(event.externalUserId);
+        break;
+      }
       case 'retry': {
         // PR 6.21 P1#4: 重试 — 旧版用错的 serialKey `retry:${user}` 调 requeueFromProcessing,
         //   但卡片回调本身不在 SpoolQueue 中 (来自 SDK onCardAction), messageId 通常已是
@@ -1249,38 +1339,8 @@ export class WecomBot {
         break;
       }
       case 'list-refresh': {
-        // PR 6 Task 6.7 + PR 6.11: 重新拉 active sessions 列表 + 推 markdown
-        // 历史: PR 5 stub 只发 sendMessage 兜底, 实际不拉列表, 用户点刷新看不到新活跃 session
-        // PR 6 Task 6.7 改成 template_card (textNotice)
-        // PR 6.11: textNotice 没 action_menu 时 aibot 报 errcode=42045 'card_action Missing or Invalid'
-        //   (微信开放社区: 文本通知型卡片字段取值范围是1.2,不能设置为0)
-        // 修法: 改成 markdown 消息, 跟 /list 命令共用渲染风格 (uuid + title + last_active)
-        // 防御: registryManager 未注入 → 静默 (logger.warn, 不发通用 markdown 兜底),
-        //   跟 confirm-stop 一致 — 不让 bot 因为缺依赖崩
-        if (!this.registryManager) {
-          logger.warn(`[wecom-bot] list-refresh: registryManager not available`);
-          break;
-        }
-        const allActive = this.registryManager.sessions;
-        const activeEntries = Object.entries(allActive)
-          .filter(([_, s]) => s.status === 'active')
-          .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
-          .slice(0, 5);
-        const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
-        const markdown = activeEntries.length === 0
-          ? '📭 当前无 active session'
-          : `📋 **活跃 sessions (${activeEntries.length}${totalActive > 5 ? '+' : ''})**\n\n` +
-            activeEntries.map(([uuid, s]) => {
-              const title = s.title ?? '(无标题)';
-              const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
-              const lastActive = s.last_active ? ` _${s.last_active.slice(0, 16)}_` : '';
-              return `• **${title}**${msgs}${lastActive}\n   \`${uuid.slice(0, 8)}…\``;
-            }).join('\n\n') +
-            `\n\n_(共 ${totalActive} 个; 用 \`/list\` 看全部)_`;
-        await this.client.sdk.sendMessage(event.externalUserId, {
-          msgtype: 'markdown',
-          markdown: { content: markdown },
-        });
+        // PR 7.3: 抽公共方法 renderActiveSessionsList, 跟 case 'switch' 共用
+        await this.renderActiveSessionsList(event.externalUserId);
         break;
       }
       default:

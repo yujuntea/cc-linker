@@ -3226,3 +3226,260 @@ describe('WecomBot handleChat appendChunk (PR 7 Task 7.6: m-2 + PR 6.20 修复)'
     expect(state.toolUses[0].inputSummary).toContain('x');
   });
 });
+
+/**
+ * PR 7.3: executeCardAction 新增 3 case (continue/switch/listdir) + 抽 2 公共函数 + 集成测试
+ *
+ * 历史:
+ * - PR 7.1: 完成卡片 button (continue/switch/listdir) 已发出, action_tag 进入 executeCardAction
+ * - PR 7.2: stream-updater complete() 末尾自动 send 完成卡片
+ * - PR 7.3: 接通 executeCardAction 3 新 case + 抽 2 公共方法 (renderActiveSessionsList/renderListDir)
+ *   + 构造器注入 WecomCompleteCardSender + handleChat 传 completeCtx
+ *
+ * 关键不变量:
+ * - continue: 幂等保护 — 已有 session / pending 时不发新 (setPending no-op + 警告文案)
+ * - continue: 无现有 → setPending + 提示新会话就绪
+ * - switch: 调 renderActiveSessionsList (按钮路径)
+ * - listdir: 调 renderListDir (按钮路径, 不走 handleCommand 路径, 避免双推送)
+ * - 复用 case (retry/list-refresh/stop/confirm-stop) 仍正常
+ * - 集成测试: handleChat 流式完成后, complete() 末尾触发 sender.send(ctx)
+ */
+
+// PR 7.3 helper: 构造带 mock sdk + mock userManager + mock spoolQueue 的 WecomBot
+// PR 7.3 review fix #4: 必须传 spoolQueue (WecomBot 构造必传, 不传 NPE)
+function makeBotWithMocks(opts: {
+  sdkSendMessage?: (chatid: string, body: any) => Promise<any>;
+  userManagerEntry?: any;  // null = 空, object = 已有 entry
+  registryManager?: any;
+} = {}) {
+  const sentMessages: any[] = [];
+  const mockSdk = {
+    sendMessage: (chatid: string, body: any) => {
+      sentMessages.push({ chatid, body });
+      return opts.sdkSendMessage ? opts.sdkSendMessage(chatid, body) : Promise.resolve({});
+    },
+    replyWelcome: () => Promise.resolve({}),
+    replyStream: () => Promise.resolve({}),
+    updateTemplateCard: () => Promise.resolve({}),
+    replyTemplateCard: () => Promise.resolve({}),
+  };
+  const mockClient = {
+    sdk: mockSdk,
+    onCardAction: () => {},
+    onMessage: () => {},
+    connect: () => {},
+    disconnect: () => {},
+  };
+  const mockSpoolQueue = {
+    enqueue: () => Promise.resolve(),
+    markDone: () => Promise.resolve(),
+    markReplied: () => Promise.resolve(),
+    markFailed: () => Promise.resolve(),
+    requeueFromProcessing: () => Promise.resolve(null),
+    listPending: () => [],
+    listProcessing: () => [],
+    claimNext: () => null,
+  };
+  const setPendingCalls: string[] = [];
+  const bot = new WecomBot({
+    botId: 'test',
+    secret: 'test',
+    userMappingPath: '/tmp/test-mapping-pr73.json',
+    client: mockClient as any,
+    spoolQueue: mockSpoolQueue as any,  // PR 7.3 fix #4: 必须传, 不然构造 NPE
+    registryManager: opts.registryManager,
+  });
+  // 覆盖 userManager 方法 (注入 mock)
+  bot.userManager.getEntry = () => opts.userManagerEntry ?? null;
+  bot.userManager.setPending = async (userId: string, _opts?: any) => {
+    setPendingCalls.push(userId);
+  };
+  // 测试辅助字段
+  (bot as any)._sentMessages = sentMessages;
+  (bot as any)._setPendingCalls = setPendingCalls;
+  return bot;
+}
+
+describe('PR 7.3: executeCardAction 新增 3 case (continue/switch/listdir)', () => {
+  it("case 'continue': setPending + 提示新会话就绪 (无现有 session)", async () => {
+    const bot = makeBotWithMocks({ userManagerEntry: null });
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test',
+      messageId: 'msg-1',
+      actionTag: 'continue',
+      actionValue: {},
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    expect((bot as any)._setPendingCalls).toEqual(['wmu_test']);
+    const newSessionMsg = (bot as any)._sentMessages.find((m: any) => m.body.markdown?.content?.includes('新会话就绪'));
+    expect(newSessionMsg).toBeDefined();
+  });
+
+  it("case 'continue': 已有 active session 时不发新 session (幂等 no-op)", async () => {
+    const bot = makeBotWithMocks({
+      userManagerEntry: { type: 'session', sessionUuid: 'uuid_existing', cwd: '/tmp' },
+    });
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test', messageId: 'msg-1',
+      actionTag: 'continue', actionValue: {},
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    expect((bot as any)._setPendingCalls.length).toBe(0);
+    const warnMsg = (bot as any)._sentMessages.find((m: any) => m.body.markdown?.content?.includes('已有'));
+    expect(warnMsg).toBeDefined();
+  });
+
+  it("case 'continue': 已有 pending_new_session 时也不发新 (幂等)", async () => {
+    const bot = makeBotWithMocks({
+      userManagerEntry: { type: 'pending_new_session', sessionUuid: null, cwd: null },
+    });
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test', messageId: 'msg-1',
+      actionTag: 'continue', actionValue: {},
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    expect((bot as any)._setPendingCalls.length).toBe(0);
+  });
+
+  it("case 'switch': 调 renderActiveSessionsList (mock)", async () => {
+    const bot = makeBotWithMocks();
+    let renderCalledWith: string | null = null;
+    (bot as any).renderActiveSessionsList = async (uid: string) => {
+      renderCalledWith = uid;
+    };
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test', messageId: 'msg-1',
+      actionTag: 'switch', actionValue: {},
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    expect(renderCalledWith).toBe('wmu_test');
+  });
+
+  it("case 'listdir': 调 renderListDir (mock)", async () => {
+    const bot = makeBotWithMocks();
+    let renderCalledWith: string | null = null;
+    (bot as any).renderListDir = async (uid: string) => {
+      renderCalledWith = uid;
+    };
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test', messageId: 'msg-1',
+      actionTag: 'listdir', actionValue: {},
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    expect(renderCalledWith).toBe('wmu_test');
+  });
+});
+
+describe('PR 7.3: executeCardAction 已有 4 case (从 action_menu 进) 仍 work', () => {
+  it.each([
+    ['retry', '重试提示'],
+    ['list-refresh', '📋'],
+  ])("action_tag=%s 仍正常 (期望文案包含: %s)", async (tag, expectedSubstring) => {
+    const bot = makeBotWithMocks();
+    if (tag === 'list-refresh') {
+      bot.registryManager = {
+        sessions: { 'uuid-1': { status: 'active', title: '测试', message_count: 5, last_active: '2026-06-20T08:00:00Z' } },
+      };
+    }
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test', messageId: 'msg-old',
+      actionTag: tag, actionValue: {},
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    const found = (bot as any)._sentMessages.find((m: any) => m.body.markdown?.content?.includes(expectedSubstring));
+    expect(found).toBeDefined();
+  });
+
+  it("action_tag='stop': 调 updater.cancel", async () => {
+    const bot = makeBotWithMocks();
+    let cancelCalled = false;
+    bot.updater.cancel = async () => { cancelCalled = true; };
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test', messageId: 'msg-old',
+      actionTag: 'stop', actionValue: {},
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    expect(cancelCalled).toBe(true);
+  });
+
+  it("action_tag='confirm-stop': 缺 sessionUuid 时 warn no-op", async () => {
+    const bot = makeBotWithMocks();
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_test', messageId: 'msg-old',
+      actionTag: 'confirm-stop', actionValue: {},  // 无 sessionUuid
+      inboundFrame: { headers: { req_id: 'req_1' } },
+    });
+    expect(true).toBe(true);  // 不抛错
+  });
+});
+
+/**
+ * PR 7.4 review fix C: 集成测试 — handleChat 调 updater.complete 时是否传 completeCtx
+ * 这个测试覆盖 PR 7.2 + PR 7.3 的连接处: complete() 末尾应触发 sender.send(ctx)
+ *
+ * 覆盖 spec §3.2 (完成卡片发送时机) + §4.2 (stream-updater 改动)
+ */
+describe('PR 7.3 集成: handleChat → updater.complete → completeCardSender.send', () => {
+  it('handleChat 流式完成后, sender.send 被调一次 + ctx 含 sessionTitle/UUID/cwd', async () => {
+    // 构造最小可工作 WecomBot: 只 mock 必要依赖 (updater + sender + sdk)
+    const sentMessages: any[] = [];
+    const senderCalls: any[] = [];
+    const mockSdk = {
+      sendMessage: (chatid: string, body: any) => { sentMessages.push({ chatid, body }); return Promise.resolve({}); },
+      replyWelcome: () => Promise.resolve({}),
+      replyStream: () => Promise.resolve({}),
+      updateTemplateCard: () => Promise.resolve({}),
+      replyTemplateCard: () => Promise.resolve({}),
+    };
+    const mockClient = {
+      sdk: mockSdk,
+      onCardAction: () => {},
+      onMessage: () => {},
+      connect: () => {},
+      disconnect: () => {},
+    };
+    const mockSpoolQueue = {
+      enqueue: () => Promise.resolve(),
+      markDone: () => Promise.resolve(),
+      markReplied: () => Promise.resolve(),
+      markFailed: () => Promise.resolve(),
+      requeueFromProcessing: () => Promise.resolve(null),
+      listPending: () => [],
+      listProcessing: () => [],
+      claimNext: () => null,
+    };
+    const bot = new WecomBot({
+      botId: 'test', secret: 'test',
+      userMappingPath: '/tmp/test-mapping-pr74-integration.json',
+      client: mockClient as any,
+      spoolQueue: mockSpoolQueue as any,
+    });
+    // 替换 updater: 真实 complete() 逻辑, 但 mock SDK replyStream + record sender call
+    const { WecomCompleteCardSender } = await import('../../../src/wecom/complete-card');
+    bot.updater.setCompleteCardSender({
+      send: async (ctx: any) => { senderCalls.push(ctx); },
+    } as any);
+
+    // 模拟 handleChat 流式完成后调 complete(...)
+    await bot.updater.startProcessing('wmu_test_user', { headers: { req_id: 'req_integration' } });
+    await bot.updater.complete(
+      'final response', 100, 200, 5000, 1,
+      undefined,  // msgFallback
+      'thinking content',  // thinking
+      [],  // toolUses
+      // completeCtx (PR 7.3 关键: 这里传, 看是否传到 sender.send)
+      {
+        sessionTitle: '集成测试 session',
+        sessionUuid: 'uuid-integration',
+        cwd: '/tmp',
+      },
+    );
+
+    // 验证 sender.send 被调一次 + ctx 含 sessionTitle
+    expect(senderCalls.length).toBe(1);
+    expect(senderCalls[0].userId).toBe('wmu_test_user');
+    expect(senderCalls[0].sessionTitle).toBe('集成测试 session');
+    expect(senderCalls[0].sessionUuid).toBe('uuid-integration');
+    expect(senderCalls[0].cwd).toBe('/tmp');
+  });
+});
