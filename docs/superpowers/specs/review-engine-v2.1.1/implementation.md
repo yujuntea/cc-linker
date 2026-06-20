@@ -155,16 +155,34 @@ interface HistoryEvent {
 
 ### 6.2 持久化目录
 
+**v2.1.2 修正**：每个 pipeline 占用一个**目录**（而非单文件），用于存放 PipelineRecord + state artifacts（review opinions 等）。
+
 ```
 ~/.cc-linker/review-pipelines/
-├── running/         # 正在跑（最多 max_concurrent_pipelines 个）
-├── human_pending/   # 等待人工决策
-├── done/            # 已完成
-├── failed/          # 失败
-└── aborted/         # 中止
+├── .lock                              # 全局锁（reconciler 用）
+├── running/
+│   └── <pipelineId>/                  # per-pipeline 目录
+│       ├── pipeline.json              # PipelineRecord 主文件
+│       ├── .lock                      # per-pipeline 锁（§6.3）
+│       └── state/                     # context-related artifacts
+│           ├── external-review-r1.json
+│           ├── external-review-r1.md
+│           └── ...
+├── queued/                            # v2.1.2 新增：排队等待（§6.5）
+│   └── <pipelineId>/pipeline.json
+├── human_pending/
+│   └── <pipelineId>/pipeline.json
+├── done/
+│   └── <pipelineId>/pipeline.json + state/
+├── failed/
+│   └── <pipelineId>/pipeline.json
+└── aborted/
+    └── <pipelineId>/pipeline.json + state/
 ```
 
-**5 目录**（不使用 pending/）。原子写规则：写 `.tmp` 再 `rename`。
+**6 目录**（不使用 pending/）。原子写规则：写 `.tmp` 再 `rename`。
+
+**目录迁移**：pipeline 状态变化时，整个 `<pipelineId>/` 目录在 6 个父目录间移动（`rename` 原子操作）。`state/` 子目录随目录一起迁移，保证 artifacts 不丢失。
 
 ### 6.3 幂等性
 
@@ -182,7 +200,7 @@ async function transition(pipeline: PipelineRecord, event: EngineEvent): Promise
 1. History 去重：`lastEvent.toState === 目标 state` → 跳过
 2. 转换函数幂等：纯函数
 3. Polling 间隔去重：500ms 一次，只在 state 变化时 emit
-4. **文件锁**：`~/.cc-linker/review-pipelines/<pipelineId>.lock`（per-pipeline，`proper-lockfile`）
+4. **文件锁**：`~/.cc-linker/review-pipelines/{running,human_pending,done,...}/<pipelineId>/.lock`（per-pipeline，`proper-lockfile`）
 
 **FIXING source-aware 幂等性**：FIXING 必须 source + inputIssues 都匹配才算幂等。
 
@@ -192,7 +210,7 @@ async function transition(pipeline: PipelineRecord, event: EngineEvent): Promise
 
 ```typescript
 async function reconcile(): Promise<ReconcileResult> {
-  await acquireLock('~/.cc-linker/review-pipelines/.lock');
+  await acquireLock('~/.cc-linker/review-pipelines/.lock');   // 全局锁
   try {
     return await reconcileInternal();
   } finally {
@@ -218,6 +236,28 @@ async function reconcile(): Promise<ReconcileResult> {
 ### 6.5 并发控制
 
 默认 1 个 pipeline 同时跑，profile 可配 `guards.max_concurrent_pipelines = 3`。
+
+> **v2.1.2 修正（P1-7）：超出并发上限时的排队机制**
+>
+> 当 `running/` 目录中 pipeline 数量 ≥ `max_concurrent_pipelines` 时，新提交的 pipeline 进入排队：
+>
+> ```
+> ~/.cc-linker/review-pipelines/
+> ├── running/         # 正在跑（≤ max_concurrent_pipelines 个）
+> ├── queued/          # v2.1.2 新增：排队等待（FIFO）
+> │   └── <pipelineId>/pipeline.json
+> ├── human_pending/
+> ├── ...
+> ```
+>
+> **排队流程**：
+> 1. `review run` 检测 `running/` 目录数量 → 超限 → 写入 `queued/` 而非 `running/`
+> 2. CLI 输出 `⏳ Pipeline queued at position N (max_concurrent_pipelines=M)`
+> 3. Reconciler 每 60s 检查：`running/` 有空位 → 将 `queued/` 中最旧的 pipeline 移入 `running/` 并启动
+> 4. `review status <id>` 对 queued pipeline 显示 `QUEUED (position=N)`
+> 5. `review cancel <id>` 对 queued pipeline 直接移到 `aborted/`（不需要 cleanup panes）
+>
+> ** queued/ 不占 worker slot**：queued pipeline 没有 bg session，不消耗 Claude CLI 资源。
 
 ### 6.6 Abort / Cleanup 流程
 
@@ -270,12 +310,14 @@ parse_retry_timeout_ms = 15000
 
 # 成本/性能硬约束
 max_cost_usd = 5.00
-max_context_resets_per_pipeline = 1
+max_context_resets_per_pipeline = 2    # v2.1.2 评审修正：1 太激进（1M 模型可能需要 2 次 reset），默认 2
 max_reset_duration_ms = 120000
-max_token_in = 500000
-max_token_out = 100000
-api_rate_limit_strategy = "backoff"          # "backoff" | "fail-fast"
-api_rate_limit_429_backoff_ms = [2000, 4000, 8000, 16000]
+
+# Phase 3 预留（v2.1.2 评审标注：当前 engine 未消费，实施时可忽略）
+# max_token_in = 500000                # 单 pipeline input token 上限
+# max_token_out = 100000               # 单 pipeline output token 上限
+# api_rate_limit_strategy = "backoff"  # "backoff" | "fail-fast"
+# api_rate_limit_429_backoff_ms = [2000, 4000, 8000, 16000]
 
 # 模型 context 上限覆盖
 [context_limits]
@@ -521,20 +563,20 @@ async function onExternalReviewComplete(pipeline: PipelineRecord): Promise<void>
   // 无论哪一档，都先写 review opinions 文件（compact/reset 都要用）
   await writeReviewOpinionsToFile(pipeline, currentReviewOpinions(pipeline));
 
-  // 3 档 cascade dispatch
+  // N+2 档 cascade dispatch（默认 maxCompact=1 → 3 档）
   const maxCompact = profile.guards.max_compact_attempts ?? 1;
   if (n <= maxCompact) {
-    // n=1: 试 compact
+    // n ≤ maxCompact: 试 compact
     const compactOk = await executeContextCompact(pipeline, contextCheck, profile);
     if (!compactOk) {
       // compact 失败 / 仍超阈值 → 升级到 reset
       await executeContextReset(pipeline, contextCheck, profile);
     }
   } else if (n === maxCompact + 1) {
-    // n=2: 直接 reset（不再试 compact，避免重复失败）
+    // n = maxCompact+1: 直接 reset（不再试 compact，避免重复失败）
     await executeContextReset(pipeline, contextCheck, profile);
   } else {
-    // n≥3: abort（max attempts reached）
+    // n > maxCompact+1: abort（max attempts reached）
     await executeContextAbort(pipeline, contextCheck);
   }
 }
@@ -721,6 +763,28 @@ async function executeContextReset(
     if (signal?.aborted) throw new AbortError('reset aborted by user cancel');
   };
 
+  // v2.1.2 修正（P0-2）：max_context_resets_per_pipeline 检查
+  const resetCount = (pipeline.contextResets ?? []).filter(r => r.strategy === 'reset').length;
+  const maxResets = profile.guards.max_context_resets_per_pipeline ?? 2;
+  if (resetCount >= maxResets) {
+    await cleanupPipeline(pipeline.pipelineId, 'reset_loop');
+    pipeline.state = {
+      kind: 'ABORTED',
+      pipelineId: pipeline.pipelineId,
+      round: pipeline.state.round,
+      reason: 'reset_loop',
+      abortedBefore: 'EXTERNAL_REVIEW',
+    };
+    await pipelineStore.saveRunning(pipeline);
+    return;
+  }
+
+  // v2.1.2 修正（P0-2）：max_reset_duration_ms 超时控制
+  const maxResetDuration = profile.guards.max_reset_duration_ms ?? 120_000;
+  const resetTimer = setTimeout(() => {
+    signal?.abort();   // 触发 checkAbort → AbortError → catch → ABORTED reset_timeout
+  }, maxResetDuration);
+
   try {
     const workShortId = pipeline.panes.work!.currentRoundShortId!;
 
@@ -790,23 +854,29 @@ async function executeContextReset(
 
     await pipelineStore.saveRunning(pipeline);
   } catch (err) {
-    // spawn 失败 → ABORTED reason=context_reset_spawn_failed
-    await cleanupPipeline(pipeline.pipelineId, 'context_reset_spawn_failed');
+    clearTimeout(resetTimer);
+    // 判断是超时还是 spawn 失败
+    const reason = err instanceof AbortError && resetTimer.hasRef?.() === false
+      ? 'reset_timeout'
+      : 'context_reset_spawn_failed';
+    await cleanupPipeline(pipeline.pipelineId, reason);
     pipeline.state = {
       kind: 'ABORTED',
       pipelineId: pipeline.pipelineId,
       round: pipeline.state.round,
-      reason: 'context_reset_spawn_failed',
+      reason,
       abortedBefore: 'EXTERNAL_REVIEW',
     };
     await pipelineStore.saveRunning(pipeline);
+  } finally {
+    clearTimeout(resetTimer);
   }
 }
 ```
 
 ##### 7.5.7.5 策略 3：`abort`（v2.1.2 第 3 档）
 
-**触发**：cascade n≥3（max attempts reached）
+**触发**：cascade n>maxCompact+1（max attempts reached，默认 maxCompact=1 → n≥3）
 
 cleanup → ABORTED reason=`context_overflow_max_attempts`。
 
@@ -843,22 +913,31 @@ async function executeContextAbort(
 - worker 无法用 `@file` 精确定位
 - 跨崩溃恢复时 Reconciler 拿不到 review 历史
 
+> **v2.1.2 修正（P1-4）**：EXTERNAL_REVIEW 完成时**总是**写 review opinions 文件（不论 context 是否 overflow）。这保证：
+> 1. 所有 EXTERNAL_REVIEW 产出都持久化，Reconciler 可直接读
+> 2. JUDGE prompt 统一用 @file 引用，无需区分 overflow/非 overflow 路径
+> 3. 后续 cascade 触发时，文件已经存在，不用额外写
+
 **方案**：EXTERNAL_REVIEW 完成时，把 opinions 写到 `~/.cc-linker/review-pipelines/<pipelineId>/state/external-review-r<N>.{json,md}`，JUDGE/FIXING prompt 改用 `@file` 引用。
 
 ##### 7.5.8.1 路径规则
 
+> **v2.1.2 修正（P0-5）**：与 §6.2 统一，主文件名为 `pipeline.json`（非 `running.json`）。路径包含状态目录（`running/` / `done/` 等）。
+
 ```
 ~/.cc-linker/review-pipelines/
-└── <pipelineId>/
-    ├── running.json                    # PipelineRecord 主文件
-    ├── state/                          # v2.1.2 新增：context-related artifacts
-    │   ├── external-review-r1.json     # 第 1 轮 external review 产出（结构化）
-    │   ├── external-review-r1.md       # 第 1 轮（可读）
-    │   ├── external-review-r2.json     # 第 2 轮（如有）
-    │   ├── external-review-r2.md
-    │   └── ...
-    ├── context-reset-r2.json           # 第 2 轮 reset 时的 injected context 快照（可选，便于 debug）
-    └── done.md / failed.md / aborted.md   # 最终报告（既有 §8.4）
+└── {running,done,failed,aborted}/
+    └── <pipelineId>/
+        ├── pipeline.json                    # PipelineRecord 主文件（与 §6.2 一致）
+        ├── .lock                            # per-pipeline 锁
+        ├── state/                           # v2.1.2 新增：context-related artifacts
+        │   ├── external-review-r1.json      # 第 1 轮 external review 产出（结构化）
+        │   ├── external-review-r1.md        # 第 1 轮（可读）
+        │   ├── external-review-r2.json      # 第 2 轮（如有）
+        │   ├── external-review-r2.md
+        │   └── ...
+        ├── context-reset-r2.json            # 第 2 轮 reset 时的 injected context 快照（可选，便于 debug）
+        └── done.md / failed.md / aborted.md # 最终报告（既有 §8.4）
 ```
 
 ##### 7.5.8.2 JSON Schema（结构化版）
@@ -868,7 +947,8 @@ interface ReviewOpinionsFile {
   pipelineId: string;
   round: number;
   generatedAt: string;
-  threshold: { used: number; max: number; model: string };
+  /** v2.1.2 修正（P1-3）：原字段名 threshold 有误导，实际存的是触发时的 usage */
+  usageAtTrigger: { used: number; max: number; model: string };
   reviews: ReviewOpinion[];
 }
 
@@ -894,7 +974,7 @@ interface ReviewOpinion {
 **Generated**: <ISO timestamp>
 **Provider**: <kimi-for-coding>
 **Session**: <uuid>
-**Context at trigger**: <used>/<max> tokens
+**Context at trigger**: <used>/<max> tokens (model: <model>)
 
 ## P0 (Critical) — 3 issues
 
@@ -943,7 +1023,7 @@ async function writeReviewOpinionsToFile(
     pipelineId: pipeline.pipelineId,
     round,
     generatedAt: new Date().toISOString(),
-    threshold: usage
+    usageAtTrigger: usage
       ? { used: usage.used, max: usage.max, model: usage.model }
       : { used: 0, max: 0, model: 'unknown' },
     reviews: reviews.map(r => ({
@@ -969,6 +1049,72 @@ async function writeReviewOpinionsToFile(
   };
 
   return { jsonPath, mdPath };
+}
+```
+
+##### 7.5.8.4.1 辅助函数定义（v2.1.2 修正 P1-1 / P1-2）
+
+```typescript
+/**
+ * P1-1：从 PipelineRecord 反查 ReviewProfile。
+ * PipelineRecord.input.profile 存 profile name（如 'default'）。
+ */
+function profileOf(pipeline: PipelineRecord): ReviewProfile {
+  return profile.load(pipeline.input.profile);
+}
+
+/**
+ * P1-2a：收集与 injectedIssues 相关的文档路径。
+ * "相关" 定义：issue.location 引用的文件 + pipeline.history 中读过的文件。
+ * 返回绝对路径数组，供 buildContextResetPrompt 在 prompt 中 @file 引用。
+ */
+function collectRelatedDocs(
+  pipeline: PipelineRecord,
+  issues: Issue[],
+): string[] {
+  const relatedFiles = new Set<string>();
+
+  // 1. issue.location 引用的源文件（如 "src/auth.ts:42" → "src/auth.ts"）
+  for (const issue of issues) {
+    const filePath = issue.location.replace(/:\d+$/, '');   // 去行号
+    const absPath = path.resolve(pipeline.input.cwd, filePath);
+    if (existsSync(absPath)) {
+      relatedFiles.add(absPath);
+    }
+  }
+
+  // 2. 历史轮次中 worker 产出过的 review opinions 文件
+  const stateDir = path.join(
+    expandPath('~/.cc-linker/review-pipelines'),
+    pipeline.pipelineId,
+    'state',
+  );
+  if (existsSync(stateDir)) {
+    for (const f of readdirSync(stateDir)) {
+      if (f.startsWith('external-review-') && f.endsWith('.md')) {
+        relatedFiles.add(path.join(stateDir, f));
+      }
+    }
+  }
+
+  return [...relatedFiles];
+}
+
+/**
+ * P1-2b：生成 round 摘要，供新 worker 了解前几轮发生了什么。
+ * 格式：每轮一行，包含 round 编号、状态转换、issue 数。
+ */
+function generateRoundSummary(pipeline: PipelineRecord): string {
+  const lines: string[] = [];
+  for (const event of pipeline.history) {
+    const issueCount = event.issues?.length ?? 0;
+    const verdictStr = event.verdict ? ` (${event.verdict})` : '';
+    lines.push(
+      `[Round ${event.round}] ${event.fromState ?? 'START'} → ${event.toState}${verdictStr} ` +
+      `— ${issueCount} issues, ${event.durationMs}ms, $${event.costUsd.toFixed(3)}`
+    );
+  }
+  return lines.join('\n');
 }
 ```
 
@@ -1010,31 +1156,84 @@ template = """
 """
 ```
 
+> **v2.1.2 修正（P1-8）：`@file` 引用在 injectReply 中的处理方式**
+>
+> Claude CLI 用户输入时 `@path` 会自动展开为文件内容。但 `injectReply` 走 daemon rendezvous 协议，**@file 展开行为尚未实测验证**。
+>
+> **双轨策略**（实施时需先实测确认）：
+>
+> | injectReply 是否展开 @file | Engine 行为 |
+> |---------------------------|------------|
+> | **是**（daemon 侧展开） | prompt 中直接写 `@{path}`，worker 收到已展开的文件内容 |
+> | **否**（daemon 不处理 @） | Engine 在调 `injectReply` 前**预展开**：读取文件内容 → 内联到 prompt 文本中（保留 `@path` 作为引用标记） |
+>
+> **预展开实现**（如果需要）：
+> ```typescript
+> function expandFileRefs(prompt: string, cwd: string): string {
+>   return prompt.replace(/@\{([^}]+)\}/g, (_, filePath) => {
+>     const absPath = path.resolve(cwd, filePath);
+>     if (!existsSync(absPath)) return `@{${filePath}}`;   // 找不到 → 保留原文
+>     const content = readFileSync(absPath, 'utf-8');
+>     return `--- @${filePath} ---\n${content}\n--- end @${filePath} ---`;
+>   });
+> }
+> ```
+>
+> **实测清单**（Phase 1 W1 前完成）：
+> 1. 调 `RendezvousClient.injectReply({ text: 'please read @{/tmp/test.md}' })` → 检查 worker 是否收到文件内容
+> 2. 如不展开 → 启用 `expandFileRefs` 预展开
+> 3. 记录结论到 `docs/superpowers/specs/review-engine-v2.1.1/appendices.md` 附录 A
+
 ##### 7.5.8.6 Reconciler 恢复增强
 
 启动时扫描 `state/external-review-r*.json`，可以直接看到每轮 EXTERNAL_REVIEW 的产出，无需重新 parse review pane。
 
 ##### 7.5.8.7 边界 case
 
+> **v2.1.2 修正（P0-4）**：明确区分"初始写入失败"与"跨崩溃恢复时文件丢失"两种场景的处理差异。
+
 | 场景 | 处理 |
 |------|------|
-| 写文件失败（磁盘满 / 权限） | **不再 fallback inline**（inline 注入会二次撑爆 context）→ `cleanupPipeline + ABORTED reason=review_opinions_write_failed`，cli-watch 提示用户手动 `cat ~/.cc-linker/review-pipelines/<id>/state/` 排查 |
-| json 文件损坏 | Reconciler 检测 + 跳过 + warn（不影响 pipeline 恢复） |
+| **初始写入失败**（磁盘满 / 权限） | `cleanupPipeline + ABORTED reason=review_opinions_write_failed`。**不 fallback inline**（inline 注入会二次撑爆 context，恶性循环）。cli-watch 提示用户手动排查 `~/.cc-linker/review-pipelines/<id>/state/` |
+| json 文件损坏（CRC 校验失败） | Reconciler 检测 + 跳过 + warn（不影响 pipeline 恢复，但 JUDGE prompt 降级到 inline 注入） |
 | MD 渲染失败（issues 字段缺失） | 降级：只写 json，MD 留 `.md.disabled` 占位 |
-| `external_review_md_path` 不存在（首次写） | prompt 模板降级到 inline 注入（仅首次，cascade 触发的二次 EXTERNAL_REVIEW 仍走写文件路径） |
-| 写文件成功但磁盘随后被清（pipeline 跨崩溃恢复时） | Reconciler 检测 `@file` 路径不存在 → prompt 模板降级到 inline 注入 + warn |
+| **跨崩溃恢复时 `@file` 路径不存在**（写入成功但后来磁盘被清 / 目录被迁移） | Reconciler 检测 → prompt 模板降级到 inline 注入 + warn。此时 pipeline 可能已 compact 或 context 已释放，inline 注入风险较低 |
+| Reconciler 恢复时发现 review pane 已死但 opinions 文件存在 | 直接读文件恢复 review issues，无需重新 spawn review pane |
 
 ---
 
 ## 9. PhaseDetector
 
+> **v2.1.2 修正（P1-9）：明确启发式优先级**
+>
+> 规则按优先级从高到低排列。命中即返回，不继续匹配后续规则。
+
 ```typescript
 function detect(input: { rawInput: string; filePath?: string; gitRef?: string }): 'spec' | 'plan' | 'code' {
-  // 启发式 1: 文件路径后缀 / 目录名
-  // 启发式 2: git ref → code
-  // 启发式 3: 关键词匹配
-  // 启发式 4: 文件后缀 / 行号引用 → 强制 code
-  // 启发式 5: LLM 分类（Phase 3，当前注释掉）
+  // 优先级 0: 用户显式 --phase flag（CLI 层已处理，不进 detect）
+
+  // 优先级 1: git ref → 强制 code（有 git ref 说明是代码变更）
+  if (input.gitRef) return 'code';
+
+  // 优先级 2: 文件后缀 / 行号引用 → 强制 code（如 "auth.ts:42"）
+  if (/\.(\w+):\d+/.test(input.rawInput)) return 'code';
+
+  // 优先级 3: 文件路径后缀 / 目录名
+  //   - *.md 在 docs/ 或 *.spec.md → spec
+  //   - *.md 在 plans/ 或 *.plan.md → plan
+  //   - *.ts / *.js / *.py 等源码后缀 → code
+  if (input.filePath) {
+    if (/docs\/.*\.md$|\.spec\.md$/.test(input.filePath)) return 'spec';
+    if (/plans\/.*\.md$|\.plan\.md$/.test(input.filePath)) return 'plan';
+    if (/\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|swift|kt)$/.test(input.filePath)) return 'code';
+  }
+
+  // 优先级 4: 关键词匹配
+  if (/\b(spec|specification|requirements|PRD)\b/i.test(input.rawInput)) return 'spec';
+  if (/\b(plan|design|architecture|implementation\s+plan)\b/i.test(input.rawInput)) return 'plan';
+  if (/\b(fix|bug|refactor|implement|code|NPE|crash|error)\b/i.test(input.rawInput)) return 'code';
+
+  // 未命中 → Phase 3 可加 LLM 分类（当前注释掉）
   throw new PhaseUnknownError(input.rawInput);
 }
 ```
@@ -1072,9 +1271,12 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
 
 ### 10.4 Retry 策略
 
+> **v2.1.2 修正（P1-14）**：Review Engine 不复用 ClaudeSessionManager（后者是 Feishu 通道的），自建两层 retry：
+
 ```typescript
-// Layer 1: ClaudeSessionManager 内部 1 次重试
-// Layer 2: 网络瞬态 503 重试（adapter 包装，3 次，backoff 2s/4s/8s）
+// Layer 1: parseBgOutputWithRetry（§7.5.4）— JSON parse 失败重试 1 次（injectReply 重生成）
+// Layer 2: adapter 网络重试 — 503/502/timeout 重试 3 次，backoff 2s/4s/8s
+// Layer 3: engine 级重试 — PANE_LOST → user retry → respawn（§5.3.3）
 ```
 
 ### 10.5 HUMAN_DECIDE 接收方式

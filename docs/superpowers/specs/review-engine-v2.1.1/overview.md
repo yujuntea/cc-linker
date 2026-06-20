@@ -28,6 +28,7 @@
 | **v2.1.1** | **2026-06-15** | **6 项 patch：单一 review 模型 / commit preamble / parse retry / context overflow / getContextUsage / review_fix 约束** |
 | v2.1.1 评审反馈 | 2026-06-17 | 7 P0 + 11 P1 修复 + I9 重设计（删 review_fix，reset 改为注入 issues + worker verify+fix）+ I10/I11 参数调整 |
 | **v2.1.2 (本轮)** | **2026-06-19** | **I9 三档 cascade（compact → reset → abort）+ review opinions 落盘（worker @file 引用）+ 阈值规则修 bug（128K/200K 模型 + 1M 模型提前干预）** |
+| v2.1.2 评审修正 | 2026-06-19 | 4 P0 + 10 P1 修复：per-pipeline 目录结构 / dead config 激活 / cascade N>1 走查 / 边界 case 去矛盾 / 辅助函数定义 / @file 双轨策略 / PhaseDetector 优先级 / 并发排队 queued/ |
 
 > 详细变更动机 + 决策链：见 [appendices.md → 附录 C](./appendices.md#附录-cv21--v211-变更背景动机--决策--章节索引)
 
@@ -109,12 +110,12 @@
 - `runChatSDK` Feishu 强耦合
 - `ExpectedReplyState` 语义错配，需要新建 `PipelineReplyState`
 
-### 3.2 新建层（13 个模块）
+### 3.2 新建层（15 个模块）
 
 ```
 src/review/
 ├── engine.ts            # 状态机驱动（9 active states + 3 terminals）
-├── pipeline-store.ts    # 持久化：5 目录（running / human_pending / done / failed / aborted）
+├── pipeline-store.ts    # 持久化：6 目录（running / queued / human_pending / done / failed / aborted）
 ├── pipeline-state.ts    # in-memory active pipeline Map
 ├── profile.ts           # ReviewProfile TOML 加载 + per-phase 深度 merge + provider 校验
 ├── phase-detect.ts      # 启发式：file path → git ref → 关键词 → 文件后缀/行号 → PhaseUnknownError
@@ -155,6 +156,14 @@ interface ContextUsage {
 //   4. 调 readLastAssistantTurn 拿 usage（turn.usage）
 //   5. 返回 ContextUsage（session 不存在 → null）
 ```
+
+> **v2.1.2 修正（P1-6）：成本数据来源**
+>
+> `HistoryEvent.costUsd` 和 `PipelineRecord.totalCostUsd` 的数据来源：
+> - 每次 bg session 完成（state=done）时，从 `state.json.output.result` 中解析 Claude CLI 输出的 JSON，提取 `cost_usd` 字段
+> - 如果 `state.json.output.result` 无 `cost_usd`（老版本 CLI），降级为从 JSONL 末条 `turn.usage` 计算：`(inputTokens * inputPrice + outputTokens * outputPrice) / 1_000_000`
+> - 价格表内置于 `model-parser.ts`（与 `KNOWN_CONTEXT_LIMITS` 同模块）
+> - `adapter.poll()` 在检测到 state=done 时自动提取 cost，engine 通过事件获取
 
 ### 3.2.2 模型解析（`model-parser.ts`）
 
