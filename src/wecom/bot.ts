@@ -16,6 +16,7 @@ import { WecomImageHandler } from './image-handler';
 import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spool';
 import type { ClaudeSessionManager } from '../proxy/session';
 import type { StreamChunk } from '../proxy/stream-parser';
+import { RegistryManager } from '../registry/registry';
 
 export type WecomBotConfig = {
   botId: string;
@@ -45,6 +46,16 @@ export type WecomBotConfig = {
    * - 未注入 → 跳过图片处理 (向后兼容旧测试 / staging)
    */
   imageHandler?: WecomImageHandler;
+  /**
+   * PR 6 Task 6.7: RegistryManager 注入点 — list-refresh card action 用。
+   * - 注入 → case 'list-refresh' 调 registryManager.listActive() + 推 template_card
+   * - 未注入 → 静默 (logger.warn, 不发 sendMessage), 不发通用 markdown 兜底
+   *
+   * 不注入默认 (new RegistryManager()) 会让 wecom-only 启动读真实 registry.json,
+   *   跟其他可选依赖 (sessionManager / imageHandler) 的 "默认 no-op" 风格不一致,
+   *   所以显式要求上游 (CLI 启动入口) 注入, 单测场景通过 mock 验证。
+   */
+  registryManager?: RegistryManager;
 };
 
 export class WecomBot {
@@ -60,6 +71,11 @@ export class WecomBot {
    * PR 6 Task 6.1: 可选 WecomImageHandler 注入。未注入时跳过图片下载 (向后兼容旧测试)。
    */
   private imageHandler?: WecomImageHandler;
+  /**
+   * PR 6 Task 6.7: 可选 RegistryManager 注入。case 'list-refresh' 用。
+   * 未注入 → 静默 (logger.warn, 不发 sendMessage), 跟 confirm-stop 一致。
+   */
+  private registryManager?: RegistryManager;
   private running = false;
 
   constructor(config: WecomBotConfig) {
@@ -74,6 +90,7 @@ export class WecomBot {
     this.spoolQueue = config.spoolQueue ?? new SpoolQueue();
     this.sessionManager = config.sessionManager;
     this.imageHandler = config.imageHandler;
+    this.registryManager = config.registryManager;
   }
 
   start(): void {
@@ -783,11 +800,25 @@ export class WecomBot {
         break;
       }
       case 'list-refresh': {
-        // 见 Task 6.7
-        logger.debug(`[wecom-bot] action ${event.actionTag} queued for execution`);
+        // PR 6 Task 6.7: 重新拉 active sessions 列表 + 推 template_card
+        // 历史: PR 5 stub 只发 sendMessage 兜底, 实际不拉列表, 用户点刷新看不到新活跃 session
+        // 修法: 调 registryManager.listActive + WecomCardBuilder.textNotice 推卡片
+        // 防御: registryManager 未注入 → 静默 (logger.warn, 不发通用 markdown 兜底),
+        //   跟 confirm-stop 一致 — 不让 bot 因为缺依赖崩
+        if (!this.registryManager) {
+          logger.warn(`[wecom-bot] list-refresh: registryManager not available`);
+          break;
+        }
+        const sessions = await this.registryManager.listActive();
+        const card = WecomCardBuilder.textNotice({
+          title: `飞书 sessions (${sessions.length})`,
+          content: sessions.length === 0
+            ? '无 active session'
+            : sessions.slice(0, 5).map(s => `• ${s.title ?? '(无标题)'} (${s.message_count ?? 0} msgs)`).join('\n'),
+        });
         await this.client.sdk.sendMessage(event.externalUserId, {
-          msgtype: 'markdown',
-          markdown: { content: `✅ 已执行: ${event.actionTag}` },
+          msgtype: 'template_card',
+          template_card: card as any,
         });
         break;
       }

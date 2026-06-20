@@ -196,4 +196,41 @@ describe('RegistryManager', () => {
     expect(entry?.message_count).toBe(10);
     expect(entry?.last_message_preview).toBe('Latest preview');
   });
+
+  // PR 6 Task 6.7: listActive() 返回 status==='active' 的 sessions
+  // 历史: list-refresh card action 需要刷新活跃 session 列表,
+  //   旧实现 stub 只发 sendMessage 兜底, 实际不拉列表
+  // 修法: RegistryManager 加 listActive() 方法, 基于 sessions map 过滤
+  it('PR 6 Task 6.7: listActive 返回 status==="active" 的 sessions (过滤掉其他状态)', async () => {
+    // 准备: 写 2 active + 1 archived + 1 provisioning
+    registry.upsert('uuid-active-1', { title: 'Active 1', status: 'active' });
+    registry.upsert('uuid-active-2', { title: 'Active 2', status: 'active' });
+    registry.upsert('uuid-archived-1', { title: 'Archived 1', status: 'archived' });
+    registry.upsert('uuid-provisioning-1', { title: 'Provisioning 1', status: 'provisioning' });
+
+    // 验证 listActive 存在且返回 2 个 active
+    const active = await registry.listActive();
+    expect(active).toHaveLength(2);
+    const activeIds = active.map(s => {
+      // SessionEntry shape: origin/cwd/.../status
+      const id = Object.entries(registry.sessions).find(([, v]) => v === s)?.[0];
+      return id;
+    });
+    expect(activeIds).toContain('uuid-active-1');
+    expect(activeIds).toContain('uuid-active-2');
+  });
+
+  it('PR 6 Task 6.7: listActive 包含默认 status (upsert 不传 status 时默认 active)', async () => {
+    // upsert 不传 status → buildSessionEntry 给默认 'active' (registry.ts:439)
+    registry.upsert('uuid-default-1', { title: 'Default 1' });
+    registry.upsert('uuid-default-2', { title: 'Default 2' });
+
+    const active = await registry.listActive();
+    expect(active).toHaveLength(2);
+  });
+
+  it('PR 6 Task 6.7: listActive 在 sessions 为空时返回空数组', async () => {
+    const active = await registry.listActive();
+    expect(active).toEqual([]);
+  });
 });

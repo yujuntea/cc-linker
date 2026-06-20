@@ -273,6 +273,20 @@ export class RegistryManager {
     await this.save();
   }
 
+  /**
+   * PR 6 Task 6.7: 列出所有 status==='active' 的 sessions。
+   * 历史: list-refresh card action (PR 5 stub 只发 sendMessage 兜底) 需要刷新活跃 session 列表。
+   * 修法: 基于 sessions map 过滤, 不用读文件 (在内存中过滤足够, 注册表是 single source of truth)。
+   *
+   * 返回数组顺序: Object.values() 保留插入顺序, 等价于 "最近注册/最近 active 的 session 在前"。
+   * 不 await reload: 写路径已 flush, 读路径不需要再 reload (避免在 batch 处理时阻塞)。
+   *   真正"实时"需求: card action 由用户点触发, 此时 registry 已被 scanner 同步,
+   *   in-memory data.sessions 已是最新的, 无需再 reload。
+   */
+  async listActive(): Promise<SessionEntry[]> {
+    return Object.values(this.data.sessions).filter(s => s.status === 'active');
+  }
+
   get sessions(): Record<string, SessionEntry> {
     return this.data.sessions;
   }

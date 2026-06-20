@@ -2212,3 +2212,147 @@ describe('WecomBot executeCardAction (PR 6 Task 6.6: confirm-stop)', () => {
     expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PR 6 Task 6.7: card action 'list-refresh' → RegistryManager.listActive + template_card
+ *
+ * 背景: PR 5 stub 把 list-refresh 用通用 log + markdown "✅ 已执行: list-refresh" 兜底,
+ *   实际没拉 registry 列表, 用户点刷新看不到新活跃 session。
+ * PR 6 Task 6.7 接 case 'list-refresh' 到 RegistryManager.listActive() + WecomCardBuilder.textNotice。
+ *   /bridge 已废弃 (2026-06-20 决定), 原 plan 的 bridge.listFeishuSessions 路径不可用。
+ *
+ * 关键不变量:
+ * - list-refresh 必调 registryManager.listActive()
+ * - 调 sdk.sendMessage 发 template_card (而非通用 markdown 兜底)
+ * - 空 sessions → 卡片 desc 含 "无 active session"
+ * - 有 sessions → 卡片 desc 含 session title 列表 (前 5 个)
+ * - registryManager 未注入 → 静默 (logger.warn, 不发 sendMessage) — 跟 confirm-stop 一致
+ */
+describe('WecomBot executeCardAction (PR 6 Task 6.7: list-refresh)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+  });
+
+  it('list-refresh: 调 registryManager.listActive + 推 template_card 含 session 列表', async () => {
+    const registryManager = {
+      listActive: mock(async () => [
+        { sessionUuid: 's-1', title: 'PR 2 review', cwd: '/Users/x/proj', messageCount: 42 } as any,
+        { sessionUuid: 's-2', title: 'Bug fix dashboard', cwd: '/Users/x/bugs', messageCount: 7 } as any,
+      ]),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t67.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      registryManager: registryManager as any,
+    });
+
+    await bot.__test_executeCardAction({
+      externalUserId: 'ext-1',
+      messageId: 'msg-lr-1',
+      actionTag: 'list-refresh',
+      actionValue: {},
+      inboundFrame: { headers: { req_id: 'req-lr' } },
+    });
+
+    // 1. registryManager.listActive 被调
+    expect(registryManager.listActive).toHaveBeenCalledTimes(1);
+
+    // 2. sendMessage 发了 template_card (非通用 markdown 兜底)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[0]).toBe('ext-1');
+    expect(smCall[1].msgtype).toBe('template_card');
+    const card = smCall[1].template_card;
+    expect(card.card_type).toBe('text_notice');
+    // desc 含 session title 列表
+    expect(card.main_title.desc).toContain('PR 2 review');
+    expect(card.main_title.desc).toContain('Bug fix dashboard');
+    // title 含数量
+    expect(card.main_title.title).toContain('2');
+  });
+
+  it('list-refresh: 0 active session → 卡片 desc 含 "无 active session"', async () => {
+    const registryManager = {
+      listActive: mock(async () => []),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t67-empty.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      registryManager: registryManager as any,
+    });
+
+    await bot.__test_executeCardAction({
+      externalUserId: 'ext-1',
+      messageId: 'msg-lr-empty',
+      actionTag: 'list-refresh',
+      actionValue: {},
+      inboundFrame: { headers: { req_id: 'req-lr-empty' } },
+    });
+
+    expect(registryManager.listActive).toHaveBeenCalledTimes(1);
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const card = mockClient.sdk.sendMessage.mock.calls[0][1].template_card;
+    expect(card.main_title.desc).toContain('无 active session');
+  });
+
+  it('list-refresh: registryManager 未注入 → 静默 (logger.warn, 不发 sendMessage)', async () => {
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t67-noreg.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      // registryManager 未注入
+    });
+
+    await bot.__test_executeCardAction({
+      externalUserId: 'ext-1',
+      messageId: 'msg-lr-noreg',
+      actionTag: 'list-refresh',
+      actionValue: {},
+      inboundFrame: { headers: { req_id: 'req-lr-noreg' } },
+    });
+
+    // 不发 sendMessage (跟 confirm-stop 一致: 缺依赖静默, 不发通用 markdown 兜底)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+  });
+});
