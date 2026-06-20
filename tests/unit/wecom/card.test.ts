@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { WecomCardBuilder } from '../../../src/wecom/card';
+import { WecomCardBuilder, type WecomTemplateCard } from '../../../src/wecom/card';
 
 describe('WecomCardBuilder', () => {
   it('builds text_notice card', () => {
@@ -50,5 +50,35 @@ describe('WecomCardBuilder', () => {
       options: [{ tag: 'opt1', text: '选项 1' }],
     });
     expect(card.card_type).toBe('vote_interaction');
+  });
+
+  it('m-4: textNotice with actionMenu sets action_menu without `as any` escape hatch', () => {
+    // PR 7 m-4 修法: 内部实现不再用 `(card as any).action_menu = ...`,
+    //   直接构造 TextNoticeCard 完整对象让 union 类型自然 narrow
+    const card = WecomCardBuilder.textNotice({
+      title: 't',
+      content: 'c',
+      actionMenu: [{ tag: 'retry', text: '重试' }],
+    });
+    // typecheck 验证: 这条赋值在没有 `as any` 的情况下也能编译
+    const _typed: WecomTemplateCard = card;
+    expect(_typed.card_type).toBe('text_notice');
+    if (_typed.card_type === 'text_notice') {
+      expect(_typed.action_menu?.desc).toBeTruthy();
+      expect(_typed.action_menu?.action_list.length).toBe(1);
+    }
+  });
+
+  it('m-4: newsNotice with source sets card_source without `as any` escape hatch', () => {
+    const card = WecomCardBuilder.newsNotice({
+      title: 't',
+      content: 'c',
+      source: { desc: 'src', url: 'https://example.com' },
+    });
+    const _typed: WecomTemplateCard = card;
+    expect(_typed.card_type).toBe('news_notice');
+    if (_typed.card_type === 'news_notice') {
+      expect(_typed.card_source?.url).toBe('https://example.com');
+    }
   });
 });

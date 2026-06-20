@@ -104,35 +104,46 @@ export type TemplateCard =
   | z.infer<typeof VoteInteractionCardSchema>
   | z.infer<typeof MultipleInteractionCardSchema>;
 
+/**
+ * PR 7 m-4: WecomTemplateCard — public alias for TemplateCard.
+ * 让外部调用方 (bot.ts / stream-updater.ts 等) 用 `card: WecomTemplateCard`
+ * 替代 `card as any`, 编译期就能 catch 字段名错误 (历史坑: main_title.titel)。
+ */
+export type WecomTemplateCard = TemplateCard;
+
 export const WecomCardBuilder = {
   textNotice(opts: TextNoticeOpts): TemplateCard {
     const validated = TextNoticeOptsSchema.parse(opts);
-    const card: TemplateCard = {
+    // PR 7 m-4: 直接构造完整 TextNoticeCard, 不再用 `(card as any).action_menu = ...`
+    //   强制类型绕过 — union 类型下 conditional property 加类型守卫更安全
+    const hasActionMenu = !!(validated.actionMenu && validated.actionMenu.length > 0);
+    return {
       card_type: 'text_notice',
       main_title: { title: validated.title, desc: validated.content },
+      ...(hasActionMenu
+        ? {
+            action_menu: {
+              desc: '操作',
+              action_list: validated.actionMenu!.map(a => ({
+                action_tag: a.tag,
+                action_title: { tag: a.tag, text: a.text },
+              })),
+            },
+          }
+        : {}),
     };
-    if (validated.actionMenu && validated.actionMenu.length > 0) {
-      (card as any).action_menu = {
-        desc: '操作',
-        action_list: validated.actionMenu.map(a => ({
-          action_tag: a.tag,
-          action_title: { tag: a.tag, text: a.text },
-        })),
-      };
-    }
-    return card;
   },
 
   newsNotice(opts: NewsNoticeOpts): TemplateCard {
     const validated = NewsNoticeOptsSchema.parse(opts);
-    const card: TemplateCard = {
+    // PR 7 m-4: 直接构造完整 NewsNoticeCard, 不用 `(card as any).card_source = ...`
+    return {
       card_type: 'news_notice',
       main_title: { title: validated.title, desc: validated.content },
+      ...(validated.source
+        ? { card_source: { desc: validated.source.desc, url: validated.source.url } }
+        : {}),
     };
-    if (validated.source) {
-      (card as any).card_source = { desc: validated.source.desc, url: validated.source.url };
-    }
-    return card;
   },
 
   buttonInteraction(opts: ButtonInteractionOpts): TemplateCard {

@@ -10,7 +10,7 @@ import type { StreamUpdater, StreamUpdateToolUse } from '../platform/stream-upda
 import { logger } from '../utils/logger';
 
 const STREAM_CONTENT_MAX_BYTES = 20480; // SDK 硬限制
-const DEFAULT_THROTTLE_MS = WecomStreamUpdater.THROTTLE_MS;
+const DEFAULT_THROTTLE_MS = 2000;
 
 type BufferedChunk = {
   thinking: string;
