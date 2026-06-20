@@ -254,14 +254,18 @@ export class WecomBot {
           //   （虽然慢于 60s spool requeue，但确保不永久卡 user-mapping）。
           await this.userManager.rollbackTimedOutClaims();
 
-          // 1. 重试卡在 processing 超时的消息（>60s 的丢回 pending）
-          // PR 2 v1.2.1 final (M-4): 传 'wecom' 过滤自己平台的消息，避免共享 SpoolQueue 时
-          //   误处理飞书 worker 的卡住消息
+          // 1. 重试卡在 processing 超时的消息（>stale_timeout 的丢回 pending）
+          // PR 6.17: stale_timeout 60s → 10min (读 config runtime.stale_timeout_ms)
+          // 历史: GLM session 17:15-17:17 反复 requeue, 因为 MiniMax-M3 思考慢, 60s 就误判卡住.
+          //   requeue 触发新一轮 handleClaimed + 新 Claude spawn, 同一 messageId 多次 spawn
+          //   → 用户看不到 thinking 累积 (每次 handleChat 局部变量清零).
+          // 修法: 调高到 10min (600_000ms) 或读 config, 给 MiniMax-M3 足够思考时间.
+          const staleTimeoutMs = config.get<number>('runtime.stale_timeout_ms', 10 * 60 * 1000);
           const processing = this.spoolQueue.listProcessing('wecom');
           for (const msg of processing) {
             const age = Date.now() - new Date(msg.updatedAt).getTime();
-            if (age > 60_000) {
-              logger.warn(`[wecom-bot] requeue stale processing: ${msg.messageId} (${Math.round(age / 1000)}s)`);
+            if (age > staleTimeoutMs) {
+              logger.warn(`[wecom-bot] requeue stale processing: ${msg.messageId} (${Math.round(age / 1000)}s, threshold=${Math.round(staleTimeoutMs / 1000)}s)`);
               this.spoolQueue.requeueFromProcessing(msg.messageId, msg.serialKey);
             }
           }
