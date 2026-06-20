@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { buildCompleteCard, COMPLETE_CARD_MAIN_BUTTONS, COMPLETE_CARD_ACTION_MENU } from '../../../src/wecom/complete-card';
+import { buildCompleteCard, WecomCompleteCardSender, COMPLETE_CARD_MAIN_BUTTONS, COMPLETE_CARD_ACTION_MENU } from '../../../src/wecom/complete-card';
 import type { WecomTemplateCard } from '../../../src/wecom/card';
 
 describe('buildCompleteCard', () => {
@@ -36,7 +36,7 @@ describe('buildCompleteCard', () => {
   it('generates unique task_id each call (ccdone- prefix + userId slice)', () => {
     const c1 = buildCompleteCard({ userId: 'wmu_user_abc' }) as any;
     const c2 = buildCompleteCard({ userId: 'wmu_user_abc' }) as any;
-    // task_id 不同 (Date.now() 不同)
+    // task_id 不同 (Math.random() 后缀 + Date.now() 不同)
     expect(c1.task_id).not.toBe(c2.task_id);
     // 都是 ccdone- 开头, 含 userId 前 12 字符
     expect(c1.task_id.startsWith('ccdone-')).toBe(true);
@@ -46,7 +46,7 @@ describe('buildCompleteCard', () => {
   it('truncates task_id to <=128 bytes for userId safety', () => {
     const longUserId = 'wmu_' + 'a'.repeat(200);
     const card = buildCompleteCard({ userId: longUserId }) as any;
-    // userId slice(0, 12) 限制 → task_id 必 ≤ "ccdone-" + 13digits + "-" + 12chars = ~31 字符
+    // userId slice(0, 12) 限制 → task_id 必 ≤ "ccdone-" + 13digits + "-" + 6rand + "-" + 12chars = ~37 字符
     expect(card.task_id.length).toBeLessThanOrEqual(128);
   });
 
@@ -56,5 +56,36 @@ describe('buildCompleteCard', () => {
 
   it('exposes COMPLETE_CARD_ACTION_MENU constant with expected tags', () => {
     expect(COMPLETE_CARD_ACTION_MENU.map(a => a.tag)).toEqual(['retry', 'stop', 'confirm-stop', 'list-refresh']);
+  });
+});
+
+describe('WecomCompleteCardSender', () => {
+  it('send() calls sdk.sendMessage with template_card msgtype + correct userId', async () => {
+    const sent: any[] = [];
+    const mockSdk = {
+      sendMessage: async (uid: string, body: any) => {
+        sent.push({ uid, body });
+      },
+    };
+    const sender = new WecomCompleteCardSender(mockSdk as any);
+    await sender.send({
+      userId: 'wmu_user_test',
+      sessionTitle: '测试 session',
+      durationMs: 12340,
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].uid).toBe('wmu_user_test');
+    expect(sent[0].body.msgtype).toBe('template_card');
+    expect(sent[0].body.template_card.card_type).toBe('button_interaction');
+  });
+
+  it('send() propagates sdk.sendMessage errors', async () => {
+    const mockSdk = {
+      sendMessage: async () => {
+        throw new Error('mock network error');
+      },
+    };
+    const sender = new WecomCompleteCardSender(mockSdk as any);
+    await expect(sender.send({ userId: 'wmu_test' })).rejects.toThrow('mock network error');
   });
 });

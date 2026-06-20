@@ -4,7 +4,7 @@
  *
  * @see docs/superpowers/specs/2026-06-20-wecom-complete-card-design.md §3.1
  */
-import type { WSClient } from '@wecom/aibot-node-sdk';
+import type { WSClient, TemplateCard } from '@wecom/aibot-node-sdk';
 import { WecomCardBuilder, type WecomTemplateCard } from './card';
 import { logger } from '../utils/logger';
 
@@ -41,13 +41,14 @@ export const COMPLETE_CARD_ACTION_MENU: ReadonlyArray<{ tag: string; text: strin
 /**
  * PR 7.1: 生成 task_id (aibot SDK 字段, 用于 updateTemplateCard 关联)
  * 限制: 数字、字母、_-@，最长 128 字节
- * 格式: ccdone-{timestamp}-{counter}-{userId 前 12 字符}
- * counter 避免同毫秒内连续调用生成相同 task_id
+ * 格式: ccdone-{timestamp}-{rand}-{userId 前 12 字符}
+ * PR 7.1 I-1: 用 Math.random() 替代 module-level counter — stateless,
+ *   避免多实例 / 多 daemon 并发不安全 + 测试间状态泄露
  */
-let _taskIdCounter = 0;
 function genCompleteCardTaskId(userId: string): string {
-  _taskIdCounter = (_taskIdCounter + 1) % 100000;
-  return `ccdone-${Date.now()}-${_taskIdCounter}-${userId.slice(0, 12)}`;
+  // 6 字符随机后缀 (base36), 保证唯一性 + stateless
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `ccdone-${Date.now()}-${rand}-${userId.slice(0, 12)}`;
 }
 
 /**
@@ -89,6 +90,15 @@ export function buildCompleteCard(ctx: CompleteCardContext): WecomTemplateCard {
 }
 
 /**
+ * PR 7.1 I-3: wire-shape payload — 用 SDK 导出的 TemplateCard 作为 wire target,
+ *   消除 buildCompleteCard → sendMessage 路径上的 as any。
+ *   运行时 aibot 服务端接受我们 button_list[].{action_tag, action_title} 格式
+ *   (对齐 WecomCardBuilder.buttonInteraction), SDK 类型用更宽松的 {text, key} 是 API 文档差异,
+ *   服务端以 builder 实际发送格式为准 (aibot SDK 自身 buttonInteraction 也用 action_tag/action_title)。
+ */
+type CompleteCardPayload = TemplateCard;
+
+/**
  * PR 7.1: 完成卡片 sender (stateless, 每次 send 都新建 card)
  * 调用方: WecomStreamUpdater.complete() 末尾
  */
@@ -97,12 +107,15 @@ export class WecomCompleteCardSender {
 
   async send(ctx: CompleteCardContext): Promise<void> {
     const card = buildCompleteCard(ctx);
-    // PR 7.1: 用 as any 跨过 SDK 的 TemplateCard 类型 (action_list 限 3 项, 字段名 {text,key} vs 内部 {action_tag,action_title})
-    //   运行时 payload 是正确的 (aibot 服务端兼容), 类型层用 any 兜底
-    await this.sdk.sendMessage(ctx.userId, {
-      msgtype: 'template_card',
-      template_card: card as any,
-    });
-    logger.info(`[wecom-complete-card] sent: userId=${ctx.userId.slice(0, 12)}... taskId=${(card as any).task_id}`);
+    // PR 7.1 I-3: 单次 cast 到 SDK wire-shape (WecomTemplateCard → TemplateCard),
+    //   buildCompleteCard 内部的 (card as any).action_menu / task_id 注入保留 —
+    //   这两字段在 WecomTemplateCard union 下 optional, 需要 mutable 注入, 留 cast。
+    const payload = {
+      msgtype: 'template_card' as const,
+      template_card: card as unknown as CompleteCardPayload,
+    };
+    await this.sdk.sendMessage(ctx.userId, payload);
+    const taskId = (card as unknown as CompleteCardPayload).task_id;
+    logger.info(`[wecom-complete-card] sent: userId=${ctx.userId.slice(0, 12)}... taskId=${taskId}`);
   }
 }
