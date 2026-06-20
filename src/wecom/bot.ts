@@ -77,6 +77,19 @@ export class WecomBot {
    */
   private registryManager?: RegistryManager;
   private running = false;
+  /**
+   * PR 7 Task 7.5 (M-2): dispatch loop 的可中断 timer handle。
+   * 历史: startDispatchLoop 用 setTimeout(r, 2000) 等下一轮 tick, stop() 设置
+   *   this.running = false, 但 await 还在 sleep 2s — 整个 loop 函数不退出。
+   * 修法: 持 timer handle + sleep promise 的 resolve, stop() clearTimeout
+   *   并手动调用 resolve 让 await 立即完成, loop 跳出 while 立即退出。
+   * 同时把 loop 函数的 promise 保存下来, 让单测 / 外部代码 await 验证
+   *   "stop 后 loop 真正退出"。
+   * @internal
+   */
+  private _dispatchTimer: ReturnType<typeof setTimeout> | null = null;
+  private _dispatchSleepResolve: (() => void) | null = null;
+  private _dispatchLoopPromise: Promise<void> | null = null;
 
   constructor(config: WecomBotConfig) {
     this.client = config.client ?? new AibotClient({
@@ -130,10 +143,33 @@ export class WecomBot {
     logger.info('[wecom-bot] started, connecting to WSS...');
   }
 
-  stop(): void {
+  /**
+   * 停 bot + 立即中断 dispatch loop。
+   *
+   * PR 7 Task 7.5 (M-2) 修法: 同步设置 this.running = false, 然后 clearTimeout
+   *   + 手动调 sleep resolve, 立即让 loop 的 await 跳出, 不等 2s tick。
+   * 返回 Promise<void>, await 等待 loop 真正退出 + client.disconnect 完成,
+   *   调用方能可靠地等 "bot 彻底停" (跟飞书侧 gracefulShutdown 对齐)。
+   */
+  async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
+    // PR 7 M-2: clearTimeout + 手动 resolve sleep promise, 让 loop 的 await 立即完成
+    if (this._dispatchTimer) {
+      clearTimeout(this._dispatchTimer);
+      this._dispatchTimer = null;
+    }
+    if (this._dispatchSleepResolve) {
+      const resolve = this._dispatchSleepResolve;
+      this._dispatchSleepResolve = null;
+      resolve();
+    }
     this.client.disconnect();
+    // await loop 真正退出 (sleep promise 已 resolve, 应当立即走 while check → break)
+    if (this._dispatchLoopPromise) {
+      await this._dispatchLoopPromise;
+      this._dispatchLoopPromise = null;
+    }
     logger.info('[wecom-bot] stopped');
   }
 
@@ -150,6 +186,13 @@ export class WecomBot {
    *
    * **PR 2 v1.2.1 (M1 修复)**: 轮询周期 500ms → 2000ms，与飞书侧 bot.dispatch 对齐
    * 减少 fs 全表扫描 IO（每秒 4 次 → 1 次）；PR 3 共享 FeishuBot.dispatch 后会变事件驱动
+   *
+   * **PR 7 Task 7.5 (M-2)**: 用可中断 timer + tracked promise 实现 stop 立即退出。
+   * 修前: setTimeout(r, 2000) 无法中断, stop() 后整个 loop 函数仍 sleep 2s,
+   *   → 测试 / daemon restart 时常卡 2s, 跟飞书侧 startForeground.dispatchLoop 不一致
+   * 修法: sleep 接受 timer handle 暴露到 this._dispatchTimer, stop() 时 clearTimeout
+   *   让 await 立即 resolve, loop 跳出 while 立即退出。loop promise 存到
+   *   this._dispatchLoopPromise, 让单测 / 外部代码 await 验证 stop 后 loop 真正退出。
    */
   private startDispatchLoop(): void {
     let stopped = false;
@@ -189,10 +232,20 @@ export class WecomBot {
         } catch (err) {
           logger.error(`[wecom-bot] dispatch loop error: ${err instanceof Error ? err.message : String(err)}`);
         }
-        await new Promise(r => setTimeout(r, 2000));
+        // PR 7 M-2: 可中断 sleep — 把 timer + resolve 暴露到 this, stop() 时
+        // clearTimeout 并手动调 resolve, 让 await 立即完成, loop 跳出 while 立即退出
+        if (stopped || !this.running) break;
+        await new Promise<void>(r => {
+          this._dispatchSleepResolve = r;
+          this._dispatchTimer = setTimeout(() => {
+            this._dispatchTimer = null;
+            this._dispatchSleepResolve = null;
+            r();
+          }, 2000);
+        });
       }
     };
-    loop();
+    this._dispatchLoopPromise = loop();
   }
 
   /**

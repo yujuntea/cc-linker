@@ -758,7 +758,7 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
     shuttingDown = true;
     console.log(chalk.yellow(`\n收到 ${signal}，优雅停机中...`));
     try { await bot?.shutdown(); } catch (err) { logger.error(`bot.shutdown() 失败: ${err}`); }
-    try { wecomBotInstance?.stop(); } catch (err) { logger.error(`wecomBot.stop() 失败: ${err}`); }
+    try { await wecomBotInstance?.stop(); } catch (err) { logger.error(`wecomBot.stop() 失败: ${err}`); }
     if (shutdown) {
       try { await shutdown(signal); } catch (err) { logger.error(`shutdown 失败: ${err}`); }
     }
@@ -880,7 +880,7 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
     shuttingDown = true;
     log('INFO', `收到 ${signal}，优雅停机中...`);
     try { await bot?.shutdown(); } catch (err) { log('ERROR', `bot.shutdown() 失败: ${err}`); }
-    try { wecomBotInstance?.stop(); } catch (err) { log('ERROR', `wecomBot.stop() 失败: ${err}`); }
+    try { await wecomBotInstance?.stop(); } catch (err) { log('ERROR', `wecomBot.stop() 失败: ${err}`); }
     if (shutdown) {
       try { await shutdown(signal); } catch (err) { log('ERROR', `shutdown 失败: ${err}`); }
     }

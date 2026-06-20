@@ -2356,3 +2356,75 @@ describe('WecomBot executeCardAction (PR 6 Task 6.7: list-refresh)', () => {
     expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PR 7 Task 7.5 (M-2): dispatch loop stop 立即中断
+ *
+ * 历史: WecomBot.startDispatchLoop 用 setTimeout(r, 2000) 等下一轮 tick, stop()
+ *   设置 this.running = false, 但要等下一次 tick 才会 break 循环 (最坏 2s)
+ *   → 测试 / daemon restart 时常卡 2s, 跟飞书侧 startForeground.dispatchLoop
+ *     (line 778 用 await new Promise) 表现不一致
+ * 修法: dispatch loop 持可中断 timer + tracked promise, stop() clearTimeout
+ *   + await loop 真正退出 (<100ms 而非 2s)
+ *
+ * 验证策略: start 后给 100ms 让 loop 进入 setTimeout 等待, 调 stop, 测 elapsed
+ *   关键不变量: stop() await 完成应 <500ms (修前要等 2s setTimeout 自然 resolve)
+ */
+describe('WecomBot stop (PR 7 Task 7.5: M-2 立即中断 dispatch loop)', () => {
+  it('M-2: stop await 在 500ms 内完成 (loop 立即退出, 不等 2s tick)', async () => {
+    const m2SpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      listProcessing: mock((_platform?: string) => []),
+      listPending: mock((_platform?: string) => []),
+      claimNext: mock((_serialKey: string) => null),
+      requeueFromProcessing: mock(async () => null),
+    };
+    const m2Client = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    const m2UserManager = {
+      validateOwner: mock((_uid: string) => true),
+      rollbackTimedOutClaims: mock(async () => 0),
+    };
+    const m2Bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-m2-stop.json',
+      client: m2Client as any,
+      spoolQueue: m2SpoolQueue as any,
+      userManager: m2UserManager as any,
+    });
+
+    m2Bot.start();
+    // 给 100ms 让 dispatch loop 完成第一次 tick (调 rollbackTimedOutClaims +
+    // listProcessing + listPending) 后进入 setTimeout(2000) 等待
+    await new Promise(r => setTimeout(r, 100));
+
+    // 确认 dispatch loop 真的在跑 (rollbackTimedOutClaims 至少被调 1 次)
+    expect(m2UserManager.rollbackTimedOutClaims).toHaveBeenCalled();
+
+    // 关键不变量: stop() await 在 500ms 内完成
+    // 修前: await loop promise 要等 2s setTimeout 自然 resolve
+    // 修后: clearTimeout 让 await 立即 resolve, loop 跳出 while 立即退出
+    const start = Date.now();
+    await m2Bot.stop();
+    const elapsed = Date.now() - start;
+
+    // 留 5x buffer (production 期望 <100ms, CI 时序抖动给 500ms 余量)
+    expect(elapsed).toBeLessThan(500);
+
+    // client.disconnect 已被调
+    expect(m2Client.disconnect).toHaveBeenCalled();
+  });
+});
