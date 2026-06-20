@@ -137,7 +137,7 @@ export class WecomBot {
       secret: config.secret,
     });
     this.updater = new WecomStreamUpdater(this.client.sdk, {
-      throttleMs: config.throttleMs ?? 2000,
+      throttleMs: config.throttleMs ?? 1500,  // PR 6.10: 跟飞书侧对齐, 默认 throttle 1500ms
     });
     // PR 6.8.4: 注入默认 msgFallback (用于 startProcessing/flushBuffer 错误兜底)
     // 注: 类级别 fallback 没有 msg context (chatId/userId), 所以默认只 log 不 send

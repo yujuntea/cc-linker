@@ -119,10 +119,11 @@ describe('WecomStreamUpdater', () => {
     expect(mockSdk._calls.length).toBe(callCount);
   });
 
-  it('m-3: exposes THROTTLE_MS class constant (was hardcoded 2000)', () => {
+  it('m-3: exposes THROTTLE_MS class constant (was hardcoded 2000, then aligned to 1500)', () => {
     // PR 7 m-3 fix: 限频窗口 2000ms 提常量 THROTTLE_MS, 跟 DEFAULT_THROTTLE_MS 同源
     // 历史: setTimeout(_, 2000) 在 stream-updater 写死, 调 throttleMs=100 不影响 hardcoded 路径
     // 修法: 改用 this.throttleMs (per-instance) 替代 hardcoded 2000
-    expect((WecomStreamUpdater as any).THROTTLE_MS).toBe(2000);
+    // PR 6.10: 2000 → 1500, 跟飞书侧 CardUpdater throttle_ms=1500 对齐, 流式增量刷新更快
+    expect((WecomStreamUpdater as any).THROTTLE_MS).toBe(1500);
   });
 });

@@ -10,7 +10,13 @@ import type { StreamUpdater, StreamUpdateToolUse } from '../platform/stream-upda
 import { logger } from '../utils/logger';
 
 const STREAM_CONTENT_MAX_BYTES = 20480; // SDK 硬限制
-const DEFAULT_THROTTLE_MS = 2000;
+const DEFAULT_THROTTLE_MS = 1500;  // PR 6.10: 跟飞书侧 CardUpdater throttle_ms=1500 对齐 (之前 2000 太慢, 流式增量慢 33%)
+/**
+ * PR 6.10: thinking 末尾显示字符数
+ * 跟飞书侧 feishu/card-updater.ts:533 maxThinkingBytes=Math.min(2000, maxCardBytes) 对齐
+ * 之前写死 500 字符截断, 用户看不到完整思考过程末尾
+ */
+const THINKING_TAIL_CHARS = 2000;
 
 type BufferedChunk = {
   thinking: string;
@@ -28,7 +34,8 @@ export type WecomStreamUpdaterOptions = {
  */
 function renderMarkdown(thinking: string, text: string, toolUses: StreamUpdateToolUse[], elapsedMs: number): string {
   const lines: string[] = [];
-  if (thinking) lines.push(`> ${thinking.slice(-500)}`);  // thinking 只显示最后 500 字符
+  // PR 6.10: 500 → 2000 字符, 跟飞书侧 maxThinkingBytes 对齐, 让用户看到完整思考过程末尾
+  if (thinking) lines.push(`> ${thinking.slice(-THINKING_TAIL_CHARS)}`);
   if (toolUses.length > 0) {
     lines.push(`\n**工具调用**：`);
     for (const t of toolUses) lines.push(`- \`${t.name}\`: ${t.inputSummary}`);
@@ -43,7 +50,7 @@ export class WecomStreamUpdater implements StreamUpdater {
    * PR 7 m-3: 限频窗口常量 (毫秒). 跟 DEFAULT_THROTTLE_MS 保持同值 (2000),
    * 对外暴露为 class constant, 允许测试和上层代码引用而不依赖魔法数。
    */
-  static readonly THROTTLE_MS = 2000;
+  static readonly THROTTLE_MS = 1500;  // PR 6.10: 跟飞书侧对齐, 提升流式增量刷新频率
   private sdk: WSClient;
   private throttleMs: number;
   private currentStreamId: string | null = null;
