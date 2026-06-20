@@ -1182,6 +1182,24 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     expect(content).toContain('/model');
   });
 
+  it('Task 6.2: /bridge 命令返回 YAGNI 提示 (spec §5.7 显式 YAGNI)', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/bridge list', 'msg_bridge'));
+
+    // 1. sendMessage 被调 (markdown 类型)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[0]).toBe('wmu_abc');
+    expect(smCall[1].msgtype).toBe('markdown');
+
+    // 2. 内容含 YAGNI 关键词 + spec §5.7 引用 + 替代方案
+    const sent = smCall[1].markdown.content;
+    expect(sent).toContain('YAGNI');
+    expect(sent).toContain('5.7');
+
+    // 3. spool markDone (不 requeue — YAGNI 是终态响应)
+    expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_bridge', 'cmd:wmu_abc:msg_bridge');
+  });
+
   it('/help 包含全部 10 个命令', async () => {
     await bot.__test_handleCommand(makeCmdMsg('/help', 'msg_help_pr5'));
 

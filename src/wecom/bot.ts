@@ -261,6 +261,12 @@ export class WecomBot {
         case 'model':
           responseText = await this.handleCommandModel(msg.userId, parsed.args);
           break;
+        // PR 6 Task 6.2: /bridge 已废弃 (2026-06-20 决定, spec §5.7 YAGNI 跨平台 session 同步)
+        // 历史: cc-connect 集成命令, cc-linker 移除 cc-connect 后孤儿, 不复活
+        // 替代: 用户在终端用 `cc-linker switch <uuid>` 跨平台管理 session
+        case 'bridge':
+          responseText = `❌ /bridge 已废弃 (spec §5.7 显式 YAGNI 跨平台 session 同步)\n\n如需跨平台 session 管理, 直接在终端用 \`cc-linker switch <uuid>\``;
+          break;
         default:
           responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /status /help /switch /resume /agents /stop /cancel /model\n\n_(/bridge 已废弃, 不再支持)_`;
       }
