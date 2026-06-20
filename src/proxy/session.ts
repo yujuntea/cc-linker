@@ -560,6 +560,17 @@ export class ClaudeSessionManager {
     const staleTimeout = config.get<number>('runtime.stale_timeout_ms', 5 * 60 * 1000);
     const hardTimeout = config.get<number>('runtime.hard_timeout_ms', 30 * 60 * 1000);
 
+    // PR 6.8.3: 加 spawn logger (与 sendSDKMessage 一致, 便于诊断 8s 静默失败)
+    // 之前 8s 流式静默成功 (replyStream 调了但 WSS 没真发送) 时:
+    //  - 0 个 "spawning" / "spawned" log → 不知道 Claude 是否真起来了
+    //  - 0 个 chunks log → 不知道 stdout 是否被消费
+    //  - 0 个 "DONE" log → 不知道 exitCode / lastResult / responseLen
+    // 现在每条关键路径都打 logger, 复现时 5s 内能看到断在哪。
+    logger.info(
+      `ClaudeStream: spawning — binary=${claudeBin}, cwd=${expandedCwd}, ` +
+        `argsLen=${args.length}, isNew=${isNew}, sessionId=${sessionId ?? '(new)'}`
+    );
+
     let proc;
     try {
       proc = Bun.spawn(args, {
@@ -570,10 +581,13 @@ export class ClaudeSessionManager {
         detached: true,
       });
     } catch (err: any) {
+      logger.error(`ClaudeStream: spawn FAILED — ${err.message}`);
       return this._errorResult(`Failed to start Claude process: ${err.message}`, sessionId);
     }
 
     const procPid = proc.pid;
+    logger.info(`ClaudeStream: spawned — pid=${procPid}, sessionId=${sessionId ?? '(new)'}`);
+
     const trackKey = sessionId ?? `pid:${procPid}`;
     this.activeProcesses.set(trackKey, {
       sessionId: sessionId ?? '',
@@ -589,12 +603,30 @@ export class ClaudeSessionManager {
     let stdoutBuffer = '';
     let lastResult: ResultChunk | null = null;
 
+    // PR 6.8.3: chunk 接收 throttle logger (避免 spam, 每 2s 最多 1 条)
+    let chunkCount = 0;
+    let lastChunkLogAt = 0;
+    const wrappedOnProgress = (chunk: StreamChunk) => {
+      chunkCount++;
+      const now = Date.now();
+      if (now - lastChunkLogAt > 2000) {
+        const textLen = chunk.type === 'text' ? ((chunk as any).content?.length ?? 0) : 0;
+        logger.info(
+          `ClaudeStream: pid=${procPid} chunks=${chunkCount} lastType=${chunk.type} textLen=${textLen}`
+        );
+        lastChunkLogAt = now;
+      }
+      onProgress(chunk);
+    };
+
     const stdoutPromise = (async () => {
       const reader = proc.stdout.getReader();
+      let stdoutBytes = 0;
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          stdoutBytes += value.byteLength;
           stdoutBuffer += decoder.decode(value, { stream: true });
           lastOutputAt = Date.now();
           const lines = stdoutBuffer.split('\n');
@@ -603,7 +635,7 @@ export class ClaudeSessionManager {
             const parsed = parser.parseLine(line);
             if (parsed) {
               if (parsed.type === 'result') lastResult = parsed as ResultChunk;
-              else onProgress(parsed);
+              else wrappedOnProgress(parsed);
             }
           }
         }
@@ -612,25 +644,38 @@ export class ClaudeSessionManager {
           const parsed = parser.parseLine(stdoutBuffer);
           if (parsed) {
             if (parsed.type === 'result') lastResult = parsed as ResultChunk;
-            else onProgress(parsed);
+            else wrappedOnProgress(parsed);
           }
         }
       } catch (err) {
-        logger.warn(`Stream: read失败: ${err}`);
+        logger.warn(`ClaudeStream: pid=${procPid} stdout read failed: ${err}`);
       }
+      logger.info(
+        `ClaudeStream: pid=${procPid} stdout closed — ${stdoutBytes} bytes, ` +
+          `lastResult=${lastResult ? 'set' : 'null'}`
+      );
     })();
 
     const stderrPromise = (async () => {
       const reader = proc.stderr.getReader();
+      let stderrBytes = 0;
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          stderrBytes += value.byteLength;
           stderrText += decoder.decode(value, { stream: true });
           lastOutputAt = Date.now();
+          // PR 6.8.3: stderr 累计超过 500 字节时 warn 一次 (避免 spam)
+          if (stderrText.length > 0 && stderrText.length % 500 < stderrBytes) {
+            logger.warn(
+              `ClaudeStream: pid=${procPid} stderr accumulated=${stderrText.length} bytes ` +
+                `(last 200: ${stderrText.slice(-200)})`
+            );
+          }
         }
       } catch (err) {
-        logger.warn(`Stream: stderr 读取失败: ${err}`);
+        logger.warn(`ClaudeStream: pid=${procPid} stderr read failed: ${err}`);
       }
     })();
 
@@ -667,7 +712,14 @@ export class ClaudeSessionManager {
     this.activeProcesses.delete(trackKey);
 
     const durationMs = Date.now() - startTime;
-    return this._buildStreamingResult(lastResult, exitCode, stderrText, sessionId, startTime, durationMs, isNew);
+    const result = await this._buildStreamingResult(lastResult, exitCode, stderrText, sessionId, startTime, durationMs, isNew);
+    // PR 6.8.3: 关键 return 路径前加综合 logger, 复现 8s 静默失败时能直接定位断点
+    logger.info(
+      `ClaudeStream: pid=${procPid} DONE — exitCode=${exitCode}, ` +
+        `lastResult=${lastResult ? 'set' : 'null'}, responseLen=${result.response.length}, ` +
+        `sessionId=${result.sessionId || '(empty)'}, hasError=${result.sessionStatus !== 'active'}`
+    );
+    return result;
   }
 
   private _errorResult(message: string, sessionId: string | null): SendMessageResult {
@@ -705,10 +757,24 @@ export class ClaudeSessionManager {
     }
 
     if (!response && exitCode !== 0) {
-      response = `Claude 执行失败: ${baseError || stderrText.trim() || '未知错误'}`;
+      // PR 6.8.3: 显式包含 exit code (之前只在 message 里, 终端用户看不出来)
+      const stderrTail = stderrText.trim().slice(-200);
+      response = `❌ Claude 进程异常退出 (exit ${exitCode}): ${baseError || stderrTail || '未知错误'}`;
       hasError = true;
     }
-    if (!response) response = '(空回复)';
+    // PR 6.8.3: 8s 流式空回复 fallback 改进
+    // 之前: response = '(空回复)' → 用户看到方框,不知道发生了什么
+    // 现在: 区分两种情况给出可操作消息
+    //  - lastResult=null + exitCode=0: Claude 跑了但没产生 result block
+    //    (可能是 superpowers skill 注入 + thinking 阶段过长,或 API 异常)
+    if (!response) {
+      if (lastResult === null && exitCode === 0) {
+        const elapsedSec = Math.round((Date.now() - startTime) / 1000);
+        response = `⏱ Claude 跑了 ${elapsedSec}s 但没产生回复 (可能思考中或 API 异常, 请重试或简化问题)`;
+      } else {
+        response = '(空回复)';
+      }
+    }
 
     let jsonlPath: string | null = null;
     // v2026-06-18: 修复 /switch 阻断 bug —— SDK/Claude 已经正常运行过的路径

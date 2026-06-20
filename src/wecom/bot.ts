@@ -701,7 +701,19 @@ export class WecomBot {
         await this.userManager.touchSession(msg.userId);
       }
 
-      await this.updater.complete(text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1);
+      // PR 6.8.3: 兜底 sendMessage 通道 — replyStream 静默失败时用户至少能看到错误
+      // 之前 8s 真实企微 E2E: 卡片始终空白, replyStream 调了但 WSS 没真发送
+      // 现在 replyStream throw → 调 sendMessage 走 markdown 错误, 路由用 resolveReceiveId (PR 6.8.1)
+      const receiveIdForFallback = resolveReceiveId(msg);
+      await this.updater.complete(
+        text, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1,
+        async (markdown: string) => {
+          await this.client.sdk.sendMessage(receiveIdForFallback, {
+            msgtype: 'markdown',
+            markdown: { content: markdown },
+          });
+        },
+      );
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
     } catch (err) {
       logger.error(`[wecom-bot] handleChat Claude flow error: ${err instanceof Error ? err.message : String(err)}`);

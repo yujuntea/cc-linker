@@ -167,6 +167,10 @@ export class WecomStreamUpdater implements StreamUpdater {
     _tokensOut: number,
     _durationMs: number,
     _numTurns: number,
+    // PR 6.8.3: 终态 replyStream 失败时兜底 (sendMessage markdown)。
+    // 之前 8s 流式静默失败时, 卡片停留在空白 thinking, 用户看不到错误。
+    // 现在 replyStream throw → 调 fallback 走 sendMessage 错误消息。
+    msgFallback?: (text: string) => Promise<void>,
   ): Promise<void> {
     if (!(await this.prepareTerminal())) return;
     const t = this.getTerminalFrame();
@@ -177,7 +181,17 @@ export class WecomStreamUpdater implements StreamUpdater {
     try {
       await this.sdk.replyStream(t.frame, t.streamId, this.truncate(response), true);
     } catch (err) {
-      logger.error(`[wecom-stream] complete replyStream failed: ${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error(`[wecom-stream] complete replyStream failed: ${errMsg}`);
+      // 兜底: 走 sendMessage 通道, 用户至少能看到错误 (不是空白卡片)
+      if (msgFallback) {
+        try {
+          await msgFallback(`❌ 流式回复失败: ${errMsg}`);
+          logger.info(`[wecom-stream] complete fallback sendMessage succeeded`);
+        } catch (fbErr) {
+          logger.error(`[wecom-stream] complete fallback sendMessage also failed: ${fbErr instanceof Error ? fbErr.message : String(fbErr)}`);
+        }
+      }
     }
     this.clearTerminalState();
   }

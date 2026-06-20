@@ -37,6 +37,8 @@ export class FeishuStreamUpdater implements StreamUpdater {
     tokensOut: number,
     durationMs: number,
     numTurns: number,
+    // PR 6.8.3: 飞书 CardUpdater 不需要 fallback (它本身有 fallback_to_text 自动转 markdown)
+    _msgFallback?: (text: string) => Promise<void>,
   ): Promise<void> {
     await this.cardUpdater.complete(response, tokensIn, tokensOut, durationMs, numTurns);
   }

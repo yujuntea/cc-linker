@@ -31,13 +31,21 @@ export interface StreamUpdater {
     toolUses?: StreamUpdateToolUse[],
   ): Promise<void>;
 
-  /** 流式完成。飞书：patch complete card；企微：replyStream finish=true */
+  /**
+   * 流式完成。飞书：patch complete card；企微：replyStream finish=true
+   *
+   * PR 6.8.3: 增加可选 `msgFallback` 参数 — 终态发送 (replyStream) 失败时,
+   * 调 fallback 走 sendMessage 兜底, 避免用户看不到回复 (流式 replyStream
+   * 静默成功但 WSS 没真发送的场景, 13:08 真实企微 E2E 复现)。
+   * 飞书实现忽略这个参数 (飞书有 fallback_to_text 自动转 markdown, 不需要)。
+   */
   complete(
     response: string,
     tokensIn: number,
     tokensOut: number,
     durationMs: number,
     numTurns: number,
+    msgFallback?: (text: string) => Promise<void>,
   ): Promise<void>;
 
   /** 流式错误。飞书：patch error card；企微：replyStream finish=true with error text */
