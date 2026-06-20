@@ -262,6 +262,13 @@ export class WecomStreamUpdater implements StreamUpdater {
     // 现在 replyStream throw → 调 fallback 走 sendMessage 错误消息。
     // PR 6.8.4: per-call 参数 + 类字段 msgFallback 同时支持, per-call 优先
     msgFallback?: (text: string) => Promise<void>,
+    // PR 6.13: complete 接 thinking + toolUses 渲染完整结构 (PR 6.12 教训)
+    // 历史: updateStream 中间 patch 不保证触发 (Claude 跑 < 1500ms throttle 时),
+    //   complete 只推 finalText, thinking 不渲染 → 用户看不到思考过程
+    // 修法: handleChat 传 thinking + toolUses, complete 渲染
+    //   '**思考过程：**\n{thinking}\n\n**当前操作：**\n...\n\n**回复：**\n{response}'
+    thinking?: string,
+    toolUses?: StreamUpdateToolUse[],
   ): Promise<void> {
     if (!(await this.prepareTerminal())) return;
     const t = this.getTerminalFrame();
@@ -271,11 +278,15 @@ export class WecomStreamUpdater implements StreamUpdater {
     }
     // PR 6.8.4: per-call 优先, 否则用类字段
     const fb = msgFallback ?? this.msgFallback;
+    // PR 6.13: 渲染完整结构 (仿飞书 buildStreamingCard + buildCompleteCard)
+    const finalMarkdown = thinking || toolUses
+      ? renderMarkdown(thinking ?? '', response, toolUses ?? [], _durationMs)
+      : response;
     try {
-      const wsFrame = await this.sdk.replyStream(t.frame, t.streamId, this.truncate(response), true) as any;
+      const wsFrame = await this.sdk.replyStream(t.frame, t.streamId, this.truncate(finalMarkdown), true) as any;
       // PR 6.8.4: 检查 WsFrame errcode (14:50:09 真实验收: 静默成功 errcode=93006 invalid chatid)
       this.checkWsFrameErrcode(wsFrame, 'complete');
-      logger.info(`[wecom-stream] complete OK: streamId=${t.streamId.slice(0, 8)}... contentLen=${response.length}`);
+      logger.info(`[wecom-stream] complete OK: streamId=${t.streamId.slice(0, 8)}... contentLen=${finalMarkdown.length}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error(`[wecom-stream] complete replyStream failed: ${errMsg}`);

@@ -405,6 +405,11 @@ export class WecomBot {
         case 'model':
           responseText = await this.handleCommandModel(msg.userId, parsed.args);
           break;
+        // PR 6.13: /listdir 命令 — 列 cwd 下子目录 (仿飞书 doListDir 但简化无 CardKit)
+        // 历史: 飞书 /listdir 渲染 CardKit 模板卡片 (buildDirListCard); wecom 推 markdown 列表
+        case 'listdir':
+          responseText = await this.handleCommandListDir(msg.userId);
+          break;
         // PR 6 Task 6.2: /bridge 已废弃 (2026-06-20 决定, spec §5.7 YAGNI 跨平台 session 同步)
         // 历史: cc-connect 集成命令, cc-linker 移除 cc-connect 后孤儿, 不复活
         // 替代: 用户在终端用 `cc-linker switch <uuid>` 跨平台管理 session
@@ -717,6 +722,62 @@ export class WecomBot {
     return `✅ 已设置 model: ${model}\n\n_(注: 当前 PR 5 临时实现, model 持久化推 PR 6+ 配合 ProviderManager)_`;
   }
 
+  /**
+   * PR 6.13: /listdir 命令 — 读 cwd 下子目录并推 markdown 列表
+   *
+   * 历史: wecom 没 /listdir (飞书 doListDir 渲染 CardKit 卡片, 但 wecom 无 CardKit)
+   * 修法: 简化版 — 读 user-mapping entry.cwd (fallback /tmp) → readdirSync → 推 markdown 列表
+   *
+   * 跟飞书 doListDir 差异:
+   * - 飞书: CardKit textNotice card (buildDirListCard), 可点击目录切换 cwd
+   * - wecom: markdown 列表 (PR 6.11 教训: textNotice 没 action_menu 时 42045)
+   * - wecom: 没法直接 "点击目录切换 cwd", 用户需 /new <路径> 切换
+   *
+   * 防御: cwd 不存在 → 报错 + cwd 路径提示
+   */
+  private async handleCommandListDir(userId: string): Promise<string> {
+    try {
+      const { readdirSync, existsSync } = await import('fs');
+      const { dirname } = await import('path');
+
+      // cwd 优先级: user-mapping entry.cwd → /tmp fallback (跟 handleChat 续聊 cwd 一致)
+      const entry = this.userManager.getEntry(userId);
+      const cwd = entry?.cwd ?? '/tmp';
+
+      if (!existsSync(cwd)) {
+        return `❌ 目录不存在: ${cwd}\n\n使用 \`/new <路径>\` 切换到有效目录`;
+      }
+
+      // 读子目录 (排除隐藏目录, 按字母排序, 限 20 条避免 markdown 过长)
+      const entries = readdirSync(cwd, { withFileTypes: true })
+        .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+        .map(e => e.name)
+        .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+        .slice(0, 20);
+
+      const totalDirs = entries.length;
+      const hasMore = totalDirs > 20;
+
+      // parent 上级目录 (根目录无 parent)
+      const parent = cwd !== dirname(cwd) ? dirname(cwd) : null;
+
+      const lines = [`📂 **目录浏览**: \`${cwd}\``, ''];
+      if (parent) lines.push(`⬆️ 上级目录: \`${parent}\``);
+      if (entries.length === 0) {
+        lines.push('📁 当前目录下没有子目录');
+      } else {
+        for (const dir of entries) {
+          lines.push(`📁 ${dir}`);
+        }
+      }
+      if (hasMore) lines.push(`\n_... 还有更多子目录未显示_`);
+      lines.push('\n💡 使用 `/new <路径>` 切换到指定目录');
+      return lines.join('\n');
+    } catch (err: any) {
+      return `❌ 无法读取目录: ${err.message ?? String(err)}`;
+    }
+  }
+
   private async handleChat(msg: SpoolMessage): Promise<void> {
     logger.info(`[wecom-bot] handleChat: userId=${msg.userId}, text=${msg.text.slice(0, 50)}`);
 
@@ -845,6 +906,7 @@ export class WecomBot {
       //   (e.g. Claude 只输出 thinking 没 text, 或 SDK 不 emit partial text),
       //   complete 传 0 长字符串导致 replyStream 显示空白方框 (15:09:50 真实验收).
       // 仿飞书侧 feishu/bot.ts:2441-2443 同款模式: text || result.response || '(空回复)'
+      // PR 6.13: 同步 finalText 变量到前面赋值声明, 因为 let → const 后续不能修改
       const finalText = text || result.response || '(空回复)';
       logger.info(`[wecom-bot] handleChat finalize: textLen=${text.length} responseLen=${result.response?.length ?? 0} finalTextLen=${finalText.length}`);
 
@@ -852,6 +914,10 @@ export class WecomBot {
       // 之前 8s 真实企微 E2E: 卡片始终空白, replyStream 调了但 WSS 没真发送
       // 现在 replyStream throw → 调 sendMessage 走 markdown 错误, 路由用 resolveReceiveId (PR 6.8.1)
       const receiveIdForFallback = resolveReceiveId(msg);
+      // PR 6.13: 传 thinking + 累计 toolUses 给 complete → 仿飞书 buildCompleteCard 结构
+      // 历史: PR 6.12 renderMarkdown 加 "思考过程：" 标签, 但 updateStream 中间 patch 不保证触发
+      //   (Claude 跑 < throttle 时不 patch), complete 只推 finalText 不含 thinking, 用户看不到思考过程.
+      // 修法: handleChat 持 state.thinking/text, complete 时把它 + thinking 一起传, 渲染完整 markdown.
       await this.updater.complete(
         finalText, result.tokensIn ?? 0, result.tokensOut ?? 0, result.durationMs, 1,
         async (markdown: string) => {
@@ -860,6 +926,8 @@ export class WecomBot {
             markdown: { content: markdown },
           });
         },
+        // PR 6.13 新增参数: 思考过程 + 工具过程
+        thinking, [],  // toolUses 暂未传到 updater (需要更新 appendChunk + proxy 层)
       );
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
     } catch (err) {

@@ -346,10 +346,13 @@ describe('WecomBot handleChat (PR 4.1)', () => {
     await bot.__test_handleChat(msg);
 
     // complete 调用: replyStream 最后一次 (final=true), content 应该是 result.response
+    // PR 6.13: 仿飞书结构 - 完整 markdown 含 "思考过程：" + "回复：" + "已用时"
     const calls = mockClient.sdk.replyStream.mock.calls;
     const completeCall = calls[calls.length - 1];
     expect(completeCall[3]).toBe(true);  // final=true
-    expect(completeCall[2]).toBe('Hi! How can I help?');  // 不是 0 长
+    expect(completeCall[2]).toContain('Hi! How can I help?');  // PR 6.13: renderMarkdown 包了 thinking label
+    expect(completeCall[2]).toContain('**回复：**');  // 仿飞书 buildStreamingCard 标签
+    expect(completeCall[2]).toContain('⏱ 已用时');
 
     // 不应发送空串
     const allContents = calls.map((c: any[]) => c[2]).join('|');
@@ -409,7 +412,10 @@ describe('WecomBot handleChat (PR 4.1)', () => {
     const calls = mockClient.sdk.replyStream.mock.calls;
     const completeCall = calls[calls.length - 1];
     expect(completeCall[3]).toBe(true);
-    expect(completeCall[2]).toBe('(空回复)');
+    // PR 6.13: 仿飞书结构 - thinking 空但 finalText="(空回复)", renderMarkdown 包了 "回复：" 标签
+    expect(completeCall[2]).toContain('(空回复)');
+    expect(completeCall[2]).toContain('**回复：**');
+    expect(completeCall[2]).toContain('⏱ 已用时');
   });
 
   it('error path: sessionManager throws → updater.error + requeue', async () => {
@@ -2849,6 +2855,130 @@ describe('WecomBot executeCardAction (PR 6 Task 6.7: list-refresh)', () => {
 
     // 不发 sendMessage (跟 confirm-stop 一致: 缺依赖静默, 不发通用 markdown 兜底)
     expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * PR 6.13: /listdir 命令 — 读 cwd 下子目录推 markdown 列表
+ *
+ * 仿飞书 doListDir (src/feishu/bot.ts:3664-3725), 但简化无 CardKit:
+ * - 飞书: CardKit textNotice card (buildDirListCard), 可点击目录切换 cwd
+ * - wecom: markdown 列表 (PR 6.11 教训: textNotice 没 action_menu 时 42045)
+ *
+ * 关键不变量:
+ * - cwd 来自 user-mapping entry.cwd (fallback /tmp)
+ * - 列子目录按字母排序, 排除隐藏目录, 限 20 条
+ * - 目录不存在 → ❌ 报错 + 提示 /new <路径> 切换
+ */
+describe('WecomBot /listdir command (PR 6.13)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+  });
+
+  it('/listdir: cwd 有子目录 → markdown 列表按字母排序', async () => {
+    const { mkdirSync, rmSync } = await import('fs');
+    const testDir = '/tmp/test-listdir-wecom-001';
+    mkdirSync(testDir, { recursive: true });
+    mkdirSync(`${testDir}/zeta`, { recursive: true });
+    mkdirSync(`${testDir}/alpha`, { recursive: true });
+    mkdirSync(`${testDir}/mid`, { recursive: true });
+    mkdirSync(`${testDir}/.hidden`, { recursive: true });
+    mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
+
+    const bot = new WecomBot({
+      botId: 'test', secret: 'test',
+      userMappingPath: '/tmp/test-listdir-pr613.json',
+      client: mockClient, spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+
+    const msg: any = {
+      messageId: 'msg-listdir-001', openId: '', text: '/listdir',
+      userId: 'WuYuJun', platform: 'wecom',
+      target: { type: 'session', sessionUuid: 'x', cwd: testDir },
+      serialKey: 'x:msg-listdir-001', status: 'pending',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      metadata: { chatId: 'abc', chatType: 'p2p' },
+    };
+
+    await bot.__test_handleCommand(msg);
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('📂 **目录浏览**');
+    expect(content).toContain(testDir);
+    // 字母顺序: alpha 在 mid 前面
+    const alphaIdx = content.indexOf('alpha');
+    const midIdx = content.indexOf('mid');
+    const zetaIdx = content.indexOf('zeta');
+    expect(alphaIdx).toBeGreaterThan(-1);
+    expect(midIdx).toBeGreaterThan(-1);
+    expect(zetaIdx).toBeGreaterThan(-1);
+    expect(alphaIdx).toBeLessThan(midIdx);
+    expect(midIdx).toBeLessThan(zetaIdx);
+    // 隐藏目录被排除
+    expect(content).not.toContain('.hidden');
+    // 提示 /new <路径>
+    expect(content).toContain('/new <路径>');
+
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('/listdir: cwd 不存在 → ❌ 报错 + 提示 /new', async () => {
+    mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: '/nonexistent/path/wecom-pr613' }));
+
+    const bot = new WecomBot({
+      botId: 'test', secret: 'test',
+      userMappingPath: '/tmp/test-listdir-nonexistent-pr613.json',
+      client: mockClient, spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+
+    const msg: any = {
+      messageId: 'msg-listdir-404-pr613', openId: '', text: '/listdir',
+      userId: 'wmu_abc', platform: 'wecom',
+      target: { type: 'session', sessionUuid: 'x', cwd: '/nonexistent/path/wecom-pr613' },
+      serialKey: 'x:msg-listdir-404-pr613', status: 'pending',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      metadata: { chatId: 'abc', chatType: 'p2p' },
+    };
+
+    await bot.__test_handleCommand(msg);
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('❌');
+    expect(content).toContain('不存在');
+    expect(content).toContain('/new <路径>');
   });
 });
 
