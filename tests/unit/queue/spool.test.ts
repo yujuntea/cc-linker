@@ -225,6 +225,34 @@ describe('SpoolQueue', () => {
     expect(spool.finalizeDeliveredMessages()).toBe(0);
     expect(spool.listProcessing()).toHaveLength(1);
   });
+
+  // PR 7 Task 7.3 (M-5): lock cleanup behavior — age decided by mtime, not lex.
+  // 构造 2 个 done 文件：lex 排序时 a_old 在前，但 mtime 时 b_new 在前。
+  // retention 设 1h，b_new (30min ago) 保留, a_old (2h ago) 删。
+  // 即使 lex 排序先看 a_old，mtime 决策决定保留 b_new。
+  test('cleanup keeps newer-by-mtime file even if lex would prefer other', () => {
+    const doneDir = join(tmpDir, 'done');
+    const now = Date.now();
+    const { utimesSync } = require('fs');
+    // a_old.json: lex 排序在前, mtime 2h 前 (超 1h cutoff → 删)
+    writeFileSync(join(doneDir, 'a_old.json'), '{}');
+    utimesSync(join(doneDir, 'a_old.json'), (now - 2 * 3600 * 1000) / 1000, (now - 2 * 3600 * 1000) / 1000);
+    // b_new.json: lex 排序在后, mtime 30min 前 (在 1h cutoff 内 → 保留)
+    writeFileSync(join(doneDir, 'b_new.json'), '{}');
+    utimesSync(join(doneDir, 'b_new.json'), (now - 30 * 60 * 1000) / 1000, (now - 30 * 60 * 1000) / 1000);
+
+    // 覆盖 config: done_retention_hours=1 (默认 24 太长, 所有都保留)
+    const { config } = require('../../../src/utils/config');
+    config.setRuntimeOverride('queue.done_retention_hours', 1);
+    config.setRuntimeOverride('queue.done_max_files', 1000);
+
+    const result = spool.cleanup();
+    const remaining = readdirSync(doneDir).sort();
+    // b_new.json 保留 (mtime 在 cutoff 内); a_old.json 被删 (mtime 超 cutoff)
+    expect(remaining).toContain('b_new.json');
+    expect(remaining).not.toContain('a_old.json');
+    expect(result.cleaned).toBe(1);
+  });
 });
 
 describe('SpoolQueue.updateMessageFlags', () => {
