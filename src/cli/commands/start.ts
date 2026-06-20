@@ -14,11 +14,12 @@ import { getClaudeProcessesByCwd } from '../../utils/process-info';
 import { AgentViewManager } from '../../agent-view/manager';
 import type { AgentViewDeps } from '../../agent-view/manager';
 import { createPatchFn } from '../../feishu/patch';
-import { RUNTIME_PID_FILE, RUNTIME_LOG_FILE } from '../../utils/paths';
+import { RUNTIME_PID_FILE, RUNTIME_LOG_FILE, expandPath } from '../../utils/paths';
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { spawnSync } from 'child_process';
+import { WecomImageHandler } from '../../wecom/image-handler';
 
 export interface StartOptions {
   daemon?: boolean;
@@ -722,12 +723,21 @@ async function startForeground(registry: RegistryManager, opts: StartOptions, pa
       }
       // PR 3.4: sharedSpoolQueue 注入 — 双平台共用同一份 spool 状态
       // PR 4.1: 注入 sharedSessionManager — 飞书 + 企微共用同一 ClaudeSessionManager 实例
+      // PR 6 Task 6.8: 注入 imageHandler — handleChat 处理 images 数组
+      // PR 6 Task 6.8: 注入 registryManager — list-refresh card action 调 listActive()
+      // 注意: imageHandler / registryManager 都不在这里 new 默认值 — 显式注入
+      // 跟其他可选依赖 (sessionManager) 的 "未注入则走 fallback" 风格保持一致。
+      const imageHandler = new WecomImageHandler({
+        cacheDir: join(expandPath('~/.cc-linker'), 'image_cache'),
+      });
       wecomBotInstance = new WecomBot({
         botId,
         secret,
         userMappingPath: WECOM_USER_MAPPING_PATH,
         spoolQueue: spoolQueue ?? undefined,
         sessionManager: sharedSessionManager ?? undefined,
+        imageHandler,
+        registryManager: registry,
       });
       wecomBotInstance.start();
       console.log(chalk.green('✅ 企微 Bot 已启动'));
@@ -846,6 +856,10 @@ async function startDaemonChild(registry: RegistryManager, opts: StartOptions): 
         userMappingPath: WECOM_USER_MAPPING_PATH,
         spoolQueue: spoolQueue ?? undefined,
         sessionManager: sharedSessionManager ?? undefined,
+        imageHandler: new WecomImageHandler({
+          cacheDir: join(expandPath('~/.cc-linker'), 'image_cache'),
+        }),
+        registryManager: registry,
       });
       wecomBotInstance.start();
       log('INFO', `企微 Bot 已启动 (bot_id=${botId})`);
