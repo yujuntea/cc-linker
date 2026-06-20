@@ -2064,3 +2064,151 @@ describe('WecomBot executeCardAction (PR 6 Task 6.5: stop)', () => {
     expect(mockClient.sdk.replyStream).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PR 6 Task 6.6: card action 'confirm-stop' → ClaudeSessionManager.killSessionByUuid
+ *
+ * 背景: PR 5 stub 把 confirm-stop 用通用 log + markdown "✅ 已执行: confirm-stop" 兜底,
+ *   实际没调 sessionManager.killSessionByUuid, 用户点确认停止后 Claude 子进程仍活着。
+ * PR 6 Task 6.6 接 case 'confirm-stop' 到新加的 sessionManager.killSessionByUuid 方法,
+ *   让用户从 agent-view 卡片点 "确认停止" 时真把 Claude 子进程 SIGTERM→SIGKILL。
+ *
+ * 关键不变量:
+ * - confirm-stop action 必调 sessionManager.killSessionByUuid(sessionUuid)
+ *   (sessionUuid 从 actionValue.sessionUuid 读)
+ * - 杀成功 → 发 markdown "已硬杀"
+ * - 杀失败 (返回 false, e.g. session 不存在) → 发 markdown "未找到"
+ * - 不发通用兜底 "✅ 已执行: confirm-stop" (PR 5 stub 行为被替换)
+ * - sessionManager 未注入或缺 killSessionByUuid 方法 → 静默 (logger.warn) 不发任何消息
+ *   (这跟 PR 6.7 list-refresh 一致 — 防御性, 不让 bot 因为缺依赖崩)
+ */
+describe('WecomBot executeCardAction (PR 6 Task 6.6: confirm-stop)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let mockSessionManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setPending: mock(async () => {}),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+  });
+
+  it('confirm-stop: 调 sessionManager.killSessionByUuid + 反馈 "已硬杀"', async () => {
+    mockSessionManager = {
+      killSessionByUuid: mock(async (_uuid: string) => true),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t66.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      sessionManager: mockSessionManager as any,
+    });
+
+    await bot.__test_executeCardAction({
+      externalUserId: 'ext-1',
+      messageId: 'msg-cs-1',
+      actionTag: 'confirm-stop',
+      actionValue: { sessionUuid: 'uuid-1' },
+      inboundFrame: { headers: { req_id: 'req-cs' } },
+    });
+
+    // 1. sessionManager.killSessionByUuid 被调, 参数是 actionValue.sessionUuid
+    expect(mockSessionManager.killSessionByUuid).toHaveBeenCalledTimes(1);
+    expect(mockSessionManager.killSessionByUuid.mock.calls[0][0]).toBe('uuid-1');
+
+    // 2. sendMessage 发了 markdown 确认 (含 "已硬杀" + sessionUuid)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[0]).toBe('ext-1');
+    expect(smCall[1].msgtype).toBe('markdown');
+    const content = smCall[1].markdown.content;
+    expect(content).toContain('已硬杀');
+    expect(content).toContain('uuid-1');
+  });
+
+  it('confirm-stop: killSessionByUuid 返回 false (session 不存在) → 反馈 "未找到"', async () => {
+    mockSessionManager = {
+      killSessionByUuid: mock(async (_uuid: string) => false),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t66b.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      sessionManager: mockSessionManager as any,
+    });
+
+    await bot.__test_executeCardAction({
+      externalUserId: 'ext-2',
+      messageId: 'msg-cs-2',
+      actionTag: 'confirm-stop',
+      actionValue: { sessionUuid: 'nonexistent' },
+      inboundFrame: { headers: { req_id: 'req-cs-2' } },
+    });
+
+    // 1. killSessionByUuid 被调 (即使 session 不存在, method 仍被尝试调用)
+    expect(mockSessionManager.killSessionByUuid).toHaveBeenCalledTimes(1);
+    expect(mockSessionManager.killSessionByUuid.mock.calls[0][0]).toBe('nonexistent');
+
+    // 2. sendMessage 发了 markdown 含 "未找到"
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[0]).toBe('ext-2');
+    expect(smCall[1].msgtype).toBe('markdown');
+    expect(smCall[1].markdown.content).toContain('未找到');
+  });
+
+  it('confirm-stop: sessionManager 未注入 → 静默 (logger.warn, 不发 sendMessage)', async () => {
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t66c.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      // sessionManager 未注入
+    });
+
+    await bot.__test_executeCardAction({
+      externalUserId: 'ext-3',
+      messageId: 'msg-cs-3',
+      actionTag: 'confirm-stop',
+      actionValue: { sessionUuid: 'uuid-3' },
+      inboundFrame: { headers: { req_id: 'req-cs-3' } },
+    });
+
+    // 不发 sendMessage (防御性, 不让 bot 因为缺依赖崩 + 误发通用兜底)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+  });
+});

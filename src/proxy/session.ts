@@ -1097,6 +1097,59 @@ export class ClaudeSessionManager {
     return Array.from(this.activeProcesses.values());
   }
 
+  /**
+   * PR 6 Task 6.6: 按 sessionUuid 硬杀 Claude 子进程
+   * 历史: PR 5 stub 只发 sendMessage 确认, 实际不杀进程
+   * 修法: 加 method 接受 sessionUuid, 查 activeProcesses map, 调顶层 terminateProcessTree
+   *
+   * activeProcesses key 是 trackKey (sessionId 或 `pid:<pid>`),
+   * 需要两种情况都尝试匹配:
+   * 1. key === sessionUuid (session 启动时已知 sessionId, 例如 --resume 模式)
+   * 2. session.sessionId === sessionUuid (session 启动时 key 是 pid:xxx,
+   *    后来 sessionId 已从 stdout 解析但 trackKey 未迁移——line 339/578 trackKey 始终是原值)
+   *
+   * 注: 实际看 line 339/577, trackKey 一旦 set 就固定, 不会随 sessionId 解析而迁移。
+   * 所以 (1) 永远命中 (因为 trackKey 用的是 sessionId); (2) 是兜底, 用于极端 race。
+   *
+   * @param sessionUuid Claude session UUID
+   * @returns true if session was active and killed, false if not found
+   */
+  async killSessionByUuid(sessionUuid: string): Promise<boolean> {
+    // 1. key 直接匹配 (trackKey === sessionUuid)
+    const directHit = this.activeProcesses.get(sessionUuid);
+    // 2. value.sessionId 匹配 (兜底)
+    let valueHit: { key: string; session: ClaudeSession } | null = null;
+    if (!directHit) {
+      for (const [key, session] of this.activeProcesses.entries()) {
+        if (session.sessionId === sessionUuid) {
+          valueHit = { key, session };
+          break;
+        }
+      }
+    }
+
+    const session = directHit ?? valueHit?.session ?? null;
+    const key = directHit ? sessionUuid : (valueHit?.key ?? null);
+
+    if (!session || !key) {
+      logger.warn(`[claude-session] killSessionByUuid: no active session for ${sessionUuid}`);
+      return false;
+    }
+
+    // 顶层 terminateProcessTree (line 60) 接受 pid
+    if (session.pid) {
+      terminateProcessTree(session.pid);
+    } else {
+      logger.warn(`[claude-session] killSessionByUuid: session ${sessionUuid} has no pid, cannot terminate`);
+      return false;
+    }
+    this.activeProcesses.delete(key);
+    // Also clean session lock to prevent deadlock on next message
+    this.sessionLocks.delete(key);
+    logger.info(`[claude-session] killSessionByUuid: killed session ${sessionUuid} (PID: ${session.pid})`);
+    return true;
+  }
+
   /** Kill idle sessions that haven't produced output within timeout */
   cleanupIdleSessions(idleTimeoutMs: number): void {
     const now = Date.now();

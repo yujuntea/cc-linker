@@ -761,11 +761,24 @@ export class WecomBot {
         break;
       }
       case 'confirm-stop': {
-        // 见 Task 6.6
-        logger.debug(`[wecom-bot] action ${event.actionTag} queued for execution`);
+        // PR 6 Task 6.6: 硬杀 Claude 子进程
+        // 历史: PR 5 stub 只 log + sendMessage 兜底, 实际不杀进程
+        // 修法: 调 sessionManager.killSessionByUuid(sessionUuid)
+        const sessionUuid = event.actionValue?.sessionUuid;
+        if (!sessionUuid) {
+          logger.warn(`[wecom-bot] confirm-stop: missing sessionUuid in actionValue`);
+          break;
+        }
+        if (!this.sessionManager || typeof (this.sessionManager as any).killSessionByUuid !== 'function') {
+          logger.warn(`[wecom-bot] confirm-stop: sessionManager or killSessionByUuid not available`);
+          break;
+        }
+        const killed = await (this.sessionManager as any).killSessionByUuid(sessionUuid);
         await this.client.sdk.sendMessage(event.externalUserId, {
           msgtype: 'markdown',
-          markdown: { content: `✅ 已执行: ${event.actionTag}` },
+          markdown: { content: killed
+            ? `✅ 已硬杀 session: ${sessionUuid}`
+            : `❌ 未找到 session: ${sessionUuid}` },
         });
         break;
       }

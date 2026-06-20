@@ -266,3 +266,56 @@ describe('cleanupOrphanProcesses', () => {
     expect(() => cleanupOrphanProcesses()).not.toThrow();
   });
 });
+
+// PR 6 Task 6.6: ClaudeSessionManager.killSessionByUuid
+// 背景: PR 5 stub 把 confirm-stop 用通用 log + markdown 兜底, 实际不杀进程。
+// PR 6 Task 6.6 给 ClaudeSessionManager 加 killSessionByUuid 方法, wecom bot 卡片
+// confirm-stop 调它真杀 Claude 子进程 (terminateProcessTree top-level helper, line 60)。
+// 关键不变量:
+// - 接受 sessionUuid 参数, 查 activeProcesses map (key 就是 sessionUuid / pid:<pid>)
+// - 调顶层 terminateProcessTree 硬杀进程
+// - 不存在的 uuid 返回 false (不抛错)
+// - 删除 activeProcesses map 里的 entry (避免下次重复杀)
+describe('Task 6.6: ClaudeSessionManager.killSessionByUuid', () => {
+  let m: ClaudeSessionManager;
+
+  beforeEach(() => {
+    m = new ClaudeSessionManager();
+  });
+
+  afterEach(() => {
+    for (const session of m.listSessions()) {
+      try { process.kill(session.pid, 'SIGKILL'); } catch {}
+    }
+  });
+
+  it('killSessionByUuid: 用 uuid 找 activeProcess 然后调 terminateProcessTree', async () => {
+    // mock: 直接往 activeProcesses map 注入一个 fake entry (key 是 uuid-1)
+    // activeProcesses 是 private, 用 (manager as any) 注入
+    const fakeSession = {
+      sessionId: 'uuid-1',
+      pid: 99999,
+      cwd: '/tmp',
+      createdAt: Date.now(),
+      lastOutputAt: Date.now(),
+      isNew: false,
+    };
+    (m as any).activeProcesses.set('uuid-1', fakeSession);
+
+    // 调 killSessionByUuid, 应该返回 true (找到了)
+    const result = await m.killSessionByUuid('uuid-1');
+    expect(result).toBe(true);
+
+    // activeProcesses entry 已被删除
+    expect((m as any).activeProcesses.has('uuid-1')).toBe(false);
+  });
+
+  it('killSessionByUuid: 不存在的 uuid 返回 false', async () => {
+    // 不注入任何 entry, 调 killSessionByUuid('nonexistent')
+    const result = await m.killSessionByUuid('nonexistent');
+    expect(result).toBe(false);
+
+    // activeProcesses 仍为空
+    expect(m.listSessions()).toHaveLength(0);
+  });
+});
