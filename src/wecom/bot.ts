@@ -410,14 +410,19 @@ export class WecomBot {
         case 'listdir':
           responseText = await this.handleCommandListDir(msg.userId);
           break;
+        // PR 6.14: /whoami 命令 — 显示当前 user externalUserId + 配置提示
+        // 仿飞书 feishu/bot.ts:1009 case 'whoami', 帮助用户诊断 owner 配置
+        case 'whoami':
+          responseText = this.handleCommandWhoami(msg.userId);
+          break;
         // PR 6 Task 6.2: /bridge 已废弃 (2026-06-20 决定, spec §5.7 YAGNI 跨平台 session 同步)
         // 历史: cc-connect 集成命令, cc-linker 移除 cc-connect 后孤儿, 不复活
         // 替代: 用户在终端用 `cc-linker switch <uuid>` 跨平台管理 session
-        case 'bridge':
-          responseText = `❌ /bridge 已废弃 (spec §5.7 显式 YAGNI 跨平台 session 同步)\n\n如需跨平台 session 管理, 直接在终端用 \`cc-linker switch <uuid>\``;
-          break;
+        // PR 6.14: 显式删除 /bridge case + 不再 default 提示 (用户截图反馈 "这个不用对用户展示")
+        //   改: bridge 命令走 default 返"未知命令"即可, 用户不需要知道历史
+        // case 'bridge': 已删除 — 历史原因在 commit msg 保留
         default:
-          responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /status /help /switch /resume /agents /stop /cancel /model\n\n_(/bridge 已废弃, 不再支持)_`;
+          responseText = `❌ 未知命令: /${parsed.cmd}\n\n可用命令: /new /list /listdir /status /help /switch /resume /agents /stop /cancel /model /whoami`;
       }
     } catch (err) {
       logger.error(`[wecom-bot] handleCommand /${parsed.cmd} error: ${err instanceof Error ? err.message : String(err)}`);
@@ -593,7 +598,7 @@ export class WecomBot {
    * PR 5: 加 6 个新命令: /switch /resume /agents /stop /cancel /model
    */
   private handleCommandHelp(): string {
-    return `🤖 cc-linker wecom Bot 命令:\n  /new [cwd]    - 强制新建 session\n  /list         - 列出当前 session\n  /status       - 显示 bot 状态\n  /help         - 显示本帮助\n  /switch <uuid> - 切换到指定 session\n  /resume       - 续聊当前 session (刷 lastActiveAt)\n  /agents       - 列出活跃 bg sessions\n  /stop <short> - 停止 bg session\n  /cancel       - 取消当前 reply (PR 5 简化: 仅返回状态)\n  /model <name> - 切换 model alias (PR 5 临时实现, 持久化推 PR 6+)\n\n_(/bridge 已废弃, 不再支持)_`;
+    return `🤖 cc-linker wecom Bot 命令:\n  /new [cwd]    - 强制新建 session\n  /list         - 列出当前 session\n  /listdir      - 浏览 cwd 子目录\n  /status       - 显示 bot 状态\n  /help         - 显示本帮助\n  /switch <uuid> - 切换到指定 session\n  /resume       - 续聊当前 session (刷 lastActiveAt)\n  /agents       - 列出活跃 bg sessions\n  /stop <short> - 停止 bg session\n  /cancel       - 取消当前 reply (PR 5 简化: 仅返回状态)\n  /model <name> - 切换 model alias (PR 5 临时实现, 持久化推 PR 6+)\n  /whoami       - 显示当前 user + owner 配置提示`;
   }
 
   /**
@@ -720,6 +725,21 @@ export class WecomBot {
     }
     const model = args[0];
     return `✅ 已设置 model: ${model}\n\n_(注: 当前 PR 5 临时实现, model 持久化推 PR 6+ 配合 ProviderManager)_`;
+  }
+
+  /**
+   * PR 6.14: /whoami 命令 — 显示当前 user externalUserId + owner 配置提示
+   * 仿飞书 feishu/bot.ts:1009 case 'whoami' (返回 open_id)
+   * 历史: 用户调试 owner_external_user_id 配置时需要知道自己的 external_user_id
+   */
+  private handleCommandWhoami(userId: string): string {
+    const ownerExternalUserId = config.get<string>('wecom.owner_external_user_id', '');
+    const isOwner = !ownerExternalUserId || ownerExternalUserId === userId;
+    return `👤 你的 external_user_id: \`${userId}\`\n\n${
+      isOwner
+        ? '✅ 已配置为 owner (wecom.owner_external_user_id)\n\n其他人发的消息会被 bot 拒绝'
+        : `⚠️ 当前配置 owner 是 \`${ownerExternalUserId}\`, 你不是 owner\n\n如需限制仅你本人使用，把上面的 userId 填到 config.toml 的 [wecom] owner_external_user_id`
+    }`;
   }
 
   /**

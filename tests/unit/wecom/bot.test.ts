@@ -1370,22 +1370,50 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     expect(content).toContain('/model');
   });
 
-  it('Task 6.2: /bridge 命令返回 YAGNI 提示 (spec §5.7 显式 YAGNI)', async () => {
+  it('PR 6.14: /bridge 命令走 default → 返"未知命令" (跟其他未识别命令一致)', async () => {
+    // PR 6.14: /bridge 历史是 cc-connect 集成命令, 现在默认走 default case
+    // 用户截图反馈 "这个不用对用户展示" → 删掉 /bridge 特定提示
     await bot.__test_handleCommand(makeCmdMsg('/bridge list', 'msg_bridge'));
 
-    // 1. sendMessage 被调 (markdown 类型)
+    // 1. sendMessage 被调 (markdown 类型, 跟其他命令一致)
     expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
     const smCall = mockClient.sdk.sendMessage.mock.calls[0];
     expect(smCall[0]).toBe('wmu_abc');
     expect(smCall[1].msgtype).toBe('markdown');
 
-    // 2. 内容含 YAGNI 关键词 + spec §5.7 引用 + 替代方案
+    // 2. 内容走默认 "未知命令" 提示 (不再包含 /bridge YAGNI 历史)
     const sent = smCall[1].markdown.content;
-    expect(sent).toContain('YAGNI');
-    expect(sent).toContain('5.7');
+    expect(sent).toContain('未知命令');
+    expect(sent).toContain('/bridge');
+    // 关键: 不再暴露 YAGNI 历史给用户
+    expect(sent).not.toContain('YAGNI');
+    expect(sent).not.toContain('5.7');
+    expect(sent).not.toContain('已废弃');
 
-    // 3. spool markDone (不 requeue — YAGNI 是终态响应)
+    // 3. spool markDone (default 跟其他命令一样收尾)
     expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_bridge', 'cmd:wmu_abc:msg_bridge');
+  });
+
+  it('PR 6.14: parseCommand lowercase → /ListDir /LISTDIR /listDir 都识别为 listdir', async () => {
+    // PR 6.14: parseCommand 加 .toLowerCase(), 仿飞书 feishu/bot.ts:941
+    // 用户实测: "/listDir" (驼峰) 报"未知命令" → 修了
+    await bot.__test_handleCommand(makeCmdMsg('/ListDir', 'msg_listdir_camel'));
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('📂 **目录浏览**');
+    expect(content).not.toContain('未知命令');
+  });
+
+  it('PR 6.14: /whoami → 显示 user external_user_id + owner 配置提示', async () => {
+    // 仿飞书 feishu/bot.ts:1009 case 'whoami'
+    await bot.__test_handleCommand(makeCmdMsg('/whoami', 'msg_whoami'));
+
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(content).toContain('wmu_abc');  // user id 展示
+    expect(content).toContain('external_user_id');
+    // 没配置 owner → "已配置为 owner" 路径
+    expect(content).toMatch(/(owner|配置)/);
   });
 
   it('/help 包含全部 10 个命令', async () => {

@@ -22,10 +22,15 @@ export type ParsedCommand = { cmd: string; args: string[] };
  * Parse /cmd arg1 arg2 → { cmd: 'cmd', args: ['arg1', 'arg2'] }
  * 任何以 / 开头第二字符非空白的消息都解析（不拒绝未知命令）
  * 返回 null 表示不是命令
+ *
+ * PR 6.14: cmd lowercase (跟飞书 feishu/bot.ts:941 parts[0]?.toLowerCase() 对齐)
+ * 历史: 16:42 真实验收, 用户发 "/listDir" (驼峰) → parseCommand 返回 cmd='listDir'
+ *   handleCommand switch case 'listdir' 不匹配 → 报'未知命令'.
+ * 修法: 统一 lowercase, 支持 /ListDir /LISTDIR /listdir 等大小写组合.
  */
 export function parseCommand(text: string): ParsedCommand | null {
   if (!isCommandMessage(text)) return null;
   const parts = text.slice(1).split(/\s+/);
-  const cmd = parts[0];
+  const cmd = parts[0].toLowerCase();
   return { cmd, args: parts.slice(1) };
 }
