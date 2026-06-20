@@ -41,6 +41,37 @@ describe('WecomStreamUpdater', () => {
     expect(id).toMatch(/^stream_/);
   });
 
+  it('PR 6.12: renderMarkdown 输出 "思考过程：" / "回复：" 标签对齐飞书 (集成测通过 replyStream content)', async () => {
+    // 仿飞书 CardUpdater.buildStreamingCard 结构 (思考过程 / 当前操作 / 回复 + ⏱ 已用时)
+    await updater.startProcessing('user-1', mockInboundFrame());
+    mockSdk._calls.length = 0;
+    await updater.updateStream('思考中: 用户说 hi', '你好!', 5000);
+    // 强制 throttle 窗口 flush (这里 throttleMs=100, 实际 flush 已经发生)
+    await new Promise(r => setTimeout(r, 150));
+    const lastCall = mockSdk._calls[mockSdk._calls.length - 1];
+    const content = lastCall.args[1] as string;
+    expect(content).toContain('**思考过程：**');
+    expect(content).toContain('思考中: 用户说 hi');
+    expect(content).toContain('**回复：**');
+    expect(content).toContain('你好!');
+    expect(content).toContain('⏱ 已用时');
+  });
+
+  it('PR 6.12: toolUses 渲染为 "当前操作：" 列表 (对齐飞书)', async () => {
+    await updater.startProcessing('user-1', mockInboundFrame());
+    mockSdk._calls.length = 0;
+    await updater.updateStream('读文件', '', 100, [
+      { name: 'Read', inputSummary: '/tmp/x.ts' },
+      { name: 'Grep', inputSummary: 'pattern: foo' },
+    ]);
+    await new Promise(r => setTimeout(r, 150));
+    const lastCall = mockSdk._calls[mockSdk._calls.length - 1];
+    const content = lastCall.args[1] as string;
+    expect(content).toContain('**当前操作：**');
+    expect(content).toContain('`Read`: /tmp/x.ts');
+    expect(content).toContain('`Grep`: pattern: foo');
+  });
+
   it('updateStream throttles to throttleMs window', async () => {
     await updater.startProcessing('user-1', mockInboundFrame());
     mockSdk._calls.length = 0;

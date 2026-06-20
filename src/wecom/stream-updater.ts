@@ -31,18 +31,41 @@ export type WecomStreamUpdaterOptions = {
 
 /**
  * 渲染 (thinking, text, toolUses) 到 markdown 字符串
+ *
+ * PR 6.12: 仿飞书 CardUpdater.buildStreamingCard (src/feishu/card-updater.ts:524-593) 结构
+ * 飞书用 "思考过程:" / "当前操作:" / "回复:" 三段加粗标签 + markdown 渲染,
+ * wecom 端 replyStream 推 markdown 字符串, 服务端渲染时需要结构化标签才能看到完整思考过程.
+ *
+ * 修法:
+ * - 加 "**思考过程：**" 标签 (跟飞书一致)
+ * - thinking 内容不用 `>` 引用 (企微 markdown 引擎可能不渲染), 改用 plain text + 截断
+ * - text 加 "**回复：**" 标签 (跟飞书一致)
+ * - toolUses 加 "**当前操作：**" 标签 (跟飞书一致)
+ * - 末尾加 "⏱ 已用时 Xs" (跟飞书一致)
+ *
+ * 历史: PR 6.10 加 THINKING_TAIL_CHARS=2000 跟飞书 maxThinkingBytes 对齐,
+ *   但 markdown 结构跟飞书不一致 → 用户截图反馈 "没有思考过程展示"
  */
 function renderMarkdown(thinking: string, text: string, toolUses: StreamUpdateToolUse[], elapsedMs: number): string {
   const lines: string[] = [];
-  // PR 6.10: 500 → 2000 字符, 跟飞书侧 maxThinkingBytes 对齐, 让用户看到完整思考过程末尾
-  if (thinking) lines.push(`> ${thinking.slice(-THINKING_TAIL_CHARS)}`);
+
+  // PR 6.12: 仿飞书 buildStreamingCard 结构
+  if (thinking) {
+    // PR 6.12: 不用 `>` 引用 (企微 markdown 引擎可能不渲染引用块), 用 plain text
+    // 截断到 THINKING_TAIL_CHARS 跟飞书 maxThinkingBytes 对齐
+    lines.push(`**思考过程：**\n${thinking.slice(-THINKING_TAIL_CHARS)}`);
+  }
   if (toolUses.length > 0) {
-    lines.push(`\n**工具调用**：`);
+    lines.push(`**当前操作：**`);
     for (const t of toolUses) lines.push(`- \`${t.name}\`: ${t.inputSummary}`);
   }
-  if (text) lines.push(`\n${text}`);
-  lines.push(`\n_${(elapsedMs / 1000).toFixed(1)}s_`);
-  return lines.join('\n');
+  if (text) {
+    lines.push(`**回复：**\n${text}`);
+  }
+  // 末尾加 "⏱ 已用时 Xs" 跟飞书一致 (飞书: ⏱ 已用时 ${elapsedSec}s)
+  const elapsedSec = Math.floor(elapsedMs / 1000);
+  lines.push(`⏱ 已用时 ${elapsedSec}s`);
+  return lines.join('\n\n');
 }
 
 export class WecomStreamUpdater implements StreamUpdater {
