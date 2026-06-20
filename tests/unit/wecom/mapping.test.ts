@@ -179,4 +179,28 @@ describe('WecomUserManager', () => {
       expect(manager.getEntry('nonexistent-user')).toBeUndefined();
     });
   });
+
+  // PR 7 Task 7.6 (m-8): mapping.ts lockKey (setPending/setSession/touchSession) JSDoc
+  // 解释 userId vs openId 语义差异。
+  // 历史: 飞书侧 lockKey = openId (飞书 user identifier),
+  //   企微侧 lockKey = userId (企微 external_userid 字段, 跟飞书的 openId 等价但命名不同)。
+  //   单仓 2 套命名, 新人 review 时常混淆。
+  // 修法: mapping.ts 三个方法 setPending/setSession/touchSession 加 JSDoc 注释。
+  it('m-8: setPending/setSession/touchSession 有 lockKey userId vs openId JSDoc', () => {
+    const { readFileSync } = require('fs');
+    const src = readFileSync(
+      require('path').resolve(__dirname, '../../../src/wecom/mapping.ts'),
+      'utf8',
+    );
+
+    // 三个方法都要有 lockKey userId vs openId JSDoc 注释
+    // 关键词: 飞书, 企微, openId, userId 至少出现 1 次
+    expect(src).toMatch(/飞书.*openId|openId.*飞书/s);
+    expect(src).toMatch(/企微.*userId|userId.*企微/s);
+
+    // 每个方法都有 lockKey 解释
+    expect(src).toMatch(/setPending[\s\S]{0,2000}lockKey/s);
+    expect(src).toMatch(/setSession[\s\S]{0,2000}lockKey/s);
+    expect(src).toMatch(/touchSession[\s\S]{0,2000}lockKey/s);
+  });
 });

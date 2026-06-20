@@ -40,7 +40,17 @@ export class WecomUserManager extends PlatformUserManager {
     return externalUserId === ownerExternalUserId;
   }
 
-  /** 企微特有：setPending 直接写（飞书侧用 CAS 模式无此方法） */
+  /**
+   * 企微特有：setPending 直接写（飞书侧用 CAS 模式无此方法）
+   *
+   * **PR 7 m-8 JSDoc 补全 — lockKey 语义解释**：
+   * - 飞书侧 lockKey = openId (飞书 user identifier, 从 im.message 事件来)
+   * - 企微侧 lockKey = userId (这里的 externalUserId, 即企微 external_userid 字段)
+   * - 新 session 场景 lockKey = `new:${userId}` (e.g. `new:wmu_abc`), 跟飞书侧 `new:${openId}` 同模式
+   * - setPending 是企微侧 skip CAS 直写入口, 因为企微侧没 claim 流程 (PR 4.5 简化)
+   *
+   * @param externalUserId 企微 external_userid, 锁文件粒度 (跟飞书侧 openId 同角色)
+   */
   async setPending(externalUserId: string, opts: { cwd?: string } = {}): Promise<void> {
     await withLock(this.mappingPath, async () => {
       this.ensureFile();
@@ -117,6 +127,12 @@ export class WecomUserManager extends PlatformUserManager {
    * 修法: 写一份新的 entry, type='session', sessionUuid, cwd；保留 createdAt（如果存在），
    *   更新 lastActiveAt，刷新 casToken。
    *
+   * **PR 7 m-8 JSDoc 补全 — lockKey 语义解释**：
+   * - 飞书侧 setSession/bindSessionToClaim 入参是 openId, 锁文件粒度
+   * - 企微侧 setSession 入参是 externalUserId (= userId), 跟飞书侧 openId 同角色
+   * - 续聊场景 lockKey = sessionUuid (用户跨 message 共享同一 session), 跟飞书侧对齐
+   * - 区别: 飞书侧走 CAS 模式 (bindSessionToClaim), 企微侧直接 set (本方法)
+   *
    * @param externalUserId 企微 external_userid
    * @param sessionUuid Claude session UUID
    * @param cwd session 工作目录
@@ -151,6 +167,11 @@ export class WecomUserManager extends PlatformUserManager {
    *   但 session 没变, 不需要 setSession 整体覆盖；只刷 lastActiveAt 即可。
    *
    * 修法: 仅在 entry.type === 'session' 时更新 lastActiveAt + version；其他情况静默 no-op。
+   *
+   * **PR 7 m-8 JSDoc 补全 — lockKey 语义解释**：
+   * - 飞书侧 touchSession 入参是 openId (飞书 user identifier)
+   * - 企微侧 touchSession 入参是 externalUserId (= userId, 企微 external_userid 字段)
+   * - lockKey 在 touch 时仍按 userId 锁定 entry, 不区分 session 还是 pending (静默 no-op)
    *
    * @param externalUserId 企微 external_userid
    */
