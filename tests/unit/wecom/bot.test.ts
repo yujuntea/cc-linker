@@ -1575,3 +1575,106 @@ describe('WecomBot handleCommandResume (PR 5 M-7: 返回新 lastActiveAt)', () =
     expect(readCount).toBeGreaterThanOrEqual(2);
   });
 });
+
+/**
+ * PR 6 Task 6.1: handleChat 处理 images 数组 — 调 imageHandler.fetchAsBase64 + cacheToDisk
+ * 平台层 PlatformMessage.images 数组已存在 (spec §10.1 第 1 项约束),
+ * handleMessage 把 images 透传到 metadata.images (沿用 metadata 扩展点),
+ * handleChat 读 metadata.images 喂给 imageHandler, 不新加 SpoolMessage 字段。
+ */
+describe('WecomBot handleChat images (PR 6 Task 6.1)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let mockImageHandler: any;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    mockImageHandler = {
+      fetchAsBase64: mock(() => Promise.resolve('aGVsbG8=')),
+      cacheToDisk: mock(() => '/cache/path'),
+    };
+  });
+
+  it('Task 6.1: handleChat 处理 images 数组, 调 imageHandler 缓存', async () => {
+    const mockSessionManager: any = {
+      sendStreamingMessage: mock(async () => ({
+        response: '看到图了',
+        costUsd: 0.001,
+        durationMs: 100,
+        sessionId: 'sess_img_1',
+        jsonlPath: null,
+        sessionStatus: 'active' as const,
+        tokensIn: 10,
+        tokensOut: 5,
+      })),
+    };
+
+    const bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t61.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      sessionManager: mockSessionManager,
+      userManager: mockUserManager as any,
+      imageHandler: mockImageHandler,
+    });
+
+    const msg: any = {
+      messageId: 'msg-img-1',
+      openId: '',
+      text: '看这张图',
+      userId: 'ext-img',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: 'new:ext-img',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: {
+        inboundFrame: { headers: { req_id: 'req-img' } },
+        // PR 6 Task 6.1: handleMessage 把 PlatformMessage.images 透传到 metadata.images
+        images: [{ fileKey: 'media-1', url: 'https://example.com/x.png' }],
+      },
+    };
+
+    await bot.__test_handleChat(msg);
+
+    // 1. fetchAsBase64 被调 (传入 image url)
+    expect(mockImageHandler.fetchAsBase64).toHaveBeenCalledWith('https://example.com/x.png');
+
+    // 2. cacheToDisk 被调 (传入 messageId + base64)
+    expect(mockImageHandler.cacheToDisk).toHaveBeenCalledWith('msg-img-1', 'aGVsbG8=');
+
+    // 3. text 被改写 (含图片占位 + 原文本)
+    const smCall = mockSessionManager.sendStreamingMessage.mock.calls[0];
+    expect(smCall[1]).toContain('[图片: fileKey=media-1');
+    expect(smCall[1]).toContain('看这张图');
+  });
+});

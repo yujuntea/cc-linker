@@ -12,6 +12,7 @@ import { AibotClient, type AibotMessageHandler } from './aibot-client';
 import { WecomStreamUpdater } from './stream-updater';
 import { WecomUserManager } from './mapping';
 import { WecomCardBuilder } from './card';
+import { WecomImageHandler } from './image-handler';
 import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spool';
 import type { ClaudeSessionManager } from '../proxy/session';
 import type { StreamChunk } from '../proxy/stream-parser';
@@ -38,6 +39,12 @@ export type WecomBotConfig = {
    * @see src/feishu/bot.ts:2600-2700
    */
   sessionManager?: ClaudeSessionManager;
+  /**
+   * PR 6 Task 6.1: 图片消息下载 + 缓存注入点。
+   * - 注入 → handleChat 在 Claude 调用前处理 msg.images 数组 (download + cacheToDisk)
+   * - 未注入 → 跳过图片处理 (向后兼容旧测试 / staging)
+   */
+  imageHandler?: WecomImageHandler;
 };
 
 export class WecomBot {
@@ -49,6 +56,10 @@ export class WecomBot {
    * PR 4.1: 可选 ClaudeSessionManager 注入。未注入时 handleChat 走 PoC echo 路径。
    */
   private sessionManager?: ClaudeSessionManager;
+  /**
+   * PR 6 Task 6.1: 可选 WecomImageHandler 注入。未注入时跳过图片下载 (向后兼容旧测试)。
+   */
+  private imageHandler?: WecomImageHandler;
   private running = false;
 
   constructor(config: WecomBotConfig) {
@@ -62,6 +73,7 @@ export class WecomBot {
     this.userManager = config.userManager ?? new WecomUserManager(config.userMappingPath);
     this.spoolQueue = config.spoolQueue ?? new SpoolQueue();
     this.sessionManager = config.sessionManager;
+    this.imageHandler = config.imageHandler;
   }
 
   start(): void {
@@ -453,6 +465,26 @@ export class WecomBot {
     // PR 5.1 followup: C-1+C-2 owner 验证已上移到 handleClaimed 统一入口
     // (PR 5 原修复在 handleChat 入口, 但漏掉 handleCommand 路径; 现统一在 handleClaimed 处理)
 
+    // PR 6 Task 6.1: 图片消息处理（复用现有 images 数组, 不新加 image 单数字段）
+    // - 复用 platform 层 PlatformMessage.images 数组字段 (spec §10.1 第 1 项约束)
+    // - handleMessage 已透传 msg.images 到 metadata.images (沿用 metadata 扩展点, 不加 SpoolMessage 字段)
+    // - imageHandler 未注入时跳过 (向后兼容旧测试 / staging)
+    // - 失败容错: 单张图下载失败 → 改写 text 为 [图片下载失败], 不阻塞后续图片 / Claude 调用
+    const images = msg.metadata?.images as Array<{ fileKey: string; url?: string }> | undefined;
+    if (images && images.length > 0 && this.imageHandler) {
+      for (const img of images) {
+        if (!img.url) continue;
+        try {
+          const base64 = await this.imageHandler.fetchAsBase64(img.url);
+          this.imageHandler.cacheToDisk(msg.messageId, base64);
+          msg.text = `[图片: fileKey=${img.fileKey}, base64=${base64.slice(0, 50)}...]\n${msg.text}`;
+        } catch (err) {
+          logger.error(`[wecom-bot] handleChat image download failed: ${err instanceof Error ? err.message : String(err)}`);
+          msg.text = `[图片下载失败: ${img.fileKey}] ${msg.text}`;
+        }
+      }
+    }
+
     // PR 4.1: PoC fallback — sessionManager 未注入时走 sendMessage echo 路径
     // 用于 staging / 单测 (确保向后兼容未升级的 wecom-only 启动)
     if (!this.sessionManager) {
@@ -612,6 +644,9 @@ export class WecomBot {
         // 修法: handleMessage enqueue 时把 chatId + chatType 写到 metadata
         const m: Record<string, any> = { chatId: msg.chatId, chatType: msg.chatType };
         if (msg.inboundFrame) m.inboundFrame = msg.inboundFrame;
+        // PR 6 Task 6.1: 把 PlatformMessage.images 透传到 metadata.images
+        // 不在 SpoolMessage 加新字段 (保持 wecom 模块边界), 复用现有 metadata 扩展点
+        if (msg.images && msg.images.length > 0) m.images = msg.images;
         return m;
       })(),
     };
