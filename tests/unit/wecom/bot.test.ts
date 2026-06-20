@@ -1883,3 +1883,83 @@ describe('WecomBot handleCommandStop (PR 6 Task 6.3: edge cases)', () => {
     expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg_stop_success', 'cmd:wmu_abc:msg_stop_success');
   });
 });
+
+/**
+ * PR 6 Task 6.4: card action 'retry' 测试
+ *
+ * 背景: PR 5 stub 把 retry/stop/confirm-stop/list-refresh 全用 default log + 通用 markdown
+ *   "✅ 已执行: <tag>" 兜底，没有真调 spoolQueue.requeueFromProcessing。
+ * spec §10.1 要求 retry 走 requeueFromProcessing 重新入队 + sendMessage 确认。
+ *
+ * 关键不变量:
+ * - retry action 必调 spoolQueue.requeueFromProcessing(messageId, serialKey)
+ * - serialKey 含 userId 标识 (e.g. `retry:<externalUserId>`)
+ * - 必发 markdown 确认消息
+ */
+describe('WecomBot executeCardAction (PR 6 Task 6.4: retry)', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => undefined),
+      setPending: mock(async () => {}),
+      setSession: mock(async () => {}),
+      touchSession: mock(async () => {}),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr6-t64.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+    });
+  });
+
+  it('retry: 调 spoolQueue.requeueFromProcessing 重新入队 + 确认 sendMessage', async () => {
+    await bot.__test_executeCardAction({
+      externalUserId: 'ext-1',
+      messageId: 'msg-retry-1',
+      actionTag: 'retry',
+      actionValue: {},
+      inboundFrame: { headers: { req_id: 'req-1' } },
+    });
+
+    // 1. spoolQueue.requeueFromProcessing 被调, 参数含 messageId + 标识用户
+    expect(mockSpoolQueue.requeueFromProcessing).toHaveBeenCalledTimes(1);
+    const rqCall = mockSpoolQueue.requeueFromProcessing.mock.calls[0];
+    expect(rqCall[0]).toBe('msg-retry-1');
+    expect(String(rqCall[1])).toContain('ext-1');
+
+    // 2. sendMessage 发了 markdown 确认
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
+    expect(smCall[0]).toBe('ext-1');
+    expect(smCall[1].msgtype).toBe('markdown');
+    expect(smCall[1].markdown.content).toContain('msg-retry-1');
+  });
+});

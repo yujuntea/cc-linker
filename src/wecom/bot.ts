@@ -741,17 +741,45 @@ export class WecomBot {
     inboundFrame?: any;
   }): Promise<void> {
     switch (event.actionTag) {
-      case 'retry':
-      case 'confirm-stop':
-      case 'list-refresh':
-      case 'stop':
-        // 真实动作由 PR 3 集成 handleClaimed + ClaudeSessionManager 时实现
+      case 'retry': {
+        // PR 6 Task 6.4: 重发原消息 — 从 processing 重新入队 pending
+        // 历史: 旧代码只 log + 通用 markdown 确认, 实际没重新入队, 用户点 retry 没效果
+        // serialKey 用 `retry:<user>` 标识来源 (跟 pending 的 `chat:wmu_xxx:<msg>` 不同)
+        await this.spoolQueue.requeueFromProcessing(event.messageId, `retry:${event.externalUserId}`);
+        logger.info(`[wecom-bot] card action retry: requeued ${event.messageId}`);
+        await this.client.sdk.sendMessage(event.externalUserId, {
+          msgtype: 'markdown',
+          markdown: { content: `✅ 已重试: ${event.messageId}` },
+        });
+        break;
+      }
+      case 'stop': {
+        // 见 Task 6.5
         logger.debug(`[wecom-bot] action ${event.actionTag} queued for execution`);
         await this.client.sdk.sendMessage(event.externalUserId, {
           msgtype: 'markdown',
           markdown: { content: `✅ 已执行: ${event.actionTag}` },
         });
         break;
+      }
+      case 'confirm-stop': {
+        // 见 Task 6.6
+        logger.debug(`[wecom-bot] action ${event.actionTag} queued for execution`);
+        await this.client.sdk.sendMessage(event.externalUserId, {
+          msgtype: 'markdown',
+          markdown: { content: `✅ 已执行: ${event.actionTag}` },
+        });
+        break;
+      }
+      case 'list-refresh': {
+        // 见 Task 6.7
+        logger.debug(`[wecom-bot] action ${event.actionTag} queued for execution`);
+        await this.client.sdk.sendMessage(event.externalUserId, {
+          msgtype: 'markdown',
+          markdown: { content: `✅ 已执行: ${event.actionTag}` },
+        });
+        break;
+      }
       default:
         logger.warn(`[wecom-bot] unknown card action: ${event.actionTag}`);
     }
@@ -782,5 +810,21 @@ export class WecomBot {
    */
   public async __test_handleCommand(msg: SpoolMessage): Promise<void> {
     return this.handleCommand(msg);
+  }
+
+  /**
+   * PR 6 Task 6.4: 测试 seam — 暴露 executeCardAction 给单测直接调用。
+   * 生产路径是 onCardAction → setImmediate → executeCardAction；单测里不想
+   * 跑 SDK 的 5s replyWelcome 窗口，直接调它。
+   * @internal
+   */
+  public async __test_executeCardAction(event: {
+    externalUserId: string;
+    messageId: string;
+    actionTag: string;
+    actionValue: any;
+    inboundFrame?: any;
+  }): Promise<void> {
+    return this.executeCardAction(event);
   }
 }
