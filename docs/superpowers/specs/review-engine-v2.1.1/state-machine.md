@@ -17,7 +17,7 @@ T4    Engine                      调 adapter.startSession({ role:'work', provid
 T5    Adapter                     Bun.spawn(['claude','--bg','NPE in auth.ts','--settings',sonnetPath])
 T6    CLI (Claude)                spawn bg session, 写 ~/.claude/jobs/<short1>/state.json, 返回 shortId
 T7    Adapter                     解析 stdout "backgrounded · short1" + 轮询 readJobState 拿 sessionId
-T8    Engine                      写 PipelineRecord 到 running/<pipelineId>.json
+T8    Engine                      写 PipelineRecord 到 running/<pipelineId>/pipeline.json
                                   panes.work = { sessionId: '<uuid>', currentRoundShortId: 'short1', startedAt: ... }
 T9    CLI (watch mode)            ANSI 进度条更新：state=PRODUCING, panes=[work:busy]
 T10   CLI (Claude work bg)        ...处理中...
@@ -84,7 +84,7 @@ T47   Engine                      写 PipelineRecord 到 done/，CLI 输出 stat
 
 | 并发维度 | 谁决定 | 怎么控 |
 |---------|--------|--------|
-| Pipeline 之间 | PipelineStore 的 `running/` 目录 | 默认 1 个同时跑（profile 可配） |
+| Pipeline 之间 | PipelineStore 的 `running/` + `queued/` 目录 | 默认 1 个同时跑，超限入 `queued/`（§6.5） |
 | Pipeline 内的 pane | 状态机驱动 | R1/R2 串行；EXTERNAL_REVIEW 单 review 串行；FIXING 串行 |
 | Polling 频率 | adapter 内部 | 500ms 一次 |
 
@@ -123,6 +123,12 @@ type ReviewState =
   | { kind: 'FIXING';            pipelineId; round: number; pane: 'work';
                                   source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2' | 'JUDGE_BY_WORK' | 'HUMAN_DECIDE';
                                   inputIssues: Issue[] }
+  // v2.1.2 修正（P1-5）：inputIssues 语义说明
+  // - source=R1/R2 时：inputIssues = 当轮自查发现的 issues（不跨轮累积）
+  // - source=JUDGE 时：inputIssues = JUDGE accept 的 issues（来自 DecisionContext.issues）
+  // - source=HUMAN 时：inputIssues = 用户通过 decide 选中的 issues
+  // - 每轮 FIXING 的 inputIssues 是独立的（替换），不是前轮累积
+  // - 如果需要追踪历史所有 issues，通过 pipeline.history[].issues 回溯
   // === 外审（单一 review session）===
   | { kind: 'EXTERNAL_REVIEW';   pipelineId; round: number; cycle: 'initial' | 'postfix';
                                   pane: { role: 'review'; shortId: string } }
@@ -214,9 +220,9 @@ stateDiagram-v2
     SELF_REVIEW_R2 --> DONE : R2 clean
     FIXING --> EXTERNAL_REVIEW : verify and fix done (source R2)
     EXTERNAL_REVIEW --> JUDGE_BY_WORK : context OK (write review opinions to file)
-    EXTERNAL_REVIEW --> JUDGE_BY_WORK : context overflow, n=1, compact OK (same work session)
-    EXTERNAL_REVIEW --> SELF_REVIEW_R1 : compact 失败 OR n=2, reset (round+1, new work + injectedIssues)
-    EXTERNAL_REVIEW --> ABORTED : context overflow, n≥3, max attempts reached
+    EXTERNAL_REVIEW --> JUDGE_BY_WORK : context overflow, n≤maxCompact, compact OK (same work session)
+    EXTERNAL_REVIEW --> SELF_REVIEW_R1 : compact 失败 OR n=maxCompact+1, reset (round+1, new work + injectedIssues)
+    EXTERNAL_REVIEW --> ABORTED : context overflow, n>maxCompact+1, max attempts reached
     JUDGE_BY_WORK --> FIXING : verdict accept (source JUDGE)
     JUDGE_BY_WORK --> HUMAN_DECIDE : verdict reject
     FIXING --> SELF_REVIEW_R1 : fix done (source JUDGE or HUMAN), round plus 1
@@ -239,13 +245,13 @@ stateDiagram-v2
     end note
 
     note right of EXTERNAL_REVIEW
-      v2.1.2 I9 cascade 策略（3 档 hysteresis）：
+      v2.1.2 I9 cascade 策略（N+2 档 hysteresis，默认 maxCompact=1 → 3 档）：
       - context < threshold → JUDGE_BY_WORK
-      - n=1 (1st overflow): executeContextCompact
+      - n≤maxCompact: executeContextCompact
           → 成功 (post-compact < threshold): JUDGE_BY_WORK (同 session，@file 引用 review 文件)
           → 失败 / 仍超阈值: 升级 → executeContextReset
-      - n=2: executeContextReset → SELF_REVIEW_R1 (round+1, 新 session + injectedIssues)
-      - n≥3: ABORTED reason=context_overflow_max_attempts
+      - n=maxCompact+1: executeContextReset → SELF_REVIEW_R1 (round+1, 新 session + injectedIssues)
+      - n>maxCompact+1: ABORTED reason=context_overflow_max_attempts
 
       n = pipeline.contextOverflowCount 累计次数（每次 EXTERNAL_REVIEW.done 超阈值 +1）
       阈值：1M 模型 = 460K（>512K 模型效率下降），其他 = max * 80%
@@ -276,7 +282,7 @@ stateDiagram-v2
                                                                        │ done + 写 review opinions 到文件
                                                                        │
                                                           ┌────────────┴───────────┬─────────────┐
-                                                          ▼ context OK              ▼ n=1          ▼ n≥2
+                                                          ▼ context OK              ▼ n≤maxCompact ▼ n>maxCompact
                                               ┌────────────────┐  ┌─────────────────┐  ┌────────────────┐
                                               │ JUDGE_BY_WORK  │  │   /compact      │  │  strategy=reset│
                                               │  (context OK)  │  │  (同 session)   │  │  (新 session) │
@@ -292,7 +298,7 @@ stateDiagram-v2
                                                        ▼          ▼                        ▼
                                                 ┌──────────────────────┐          ┌──────────┐
                                                 ▼ verdict=accept        ▼ reject   │ ABORTED  │
-                                          ┌──────────────┐    ┌──────────────┐    │(n≥3 ovrf)│
+                                          ┌──────────────┐    ┌──────────────┐    │(n>maxC+1)│
                                           │    FIXING    │    │ HUMAN_DECIDE │    └──────────┘
                                           │ source=JUDGE │    │  (4h timeout)│
                                           └──────┬───────┘    └──────┬───────┘
@@ -342,9 +348,9 @@ stateDiagram-v2
 | **FIXING (source=R1)** | done | SELF_REVIEW_R2 | 记录 per_issue | work | 不变 |
 | **FIXING (source=R2)** | done | EXTERNAL_REVIEW | 同上 | work | 不变 |
 | **EXTERNAL_REVIEW** | review state=`done` + context < threshold | JUDGE_BY_WORK | 收集 review opinions + writeReviewOpinionsToFile | review (×1) | 不变 |
-| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n=1, **compact 成功** | JUDGE_BY_WORK | executeContextCompact + writeReviewOpinionsToFile + @file 引用 | work (同 session) | 不变 |
-| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n=1, **compact 失败** OR n=2 | SELF_REVIEW_R1 | executeContextReset 6 步 + round += 1 | work (新 session) | +1 |
-| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n≥3 | ABORTED | reason=`context_overflow_max_attempts` | — | 不变 |
+| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n≤maxCompact, **compact 成功** | JUDGE_BY_WORK | executeContextCompact + writeReviewOpinionsToFile + @file 引用 | work (同 session) | 不变 |
+| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n≤maxCompact, **compact 失败** OR n=maxCompact+1 | SELF_REVIEW_R1 | executeContextReset 6 步 + round += 1 | work (新 session) | +1 |
+| **EXTERNAL_REVIEW** | review state=`done` + context ≥ threshold, n>maxCompact+1 | ABORTED | reason=`context_overflow_max_attempts` | — | 不变 |
 | **JUDGE_BY_WORK** | verdict=`accept` | FIXING (source=JUDGE) | 记录 accepted issues | work (injectReply) | 不变 |
 | **JUDGE_BY_WORK** | verdict=`reject` | HUMAN_DECIDE | 移到 `human_pending/` | work (injectReply) | 不变 |
 | **HUMAN_DECIDE** | user accept | FIXING (source=HUMAN) | 移到 `running/` | — | 不变 |
@@ -365,7 +371,7 @@ stateDiagram-v2
 | **ABORTED** | `max_rounds_exceeded` | 进入 SELF_REVIEW_R1 时 round≥max |
 | **ABORTED** | `pane_lost_timeout` | PANE_LOST 24h |
 | **ABORTED** | `human_decision_timeout` | HUMAN_DECIDE 4h |
-| **ABORTED** | `context_overflow_max_attempts` | v2.1.2：cascade n≥3 时触发（从旧 `context_overflow` 改名） |
+| **ABORTED** | `context_overflow_max_attempts` | v2.1.2：cascade n>maxCompact+1 时触发（默认 maxCompact=1 → n≥3） |
 | **ABORTED** | `context_reset_spawn_failed` | reset 中 startSession 失败 |
 | **ABORTED** | `review_opinions_write_failed` | v2.1.2 新增：写 review opinions 文件失败（fallback inline 会撑爆 context，所以直接 abort） |
 | **ABORTED** | `work_session_lost_exceeds_max_rounds` | retry PANE_LOST 触发 |
@@ -390,6 +396,8 @@ stateDiagram-v2
 | 200 | **FIXING (source=JUDGE)** | 1 | apply accepted |
 | 245 | **SELF_REVIEW_R1** | **2** | cycle=postfix |
 | 350 | **SELF_REVIEW_R1** | **3** | 0 issues → DONE |
+
+> **v2.1.2 修正（P2-2）**：round 2 的 postfix cycle 中 R1 直接发现 0 issues，因此跳过 R2/EXTERNAL_REVIEW/JUDGE，直接 → DONE。这是正常收敛路径，不是遗漏步骤。完整 postfix 路径（R1 有 issues）见 §5.3.5.1。
 
 **总耗时**：~6 分钟，3 cycles。
 
@@ -430,6 +438,30 @@ stateDiagram-v2
 | 460 | R1 → FIXING → R2 → EXTERNAL_REVIEW | 3 | 2 | 第三个 cycle |
 | 540 | EXTERNAL_REVIEW done | 3 | 3 | context 仍超 → n=3 → ABORTED |
 | 540+ | **ABORTED** (context_overflow_max_attempts) | 3 | 3 | max_attempts 触发 |
+
+#### 5.3.5.3 走查示例 4：`max_compact_attempts=2` 的 4 档 cascade（v2.1.2 P0-3 修正）
+
+**前置**：profile 配置 `max_compact_attempts = 2`，其余同 §5.3.5。4 档行为：n=1 → compact, n=2 → compact, n=3 → reset, n≥4 → abort。
+
+| t (秒) | 状态 | round | n | 备注 |
+|--------|------|-------|---|------|
+| 130 | EXTERNAL_REVIEW | 1 | 0 | spawn short5；work context 185K/200K |
+| 170 | EXTERNAL_REVIEW done | 1 | 1 | 185K ≥ threshold(160K) → n=1 ≤ maxCompact(2) → compact |
+| 175 | (compact 成功) | 1 | 1 | /compact 后 usage 95K < 160K → 注入 JUDGE prompt → JUDGE_BY_WORK |
+| 240 | JUDGE → FIXING → SELF_REVIEW_R1 (postfix) | **2** | 1 | round+1 |
+| 340 | R1 → FIXING → R2 → EXTERNAL_REVIEW | 2 | 1 | 第二个 cycle |
+| 400 | EXTERNAL_REVIEW done | 2 | 2 | context 到 175K → n=2 ≤ maxCompact(2) → 再试 compact |
+| 405 | (compact 成功) | 2 | 2 | /compact 后 usage 88K < 160K → JUDGE_BY_WORK |
+| 470 | JUDGE → FIXING → SELF_REVIEW_R1 (postfix) | **3** | 2 | round+1 |
+| 570 | R1 → FIXING → R2 → EXTERNAL_REVIEW | 3 | 2 | 第三个 cycle |
+| 630 | EXTERNAL_REVIEW done | 3 | 3 | context 到 190K → n=3 = maxCompact+1(3) → 直接 reset（跳过 compact） |
+| 640 | SELF_REVIEW_R1 (reset) | **4** | 3 | 新 session |
+| 740 | R1 → FIXING → R2 → EXTERNAL_REVIEW | 4 | 3 | 第四个 cycle |
+| 800 | EXTERNAL_REVIEW done | 4 | 4 | context 仍超 → n=4 > maxCompact+1 → **ABORTED** |
+
+**总耗时**：~13 分钟，4 cycles，2 次 compact + 1 次 reset + 1 次 abort。
+
+> **对比 §5.3.5.2**（`max_compact_attempts=1`）：`max_compact_attempts=2` 多给了 1 次 compact 机会（n=2 时再试而非直接 reset），但总 cascade 档位从 3 变成 4，最终仍会 abort。
 
 ### 5.4 Verdict Decision Logic
 

@@ -19,6 +19,21 @@
 
 **结论**：`claude --bg` + `--settings` + `--resume --reply-on-resume` + `stop` + `logs` + `state.json` 全链路可用。直接 `--resume` 在 running bg 上不可用，必须用 daemon rendezvous 协议。
 
+> **v2.1.2 修正（P1-10）：`state.json.output` 格式待实测确认**
+>
+> §7.5.1 声称 `state.json.output` 是 `{ result: string }` 对象，但 Claude CLI 不同版本的 output 格式可能不同：
+> - 可能是 `{ result: string }`
+> - 可能是纯 `string`
+> - 可能还包含 `cost_usd` / `session_id` 等字段
+>
+> **实施前必须实测**（Phase 1 W1）：
+> 1. 跑一个 `claude --bg "say hi"` → 等 done → `cat ~/.claude/jobs/<short>/state.json`
+> 2. 检查 `output` 字段的实际类型和内容
+> 3. 确认 `cost_usd` 是否内嵌在 output 中还是在 state.json 的顶层字段
+> 4. 将实测结果追加到本附录表格
+>
+> 如格式与预期不符，需同步修改 §7.5.1 的 `ExtendedJobStateFile` 类型声明和 `parseBgOutputWithRetry` 的 JSON 提取策略。
+
 ## 附录 B：复用的 Agent View 模块清单
 
 | 模块 | 路径 | 复用方式 |
@@ -76,7 +91,7 @@
 **v2.1.2 三档 cascade**：
 1. **compact**（n=1，1st overflow）：injectReply `/compact` → 同 session 继续
 2. **reset**（n=2 或 compact 失败）：杀 session + spawn 新 + 注入 context
-3. **abort**（n≥3）：reason=`context_overflow_max_attempts`
+3. **abort**（n>maxCompact+1，默认 n≥3）：reason=`context_overflow_max_attempts`
 
 **配套改进**：
 - 阈值规则修 bug（v2.1.1 对 128K 模型**永不会触发** overflow 检查；200K 模型只在 100% 才触发）
@@ -88,7 +103,7 @@
 
 **动机**：C.4 需要 engine 查 work session context 用量。
 
-**实现**：见 [overview.md §3.2](./overview.md#32-新建层13-个模块) adapter.ts 说明。
+**实现**：见 [overview.md §3.2](./overview.md#32-新建层15-个模块) adapter.ts 说明。
 
 ### C.6 完整决策链
 
@@ -200,14 +215,14 @@
 | ID | 类别 | 问题 | 修复位置 |
 |---|---|---|---|
 | B1 | P0 | `output` 类型错 | [implementation.md §7.5.1](./implementation.md#751-数据来源) |
-| B2 | P0 | 函数名错 `readLastAssistantUsage` | [overview.md §3.2](./overview.md#32-新建层13-个模块) |
+| B2 | P0 | 函数名错 `readLastAssistantUsage` | [overview.md §3.2](./overview.md#32-新建层15-个模块) |
 | B3 | P0 | 引用未定义变量 | [implementation.md §7.5.7](./implementation.md#757-context-window-策略化处理) |
-| B4 | P0 | model-parser 公式冗余 | [overview.md §3.2](./overview.md#32-新建层13-个模块) |
+| B4 | P0 | model-parser 公式冗余 | [overview.md §3.2](./overview.md#32-新建层15-个模块) |
 | B5 | P0 | source 枚举不完整 | [state-machine.md §5.1](./state-machine.md#51-reviewstate-枚举) |
-| B6 | P0 | injectReply signal 不可达 | [overview.md §3.2](./overview.md#32-新建层13-个模块) |
+| B6 | P0 | injectReply signal 不可达 | [overview.md §3.2](./overview.md#32-新建层15-个模块) |
 | B7 | P0 | executeContextReset 签名缺 profile | [implementation.md §7.5.7.3](./implementation.md#7573-策略-1reset默认) |
 | I1 | P1 | v2.1 review-A/B 残留 | 全文清理 |
-| I2 | P1 | 注释与代码不一致（模块计数 9→13） | [overview.md §3.2](./overview.md#32-新建层13-个模块) |
+| I2 | P1 | 注释与代码不一致（模块计数 9→13） | [overview.md §3.2](./overview.md#32-新建层15-个模块) |
 | I3 | P1 | panes.review 生命周期不清 | [implementation.md §6.1](./implementation.md#61-pipelinerecord-数据结构) |
 | I4 | P1 | findDeadPanes 实现缺失 | [implementation.md §6.4](./implementation.md#64-reconciler) |
 | I5 | P1 | JobStateFile 扩展路径未拍板 | [implementation.md §7.5.6](./implementation.md#756-jobstatefile-接口扩展) |
