@@ -182,11 +182,12 @@ describe('PR 7.2: complete() 触发 completeCardSender.send', () => {
 
   it('does NOT call sender.send when not injected', async () => {
     // 验证默认行为: 不注入 sender → 不发卡片 (向后兼容)
+    const sendCallsBefore = mockSender.sendCalls.length;
     const updater2 = new WecomStreamUpdater(mockSdk, { throttleMs: 100 });
     await updater2.startProcessing('user-1', mockInboundFrame());
     await updater2.complete('完成内容', 100, 200, 5000, 1);
-    // 不抛错, 不调 mockSender (没注入)
-    expect(true).toBe(true);
+    // 验证: mockSender.sendCalls 数量没增加 (updater2 没注入 sender, 不应该调用)
+    expect(mockSender.sendCalls.length).toBe(sendCallsBefore);
   });
 
   it('calls sender.send with userId/duration after complete() success', async () => {
@@ -216,19 +217,23 @@ describe('PR 7.2: complete() 触发 completeCardSender.send', () => {
   });
 
   it('PR 7.2 review: sender.send is called AFTER replyStream(finish=true) completes', async () => {
-    const order: string[] = [];
+    const replyStreamFinishTrueAt: number[] = [];
+    const senderSendAt: number[] = [];
+    let callSeq = 0;
     mockSdk.replyStream = (...args: any[]) => {
-      order.push(`replyStream(finish=${args[3]})`);
+      if (args[3] === true) replyStreamFinishTrueAt.push(++callSeq);
       return Promise.resolve({});
     };
     mockSender.send = (ctx: any) => {
-      order.push('sender.send');
+      senderSendAt.push(++callSeq);
       return Promise.resolve();
     };
     await updater.startProcessing('user_y', mockInboundFrame());
-    // 跳过 startProcessing 自身的 replyStream(false), 只断言 complete() 末尾两步顺序
-    order.length = 0;
     await updater.complete('done', 1, 2, 3000, 1);
-    expect(order).toEqual(['replyStream(finish=true)', 'sender.send']);
+    // 断言: replyStream(finish=true) 被调一次 + sender.send 被调一次
+    expect(replyStreamFinishTrueAt.length).toBe(1);
+    expect(senderSendAt.length).toBe(1);
+    // 断言: sender.send 在 replyStream(finish=true) 之后 (调用序号更大)
+    expect(senderSendAt[0]).toBeGreaterThan(replyStreamFinishTrueAt[0]);
   });
 });
