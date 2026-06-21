@@ -323,15 +323,43 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.16: /list 同步直发 (FINAL fix)
-   * 读 registryManager.sessions (in-memory), buildListCard, transformToWireShape,
-   *   replyTemplateCard (走 WsCmd.RESPONSE = aibot_respond_msg, 配 text 消息 req_id).
+   * PR 7.5.17: 终极 fallback — sync 命令统一走 replyStream (FINAL fix).
    *
-   * 历史: PR 7.5.15 用 sendViaReply → replyWelcome (WsCmd.RESPONSE_WELCOME),
-   *   仍 errcode=846605 — SDK 文档明确 replyWelcome 仅 enter_chat 事件能调.
-   *   PR 7.5.16: 直接调 client.sdk.replyTemplateCard, 走 WsCmd.RESPONSE 协议.
-   *   (sendViaReply 路径暂未动 — button callback 等场景需保留 replyWelcome fallback.
-   *    后续 PR 可统一收口 sendViaReply 也走 replyTemplateCard.)
+   * 历史演进:
+   *   PR 7.5.15: replyWelcome → errcode=846605 (replyWelcome 仅 enter_chat 事件用).
+   *   PR 7.5.16: replyTemplateCard / reply (markdown) → errcode=40016 invalid button size
+   *     (aibot server 实际不支持 first-reply template_card, 即使 wire shape 跟 SDK canonical types
+   *     完全一致, server 仍拒收).
+   *   经过 16 个 PR 穷举, 唯一在真机验证可工作的 path 是 replyStream (PR 4.1 handleChat
+   *     已稳定用 8+ 个月).
+   *
+   * 修法: handleCommandSynchronously 改为统一调 replyStream(frame, streamId, markdown, true).
+   *   把 list/status/help/whoami 渲染为带结构化标签的 markdown (模仿飞书 buildListCard 风格:
+   *   👉 current marker + /switch <uuid> 操作指引 + cwd code block 等).
+   *   用户看不到 button_interaction card, 但看到 markdown 卡片化渲染, 体验比 fallback markdown 好.
+   *
+   * Trade-off: 用户需手打命令 (不能 click button), 后续 PR 可探索 aibot admin 控制台
+   *   template_card 权限配置 / 客户端 SDK 升级.
+   */
+  private async _syncHandleMarkdown(msg: PlatformMessage, markdown: string): Promise<boolean> {
+    const inboundFrame = msg.inboundFrame;
+    if (!inboundFrame) return false;
+
+    const streamId = 'sync-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    try {
+      await this.client.sdk.replyStream(inboundFrame, streamId, markdown, true);
+      return true;
+    } catch (err) {
+      logger.warn(`[wecom-bot] sync replyStream failed: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  /**
+   * PR 7.5.17: /list 同步直发 — 终极 fallback: 用 replyStream 推卡片化 markdown.
+   * 历史: PR 7.5.16 用 replyTemplateCard → errcode=40016 (server 拒收 first-reply template_card).
+   * 修法: 把 list 渲染为带结构化标签的 markdown (👉 marker + /switch <uuid> 操作指引),
+   *   走 replyStream(finish=true) 一次推完.
    */
   private async _syncHandleList(msg: PlatformMessage): Promise<boolean> {
     if (!this.registryManager) {
@@ -343,43 +371,62 @@ export class WecomBot {
       const activeEntries = Object.entries(allActive)
         .filter(([_, s]) => s.status === 'active')
         .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
-        .slice(0, 6)
-        .map(([sessionUuid, s]) => ({
-          sessionUuid,
-          title: s.title ?? '(无标题)',
-          messageCount: s.message_count ?? 0,
-          lastActive: s.last_active ?? '',
-        }));
+        .slice(0, 10);
       const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
 
-      const card = buildListCard({ entries: activeEntries, totalActive });
-      const wireCard = transformToWireShape(card);
-      // PR 7.5.16: replyTemplateCard 走 WsCmd.RESPONSE (aibot_respond_msg) — 配 text 消息 req_id.
-      //   replyWelcome 走 WsCmd.RESPONSE_WELCOME (aibot_respond_welcome_msg) — 仅 enter_chat 事件.
-      await (this.client.sdk as any).replyTemplateCard(msg.inboundFrame, wireCard);
-      logger.info(`[wecom-bot] sync /list: replyTemplateCard ok (entries=${activeEntries.length}, totalActive=${totalActive})`);
-      return true;
+      if (activeEntries.length === 0) {
+        const ok = await this._syncHandleMarkdown(msg, '📭 当前无 active session');
+        if (ok) {
+          logger.info(`[wecom-bot] sync /list: replyStream ok (empty)`);
+        }
+        return ok;
+      }
+
+      // Build card-like markdown with structured labels (模仿飞书 buildListCard 风格)
+      const currentEntry = this.userManager.getEntry(msg.userId);
+      const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
+
+      const lines: string[] = [];
+      lines.push(`📋 **活跃 sessions (${activeEntries.length}${totalActive > 10 ? '+' : ''})**`);
+      lines.push('');
+      lines.push('💡 _企微 SDK 暂不支持 first-reply template_card (PR 7.5.16 调研确认), 用 markdown 卡片化渲染_');
+      lines.push('');
+
+      for (const [uuid, s] of activeEntries) {
+        const marker = uuid === currentUuid ? '👉' : '　';
+        const title = (s.title ?? '(无标题)').slice(0, 18);
+        const cwd = s.cwd ? ` \`${s.cwd}\`` : '';
+        const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
+        const lastActive = s.last_active ? ` _${s.last_active.slice(0, 16)}_` : '';
+        lines.push(`${marker} **${title}**${msgs}${cwd}${lastActive}`);
+        lines.push(`   \`${uuid.slice(0, 8)}…\``);
+        lines.push(`   操作: \`/switch ${uuid.slice(0, 8)}\` 或 \`/resume ${uuid.slice(0, 8)}\``);
+      }
+      lines.push('');
+      lines.push(`_(共 ${totalActive} 个, 只显示前 ${activeEntries.length}; 续聊用 \`/switch <uuid>\`)_`);
+
+      const ok = await this._syncHandleMarkdown(msg, lines.join('\n'));
+      if (ok) {
+        logger.info(`[wecom-bot] sync /list: replyStream ok (entries=${activeEntries.length}, totalActive=${totalActive})`);
+      }
+      return ok;
     } catch (err) {
-      logger.warn(`[wecom-bot] sync /list failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
+      logger.warn(`[wecom-bot] sync /list build failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
       return false;
     }
   }
 
   /**
-   * PR 7.5.16: /status 同步直发 (FINAL fix).
-   * markdown 文本用 reply (WsCmd.RESPONSE = aibot_respond_msg), 配 text 消息 req_id.
-   *   历史: PR 7.5.15 用 replyWelcome (WsCmd.RESPONSE_WELCOME) 仍 errcode=846605 —
-   *     replyWelcome 仅 enter_chat 事件能调, 不能用于 aibot_msg_callback text 消息.
+   * PR 7.5.17: /status 同步直发 — 终极 fallback 用 replyStream (markdown).
    */
   private async _syncHandleStatus(msg: PlatformMessage): Promise<boolean> {
     try {
       const text = this.handleCommandStatus(msg.userId);
-      await this.client.sdk.reply(msg.inboundFrame, {
-        msgtype: 'markdown',
-        markdown: { content: text },
-      } as any);
-      logger.info(`[wecom-bot] sync /status: reply (markdown) ok`);
-      return true;
+      const ok = await this._syncHandleMarkdown(msg, text);
+      if (ok) {
+        logger.info(`[wecom-bot] sync /status: replyStream (markdown) ok`);
+      }
+      return ok;
     } catch (err) {
       logger.warn(`[wecom-bot] sync /status failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
       return false;
@@ -387,17 +434,16 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.16: /help 同步直发 (FINAL fix)
+   * PR 7.5.17: /help 同步直发 — 终极 fallback 用 replyStream (markdown).
    */
   private async _syncHandleHelp(msg: PlatformMessage): Promise<boolean> {
     try {
       const text = this.handleCommandHelp();
-      await this.client.sdk.reply(msg.inboundFrame, {
-        msgtype: 'markdown',
-        markdown: { content: text },
-      } as any);
-      logger.info(`[wecom-bot] sync /help: reply (markdown) ok`);
-      return true;
+      const ok = await this._syncHandleMarkdown(msg, text);
+      if (ok) {
+        logger.info(`[wecom-bot] sync /help: replyStream (markdown) ok`);
+      }
+      return ok;
     } catch (err) {
       logger.warn(`[wecom-bot] sync /help failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
       return false;
@@ -405,17 +451,16 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.16: /whoami 同步直发 (FINAL fix)
+   * PR 7.5.17: /whoami 同步直发 — 终极 fallback 用 replyStream (markdown).
    */
   private async _syncHandleWhoami(msg: PlatformMessage): Promise<boolean> {
     try {
       const text = this.handleCommandWhoami(msg.userId);
-      await this.client.sdk.reply(msg.inboundFrame, {
-        msgtype: 'markdown',
-        markdown: { content: text },
-      } as any);
-      logger.info(`[wecom-bot] sync /whoami: reply (markdown) ok`);
-      return true;
+      const ok = await this._syncHandleMarkdown(msg, text);
+      if (ok) {
+        logger.info(`[wecom-bot] sync /whoami: replyStream (markdown) ok`);
+      }
+      return ok;
     } catch (err) {
       logger.warn(`[wecom-bot] sync /whoami failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
       return false;

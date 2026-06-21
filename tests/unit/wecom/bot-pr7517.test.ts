@@ -1,24 +1,18 @@
 /**
- * PR 7.5.15 → PR 7.5.16: 命令同步直发 — onMessage 内 5s 窗口内
- *   replyTemplateCard (/list) / reply (/status /help /whoami markdown), 不走 SpoolQueue.
+ * PR 7.5.17: 命令同步直发终极 fallback — onMessage 内 5s 窗口内
+ *   统一用 replyStream (frame, streamId, markdown, finish=true) 推回 markdown.
  *
- * 背景: 经过 15 个 PR 才锁定真根因 —
- *   aibot server 用 rendezvous 协议, inbound event 的 req_id 5s 后过期.
- *   SpoolQueue dispatch 1-3s + handleCommand 处理时间 → sendViaReply 时 req_id 已失效
- *   → errcode=846605 → markdown fallback.
- *
- *   PR 7.5.15 修法: 在 onMessage (fresh inbound frame) 同步调 replyWelcome, 5s 窗口内必中.
- *     仍失败 (errcode=846605) — SDK 文档明确 replyWelcome 仅 enter_chat 事件能调,
- *     不能用于普通 text 消息 (aibot_msg_callback). replyWelcome 走 WsCmd.RESPONSE_WELCOME
- *     = 'aibot_respond_welcome_msg', 仅 enter_chat 事件用. text 消息应走 WsCmd.RESPONSE
- *     = 'aibot_respond_msg' (= replyStream 用的同一协议).
- *
- *   PR 7.5.16 修法: sync 改用 replyTemplateCard (template_card 卡片) / reply (markdown/text)
- *     都走 WsCmd.RESPONSE 协议, 配 text 消息 req_id 5s 窗口内必中.
+ * 历史演进:
+ *   PR 7.5.15: replyWelcome → errcode=846605 (replyWelcome 仅 enter_chat 事件能调).
+ *   PR 7.5.16: replyTemplateCard / reply (markdown) → errcode=40016 invalid button size
+ *     (aibot server 实际不支持 first-reply template_card, 即使 wire shape 跟 SDK canonical
+ *     types 完全一致, server 仍拒收).
+ *   PR 7.5.17: 终极 fallback — replyStream 唯一真机验证可工作 (PR 4.1 handleChat
+ *     已稳定用 8+ 个月). 把 list/status/help/whoami 渲染为带结构化标签的 markdown.
  *
  * 测试覆盖:
- * - /list 同步走 replyTemplateCard (WsCmd.RESPONSE + template_card)
- * - /status /help /whoami 同步走 reply (WsCmd.RESPONSE + markdown)
+ * - /list 同步走 replyStream (render card-like markdown with 👉 marker + /switch 操作)
+ * - /status /help /whoami 同步走 replyStream (markdown)
  * - 非命令 (普通 chat) → 返回 false, 走 enqueue 路径
  * - 失败时 → 返回 false, fallback enqueue
  * - sync 成功后 enqueue 不被调 (避免重复推卡)
@@ -45,7 +39,7 @@ const execFileMock = Object.assign(
 mock.module('node:child_process', () => ({ ...require('node:child_process'), execFile: execFileMock }));
 mock.module('child_process', () => ({ ...require('child_process'), execFile: execFileMock }));
 
-describe('PR 7.5.15: handleCommandSynchronously', () => {
+describe('PR 7.5.17: handleCommandSynchronously', () => {
   let mockSpoolQueue: any;
   let mockClient: any;
   let mockCardSender: any;
@@ -90,7 +84,7 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
     bot = new WecomBot({
       botId: 'test',
       secret: 'test',
-      userMappingPath: '/tmp/test-pr7515.json',
+      userMappingPath: '/tmp/test-pr7517.json',
       client: mockClient,
       spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
@@ -99,7 +93,7 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
   });
 
   describe('/list 命令同步直发', () => {
-    it('sync /list 调用 replyTemplateCard (WsCmd.RESPONSE) 而不走 enqueue / sendViaReply', async () => {
+    it('sync /list 调用 replyStream (finish=true) 推卡片化 markdown 而不走 enqueue', async () => {
       const registryManager = {
         sessions: {
           'uuid-a': { status: 'active', title: 'Project A', message_count: 10, last_active: '2026-06-21T10:00:00Z' },
@@ -121,17 +115,46 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
       });
 
       expect(handled).toBe(true);
-      // PR 7.5.16: /list sync 改用 replyTemplateCard (走 WsCmd.RESPONSE), 不再走 sendViaReply
-      expect(mockClient.sdk.replyTemplateCard).toHaveBeenCalledTimes(1);
+      // PR 7.5.17: /list sync 终极 fallback 用 replyStream (finish=true), 不再用 replyTemplateCard
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
+      expect(mockClient.sdk.replyTemplateCard).not.toHaveBeenCalled();
       // 验证传入的 frame 是 fresh 的 inboundFrame
-      const callArgs = mockClient.sdk.replyTemplateCard.mock.calls[0];
+      const callArgs = mockClient.sdk.replyStream.mock.calls[0];
       expect(callArgs[0]).toEqual({ headers: { req_id: 'fresh-req-id' }, body: { msgid: 'msg-1' } });
-      // 验证 card 数据包含 active sessions (wire shape 后)
-      const cardArg = callArgs[1];
-      expect(cardArg).toBeDefined();
-      expect(cardArg.card_type).toBeDefined();
-      // sendViaReply 不再被 _syncHandleList 调用
-      expect(mockCardSender.sendViaReply).not.toHaveBeenCalled();
+      // streamId 是 sync- 开头的 random id
+      expect(callArgs[1]).toMatch(/^sync-\d+-[a-z0-9]+$/);
+      // finish=true (第 4 个参数)
+      expect(callArgs[3]).toBe(true);
+      // markdown content 包含 active session 信息
+      const markdown = callArgs[2] as string;
+      expect(markdown).toContain('📋');
+      expect(markdown).toContain('Project A');
+      expect(markdown).toContain('Project B');
+      expect(markdown).toContain('/switch uuid-a');
+      expect(markdown).toContain('/resume uuid-b');
+    });
+
+    it('sync /list empty 走 replyStream 推 "📭 当前无 active session"', async () => {
+      const registryManager = { sessions: {} };
+      (bot as any).registryManager = registryManager;
+
+      const handled = await (bot as any).handleCommandSynchronously({
+        platform: 'wecom',
+        userId: 'wmu_user',
+        chatType: 'p2p',
+        chatId: 'wmu_user',
+        messageId: 'msg-1',
+        text: '/list',
+        timestamp: Date.now(),
+        raw: {},
+        inboundFrame: { headers: { req_id: 'r1' } },
+      });
+
+      expect(handled).toBe(true);
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
+      const callArgs = mockClient.sdk.replyStream.mock.calls[0];
+      expect(callArgs[2]).toContain('📭 当前无 active session');
+      expect(callArgs[3]).toBe(true);
     });
 
     it('sync /list 成功后 enqueue 不被调 (避免 dispatch 重复推卡)', async () => {
@@ -163,7 +186,7 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
       // 给 microtask 时间让 then chain 跑
       await new Promise(r => setTimeout(r, 50));
 
-      expect(mockClient.sdk.replyTemplateCard).toHaveBeenCalledTimes(1);
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
       expect(mockSpoolQueue.enqueue).not.toHaveBeenCalled();
       expect(mockHandleMessage).not.toHaveBeenCalled();
     });
@@ -184,17 +207,17 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
       });
 
       expect(handled).toBe(false);
-      expect(mockClient.sdk.replyTemplateCard).not.toHaveBeenCalled();
+      expect(mockClient.sdk.replyStream).not.toHaveBeenCalled();
     });
 
-    it('replyTemplateCard 失败 → sync /list 返回 false, 走 enqueue', async () => {
+    it('replyStream 失败 → sync /list 返回 false, 走 enqueue', async () => {
       const registryManager = {
         sessions: {
           'uuid-a': { status: 'active', title: 'A', message_count: 1, last_active: '2026-06-21T10:00:00Z' },
         },
       };
       (bot as any).registryManager = registryManager;
-      mockClient.sdk.replyTemplateCard = mock(async () => { throw new Error('errcode=846605 invalid req_id'); });
+      mockClient.sdk.replyStream = mock(async () => { throw new Error('errcode=846605 invalid req_id'); });
 
       const handled = await (bot as any).handleCommandSynchronously({
         platform: 'wecom',
@@ -212,8 +235,8 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
     });
   });
 
-  describe('/status /help /whoami 同步直发 (markdown)', () => {
-    it('sync /status 调用 reply (markdown, WsCmd.RESPONSE)', async () => {
+  describe('/status /help /whoami 同步直发 (replyStream markdown)', () => {
+    it('sync /status 调用 replyStream (finish=true, markdown content 含 📊)', async () => {
       const handled = await (bot as any).handleCommandSynchronously({
         platform: 'wecom',
         userId: 'wmu_user',
@@ -226,16 +249,18 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
         inboundFrame: { headers: { req_id: 'r1' } },
       });
       expect(handled).toBe(true);
-      // PR 7.5.16: text 消息 sync 改用 reply (WsCmd.RESPONSE), 不再 replyWelcome
-      expect(mockClient.sdk.reply).toHaveBeenCalledTimes(1);
+      // PR 7.5.17: sync 命令统一用 replyStream, 不再用 reply / replyWelcome
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
+      expect(mockClient.sdk.reply).not.toHaveBeenCalled();
       expect(mockClient.sdk.replyWelcome).not.toHaveBeenCalled();
-      const callArgs = mockClient.sdk.reply.mock.calls[0];
+      const callArgs = mockClient.sdk.replyStream.mock.calls[0];
       expect(callArgs[0]).toEqual({ headers: { req_id: 'r1' } });
-      expect(callArgs[1].msgtype).toBe('markdown');
-      expect(callArgs[1].markdown.content).toContain('📊');
+      expect(callArgs[1]).toMatch(/^sync-\d+-[a-z0-9]+$/);
+      expect(callArgs[3]).toBe(true);
+      expect(callArgs[2]).toContain('📊');
     });
 
-    it('sync /help 调用 reply (markdown)', async () => {
+    it('sync /help 调用 replyStream (finish=true, markdown content 含 🤖)', async () => {
       const handled = await (bot as any).handleCommandSynchronously({
         platform: 'wecom',
         userId: 'wmu_user',
@@ -248,11 +273,13 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
         inboundFrame: { headers: { req_id: 'r1' } },
       });
       expect(handled).toBe(true);
-      expect(mockClient.sdk.reply).toHaveBeenCalledTimes(1);
-      expect(mockClient.sdk.replyWelcome).not.toHaveBeenCalled();
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
+      const callArgs = mockClient.sdk.replyStream.mock.calls[0];
+      expect(callArgs[3]).toBe(true);
+      expect(callArgs[2]).toContain('🤖');
     });
 
-    it('sync /whoami 调用 reply (markdown)', async () => {
+    it('sync /whoami 调用 replyStream (finish=true, markdown content 含 👤)', async () => {
       const handled = await (bot as any).handleCommandSynchronously({
         platform: 'wecom',
         userId: 'wmu_user',
@@ -265,8 +292,10 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
         inboundFrame: { headers: { req_id: 'r1' } },
       });
       expect(handled).toBe(true);
-      expect(mockClient.sdk.reply).toHaveBeenCalledTimes(1);
-      expect(mockClient.sdk.replyWelcome).not.toHaveBeenCalled();
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
+      const callArgs = mockClient.sdk.replyStream.mock.calls[0];
+      expect(callArgs[3]).toBe(true);
+      expect(callArgs[2]).toContain('👤');
     });
   });
 
@@ -357,7 +386,7 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
       });
       await new Promise(r => setTimeout(r, 50));
 
-      expect(mockClient.sdk.replyTemplateCard).toHaveBeenCalledTimes(1);
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
       expect(mockSpoolQueue.enqueue).not.toHaveBeenCalled();
     });
 
@@ -387,7 +416,7 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
         },
       };
       (bot as any).registryManager = registryManager;
-      mockClient.sdk.replyTemplateCard = mock(async () => { throw new Error('errcode=846605'); });
+      mockClient.sdk.replyStream = mock(async () => { throw new Error('errcode=846605'); });
 
       let capturedHandler: any;
       mockClient.onMessage = (h: any) => { capturedHandler = h; };
@@ -404,7 +433,7 @@ describe('PR 7.5.15: handleCommandSynchronously', () => {
       });
       await new Promise(r => setTimeout(r, 50));
 
-      expect(mockClient.sdk.replyTemplateCard).toHaveBeenCalledTimes(1);
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
       expect(mockSpoolQueue.enqueue).toHaveBeenCalledTimes(1);
     });
   });
