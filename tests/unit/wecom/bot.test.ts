@@ -4058,15 +4058,19 @@ describe('PR 7.5.3: /switch /resume /stop /agents 附加卡 + case 双语义', (
 
 /**
  * PR 7.5.5 hotfix: 命令路径卡走 replyTemplateCard 不 sendMessage
+ * PR 7.5.8 fix: 改走 replyWelcome 协议 — replyTemplateCard 内部走 WsCmd.RESPONSE
+ *   (aibot_respond_msg, 普通回复), 而 first-reply 卡应该走 WsCmd.RESPONSE_WELCOME
+ *   (aibot_respond_welcome_msg, 欢迎语协议). PR 7.5.7 部署后真机仍 42014,
+ *   推断 replyTemplateCard 协议不匹配 → 改 replyWelcome.
  *
  * 真机 E2E 修复: PR 7.5 deploy 后 /list 仍返回 markdown, 不返回 card
  * 根因: WecomCompleteCardSender.send 用 sdk.sendMessage(chatid, body), 走 SEND_MSG + 5s ack timeout.
  *   命令路径是 first reply (无 replyWelcome / replyStream 前置消耗 5s 窗口),
  *   sendMessage 等 ack 超时 → 触发 markdown fallback.
- * 修法: sendViaReply(frame, ctx, card) 走 sdk.replyTemplateCard(frame, card), 复用原始消息 event 的 req_id
+ * 修法: sendViaReply(frame, ctx, card) 走 sdk.replyWelcome(frame, payload), 复用原始消息 event 的 req_id
  *   (WsCmd.RESPONSE_WELCOME 协议, 不超时).
  */
-describe('PR 7.5.5 hotfix: replyTemplateCard for first-reply card', () => {
+describe('PR 7.5.5 hotfix: replyWelcome for first-reply card', () => {
   let mockSpoolQueue: any;
   let mockClient: any;
   let mockUserManager: any;
@@ -4090,9 +4094,9 @@ describe('PR 7.5.5 hotfix: replyTemplateCard for first-reply card', () => {
       disconnect: mock(() => {}),
       sdk: {
         replyStream: mock(async () => {}),
-        replyWelcome: mock(async () => {}),
+        replyWelcome: mock(async () => {}),  // ← PR 7.5.8: key mock for first-reply path
         updateTemplateCard: mock(async () => {}),
-        replyTemplateCard: mock(async () => {}),  // ← key mock for this test
+        replyTemplateCard: mock(async () => {}),
         sendMessage: mock(async () => {}),
       },
     };
@@ -4115,7 +4119,7 @@ describe('PR 7.5.5 hotfix: replyTemplateCard for first-reply card', () => {
     }
     mockRegistryManager = { sessions, listActive: mock(() => Object.values(sessions)) };
     // 不注入 completeCardSender, 让真实 WecomCompleteCardSender 被构造并调用
-    // mockClient.sdk.replyTemplateCard / sendMessage — 这样能直接验证走的哪个 SDK 通道
+    // mockClient.sdk.replyWelcome / sendMessage — 这样能直接验证走的哪个 SDK 通道
     bot = new WecomBot({
       botId: 'test', secret: 'test',
       userMappingPath: '/tmp/test-pr755-hotfix.json',
@@ -4138,18 +4142,19 @@ describe('PR 7.5.5 hotfix: replyTemplateCard for first-reply card', () => {
     };
   }
 
-  it('/list (with inboundFrame) → 调 replyTemplateCard, NOT sendMessage', async () => {
+  it('/list (with inboundFrame) → 调 replyWelcome, NOT sendMessage', async () => {
     await bot.__test_handleCommand(makeCmdMsg('/list', 'msg_pr755_list'));
-    // 关键断言: replyTemplateCard 被调 1 次
-    expect(mockClient.sdk.replyTemplateCard).toHaveBeenCalledTimes(1);
+    // PR 7.5.8: 关键断言 — replyWelcome 被调 1 次 (协议升级后)
+    expect(mockClient.sdk.replyWelcome).toHaveBeenCalledTimes(1);
     // sendMessage 应该没被调 (避免 5s ack timeout)
     expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
-    // replyTemplateCard 收到的 frame 必须是 inboundFrame
-    const callArgs = mockClient.sdk.replyTemplateCard.mock.calls[0];
+    // replyWelcome 收到的 frame 必须是 inboundFrame
+    const callArgs = mockClient.sdk.replyWelcome.mock.calls[0];
     expect(callArgs[0]).toBe(inboundFrame);  // frame 透传
-    // 第二参是 template_card 对象, card_type=button_interaction
-    expect(callArgs[1].card_type).toBe('button_interaction');
-    expect(callArgs[1].button_list.button.length).toBe(20);
+    // 第二参是 wrapped body {msgtype: 'template_card', template_card: ...}
+    expect(callArgs[1].msgtype).toBe('template_card');
+    expect(callArgs[1].template_card.card_type).toBe('button_interaction');
+    expect(callArgs[1].template_card.button_list.button.length).toBe(20);
   });
 
   it('/list (without inboundFrame) → fallback to sendMessage (compatibility)', async () => {
@@ -4157,23 +4162,23 @@ describe('PR 7.5.5 hotfix: replyTemplateCard for first-reply card', () => {
     delete msgNoFrame.metadata.inboundFrame;
     await bot.__test_handleCommand(msgNoFrame);
     // 无 inboundFrame → 走 sendMessage fallback
-    expect(mockClient.sdk.replyTemplateCard).not.toHaveBeenCalled();
+    expect(mockClient.sdk.replyWelcome).not.toHaveBeenCalled();
     expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
     const sentBody = mockClient.sdk.sendMessage.mock.calls[0][1];
     expect(sentBody.msgtype).toBe('template_card');
     expect(sentBody.template_card.card_type).toBe('button_interaction');
   });
 
-  it('/listdir (with inboundFrame) → 调 replyTemplateCard', async () => {
-    // cwd 用 /tmp — 任何存在的目录都行, 关键验证 replyTemplateCard 通道被用
+  it('/listdir (with inboundFrame) → 调 replyWelcome', async () => {
+    // cwd 用 /tmp — 任何存在的目录都行, 关键验证 replyWelcome 通道被用
     await bot.__test_handleCommand(makeCmdMsg('/listdir /tmp', 'msg_pr755_listdir'));
-    const calledReply = mockClient.sdk.replyTemplateCard.mock.calls.length > 0;
+    const calledReply = mockClient.sdk.replyWelcome.mock.calls.length > 0;
     const calledSend = mockClient.sdk.sendMessage.mock.calls.length > 0;
-    // 至少一个被调 (replyTemplateCard 或 sendMessage fallback)
+    // 至少一个被调 (replyWelcome 或 sendMessage fallback)
     expect(calledReply || calledSend).toBe(true);
-    // 优先: 如果 replyTemplateCard 被调, 验证 frame
+    // 优先: 如果 replyWelcome 被调, 验证 frame
     if (calledReply) {
-      expect(mockClient.sdk.replyTemplateCard.mock.calls[0][0]).toBe(inboundFrame);
+      expect(mockClient.sdk.replyWelcome.mock.calls[0][0]).toBe(inboundFrame);
     }
   });
 });

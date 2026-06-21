@@ -143,14 +143,15 @@ describe('PR 7.5.6: wire shape transformation', () => {
     });
     const capturedPayload: any[] = [];
     const mockSdk = {
-      replyTemplateCard: mock(async (_frame: any, card: any) => {
-        capturedPayload.push(card);
+      replyWelcome: mock(async (_frame: any, body: any) => {
+        capturedPayload.push(body);
       }),
     } as any;
     const sender = new WecomCompleteCardSender(mockSdk);
     const fakeFrame = { headers: { req_id: 'fake_req' } };
     await sender.sendViaReply(fakeFrame, { userId: 'u', chatId: 'u' }, card);
-    const wire = capturedPayload[0];
+    // PR 7.5.8: replyWelcome body 是 wrapped body {msgtype, template_card}, 不是裸 card
+    const wire = capturedPayload[0].template_card;
     expect(wire.button_list.button[0]).toEqual({ text: '切换', key: 'switch', style: 2 });
   });
 });
@@ -203,7 +204,7 @@ describe('PR 7.5.7: no task_id + error normalization', () => {
       buttons: [{ tag: 'k', text: 't' }],
     });
     const mockSdk = {
-      replyTemplateCard: mock(async () => {
+      replyWelcome: mock(async () => {
         throw { errcode: 42014, errmsg: 'taskid has existed', hint: '1234567890' };
       }),
     } as any;
@@ -216,7 +217,7 @@ describe('PR 7.5.7: no task_id + error normalization', () => {
       thrownErr = err;
     }
     expect(thrownErr).toBeInstanceOf(Error);
-    expect(thrownErr.message).toContain('replyTemplateCard');
+    expect(thrownErr.message).toContain('replyWelcome');
     expect(thrownErr.message).toContain('errcode=42014');
     expect(thrownErr.message).not.toContain('[object Object]');
   });

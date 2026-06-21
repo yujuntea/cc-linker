@@ -220,6 +220,8 @@ export class WecomCompleteCardSender {
       msgtype: 'template_card' as const,
       template_card: wireCard as unknown as CompleteCardPayload,
     };
+    // PR 7.5.8: 诊断日志 — 真机 42014 后我们需要看到真正发的 JSON
+    logger.info(`[wecom-complete-card] send wire payload: ${JSON.stringify(wireCard).slice(0, 2000)}`);
     // PR 7 final cleanup: 群聊场景下 chatId 优先 — 单聊 chatId === userId 无影响
     const receiveId = ctx.chatId ?? ctx.userId;
     try {
@@ -235,13 +237,18 @@ export class WecomCompleteCardSender {
 
   /**
    * PR 7.5.5 hotfix: 用 replyTemplateCard 推卡片 (不走 sendMessage 的 5s ack 路径)
+   * PR 7.5.8 fix: 改用 replyWelcome 协议 — replyTemplateCard 内部走 WsCmd.RESPONSE
+   *   (aibot_respond_msg, 普通回复协议), 而 replyWelcome 走 WsCmd.RESPONSE_WELCOME
+   *   (aibot_respond_welcome_msg, 欢迎语协议 — 命令路径的 first-reply 卡片应该走这个).
+   *   PR 7.5.7 部署后真机 /list 仍 fallback, errcode=42014 taskid has existed or empty
+   *   or exceed max len, 推断是协议不匹配导致 server 校验失败.
    *
    * 背景: 命令路径 (/list /listdir /model) 是用户消息的 FIRST reply, 此时 SDK 的
    *   5s replyWelcome 窗口需要用原始消息 event 的 inboundFrame (含 req_id) 才能 ack.
    *   sendMessage 走 WsCmd.SEND_MSG 协议, 等的 ack 路径不同 → 5s 超时.
    *
-   * 修法: 用 SDK 的 replyTemplateCard(frame, card) — 它走 WsCmd.RESPONSE_WELCOME 路径,
-   *   复用原始消息的 req_id, 不需要新 ack.
+   * 修法: 用 SDK 的 replyWelcome(frame, body) — 它走 WsCmd.RESPONSE_WELCOME 路径,
+   *   复用原始消息的 req_id, 不需要新 ack. body 支持 text 或 template_card 格式.
    *
    * @param frame 原始消息 event 的 WebSocket frame (msg.metadata.inboundFrame)
    * @param ctx 卡片上下文, 必填 userId / chatId (跟 send 一致), sessionTitle 等其他字段忽略
@@ -255,12 +262,20 @@ export class WecomCompleteCardSender {
     const finalCard = card ?? ctx.template_card ?? buildCompleteCard(ctx);
     // PR 7.5.6: wire shape 转换 (同 send) — action_tag→key, action_title.text→text, button_type→style + task_id sanitize
     const wireCard = transformToWireShape(finalCard);
-    // replyTemplateCard(frame, templateCard, feedback) — frame 必传, 第二参是 template_card 对象 (不是 wrapped body)
+    // PR 7.5.8: replyWelcome body 接受 {msgtype: 'template_card', template_card: ...} —
+    //   WelcomeTemplateCardReplyBody 类型正好是这个 shape.
+    const payload = {
+      msgtype: 'template_card' as const,
+      template_card: wireCard as unknown as CompleteCardPayload,
+    };
+    // PR 7.5.8: 诊断日志 — 真机 42014 后我们需要看到真正发的 JSON
+    logger.info(`[wecom-complete-card] sendViaReply (via replyWelcome) wire payload: ${JSON.stringify(wireCard).slice(0, 2000)}`);
     try {
-      await this.sdk.replyTemplateCard(frame, wireCard as unknown as CompleteCardPayload);
+      // PR 7.5.8: 改用 replyWelcome 走 RESPONSE_WELCOME 协议 — replyTemplateCard 用 RESPONSE 协议可能不对
+      await this.sdk.replyWelcome(frame, payload);
     } catch (err) {
       // PR 7.5.7: 标准化 SDK frame-style err 为 Error 实例
-      throw normalizeSdkError(err, 'replyTemplateCard');
+      throw normalizeSdkError(err, 'replyWelcome');
     }
     const taskId = (wireCard as unknown as CompleteCardPayload).task_id;
     const receiveId = ctx.chatId ?? ctx.userId;
