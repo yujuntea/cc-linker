@@ -9,13 +9,18 @@
  *   - 新增 _formatAIPreview() helper (esc markdown + 限 60 字符)
  *   - _syncHandleList 拿 sessionManager.listSessions() 构建 runningUuids 集合
  *
+ * PR 7.5.22: AI 预览对齐飞书 preview() — 折行所有空白 → 单空格, 截 80 字 (不 escape markdown,
+ *   企微 aibot 客户端支持 *bold* _italic_ 语法; 只去除前导 # / ` / > 等 markdown 破坏字符).
+ *
  * 测试覆盖:
  *   1. AI preview line 渲染 (含 🤖 + 实际文本)
  *   2. running badge 渲染 (含 🔴 **运行中**)
- *   3. AI preview 截断到 60 字符 (含 '...')
- *   4. AI preview 转义 markdown 特殊字符 (* _ [ ] `)
- *   5. AI preview 取第一非空行 (跳过前导空白行)
- *   6. running 缺失时无 🔴 (不破坏无 sessionManager 的场景)
+ *   3. PR 7.5.22: AI preview 截断到 80 字符 (含 '...')
+ *   4. PR 7.5.22: AI preview 不 escape * 和 _ (保留 markdown 语义)
+ *   5. PR 7.5.22: AI preview 折行 (多行 → 单空格)
+ *   6. PR 7.5.22: AI preview 去除前导 markdown 破坏字符 (# ` >)
+ *   7. PR 7.5.22: AI preview 短文本透传
+ *   8. running 缺失时无 🔴 (不破坏无 sessionManager 的场景)
  */
 import { describe, it, expect, mock, beforeEach } from 'bun:test';
 import { WecomBot } from '../../../src/wecom/bot';
@@ -217,33 +222,33 @@ describe('PR 7.5.21: /list AI 预览 + 运行中 badge', () => {
     expect(md).not.toContain('🔴 **运行中**');
   });
 
-  it('PR 7.5.21: AI preview truncated to 60 chars with "..."', () => {
+  it('PR 7.5.22: AI preview matches Feishu behavior - collapse whitespace + truncate 80', () => {
     const longText = 'a'.repeat(100);
     const formatted = (bot as any)._formatAIPreview(longText);
-    expect(formatted.length).toBeLessThanOrEqual(60);
+    expect(formatted.length).toBeLessThanOrEqual(80);  // 80 + 3 for ...
     expect(formatted.endsWith('...')).toBe(true);
   });
 
-  it('PR 7.5.21: AI preview escapes markdown special chars', () => {
-    const formatted = (bot as any)._formatAIPreview('测试 *bold* 和 _italic_ 还有 `code` 和 [link]');
-    expect(formatted).toContain('\\*');
-    expect(formatted).toContain('\\_');
-    expect(formatted).toContain('\\`');
-    expect(formatted).toContain('\\[');
-    expect(formatted).toContain('\\]');
+  it('PR 7.5.22: AI preview collapses newlines to spaces', () => {
+    const formatted = (bot as any)._formatAIPreview('Line 1\nLine 2\nLine 3');
+    expect(formatted).toBe('Line 1 Line 2 Line 3');
   });
 
-  it('PR 7.5.21: AI preview 取第一非空行 (跳过前导空白)', () => {
-    const multi = '\n\n   \n第一行内容\n第二行';
-    const formatted = (bot as any)._formatAIPreview(multi);
-    expect(formatted).toBe('第一行内容');
+  it('PR 7.5.22: AI preview does NOT escape * and _ (preserve emoji semantics)', () => {
+    const formatted = (bot as any)._formatAIPreview('hello *world* and _test_');
+    // * 和 _ 应该保留 (不是 escape \*), 企微 markdown 支持
+    expect(formatted).toContain('*world*');
+    expect(formatted).toContain('_test_');
   });
 
-  it('PR 7.5.21: AI preview 短文本 (< 60 字符) 不截断', () => {
-    const short = '简短预览';
-    const formatted = (bot as any)._formatAIPreview(short);
-    expect(formatted).toBe('简短预览');
-    expect(formatted).not.toContain('...');
+  it('PR 7.5.22: AI preview removes leading markdown breakers (# ` >)', () => {
+    expect((bot as any)._formatAIPreview('# Heading text').startsWith('#')).toBe(false);
+    expect((bot as any)._formatAIPreview('`code` text').startsWith('`')).toBe(false);
+    expect((bot as any)._formatAIPreview('> quote text').startsWith('>')).toBe(false);
+  });
+
+  it('PR 7.5.22: AI preview short text passes through', () => {
+    expect((bot as any)._formatAIPreview('short')).toBe('short');
   });
 
   it('PR 7.5.21: 无 sessionManager 注入时 /list 不抛错', async () => {

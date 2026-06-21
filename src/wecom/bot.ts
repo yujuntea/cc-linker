@@ -436,7 +436,7 @@ export class WecomBot {
         const origin = this._formatOrigin(s.status);
         const projectName = s.project_name ?? '';
         const cwd = s.cwd ?? '-';
-        // PR 7.5.21: AI 最后消息预览 (限 60 字符 + markdown esc)
+        // PR 7.5.22: AI 最后消息预览 (对齐飞书 preview() — 折行 + 限 80 字)
         const aiPreview = s.last_assistant_preview
           ? this._formatAIPreview(s.last_assistant_preview)
           : null;
@@ -447,12 +447,13 @@ export class WecomBot {
         lines.push(`**${index + 1}. ${title}**${runningMark}${currentMark ? ' ' + currentMark : ''}`);
         lines.push(`ID: \`${uuid.slice(0, 8)}\` | ${msgs}条 | ${lastActive} | ${origin} | ${projectName}`);
         lines.push(`📁 \`${cwd}\``);
-        // PR 7.5.21: AI 预览行 (对齐飞书 🤖)
+        // PR 7.5.22: AI 预览独立行 + 空行分隔 (对齐飞书 buildListCard 视觉)
         if (aiPreview) {
+          lines.push('');
           lines.push(`🤖 ${aiPreview}`);
+          lines.push('');
         }
         // PR 7.5.20 简化: 只有 /switch 命令 (用户反馈不需要 /resume)
-        lines.push('');
         lines.push('切换:');
         lines.push('```');
         lines.push(`/switch ${uuid.slice(0, 8)}`);
@@ -512,22 +513,25 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.21: 格式化 AI 最后消息预览 (对齐飞书 esc() + 限 60 字符)
-   *   - 取第一非空行 (避免多行 markdown 干扰 code block / 列表渲染)
-   *   - 转义 markdown 特殊字符 (避免渲染问题)
-   *   - 截断到 60 字符 (跟飞书 preview() 一致)
+   * PR 7.5.22: AI 预览对齐飞书 preview()
+   * 飞书逻辑: 折行所有空白到空格 + 截断 80 字 + 加 ...
+   * 企微适配: 同样折行, 但限 80 字保持视觉一致. 不 escape markdown (企微的 aibot 客户端
+   *   渲染 card markdown 时, *bold* _italic_ 等是合法语法, escape 反而破坏显示).
+   *   只过滤可能造成 markdown 解析问题的 chars (前导 # / ` / > 等)
    */
   private _formatAIPreview(raw: string): string {
-    const firstLine = raw.split('\n').find(l => l.trim().length > 0) ?? '';
-    const escaped = firstLine
-      .replace(/\\/g, '\\\\')
-      .replace(/\*/g, '\\*')
-      .replace(/_/g, '\\_')
-      .replace(/\[/g, '\\[')
-      .replace(/\]/g, '\\]')
-      .replace(/`/g, '\\`')
-      .trim();
-    return escaped.length > 60 ? escaped.slice(0, 57) + '...' : escaped;
+    // 1. 折行空白 → 单空格 (跟飞书一致)
+    const normalized = raw.replace(/\s+/g, ' ').trim();
+
+    // 2. 截断到 80 字 (跟飞书默认 maxLength)
+    const MAX_LEN = 80;
+    const truncated = normalized.length > MAX_LEN
+      ? `${normalized.slice(0, MAX_LEN - 3)}...`
+      : normalized;
+
+    // 3. 移除行首可能造成 markdown 解析问题的字符 (Feishu 不需要因为用 card 元素)
+    //    飞书不会 escape, 企微要避免用户原始消息里 # 标题/`code`/`>`引用 破坏渲染
+    return truncated.replace(/^[#>`]+/g, '');
   }
 
   /**
