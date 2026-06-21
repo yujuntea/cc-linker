@@ -140,6 +140,44 @@ export type WecomBotConfig = {
   providerManager?: ProviderManager;
 };
 
+/**
+ * PR 7.5.2 Task 2.0: handleCommandListCard 返回结构 — PR 7.5.2 Task 2.2 用 .entries 喂 buildListCard
+ * @see docs/superpowers/specs/2026-06-21-wecom-command-cards-design.md §4.1
+ */
+type ListCardData = {
+  markdown: string;
+  entries: Array<{
+    sessionUuid: string;
+    title: string;
+    messageCount: number;
+    lastActive: string;
+    cwd?: string | undefined;  // 内部用 (渲染 markdown 模板), Task 2.2 卡片化不依赖
+  }>;
+  totalActive: number;
+  currentUuid: string | null;  // PR 7.5.2 M7 fix: 标记当前 user 的 session 用
+};
+
+/**
+ * PR 7.5.2 Task 2.0: handleCommandListDir 返回结构 — PR 7.5.2 Task 2.2 用 .dirs/.parent/.hasMore 喂 buildDirListCard
+ * @see docs/superpowers/specs/2026-06-21-wecom-command-cards-design.md §4.2
+ */
+type DirListData = {
+  markdown: string;
+  cwd: string;
+  parent: string | null;
+  dirs: Array<{ name: string; fullPath: string }>;
+  hasMore: boolean;
+};
+
+/**
+ * PR 7.5.2 Task 2.0: handleCommandAgents 返回结构 — PR 7.5.3 Task 3.2 用 .bgCount 喂 buildAgentsRefreshCard
+ * @see docs/superpowers/specs/2026-06-21-wecom-command-cards-design.md §4.5
+ */
+type AgentsData = {
+  markdown: string;
+  bgCount: number;
+};
+
 export class WecomBot {
   private client: AibotClient;
   private updater: WecomStreamUpdater;
@@ -448,7 +486,8 @@ export class WecomBot {
           responseText = await this.handleCommandResume(msg.userId, parsed.args);
           break;
         case 'agents':
-          responseText = await this.handleCommandAgents(msg.userId, parsed.args);
+          // PR 7.5.2 Task 2.0: handleCommandAgents 改返 AgentsData 结构, 取 .markdown 喂统一推送
+          responseText = (await this.handleCommandAgents(msg.userId, parsed.args)).markdown;
           break;
         case 'stop':
           responseText = await this.handleCommandStop(msg.userId, parsed.args);
@@ -465,7 +504,8 @@ export class WecomBot {
         //   走外层 sendMessage (bot.ts:478-483), 避免双推送
         //   按钮路径 (executeCardAction case 'listdir') 走 renderListDir
         case 'listdir':
-          responseText = await this.handleCommandListDir(msg.userId);
+          // PR 7.5.2 Task 2.0: handleCommandListDir 改返 DirListData 结构, 取 .markdown 喂统一推送
+          responseText = (await this.handleCommandListDir(msg.userId)).markdown;
           break;
         // PR 6.14: /whoami 命令 — 显示当前 user externalUserId + 配置提示
         // 仿飞书 feishu/bot.ts:1009 case 'whoami', 帮助用户诊断 owner 配置
@@ -560,55 +600,33 @@ export class WecomBot {
   private async handleCommandListCard(msg: SpoolMessage): Promise<void> {
     logger.info(`[wecom-bot] handleCommandListCard: userId=${msg.userId}`);
 
-    // 1. 渲染列表 markdown
-    let markdown: string;
-    if (this.registryManager) {
-      try {
-        // PR 6.9: 用 registryManager.sessions (Record<uuid, SessionEntry>) 拿完整 uuid
-        // listActive() 返回 SessionEntry[] 没 uuid, 反查 O(n²) 不好
-        // sessions 是 in-memory cache (start.ts syncBeforeCommand 已 flush 最新数据)
-        const allActive = this.registryManager.sessions;
-        const activeEntries = Object.entries(allActive)
-          .filter(([_, s]) => s.status === 'active')
-          .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
-          .slice(0, 10);
-        const currentEntry = this.userManager.getEntry(msg.userId);
-        const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
-        const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
-        if (activeEntries.length === 0) {
-          markdown = '📭 当前无 active session';
-        } else {
-          const header = `📋 **活跃 sessions (${activeEntries.length}${totalActive > 10 ? '+' : ''})**\n\n`;
-          const lines = activeEntries.map(([uuid, s]) => {
-            const marker = uuid === currentUuid ? '👉' : '　';
-            const title = s.title ?? '(无标题)';
-            const cwd = s.cwd ? ` \`${s.cwd}\`` : '';
-            const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
-            const lastActive = s.last_active ? ` _${s.last_active.slice(0, 16)}_` : '';
-            return `${marker} **${title}**${msgs}${cwd}${lastActive}\n   \`${uuid.slice(0, 8)}…\``;
-          });
-          markdown = header + lines.join('\n\n') +
-            `\n\n_(共 ${totalActive} 个, 只显示前 ${activeEntries.length}; 续聊用 \`/switch <uuid>\`)_`;
-        }
-        logger.info(`[wecom-bot] handleCommandListCard: rendering ${activeEntries.length}/${totalActive} sessions for userId=${msg.userId}`);
-      } catch (err) {
-        logger.error(`[wecom-bot] handleCommandListCard: registry access failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
-        await this.fallbackListMarkdown(msg);
-        return;
-      }
-    } else {
+    // PR 7.5.2 Task 2.0: 拆 _Internal 返回结构 + _renderXxxMarkdown 渲染字符串
+    // 调用方 0 regression: handleCommandListCard 仍走 sendMessage markdown + markDone
+    // Task 2.2 调 _handleCommandListCardInternal 拿结构数据喂 buildListCard
+    if (!this.registryManager) {
       // registryManager 未注入 (wecom-only staging / 旧测试) → 走老 markdown 路径
       logger.warn('[wecom-bot] handleCommandListCard: registryManager not injected, fallback to markdown');
       await this.fallbackListMarkdown(msg);
       return;
     }
 
-    // 2. sendMessage markdown
+    let data: ListCardData;
+    try {
+      const internal = await this._handleCommandListCardInternal(msg);
+      data = { ...internal, markdown: this._renderListMarkdown(internal) };
+      logger.info(`[wecom-bot] handleCommandListCard: rendering ${internal.entries.length}/${internal.totalActive} sessions for userId=${msg.userId}`);
+    } catch (err) {
+      logger.error(`[wecom-bot] handleCommandListCard: registry access failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
+      await this.fallbackListMarkdown(msg);
+      return;
+    }
+
+    // 2. sendMessage markdown (行为不变 — 跟 P0#2 / P1#6 一致)
     try {
       const receiveId = resolveReceiveId(msg);
       await this.client.sdk.sendMessage(receiveId, {
         msgtype: 'markdown',
-        markdown: { content: markdown },
+        markdown: { content: data.markdown },
       });
       this.spoolQueue.markDone(msg.messageId, msg.serialKey);
       logger.info(`[wecom-bot] handleCommandListCard: sent markdown to ${receiveId}`);
@@ -622,6 +640,53 @@ export class WecomBot {
         logger.warn(`[wecom-bot] handleCommandListCard markDone failed: ${markDoneErr instanceof Error ? markDoneErr.message : String(markDoneErr)}`);
       }
     }
+  }
+
+  /**
+   * PR 7.5.2 Task 2.0: 读 registry 拿结构化数据 (无 markdown 渲染, 无 sendMessage).
+   * Task 2.2 用 entries + currentUuid 喂 buildListCard.
+   */
+  private async _handleCommandListCardInternal(msg: SpoolMessage): Promise<Omit<ListCardData, 'markdown'>> {
+    // PR 6.9: 用 registryManager.sessions (Record<uuid, SessionEntry>) 拿完整 uuid
+    // listActive() 返回 SessionEntry[] 没 uuid, 反查 O(n²) 不好
+    // sessions 是 in-memory cache (start.ts syncBeforeCommand 已 flush 最新数据)
+    const allActive = this.registryManager!.sessions;
+    const activeEntries = Object.entries(allActive)
+      .filter(([_, s]) => s.status === 'active')
+      .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
+      .slice(0, 10)
+      .map(([sessionUuid, s]) => ({
+        sessionUuid,
+        title: s.title ?? '(无标题)',
+        // 渲染时要用 cwd 字段 (PR 6.9 模板), Task 2.2 卡片化不依赖
+        cwd: s.cwd,
+        messageCount: s.message_count ?? 0,
+        lastActive: s.last_active ?? '',
+      }));
+    const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
+    const currentEntry = this.userManager.getEntry(msg.userId);
+    const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
+    return { entries: activeEntries, totalActive, currentUuid };
+  }
+
+  /**
+   * PR 7.5.2 Task 2.0: 渲染 list markdown 字符串 (与原 handleCommandListCard 输出完全一致,
+   * 保留 cwd + msgs + lastActive + uuid 前 8 字符 + 👉 marker)
+   */
+  private _renderListMarkdown(internal: Omit<ListCardData, 'markdown'>): string {
+    if (internal.entries.length === 0) {
+      return '📭 当前无 active session';
+    }
+    const header = `📋 **活跃 sessions (${internal.entries.length}${internal.totalActive > 10 ? '+' : ''})**\n\n`;
+    const lines = internal.entries.map(e => {
+      const marker = e.sessionUuid === internal.currentUuid ? '👉' : '　';
+      const cwd = e.cwd ? ` \`${e.cwd}\`` : '';
+      const msgs = e.messageCount != null ? ` (${e.messageCount} msgs)` : '';
+      const lastActive = e.lastActive ? ` _${e.lastActive.slice(0, 16)}_` : '';
+      return `${marker} **${e.title}**${msgs}${cwd}${lastActive}\n   \`${e.sessionUuid.slice(0, 8)}…\``;
+    });
+    return header + lines.join('\n\n') +
+      `\n\n_(共 ${internal.totalActive} 个, 只显示前 ${internal.entries.length}; 续聊用 \`/switch <uuid>\`)_`;
   }
 
   /**
@@ -708,22 +773,23 @@ export class WecomBot {
    * 简化版实现：读 ~/.claude/jobs/ 目录下每个 state.json 列出 shortId + status
    * 完整 AgentView 卡片渲染逻辑推 PR 6+ (需要 bg session 的 peek/reply/stop 交互)
    */
-  private async handleCommandAgents(_userId: string, _args: string[]): Promise<string> {
+  private async handleCommandAgents(_userId: string, _args: string[]): Promise<AgentsData> {
     try {
       const { readdirSync, readFileSync, existsSync } = await import('fs');
       const { join } = await import('path');
       const { homedir } = await import('os');
       const jobsDir = join(homedir(), '.claude', 'jobs');
       if (!existsSync(jobsDir)) {
-        return '📭 无活跃 bg sessions (jobs 目录不存在)';
+        return { markdown: '📭 无活跃 bg sessions (jobs 目录不存在)', bgCount: 0 };
       }
       const entries = readdirSync(jobsDir, { withFileTypes: true })
         .filter(d => d.isDirectory())
         .slice(0, 10);  // 限 10 个
       if (entries.length === 0) {
-        return '📭 无活跃 bg sessions';
+        return { markdown: '📭 无活跃 bg sessions', bgCount: 0 };
       }
       const lines = ['📋 活跃 bg sessions:'];
+      let bgCount = 0;
       for (const entry of entries) {
         const statePath = join(jobsDir, entry.name, 'state.json');
         if (!existsSync(statePath)) continue;
@@ -732,11 +798,13 @@ export class WecomBot {
           const status = state.status ?? 'unknown';
           const name = state.name ?? state.shortId ?? entry.name;
           lines.push(`  • ${name} [${status}] (${entry.name})`);
+          bgCount++;
         } catch { /* skip malformed state.json */ }
       }
-      return lines.join('\n');
+      return { markdown: lines.join('\n'), bgCount };
     } catch (err) {
-      return `❌ 读取 bg sessions 失败: ${err instanceof Error ? err.message : String(err)}`;
+      const errMsg = `❌ 读取 bg sessions 失败: ${err instanceof Error ? err.message : String(err)}`;
+      return { markdown: errMsg, bgCount: 0 };
     }
   }
 
@@ -871,61 +939,91 @@ export class WecomBot {
    * @param userId 企微 external_userid (推送目标)
    */
   private async renderListDir(userId: string): Promise<void> {
-    const markdown = await this.handleCommandListDir(userId);
+    const data = await this.handleCommandListDir(userId);
     await this.client.sdk.sendMessage(userId, {
       msgtype: 'markdown',
-      markdown: { content: markdown },
+      markdown: { content: data.markdown },
     });
   }
 
-  private async handleCommandListDir(userId: string): Promise<string> {
+  private async handleCommandListDir(userId: string): Promise<DirListData> {
     try {
-      const { readdirSync, existsSync } = await import('fs');
-      const { dirname } = await import('path');
-
-      // PR 6.15 + PR 6.16: cwd 优先级 — user-mapping entry.cwd → 平台 config → 通用 config → /tmp fallback
-      // 历史:
-      //   PR 6.13: 只读 user-mapping entry.cwd, 缺则 /tmp fallback → 用户反馈
-      //   PR 6.15: 加 wecom.default_cwd 平台配置 (仿飞书 feishu_bot.default_cwd)
-      //   PR 6.16: 用户提意"飞书微信不必各配一遍" → 加通用 [general] default_cwd 公共 fallback
-      const entry = this.userManager.getEntry(userId);
-      const cwd = entry?.cwd
-        ?? config.get<string>('wecom.default_cwd', '')
-        ?? config.get<string>('general.default_cwd', '')
-        ?? '/tmp';
-
-      if (!existsSync(cwd)) {
-        return `❌ 目录不存在: ${cwd}\n\n使用 \`/new <路径>\` 切换到有效目录`;
-      }
-
-      // 读子目录 (排除隐藏目录, 按字母排序, 限 20 条避免 markdown 过长)
-      const entries = readdirSync(cwd, { withFileTypes: true })
-        .filter(e => e.isDirectory() && !e.name.startsWith('.'))
-        .map(e => e.name)
-        .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
-        .slice(0, 20);
-
-      const totalDirs = entries.length;
-      const hasMore = totalDirs > 20;
-
-      // parent 上级目录 (根目录无 parent)
-      const parent = cwd !== dirname(cwd) ? dirname(cwd) : null;
-
-      const lines = [`📂 **目录浏览**: \`${cwd}\``, ''];
-      if (parent) lines.push(`⬆️ 上级目录: \`${parent}\``);
-      if (entries.length === 0) {
-        lines.push('📁 当前目录下没有子目录');
-      } else {
-        for (const dir of entries) {
-          lines.push(`📁 ${dir}`);
-        }
-      }
-      if (hasMore) lines.push(`\n_... 还有更多子目录未显示_`);
-      lines.push('\n💡 使用 `/new <路径>` 切换到指定目录');
-      return lines.join('\n');
+      const internal = await this._handleCommandListDirInternal(userId);
+      return { ...internal, markdown: this._renderDirListMarkdown(internal) };
     } catch (err: any) {
-      return `❌ 无法读取目录: ${err.message ?? String(err)}`;
+      // PR 7.5.2 Task 2.0: 保留原 error markdown (跟 PR 6.13 原版一字不差)
+      // 原版: cwd 不存在 → "❌ 目录不存在: ${cwd}\n\n使用 `/new <路径>` 切换到有效目录"
+      // 其它读目录失败 → "❌ 无法读取目录: ${err.message}"
+      const errMsg = err?.message?.startsWith('目录不存在')
+        ? `❌ ${err.message}\n\n使用 \`/new <路径>\` 切换到有效目录`
+        : `❌ 无法读取目录: ${err.message ?? String(err)}`;
+      return {
+        markdown: errMsg,
+        cwd: '(unknown)',
+        parent: null,
+        dirs: [],
+        hasMore: false,
+      };
     }
+  }
+
+  /**
+   * PR 7.5.2 Task 2.0: 读 cwd 子目录返回结构 (无 markdown 渲染, 无 sendMessage).
+   * Task 2.2 用 .dirs/.parent/.hasMore 喂 buildDirListCard.
+   */
+  private async _handleCommandListDirInternal(userId: string): Promise<Omit<DirListData, 'markdown'>> {
+    const { readdirSync, existsSync } = await import('fs');
+    const { dirname } = await import('path');
+
+    // PR 6.15 + PR 6.16: cwd 优先级 — user-mapping entry.cwd → 平台 config → 通用 config → /tmp fallback
+    // 历史:
+    //   PR 6.13: 只读 user-mapping entry.cwd, 缺则 /tmp fallback → 用户反馈
+    //   PR 6.15: 加 wecom.default_cwd 平台配置 (仿飞书 feishu_bot.default_cwd)
+    //   PR 6.16: 用户提意"飞书微信不必各配一遍" → 加通用 [general] default_cwd 公共 fallback
+    const entry = this.userManager.getEntry(userId);
+    const cwd = entry?.cwd
+      ?? config.get<string>('wecom.default_cwd', '')
+      ?? config.get<string>('general.default_cwd', '')
+      ?? '/tmp';
+
+    if (!existsSync(cwd)) {
+      // 抛带"目录不存在"前缀的错, 外层 catch 把它转成原版 markdown
+      throw new Error(`目录不存在: ${cwd}`);
+    }
+
+    // 读子目录 (排除隐藏目录, 按字母排序, 限 20 条避免 markdown 过长)
+    const entries = readdirSync(cwd, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+      .map(e => e.name)
+      .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+      .slice(0, 20);
+
+    const totalDirs = entries.length;
+    const hasMore = totalDirs > 20;
+
+    // parent 上级目录 (根目录无 parent)
+    const parent = cwd !== dirname(cwd) ? dirname(cwd) : null;
+    const dirs = entries.map(name => ({ name, fullPath: `${cwd}/${name}`.replace('//', '/') }));
+
+    return { cwd, parent, dirs, hasMore };
+  }
+
+  /**
+   * PR 7.5.2 Task 2.0: 渲染 /listdir markdown 字符串 (与原 handleCommandListDir 输出完全一致)
+   */
+  private _renderDirListMarkdown(internal: Omit<DirListData, 'markdown'>): string {
+    const lines = [`📂 **目录浏览**: \`${internal.cwd}\``, ''];
+    if (internal.parent) lines.push(`⬆️ 上级目录: \`${internal.parent}\``);
+    if (internal.dirs.length === 0) {
+      lines.push('📁 当前目录下没有子目录');
+    } else {
+      for (const dir of internal.dirs) {
+        lines.push(`📁 ${dir.name}`);
+      }
+    }
+    if (internal.hasMore) lines.push(`\n_... 还有更多子目录未显示_`);
+    lines.push('\n💡 使用 `/new <路径>` 切换到指定目录');
+    return lines.join('\n');
   }
 
   private async handleChat(msg: SpoolMessage): Promise<void> {
