@@ -263,6 +263,152 @@ export class WecomBot {
     this.wecomCompleteCardSender = config.completeCardSender ?? new WecomCompleteCardSender(this.client.sdk);
   }
 
+  /**
+   * PR 7.5.15: 命令同步直发 — 在 onMessage 内 (5s req_id 窗口内) 直接 replyWelcome,
+   *   不走 SpoolQueue dispatch.
+   *
+   * 根因 (经过 14 个 PR 都失败, 真因在 PR 7.5.15 锁定):
+   *   aibot server 用 rendezvous 协议 — inbound event 的 req_id 5s 后过期.
+   *   cc-linker SpoolQueue dispatch loop 1-3s + handleCommand 处理时间,
+   *   到 sendViaReply 时 req_id 已失效 → server 拒收 (errcode=846605).
+   *   markdown fallback 一直能用 sendMessage 是因为 sendMessage 自己生成 req_id.
+   *   修法: 在 onMessage (fresh inbound frame) 同步调 replyWelcome.
+   *
+   * 支持范围:
+   * - /list — 只读 in-memory registryManager.sessions, 同步可处理 (PR 7.5.15 first cut)
+   * - 后续可扩展 /model (providerManager.list 也 in-memory, 同步)
+   *   /status /whoami /help (string 直接返回) /new /switch 等需写 user-mapping 的
+   *   → 仍走 enqueue 路径 (并发安全, SpoolQueue 串行)
+   *
+   * 返回:
+   * - true → 已同步处理, 调用方应跳过 enqueue (避免 dispatch 重复推卡)
+   * - false → 未处理, 调用方继续走 enqueue 路径
+   * - throw → 调用方 catch 后 fallback 到 enqueue
+   *
+   * @param msg 平台消息 (含 inboundFrame — aibot ws 原始 msg, headers.req_id)
+   */
+  async handleCommandSynchronously(msg: PlatformMessage): Promise<boolean> {
+    // 1. 必须有 inboundFrame (用 fresh req_id), 没 frame 走 enqueue
+    if (!msg.inboundFrame) {
+      return false;
+    }
+    // 2. 必须是命令 (parseCommand 识别)
+    const parsed = parseCommand(msg.text);
+    if (!parsed) {
+      return false;
+    }
+
+    // 3. 只处理能同步拿数据的命令
+    switch (parsed.cmd) {
+      case 'list':
+        return this._syncHandleList(msg);
+      case 'status':
+        return this._syncHandleStatus(msg);
+      case 'help':
+        return this._syncHandleHelp(msg);
+      case 'whoami':
+        return this._syncHandleWhoami(msg);
+      default:
+        // /model /listdir /switch /resume /new /agents /stop /cancel
+        //   → 需要写 user-mapping 或读 cwd 等, 走 enqueue 路径
+        return false;
+    }
+  }
+
+  /**
+   * PR 7.5.15: /list 同步直发
+   * 读 registryManager.sessions (in-memory), buildListCard, sendViaReply.
+   * sendViaReply 内 replyWelcome (fresh req_id) → sendMessage fallback.
+   */
+  private async _syncHandleList(msg: PlatformMessage): Promise<boolean> {
+    if (!this.registryManager) {
+      // 没 registryManager 注入 → 走 enqueue (老 handleCommandListCard 路径)
+      return false;
+    }
+    try {
+      const allActive = this.registryManager.sessions;
+      const activeEntries = Object.entries(allActive)
+        .filter(([_, s]) => s.status === 'active')
+        .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
+        .slice(0, 6)
+        .map(([sessionUuid, s]) => ({
+          sessionUuid,
+          title: s.title ?? '(无标题)',
+          messageCount: s.message_count ?? 0,
+          lastActive: s.last_active ?? '',
+        }));
+      const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
+
+      const card = buildListCard({ entries: activeEntries, totalActive });
+      const receiveId = msg.chatId || msg.userId;
+      await this.wecomCompleteCardSender.sendViaReply(
+        msg.inboundFrame,
+        { userId: msg.userId, chatId: receiveId },
+        card,
+      );
+      logger.info(`[wecom-bot] sync /list: replyWelcome ok (entries=${activeEntries.length}, totalActive=${totalActive})`);
+      return true;
+    } catch (err) {
+      logger.warn(`[wecom-bot] sync /list failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
+      return false;
+    }
+  }
+
+  /**
+   * PR 7.5.15: /status 同步直发 (无卡片, 纯 markdown 文本).
+   * markdown 用 replyWelcome (fresh req_id, 走 inbound frame, 一次性 ack).
+   */
+  private async _syncHandleStatus(msg: PlatformMessage): Promise<boolean> {
+    try {
+      const text = this.handleCommandStatus(msg.userId);
+      await this.client.sdk.replyWelcome(msg.inboundFrame, {
+        msgtype: 'markdown',
+        markdown: { content: text },
+      } as any);
+      logger.info(`[wecom-bot] sync /status: replyWelcome ok`);
+      return true;
+    } catch (err) {
+      logger.warn(`[wecom-bot] sync /status failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
+      return false;
+    }
+  }
+
+  /**
+   * PR 7.5.15: /help 同步直发
+   */
+  private async _syncHandleHelp(msg: PlatformMessage): Promise<boolean> {
+    try {
+      const text = this.handleCommandHelp();
+      await this.client.sdk.replyWelcome(msg.inboundFrame, {
+        msgtype: 'markdown',
+        markdown: { content: text },
+      } as any);
+      logger.info(`[wecom-bot] sync /help: replyWelcome ok`);
+      return true;
+    } catch (err) {
+      logger.warn(`[wecom-bot] sync /help failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
+      return false;
+    }
+  }
+
+  /**
+   * PR 7.5.15: /whoami 同步直发
+   */
+  private async _syncHandleWhoami(msg: PlatformMessage): Promise<boolean> {
+    try {
+      const text = this.handleCommandWhoami(msg.userId);
+      await this.client.sdk.replyWelcome(msg.inboundFrame, {
+        msgtype: 'markdown',
+        markdown: { content: text },
+      } as any);
+      logger.info(`[wecom-bot] sync /whoami: replyWelcome ok`);
+      return true;
+    } catch (err) {
+      logger.warn(`[wecom-bot] sync /whoami failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
+      return false;
+    }
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
@@ -281,8 +427,25 @@ export class WecomBot {
       logger.info(`[wecom-bot] onMessage received: ${JSON.stringify(event).slice(0, 300)}`);
       const platformMsg = aibotMessageToPlatform(event);
       logger.info(`[wecom-bot] platformMsg: ${JSON.stringify(platformMsg)}`);
-      this.handleMessage(platformMsg).catch(err => {
-        logger.error(`[wecom-bot] handleMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+
+      // PR 7.5.15: 命令同步直发 — 在 onMessage 内同步调用 replyWelcome
+      //   拿到 inbound 5s 窗口, 不走 SpoolQueue (1-3s dispatch) → 不超时.
+      //   只支持同步可处理的命令 (/list 读 in-memory registry);
+      //   异步命令 (handleCommandListDir 等) 返回 false 走原 enqueue 路径.
+      //   如果同步成功, 不再 enqueue, 避免 dispatch 后续重复推卡.
+      this.handleCommandSynchronously(platformMsg).then(handled => {
+        if (handled) {
+          logger.info(`[wecom-bot] onMessage: 命令 ${platformMsg.text.slice(0, 30)} 已同步直发, 跳过 enqueue`);
+          return;
+        }
+        this.handleMessage(platformMsg).catch(err => {
+          logger.error(`[wecom-bot] handleMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }).catch(err => {
+        logger.error(`[wecom-bot] handleCommandSynchronously crashed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
+        this.handleMessage(platformMsg).catch(err2 => {
+          logger.error(`[wecom-bot] handleMessage failed after sync crash: ${err2 instanceof Error ? err.message : String(err2)}`);
+        });
       });
     });
 
