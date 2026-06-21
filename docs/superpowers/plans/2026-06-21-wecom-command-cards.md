@@ -246,7 +246,8 @@ export type DirListCardContext = {
 };
 
 export type ModelCardContext = {
-  providers: Array<{ alias: string; label: string }>;
+  // PR 7.5 C2 fix: ProviderConfig 字段是 'name' 不是 'label' (utils/providers.ts:9-14)
+  providers: Array<{ alias: string; name: string }>;
   currentAlias?: string;
 };
 
@@ -257,17 +258,28 @@ export type StopCardContext = { shortId: string };
 // ============ Builder 实现 ============
 
 /**
- * PR 7.5 E2: aibot SDK TemplateCardButton 类型无 value 字段,
- *   但运行时 aibot 服务端接受 object value (aibot-client.ts:168 实证).
- *   修法: (button as any).value = { sessionUuid: ... } 注入, 单测覆盖
+ * PR 7.5 E2 + C4 fix: aibot SDK TemplateCardButton 类型无 value 字段,
+ *   但 WecomCardBuilder.buttonInteraction Zod schema (card.ts:21-25) 强制
+ *   {tag, text, type} 字段名. value 字段 SDK 类型无声明, 但运行时
+ *   aibot 服务端接受 object value (aibot-client.ts:168 实证).
+ *   修法: 构造符合 Zod schema 的对象 + (btn as any).value = ... 注入.
  */
-function makeButton(text: string, key: string, value?: { sessionUuid: string }): any {
-  const btn: any = { text, key };
+function makeButton(text: string, tag: string, value?: { sessionUuid: string }): any {
+  const btn: any = { text, tag };
   if (value) btn.value = value;
   return btn;
 }
 
 export function buildListCard(ctx: ListCardContext): WecomTemplateCard {
+  // PR 7.5 C3 fix: empty entries 时 WecomCardBuilder.buttonInteraction Zod schema
+  //   要求 buttons.min(1) (card.ts:42), 0 按钮会抛错. 改用 textNotice 路径.
+  if (ctx.entries.length === 0) {
+    return WecomCardBuilder.textNotice({
+      title: `📋 我的会话 (0/${ctx.totalActive})`,
+      content: '📭 当前无 active session',
+      actionMenu: [{ tag: 'list-refresh', text: '🔄 刷新' }],
+    });
+  }
   const buttons: any[] = [];
   for (const e of ctx.entries) {
     buttons.push(makeButton('🔄 切换', 'switch', { sessionUuid: e.sessionUuid }));
@@ -304,16 +316,21 @@ export function buildDirListCard(ctx: DirListCardContext): WecomTemplateCard {
 export function buildModelCard(ctx: ModelCardContext): WecomTemplateCard {
   const buttons: any[] = ctx.providers.map(p => {
     const isCurrent = p.alias === ctx.currentAlias;
+    // PR 7.5 C4 fix: WecomCardBuilder.buttonInteraction Zod schema (card.ts:21-25)
+    //   强制 {tag, text, type} 字段名, 不是 {key, text, style}.
+    //   value 字段 SDK 类型无声明, (btn as any).value = ... 注入 (PR 7.5 E2)
     return {
-      ...makeButton(
-        isCurrent ? `🎯 ${p.label} (当前)` : `🎯 ${p.label}`,
-        'select_model',
-        { sessionUuid: p.alias },
-      ),
-      button_type: isCurrent ? 'default' : 'primary',
+      tag: 'select_model',
+      text: isCurrent ? `🎯 ${p.name} (当前)` : `🎯 ${p.name}`,
+      type: isCurrent ? 'default' : 'primary',
+      value: { sessionUuid: p.alias },
     };
   });
-  buttons.push({ text: '🧹 清除默认', key: 'clear_model', button_type: 'danger' } as any);
+  buttons.push({
+    tag: 'clear_model',
+    text: '🧹 清除默认',
+    type: 'danger',
+  });
   return WecomCardBuilder.buttonInteraction({
     title: '🤖 模型选择',
     description: '💡 点按下方按钮设默认模型',
@@ -581,15 +598,13 @@ import { ProviderManager } from '../utils/providers';
 
 ```typescript
   /**
-   * PR 7.5.1: handleCommandModel 实际集成 ProviderManager
+   * PR 7.5.1 + C1 fix: handleCommandModel 实际集成 ProviderManager
    * 旧版 (PR 5 stub): 只 log + 返回 markdown 占位 "已设置 model: <name>"
    * 新版:
    * - alias = '--clear' → 调 userManager.clearDefaultProvider(userId) + 返回"已清除"
-   * - alias = '<name>'  → 调 userManager.setDefaultProvider(userId, alias) + 返回"已设置"
+   * - alias = '<name>'  → ProviderManager.resolve(alias) 验证 → userManager.setDefaultProvider → 返回"已设置"
+   *   - PR 7.5 C1 fix: ProviderManager.resolve 返回 null (不抛错), 必须显式 null 检查返回错误
    * - 无 alias → handleCommand case 'model' 入口拦截, 走 buildModelCard 路径 (PR 7.5.2)
-   *
-   * 注: ProviderManager.resolve(alias) 验证 alias 是否在已知 provider 列表里,
-   *   不在则抛错 → catch 后返回 "❌ 未知 model alias".
    */
   private async handleCommandModel(userId: string, args: string[]): Promise<string> {
     if (args.length === 0 || !args[0]) {
@@ -597,20 +612,16 @@ import { ProviderManager } from '../utils/providers';
       return '❌ 用法: /model <model-alias> (例如: /model sonnet)';
     }
     const alias = args[0];
-    try {
-      if (alias === '--clear') {
-        await this.userManager.clearDefaultProvider(userId);
-        return '✅ 已清除默认模型';
-      }
-      // 验证 alias 合法 (ProviderManager.resolve 找不到 alias 时抛错)
-      if (this.providerManager) {
-        this.providerManager.resolve(alias);  // 验证 alias 存在
-      }
-      await this.userManager.setDefaultProvider(userId, alias);
-      return `✅ 默认模型已设置为 ${alias}`;
-    } catch (err) {
-      return `❌ ${err instanceof Error ? err.message : String(err)}`;
+    if (alias === '--clear') {
+      await this.userManager.clearDefaultProvider(userId);
+      return '✅ 已清除默认模型';
     }
+    // PR 7.5 C1 fix: resolve 返回 null (utils/providers.ts:38-49), 不抛错
+    if (this.providerManager && !this.providerManager.resolve(alias)) {
+      return `❌ 未知 model alias: ${alias}`;
+    }
+    await this.userManager.setDefaultProvider(userId, alias);
+    return `✅ 默认模型已设置为 ${alias}`;
   }
 ```
 
@@ -636,10 +647,11 @@ PR 7.5.1: 改造 handleCommandModel 实际写 user-mapping entry.defaultProvider
 - handleCommandModel 改造:
   - alias = '--clear' → userManager.clearDefaultProvider + 返回'已清除'
   - alias = '<name>'  → userManager.setDefaultProvider + 返回'已设置'
-  - alias 验证: providerManager.resolve(alias) 找不到时抛错 → 返回错误
+- PR 7.5 C1 fix: alias 验证 ProviderManager.resolve(alias) 返回 null (utils/providers.ts:38-49)
+  时显式返回错误 '❌ 未知 model alias: <alias>', 不依赖 catch
 - 无 alias → 兜底'用法' markdown (PR 7.5.2 handleCommand 入口拦截, 走 buildModelCard)
 
-2 单测覆盖: set + clear 双向, mock providerManager + userManager"
+2 单测覆盖: set + clear 双向 + alias 验证 null 路径, mock providerManager + userManager"
 ```
 
 ---
@@ -648,7 +660,146 @@ PR 7.5.1: 改造 handleCommandModel 实际写 user-mapping entry.defaultProvider
 
 **Files:**
 - Modify: `src/wecom/bot.ts:402-461` (handleCommand case 'list' / 'listdir' 改造)
+- Modify: `src/wecom/bot.ts:547-588` (handleCommandListCard 拆分 — Task 2.0)
+- Modify: `src/wecom/bot.ts:803-851` (handleCommandListDir 拆分 — Task 2.0)
+- Modify: `src/wecom/bot.ts:698-728` (handleCommandAgents 拆分 — Task 2.0)
 - Modify: `src/wecom/bot.ts:1262-1345` (executeCardAction switch 加 3 case)
+
+---
+
+### Task 2.0: 改造 handleCommandListCard / handleCommandListDir / handleCommandAgents 返回结构 (I6 + M7 fix)
+
+**Files:**
+- Modify: `src/wecom/bot.ts:547-588` (handleCommandListCard) — 拆分 _Internal 返回结构
+- Modify: `src/wecom/bot.ts:803-851` (handleCommandListDir) — 拆分 _Internal 返回结构
+- Modify: `src/wecom/bot.ts:698-728` (handleCommandAgents) — 拆分 _Internal 返回结构
+
+- [ ] **Step 1: handleCommandListCard 拆分 (PR 7.5.2 M7 fix)**
+
+```typescript
+// M7 fix: bot.ts:409-412 已有 'list' 命令提前拦截走 handleCommandListCard,
+//   改 handleCommandListCard (不是 case 'list' switch)
+// 改造签名: 返回 ListCardData 结构 (handleCommand case 'list' 拆 .markdown, 卡片路径用 .entries)
+
+type ListCardData = {
+  markdown: string;  // 现有 markdown 渲染 (handleClaimed 外层 sendMessage 仍要)
+  entries: Array<{ sessionUuid: string; title: string; messageCount: number; lastActive: string }>;
+  totalActive: number;
+};
+
+// handleCommandListCard 现有签名: private handleCommandListCard(msg: SpoolMessage): Promise<void>
+// 改造为: 返回 ListCardData (调用方 handleCommand case 'list' 处理返回的 string 是从 .markdown 拿)
+
+private async handleCommandListCard(msg: SpoolMessage): Promise<ListCardData> {
+  const internal = await this._handleCommandListCardInternal(msg);
+  return { ...internal, markdown: this._renderListMarkdown(internal) };
+}
+
+private async _handleCommandListCardInternal(msg: SpoolMessage): Promise<Omit<ListCardData, 'markdown'>> {
+  if (!this.registryManager) {
+    return { entries: [], totalActive: 0 };
+  }
+  const allActive = this.registryManager.sessions;
+  const activeEntries = Object.entries(allActive)
+    .filter(([_, s]) => s.status === 'active')
+    .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
+    .slice(0, 10)
+    .map(([sessionUuid, s]) => ({
+      sessionUuid,
+      title: s.title ?? '(无标题)',
+      messageCount: s.message_count ?? 0,
+      lastActive: s.last_active ?? '',
+    }));
+  const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
+  return { entries: activeEntries, totalActive };
+}
+
+private _renderListMarkdown(data: Omit<ListCardData, 'markdown'>): string {
+  // 提取原 handleCommandListCard markdown 渲染 (bot.ts:547-588)
+  // ...
+}
+```
+
+**关键调用方更新**: `handleCommand case 'list':` (bot.ts:414-419 提前拦截) — 当前直接 `await this.handleCommandListCard(msg)`, 改造后必须 `const data = await this.handleCommandListCard(msg); responseText = data.markdown;`, 卡片路径从 `data.entries / data.totalActive` 喂 `buildListCard`.
+
+- [ ] **Step 2: handleCommandListDir 拆分 (PR 7.5.2 I6 fix)**
+
+```typescript
+type DirListData = {
+  markdown: string;
+  cwd: string;
+  parent: string | null;
+  dirs: Array<{ name: string; fullPath: string }>;
+  hasMore: boolean;
+};
+
+// 保留 handleCommandListDir 现有签名 (返回 string 给现有调用方 + PR 7.3 renderListDir 共用)
+// 内部拆 _handleCommandListDirInternal + _renderDirListMarkdown
+
+private async handleCommandListDir(userId: string): Promise<string> {
+  const internal = await this._handleCommandListDirInternal(userId);
+  return this._renderDirListMarkdown(internal);
+}
+
+private async _handleCommandListDirInternal(userId: string): Promise<Omit<DirListData, 'markdown'>> {
+  // 提取原 handleCommandListDir 的 readdirSync + existsSync 逻辑 (bot.ts:803-851)
+  // ...
+}
+
+private _renderDirListMarkdown(data: Omit<DirListData, 'markdown'>): string {
+  // 提取原 markdown 渲染
+  // ...
+}
+```
+
+- [ ] **Step 3: handleCommandAgents 拆分 (PR 7.5.2 I4 fix)**
+
+```typescript
+type AgentsData = {
+  markdown: string;
+  bgCount: number;
+};
+
+private async handleCommandAgents(userId: string, args: string[]): Promise<AgentsData> {
+  const internal = await this._handleCommandAgentsInternal(userId);
+  return { ...internal, markdown: this._renderAgentsMarkdown(internal) };
+}
+
+private async _handleCommandAgentsInternal(userId: string): Promise<Omit<AgentsData, 'markdown'>> {
+  // 提取原 handleCommandAgents 的 readdirSync + state.json 解析逻辑 (bot.ts:698-728)
+  // 返回 { bgCount: number } (内部统计数量)
+}
+
+private _renderAgentsMarkdown(data: Omit<AgentsData, 'markdown'>): string {
+  // 提取原 markdown 渲染
+}
+```
+
+**关键调用方更新**: `handleCommand case 'agents':` — 当前 `responseText = await this.handleCommandAgents(...)`, 改造后 `const data = await this.handleCommandAgents(...); responseText = data.markdown;`, 卡片路径从 `data.bgCount` 喂 `buildAgentsRefreshCard`.
+
+- [ ] **Step 4: 跑测试确认 0 regression**
+
+Run: `bun test tests/unit/wecom/bot.test.ts`
+Expected: 1289 旧测试全部 pass (PR 7 已 ship 不会 break)
+
+- [ ] **Step 5: commit**
+
+```bash
+git add src/wecom/bot.ts
+git commit -m "refactor(wecom): handleCommandListCard/ListDir/Agents 拆返回结构
+
+PR 7.5.2 I6 + M7 fix: 3 个 handleCommand 方法拆 _Internal 返回结构
++ _renderXxxMarkdown 渲染字符串. 准备 PR 7.5.2 command card 化:
+- handleCommandListCard 改返 ListCardData {markdown, entries, totalActive}
+  (M7 fix: 改 handleCommandListCard 不是 case 'list' switch,
+   因为 bot.ts:409-412 提前拦截)
+- handleCommandListDir 拆 _handleCommandListDirInternal + _renderDirListMarkdown
+- handleCommandAgents 拆 _handleCommandAgentsInternal + _renderAgentsMarkdown
+  (I4 fix: bgCount 从字符串解析 hack 改成结构返回)
+- 保持调用方 0 regression (handleCommand case 仍可用 .markdown 字符串)
+
+后续 PR 7.5.2 Task 2.2 用这些结构直接喂 buildListCard/buildDirListCard/buildAgentsRefreshCard"
+```
 
 ---
 
@@ -994,12 +1145,15 @@ import { buildListCard, buildDirListCard, buildModelCard, buildAgentsRefreshCard
 ```typescript
         case 'switch':
           responseText = await this.handleCommandSwitch(msg.userId, parsed.args);
-          // PR 7.5.3: 附加 PR 7 完成卡 (markdown 响应后追加 buildCompleteCard)
+          // PR 7.5.3 + I3 fix: 附加 PR 7 完成卡 (从 registryManager.sessions[uuid]?.title 拿真实 title,
+          //   fallback 用 uuid.slice(0, 18). 不用 uuid 直接当 title 否则主标题'已切换: abc123...' 丑陋)
           if (responseText.startsWith('✅') && parsed.args.length > 0) {
             const targetUuid = parsed.args[0];
+            const sessionEntry = this.registryManager?.sessions?.[targetUuid];
+            const sessionTitle = sessionEntry?.title ?? targetUuid.slice(0, 18);
             const card = buildCompleteCard({
               userId: msg.userId,
-              sessionTitle: targetUuid.slice(0, 18),  // 占位 (实际 title 后续 PR 7+ 拿)
+              sessionTitle,
               sessionUuid: targetUuid,
               cwd: this.userManager.getEntry(msg.userId)?.cwd,
             });
@@ -1051,11 +1205,13 @@ import { buildListCard, buildDirListCard, buildModelCard, buildAgentsRefreshCard
 
 ```typescript
         case 'agents':
-          responseText = await this.handleCommandAgents(msg.userId, parsed.args);
-          // PR 7.5.3: 附加 buildAgentsRefreshCard
+          // PR 7.5.3 + I4 fix: handleCommandAgents 改造返回 {markdown, bgCount} 结构,
+          //   避免字符串解析 hack. _handleCommandAgentsInternal 抽 readdirSync,
+          //   _renderAgentsMarkdown 拼 markdown.
+          const agentsResult = await this.handleCommandAgents(msg.userId, parsed.args);
+          responseText = agentsResult.markdown;
           {
-            const bgCount = responseText.split('\n').filter(l => l.startsWith('  •')).length;
-            const card = buildAgentsRefreshCard({ bgCount });
+            const card = buildAgentsRefreshCard({ bgCount: agentsResult.bgCount });
             this.wecomCompleteCardSender?.send({ userId: msg.userId, template_card: card })
               .catch(err => logger.warn(`[wecom-bot] complete card after agents failed: ${err}`));
           }
