@@ -16,7 +16,7 @@ import {
 import type { WecomTemplateCard } from '../../../src/wecom/card';
 
 describe('buildListCard', () => {
-  it('builds button_interaction with 1 switch button (first entry only) + NO action_menu (PR 7.5.12: 40016 isolation)', () => {
+  it('builds button_interaction with up to 6 switch buttons (PR 7.5.13: real fix, button text length not count)', () => {
     const ctx: ListCardContext = {
       entries: [
         { sessionUuid: 'uuid-1', title: 'Analyze AI coding attribution', messageCount: 768, lastActive: '2026-06-21T13:24:00Z' },
@@ -27,14 +27,14 @@ describe('buildListCard', () => {
     const card: WecomTemplateCard = buildListCard(ctx);
     expect(card.card_type).toBe('button_interaction');
     if (card.card_type !== 'button_interaction') throw new Error('unreachable');
-    // PR 7.5.12: 最小化 — 只 1 button (即使多 entries), 验证最小 wire shape 能过 server
-    expect(card.button_list.button.length).toBe(1);
+    // PR 7.5.13: 恢复 6 按钮上限 (button count 本身合规, 真因是 text length)
+    expect(card.button_list.button.length).toBe(2);
     expect(card.button_list.button[0].action_tag).toBe('switch');
     expect((card.button_list.button[0] as any).value?.sessionUuid).toBe('uuid-1');
-    // 按钮文本含 title 前缀 (makeButton 接任意文本)
+    // PR 7.5.13: button text = title.slice(0, 10) (无 emoji 前缀, 省单位)
     expect(card.button_list.button[0].action_title.text).toContain('Analyze');
-    expect(card.main_title.title).toContain('1/777');
-    // PR 7.5.12: action_menu 暂时不注入 — 隔离 40016 真因
+    expect(card.main_title.title).toContain('2/777');
+    // 简化 desc (无 action_menu)
     expect((card as any).action_menu).toBeUndefined();
   });
 
@@ -46,7 +46,7 @@ describe('buildListCard', () => {
     expect(card.main_title.desc).toContain('📭');
   });
 
-  it('PR 7.5.12: limits to 1 button (server 40016 isolation) + truncation desc', () => {
+  it('PR 7.5.13: limits to 6 buttons max + simplified desc', () => {
     const ctx: ListCardContext = {
       entries: Array.from({ length: 10 }, (_, i) => ({
         sessionUuid: `uuid-${i}`,
@@ -59,12 +59,40 @@ describe('buildListCard', () => {
     const card = buildListCard(ctx);
     expect(card.card_type).toBe('button_interaction');
     if (card.card_type !== 'button_interaction') throw new Error('unreachable');
-    // PR 7.5.12: 1 button 隔离 (不是 SDK 文档 6 上限, 服务端可能更严)
-    expect(card.button_list.button.length).toBe(1);
-    // desc 提示用户还有未显示的
-    expect(card.main_title.desc).toContain('还有 9 个未显示');
-    // 截断但 totalActive 仍报告总数 (title 显示 1/778)
-    expect(card.main_title.title).toContain('1/778');
+    // PR 7.5.13: SDK 允许 6 按钮上限, 10 entries 截前 6
+    expect(card.button_list.button.length).toBe(6);
+    // desc 提示用户还有未显示的 (简化版, ≤30 字)
+    expect(card.main_title.desc).toContain('还有 4 个未显示');
+    // title 显示 6/778
+    expect(card.main_title.title).toContain('6/778');
+  });
+
+  it('PR 7.5.13: button.text length ≤10 (SDK limit, server 40016 prevention)', () => {
+    const ctx: ListCardContext = {
+      entries: [
+        { sessionUuid: 'u1', title: 'Review AI attribution fix plan (very long title)', messageCount: 100, lastActive: '2026-06-21T13:00:00Z' },
+        { sessionUuid: 'u2', title: '短标题', messageCount: 50, lastActive: '2026-06-21T13:01:00Z' },
+      ],
+      totalActive: 10,
+    };
+    const card = buildListCard(ctx);
+    if (card.card_type !== 'button_interaction') throw new Error('unreachable');
+    for (const btn of card.button_list.button) {
+      expect((btn.action_title.text ?? '').length).toBeLessThanOrEqual(10);
+    }
+  });
+
+  it('PR 7.5.13: title ≤26, desc ≤30 (SDK limits)', () => {
+    const ctx: ListCardContext = {
+      entries: [
+        { sessionUuid: 'u1', title: 'test', messageCount: 1, lastActive: '2026-06-21T13:00:00Z' },
+      ],
+      totalActive: 9999,  // 大数字可能撑大 title
+    };
+    const card = buildListCard(ctx);
+    if (card.card_type !== 'button_interaction') throw new Error('unreachable');
+    expect((card.main_title.title ?? '').length).toBeLessThanOrEqual(26);
+    expect((card.main_title.desc ?? '').length).toBeLessThanOrEqual(30);
   });
 });
 
@@ -109,6 +137,25 @@ describe('buildDirListCard', () => {
     const card = buildDirListCard(ctx);
     expect(card.main_title.desc).toContain('还有更多');
   });
+
+  it('PR 7.5.13: button.text ≤10 + title ≤26 + desc ≤30 (defensive)', () => {
+    const ctx: DirListCardContext = {
+      cwd: '/Users/wuyujun/Git/some-very-long-path-name',  // > 26
+      parent: '/',
+      dirs: [
+        { name: 'a-very-long-directory-name-here', fullPath: '/Users/.../a-very-long-directory-name-here' },
+        { name: 'short', fullPath: '/Users/.../short' },
+      ],
+      hasMore: true,
+    };
+    const card = buildDirListCard(ctx);
+    if (card.card_type !== 'button_interaction') throw new Error('unreachable');
+    for (const btn of card.button_list.button) {
+      expect((btn.action_title.text ?? '').length).toBeLessThanOrEqual(10);
+    }
+    expect((card.main_title.title ?? '').length).toBeLessThanOrEqual(26);
+    expect((card.main_title.desc ?? '').length).toBeLessThanOrEqual(30);
+  });
 });
 
 describe('buildModelCard', () => {
@@ -131,10 +178,30 @@ describe('buildModelCard', () => {
     expect(card.button_list.button[0].action_title.text).not.toContain('当前');
     expect(card.button_list.button[1].action_tag).toBe('select_model');
     expect((card.button_list.button[1] as any).value?.sessionUuid).toBe('sonnet');
-    expect(card.button_list.button[1].action_title.text).toContain('当前');
+    // PR 7.5.13: '🎯 Sonnet (当前)' = 13 字 > 10 SDK 限制
+    //   修法: 截到 ≤10, 牺牲 '(当前)' 文本 → 用 type='default' 视觉传达
+    expect(card.button_list.button[1].action_title.text.length).toBeLessThanOrEqual(10);
+    expect(card.button_list.button[1].action_title.text).toContain('Sonnet');
+    // type='default' 仍是当前标识 (aibot 客户端会用不同样式)
+    expect((card.button_list.button[1] as any).button_type).toBe('default');
     const clearBtn = card.button_list.button[3];
     expect(clearBtn.action_tag).toBe('clear_model');
     expect(clearBtn.action_title.text).toContain('清除');
+  });
+
+  it('PR 7.5.13: button.text ≤10 even with long provider name (defensive)', () => {
+    const ctx: ModelCardContext = {
+      providers: [
+        { alias: 'long', name: 'Very-Long-Provider-Name-Here' },
+        { alias: 'opus', name: 'Opus' },
+      ],
+      currentAlias: 'long',
+    };
+    const card = buildModelCard(ctx);
+    if (card.card_type !== 'button_interaction') throw new Error('unreachable');
+    for (const btn of card.button_list.button) {
+      expect((btn.action_title.text ?? '').length).toBeLessThanOrEqual(10);
+    }
   });
 });
 
