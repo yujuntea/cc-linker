@@ -13,8 +13,15 @@ import { WecomStreamUpdater } from './stream-updater';
 import { WecomUserManager } from './mapping';
 import { WecomCardBuilder, type TemplateCard } from './card';
 import { WecomImageHandler } from './image-handler';
-import { WecomCompleteCardSender } from './complete-card';
-import { buildListCard, buildDirListCard, buildModelCard } from './card-builders';
+import { WecomCompleteCardSender, buildCompleteCard } from './complete-card';
+import {
+  buildListCard,
+  buildDirListCard,
+  buildModelCard,
+  buildResumeCard,
+  buildStopCard,
+  buildAgentsRefreshCard,
+} from './card-builders';
 import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spool';
 import type { ClaudeSessionManager } from '../proxy/session';
 import type { StreamChunk } from '../proxy/stream-parser';
@@ -511,19 +518,57 @@ export class WecomBot {
           responseText = this.handleCommandHelp();
           break;
         // PR 5: 6 个新命令
-        case 'switch':
+        case 'switch': {
           responseText = await this.handleCommandSwitch(msg.userId, parsed.args);
+          // PR 7.5.3: 切换成功后附加 PR 7 完成卡 (复用 buildCompleteCard, 3 主按钮 + 4 action_menu)
+          //   异步发, 不阻塞 responseText 推回
+          if (responseText.startsWith('✅') && parsed.args.length > 0) {
+            const targetUuid = parsed.args[0];
+            const sessionEntry = this.registryManager?.sessions?.[targetUuid];
+            const sessionTitle = sessionEntry?.title ?? targetUuid.slice(0, 18);
+            const card = buildCompleteCard({
+              userId: msg.userId,
+              sessionTitle,
+              sessionUuid: targetUuid,
+              cwd: this.userManager.getEntry(msg.userId)?.cwd,
+            });
+            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+              .catch(err => logger.warn(`[wecom-bot] complete card after switch failed: ${err instanceof Error ? err.message : String(err)}`));
+          }
           break;
+        }
         case 'resume':
           responseText = await this.handleCommandResume(msg.userId, parsed.args);
+          // PR 7.5.3: 附加 buildResumeCard (text_notice + 1 switch 按钮, no value 走 list 语义)
+          {
+            const entry = this.userManager.getEntry(msg.userId);
+            const card = buildResumeCard({ sessionUuid: entry?.sessionUuid ?? '' });
+            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+              .catch(err => logger.warn(`[wecom-bot] resume card send failed: ${err instanceof Error ? err.message : String(err)}`));
+          }
           break;
-        case 'agents':
+        case 'agents': {
           // PR 7.5.2 Task 2.0: handleCommandAgents 改返 AgentsData 结构, 取 .markdown 喂统一推送
-          responseText = (await this.handleCommandAgents(msg.userId, parsed.args)).markdown;
+          // PR 7.5.3: 同时附加 buildAgentsRefreshCard (text_notice + agents-refresh action_menu)
+          const agentsData = await this.handleCommandAgents(msg.userId, parsed.args);
+          responseText = agentsData.markdown;
+          {
+            const card = buildAgentsRefreshCard({ bgCount: agentsData.bgCount });
+            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+              .catch(err => logger.warn(`[wecom-bot] agents card send failed: ${err instanceof Error ? err.message : String(err)}`));
+          }
           break;
-        case 'stop':
+        }
+        case 'stop': {
           responseText = await this.handleCommandStop(msg.userId, parsed.args);
+          // PR 7.5.3: 附加 buildStopCard (text_notice + 1 switch 按钮, no value 走 list 语义)
+          if (parsed.args.length > 0 && responseText.startsWith('✅')) {
+            const card = buildStopCard({ shortId: parsed.args[0] });
+            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+              .catch(err => logger.warn(`[wecom-bot] stop card send failed: ${err instanceof Error ? err.message : String(err)}`));
+          }
           break;
+        }
         case 'cancel':
           responseText = await this.handleCommandCancel(msg.userId, parsed.args);
           break;
@@ -1486,7 +1531,15 @@ export class WecomBot {
         break;
       }
       case 'switch': {
-        await this.renderActiveSessionsList(event.externalUserId);
+        // PR 7.5.3 双语义:
+        //   - 有 value.sessionUuid → 切到具体 session (用户从 /list 卡片点 🔄 切换)
+        //   - 无 value → 列 active sessions (PR 7.3 ship 行为, 用户从完成卡点 📂 切换 session)
+        const targetUuid = event.actionValue?.sessionUuid;
+        if (targetUuid) {
+          await this.handleCommandSwitch(event.externalUserId, [targetUuid]);
+        } else {
+          await this.renderActiveSessionsList(event.externalUserId);
+        }
         break;
       }
       case 'listdir': {
@@ -1572,6 +1625,15 @@ export class WecomBot {
       case 'list-refresh': {
         // PR 7.3: 抽公共方法 renderActiveSessionsList, 跟 case 'switch' 共用
         await this.renderActiveSessionsList(event.externalUserId);
+        break;
+      }
+      case 'agents-refresh': {
+        // PR 7.5.3: 重新跑 /agents 命令响应 (从 buildAgentsRefreshCard 卡片右上角点 🔄 刷新)
+        const agentsData = await this.handleCommandAgents(event.externalUserId, []);
+        await this.client.sdk.sendMessage(event.externalUserId, {
+          msgtype: 'markdown',
+          markdown: { content: agentsData.markdown },
+        });
         break;
       }
       default:

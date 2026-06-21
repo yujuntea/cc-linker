@@ -1207,6 +1207,9 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
       client: mockClient,
       spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
+      // PR 7.5.3: 注入 no-op completeCardSender, 让 switch/resume/stop/agents 附加卡不进 sdk.sendMessage
+      //   (否则旧 PR 5 测试用 mock.calls[0][1].markdown.content 读不到响应 — 卡先到)
+      completeCardSender: { send: mock(async () => {}) } as any,
     });
   });
 
@@ -1933,6 +1936,8 @@ describe('WecomBot handleCommandResume (PR 5 M-7: 返回新 lastActiveAt)', () =
       client: mockClient,
       spoolQueue: mockSpoolQueue,
       // userManager 在每个测试里单独定义 (需要 readCount 控制)
+      // PR 7.5.3: 注入 no-op completeCardSender, /resume 附加卡不进 sdk.sendMessage
+      completeCardSender: { send: mock(async () => {}) } as any,
     });
   });
 
@@ -1981,6 +1986,8 @@ describe('WecomBot handleCommandResume (PR 5 M-7: 返回新 lastActiveAt)', () =
       client: mockClient,
       spoolQueue: mockSpoolQueue,
       userManager: userManager as any,
+      // PR 7.5.3: 注入 no-op completeCardSender (避免 /resume 附加卡污染 mockClient.sdk.sendMessage)
+      completeCardSender: { send: mock(async () => {}) } as any,
     });
 
     await bot.__test_handleCommand(makeCmdMsg('/resume', 'msg_m7'));
@@ -2158,6 +2165,8 @@ describe('WecomBot handleCommandStop (PR 6 Task 6.3: edge cases)', () => {
       client: mockClient,
       spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
+      // PR 7.5.3: 注入 no-op completeCardSender, /stop 附加卡不进 sdk.sendMessage
+      completeCardSender: { send: mock(async () => {}) } as any,
     });
 
     // 每个 case 重置 execFile mock (基线: 成功, 跟生产 promisify custom 行为对齐)
@@ -3840,5 +3849,191 @@ describe('PR 7.5.2: /list + /listdir + /model 卡片化 + 3 new case', () => {
     expect(mockUserManager.setDefaultProvider).toHaveBeenCalledWith('wmu_user_1', 'opus');
     expect(cardSendCalls.length).toBe(0);  // 不发卡, 走 markdown responseText
     expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+  });
+});
+
+/**
+ * PR 7.5.3 Task 3.1+3.2: 4 命令附加卡 + executeCardAction 2 改动
+ * - /switch /resume /stop /agents 各自附加卡片 (fire-and-forget via completeCardSender.send)
+ * - executeCardAction case 'switch' 改双语义 (有 value.sessionUuid → handleCommandSwitch; 无 → renderActiveSessionsList)
+ * - executeCardAction 新增 case 'agents-refresh' → handleCommandAgents
+ */
+describe('PR 7.5.3: /switch /resume /stop /agents 附加卡 + case 双语义', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let mockRegistryManager: any;
+  let cardSendCalls: any[];
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    cardSendCalls = [];
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => ({
+        type: 'session',
+        sessionUuid: 'uuid-current',
+        cwd: '/tmp',
+        createdAt: '2026-06-21T00:00:00Z',
+        lastActiveAt: '2026-06-21T13:00:00Z',
+        casToken: 'token',
+      })),
+      touchSession: mock(async () => {}),
+      setSession: mock(async (_uid: string, _uuid: string, _cwd: string) => {}),
+      setPending: mock(async () => {}),
+    };
+    mockRegistryManager = {
+      sessions: {
+        'uuid-current': { sessionUuid: 'uuid-current', title: 'Current Session', message_count: 100, last_active: '2026-06-21T13:00:00Z', status: 'active', cwd: '/tmp' },
+        'uuid-other': { sessionUuid: 'uuid-other', title: 'Other Session', message_count: 50, last_active: '2026-06-21T12:00:00Z', status: 'active', cwd: '/tmp' },
+      },
+      listActive: mock(() => []),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr753.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      registryManager: mockRegistryManager as any,
+      // 注入 mock completeCardSender 跟踪 send 调用
+      completeCardSender: {
+        send: mock(async (ctx: any) => {
+          cardSendCalls.push(ctx);
+        }),
+      } as any,
+    });
+  });
+
+  function makeCmdMsg(text: string, messageId: string): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'wmu_user_1',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_user_1:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: `inb_${messageId}` } } },
+    };
+  }
+
+  it('/switch <uuid> → responseText + sender.send 收到 PR 7 完成卡', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/switch uuid-other', 'msg_switch'));
+    // responseText 走外层 sendMessage
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    // 卡片异步发 (fire-and-forget), 给 50ms 让 promise 微任务跑完
+    await new Promise(r => setTimeout(r, 50));
+    expect(cardSendCalls.length).toBe(1);
+    const sentCard = cardSendCalls[0].template_card;
+    expect(sentCard.card_type).toBe('button_interaction');
+    // PR 7 完成卡有 3 个主按钮 (continue / switch / listdir)
+    if (sentCard.card_type === 'button_interaction') {
+      expect(sentCard.button_list.button.length).toBe(3);
+    }
+    // buildCompleteCard 标题格式: "✅ Claude 处理完成: {sessionTitle}"
+    expect(sentCard.main_title.title).toContain('Claude 处理完成');
+  });
+
+  it('/resume → responseText + sender.send 收到 buildResumeCard', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/resume', 'msg_resume_card'));
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    await new Promise(r => setTimeout(r, 50));
+    expect(cardSendCalls.length).toBe(1);
+    const sentCard = cardSendCalls[0].template_card;
+    expect(sentCard.card_type).toBe('text_notice');
+    expect(sentCard.main_title.title).toContain('Session 已 touch');
+  });
+
+  it('/stop <short> → responseText + sender.send 收到 buildStopCard (success 路径)', async () => {
+    // 不 mock child_process (会污染其他测试的模块缓存), 直接验证 sendMessage 被调
+    // 真实环境下 /stop 调 claude CLI, 可能成功也可能 ENOENT 失败 — 两种都验证不卡死
+    await bot.__test_handleCommand(makeCmdMsg('/stop abc12345', 'msg_stop_card'));
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    await new Promise(r => setTimeout(r, 50));
+    // /stop 成功时 (responseText 以 ✅ 开头) 才发 buildStopCard
+    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    if (content.includes('已停止')) {
+      expect(cardSendCalls.length).toBe(1);
+      const sentCard = cardSendCalls[0].template_card;
+      expect(sentCard.card_type).toBe('text_notice');
+      expect(sentCard.main_title.title).toContain('已停止');
+    } else {
+      // 失败 (claude CLI 不可用): responseText 包含 "停止失败", 不发 buildStopCard
+      expect(content).toContain('停止失败');
+      expect(cardSendCalls.length).toBe(0);
+    }
+  });
+
+  it('/agents → responseText + sender.send 收到 buildAgentsRefreshCard', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/agents', 'msg_agents_card'));
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    await new Promise(r => setTimeout(r, 50));
+    expect(cardSendCalls.length).toBe(1);
+    const sentCard = cardSendCalls[0].template_card;
+    expect(sentCard.card_type).toBe('text_notice');
+    expect(sentCard.main_title.title).toContain('BG Sessions');
+  });
+
+  it("case 'agents-refresh' → 调 handleCommandAgents 重新执行", async () => {
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_user_1',
+      messageId: 'msg_card_agents_refresh',
+      actionTag: 'agents-refresh',
+      actionValue: undefined,
+      inboundFrame: { headers: { req_id: 'inb_agents_refresh' } },
+    });
+    // handleCommandAgents 返回 markdown → 走 sendMessage
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+  });
+
+  it("case 'switch' 双语义: 有 value.sessionUuid → handleCommandSwitch([uuid])", async () => {
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_user_1',
+      messageId: 'msg_card_switch_uuid',
+      actionTag: 'switch',
+      actionValue: { sessionUuid: 'uuid-other' },
+      inboundFrame: { headers: { req_id: 'inb_switch_uuid' } },
+    });
+    // 期望: handleCommandSwitch 被调 (通过 mockUserManager.setSession 验证)
+    expect(mockUserManager.setSession).toHaveBeenCalled();
+  });
+
+  it("case 'switch' 双语义: 无 value → renderActiveSessionsList (PR 7 行为)", async () => {
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_user_1',
+      messageId: 'msg_card_switch_noval',
+      actionTag: 'switch',
+      actionValue: undefined,
+      inboundFrame: { headers: { req_id: 'inb_switch_noval' } },
+    });
+    // 期望: renderActiveSessionsList 走 sendMessage (markdown 列表)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    // setSession NOT called (因为是无 value 路径, 走 list 渲染)
+    expect(mockUserManager.setSession).not.toHaveBeenCalled();
   });
 });
