@@ -220,8 +220,8 @@ export class WecomCompleteCardSender {
       msgtype: 'template_card' as const,
       template_card: wireCard as unknown as CompleteCardPayload,
     };
-    // PR 7.5.8: 诊断日志 — 真机 42014 后我们需要看到真正发的 JSON
-    logger.info(`[wecom-complete-card] send wire payload: ${JSON.stringify(wireCard).slice(0, 2000)}`);
+    // PR 7.5.9: 诊断日志从 info 降为 debug — 避免 log 噪音 (每次 /list 都打 2000 字符)
+    logger.debug(`[wecom-complete-card] send wire payload: ${JSON.stringify(wireCard).slice(0, 500)}`);
     // PR 7 final cleanup: 群聊场景下 chatId 优先 — 单聊 chatId === userId 无影响
     const receiveId = ctx.chatId ?? ctx.userId;
     try {
@@ -236,19 +236,23 @@ export class WecomCompleteCardSender {
   }
 
   /**
-   * PR 7.5.5 hotfix: 用 replyTemplateCard 推卡片 (不走 sendMessage 的 5s ack 路径)
-   * PR 7.5.8 fix: 改用 replyWelcome 协议 — replyTemplateCard 内部走 WsCmd.RESPONSE
-   *   (aibot_respond_msg, 普通回复协议), 而 replyWelcome 走 WsCmd.RESPONSE_WELCOME
-   *   (aibot_respond_welcome_msg, 欢迎语协议 — 命令路径的 first-reply 卡片应该走这个).
-   *   PR 7.5.7 部署后真机 /list 仍 fallback, errcode=42014 taskid has existed or empty
-   *   or exceed max len, 推断是协议不匹配导致 server 校验失败.
+   * PR 7.5.9 fallback chain: replyWelcome (优先, fresh req_id 场景) → sendMessage (fallback).
    *
-   * 背景: 命令路径 (/list /listdir /model) 是用户消息的 FIRST reply, 此时 SDK 的
-   *   5s replyWelcome 窗口需要用原始消息 event 的 inboundFrame (含 req_id) 才能 ack.
-   *   sendMessage 走 WsCmd.SEND_MSG 协议, 等的 ack 路径不同 → 5s 超时.
+   * 历史: PR 7.5.5/7.5.8 只调 replyWelcome, 真机部署后 /list 仍 fallback 到 markdown,
+   *   daemon log 暴露真根因 errcode=846605 "Warning: wrong json format. invalid req_id".
    *
-   * 修法: 用 SDK 的 replyWelcome(frame, body) — 它走 WsCmd.RESPONSE_WELCOME 路径,
-   *   复用原始消息的 req_id, 不需要新 ack. body 支持 text 或 template_card 格式.
+   * 真根因: aibot server 用 rendezvous 协议 — inbound event 的 req_id 5s 后过期.
+   *   cc-linker SpoolQueue dispatch loop 1-3s + handleCommand 处理时间,
+   *   到 sendViaReply 时 req_id 已失效 → server 拒收.
+   *   PR 7.5.5/8 选 replyWelcome (用 inbound req_id) 是错的协议 — 命令路径下必然超时.
+   *
+   * markdown 兜底一直能用 sendMessage 是因为 sendMessage 走 WsCmd.SEND_MSG 协议,
+   *   server 自己生成 req_id (不依赖 inbound). PR 7.5.6 修了 wire shape 后
+   *   sendMessage 应该能正常推卡片.
+   *
+   * 修法: fallback chain — 先试 replyWelcome (fresh req_id 场景, 比如 button callback),
+   *   失败时若是 846605 → fallback 到 sendMessage (主动推送, 自己生成 req_id).
+   *   其他错误 (40058 wire shape 错 等) 不 fallback, 抛给上层走 markdown 兜底.
    *
    * @param frame 原始消息 event 的 WebSocket frame (msg.metadata.inboundFrame)
    * @param ctx 卡片上下文, 必填 userId / chatId (跟 send 一致), sessionTitle 等其他字段忽略
@@ -260,25 +264,39 @@ export class WecomCompleteCardSender {
     card?: WecomTemplateCard,
   ): Promise<void> {
     const finalCard = card ?? ctx.template_card ?? buildCompleteCard(ctx);
-    // PR 7.5.6: wire shape 转换 (同 send) — action_tag→key, action_title.text→text, button_type→style + task_id sanitize
+    // PR 7.5.6: wire shape 转换 (同 send) — action_tag→key, action_title.text→text, button_type→style
     const wireCard = transformToWireShape(finalCard);
-    // PR 7.5.8: replyWelcome body 接受 {msgtype: 'template_card', template_card: ...} —
-    //   WelcomeTemplateCardReplyBody 类型正好是这个 shape.
     const payload = {
       msgtype: 'template_card' as const,
       template_card: wireCard as unknown as CompleteCardPayload,
     };
-    // PR 7.5.8: 诊断日志 — 真机 42014 后我们需要看到真正发的 JSON
-    logger.info(`[wecom-complete-card] sendViaReply (via replyWelcome) wire payload: ${JSON.stringify(wireCard).slice(0, 2000)}`);
+    // PR 7.5.9: 诊断日志从 info 降为 debug — 避免 log 噪音 (每次 /list 都打 2000 字符)
+    logger.debug(`[wecom-complete-card] sendViaReply wire payload: ${JSON.stringify(wireCard).slice(0, 500)}`);
+
+    // 1. 优先 replyWelcome (fresh req_id 场景: button callback 等能用)
     try {
-      // PR 7.5.8: 改用 replyWelcome 走 RESPONSE_WELCOME 协议 — replyTemplateCard 用 RESPONSE 协议可能不对
       await this.sdk.replyWelcome(frame, payload);
+      logger.info(`[wecom-complete-card] sent via replyWelcome`);
+      return;
     } catch (err) {
-      // PR 7.5.7: 标准化 SDK frame-style err 为 Error 实例
-      throw normalizeSdkError(err, 'replyWelcome');
+      // PR 7.5.9: 846605 invalid req_id → fallback 到 sendMessage (主动推送, 自己生成 req_id)
+      const wrappedErr = normalizeSdkError(err, 'replyWelcome');
+      const errMsg = wrappedErr.message;
+      if (errMsg.includes('846605') || errMsg.toLowerCase().includes('invalid req_id')) {
+        logger.warn(`[wecom-complete-card] replyWelcome failed with 846605 (req_id expired), fallback to sendMessage`);
+      } else {
+        // 其他错误 (40058/42014 等) 不 fallback, 直接抛给上层
+        throw wrappedErr;
+      }
     }
-    const taskId = (wireCard as unknown as CompleteCardPayload).task_id;
+
+    // 2. fallback: sendMessage (主动推送, 自己生成 req_id, 不依赖 inbound)
     const receiveId = ctx.chatId ?? ctx.userId;
-    logger.info(`[wecom-complete-card] sent via reply: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
+    try {
+      await this.sdk.sendMessage(receiveId, payload);
+    } catch (err) {
+      throw normalizeSdkError(err, 'sendMessage (fallback)');
+    }
+    logger.info(`[wecom-complete-card] sent via sendMessage (fallback): receiveId=${receiveId.slice(0, 12)}...`);
   }
 }

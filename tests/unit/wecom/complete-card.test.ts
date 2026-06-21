@@ -222,3 +222,58 @@ describe('PR 7.5.7: no task_id + error normalization', () => {
     expect(thrownErr.message).not.toContain('[object Object]');
   });
 });
+
+/**
+ * PR 7.5.9: sendViaReply fallback chain (replyWelcome → sendMessage on 846605)
+ *
+ * 背景: aibot server 用 rendezvous 协议, inbound req_id 5s 后过期.
+ *   SpoolQueue dispatch 1-3s + handleCommand 处理 → req_id 已失效 → replyWelcome 846605.
+ *   sendMessage (主动推送) 自己生成 req_id, 不依赖 inbound. PR 7.5.6 修了 wire shape 后可用.
+ */
+describe('PR 7.5.9: sendViaReply fallback chain', () => {
+  it('sendViaReply falls back to sendMessage when replyWelcome fails 846605', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't', description: 'd',
+      buttons: [{ tag: 'switch', text: '切换', type: 'primary' }],
+    });
+    const sendMessageCalls: any[] = [];
+    const replyWelcomeCalls: any[] = [];
+    const mockSdk = {
+      replyWelcome: mock(async (_frame: any, _body: any) => {
+        replyWelcomeCalls.push(_body);
+        throw { errcode: 846605, errmsg: 'invalid req_id' };
+      }),
+      sendMessage: mock(async (_chatid: string, body: any) => {
+        sendMessageCalls.push(body);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    const fakeFrame = { headers: { req_id: 'expired_req' } };
+    await sender.sendViaReply(fakeFrame, { userId: 'u', chatId: 'u' }, card);
+    expect(replyWelcomeCalls.length).toBe(1);
+    expect(sendMessageCalls.length).toBe(1);
+    expect(sendMessageCalls[0].template_card.button_list.button[0].key).toBe('switch');
+  });
+
+  it('sendViaReply does NOT fallback to sendMessage when replyWelcome succeeds', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't', description: 'd',
+      buttons: [{ tag: 'switch', text: '切换', type: 'primary' }],
+    });
+    const sendMessageCalls: any[] = [];
+    const replyWelcomeCalls: any[] = [];
+    const mockSdk = {
+      replyWelcome: mock(async (_frame: any, _body: any) => {
+        replyWelcomeCalls.push(_body);
+      }),
+      sendMessage: mock(async (_chatid: string, body: any) => {
+        sendMessageCalls.push(body);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    const fakeFrame = { headers: { req_id: 'fresh_req' } };
+    await sender.sendViaReply(fakeFrame, { userId: 'u', chatId: 'u' }, card);
+    expect(replyWelcomeCalls.length).toBe(1);
+    expect(sendMessageCalls.length).toBe(0);
+  });
+});

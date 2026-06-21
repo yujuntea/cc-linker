@@ -4157,6 +4157,29 @@ describe('PR 7.5.5 hotfix: replyWelcome for first-reply card', () => {
     expect(callArgs[1].template_card.button_list.button.length).toBe(20);
   });
 
+  it('PR 7.5.9: /list → replyWelcome fails 846605 → fallback to sendMessage', async () => {
+    // 模拟真机部署场景: inbound req_id 5s 后过期, replyWelcome 抛 846605
+    mockClient.sdk.replyWelcome = mock(async () => {
+      throw { errcode: 846605, errmsg: 'Warning: wrong json format. invalid req_id' };
+    });
+    await bot.__test_handleCommand(makeCmdMsg('/list', 'msg_pr759_fallback'));
+    // replyWelcome 被调 1 次 (fallback 触发)
+    expect(mockClient.sdk.replyWelcome).toHaveBeenCalledTimes(1);
+    // fallback: sendMessage 也被调 1 次 (主动推送, 自己生成 req_id)
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
+    const sentBody = mockClient.sdk.sendMessage.mock.calls[0][1];
+    expect(sentBody.msgtype).toBe('template_card');
+    expect(sentBody.template_card.card_type).toBe('button_interaction');
+    expect(sentBody.template_card.button_list.button.length).toBe(20);
+  });
+
+  it('PR 7.5.9: /list → replyWelcome succeeds → sendMessage NOT called', async () => {
+    // 默认 mock replyWelcome succeed, sendMessage 不应被调
+    await bot.__test_handleCommand(makeCmdMsg('/list', 'msg_pr759_success'));
+    expect(mockClient.sdk.replyWelcome).toHaveBeenCalledTimes(1);
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('/list (without inboundFrame) → fallback to sendMessage (compatibility)', async () => {
     const msgNoFrame = makeCmdMsg('/list', 'msg_pr755_list_nofrm');
     delete msgNoFrame.metadata.inboundFrame;
