@@ -6,8 +6,8 @@
 
 **Architecture:** 4 个独立 ship-ready PR 串行实施。每 PR ship 后立即可部署可真机验收。
 - **PR 7.5.1**: 公共框架 — 新建 `card-builders.ts` 6 个 builder + WecomBotConfig 加 `providerManager` 字段 + WecomUserManager 加 `setDefaultProvider`/`clearDefaultProvider` 方法 + 改 handleCommandModel 集成 ProviderManager
-- **PR 7.5.2**: `/list` + `/listdir` 改造 + executeCardAction 新增 3 case (switch 双语义 / select_dir / select_model) + 改 1 case (select_model = clear_model)
-- **PR 7.5.3**: `/model` + `/switch` + `/agents` + `/resume` + `/stop` 附加卡片 + case 'agents-refresh'
+- **PR 7.5.2**: `/list` + `/listdir` + `/model` 改造（PR 7.5.2 C1+C3 fix: 改早期 return 块 + 强选 handleCommandListDir 返结构）+ executeCardAction 新增 3 case (select_dir / select_model / clear_model)
+- **PR 7.5.3**: `/switch` + `/agents` + `/resume` + `/stop` 附加卡片 + executeCardAction 改 case 'switch' 双语义 + 新增 case 'agents-refresh'
 - **PR 7.5.4**: 真机 E2E + 部署 + 截图
 
 **Tech Stack:** Bun + TypeScript + `bun:test` + `@wecom/aibot-node-sdk` 1.0.7 + Zod
@@ -367,7 +367,7 @@ export function buildStopCard(ctx: StopCardContext): WecomTemplateCard {
 - [ ] **Step 2: 跑测试确认通过**
 
 Run: `bun test tests/unit/wecom/card-builders.test.ts`
-Expected: 8 tests pass (buildListCard 2 + buildDirListCard 3 + buildModelCard 1 + buildAgentsRefreshCard 1 + buildResumeCard 1 + buildStopCard 1)
+Expected: **9 tests pass** (PR 7.5 M1 fix: buildListCard 2 + buildDirListCard 3 + buildModelCard 1 + buildAgentsRefreshCard 1 + buildResumeCard 1 + buildStopCard 1 = 9)
 
 - [ ] **Step 3: typecheck**
 
@@ -722,27 +722,29 @@ private _renderListMarkdown(data: Omit<ListCardData, 'markdown'>): string {
 
 **关键调用方更新**: `handleCommand case 'list':` (bot.ts:414-419 提前拦截) — 当前直接 `await this.handleCommandListCard(msg)`, 改造后必须 `const data = await this.handleCommandListCard(msg); responseText = data.markdown;`, 卡片路径从 `data.entries / data.totalActive` 喂 `buildListCard`.
 
-- [ ] **Step 2: handleCommandListDir 拆分 (PR 7.5.2 I6 fix)**
+- [ ] **Step 2: handleCommandListDir 拆分 (PR 7.5.2 C3 + I6 fix)**
+
+**关键修正**: v1.1 计划保持 `handleCommandListDir` 返回 string + 让 case 'listdir' 反向解析 string — 这是 dead code 路径。v1.2 强选 (a) 方案 — handleCommandListDir **改返 DirListData 结构**, 同步改 PR 7.3 ship 的 `renderListDir` 拆 `.markdown`.
 
 ```typescript
+// PR 7.5.2 C3 fix: handleCommandListDir 改返 DirListData 结构 (string → DirListData)
 type DirListData = {
-  markdown: string;
+  markdown: string;  // 现有 markdown 渲染 (handleClaimed 外层 sendMessage / renderListDir 用)
   cwd: string;
   parent: string | null;
   dirs: Array<{ name: string; fullPath: string }>;
   hasMore: boolean;
 };
 
-// 保留 handleCommandListDir 现有签名 (返回 string 给现有调用方 + PR 7.3 renderListDir 共用)
-// 内部拆 _handleCommandListDirInternal + _renderDirListMarkdown
-
-private async handleCommandListDir(userId: string): Promise<string> {
+private async handleCommandListDir(userId: string): Promise<DirListData> {
+  // 注意: 返回类型变了, PR 7.3 renderListDir + 现有 case 'listdir' 调用方需同步改
   const internal = await this._handleCommandListDirInternal(userId);
-  return this._renderDirListMarkdown(internal);
+  return { ...internal, markdown: this._renderDirListMarkdown(internal) };
 }
 
 private async _handleCommandListDirInternal(userId: string): Promise<Omit<DirListData, 'markdown'>> {
   // 提取原 handleCommandListDir 的 readdirSync + existsSync 逻辑 (bot.ts:803-851)
+  // 返回结构: { cwd, parent, dirs, hasMore }
   // ...
 }
 
@@ -750,6 +752,26 @@ private _renderDirListMarkdown(data: Omit<DirListData, 'markdown'>): string {
   // 提取原 markdown 渲染
   // ...
 }
+```
+
+**同步改 PR 7.3 ship 的 renderListDir** (bot.ts:847-853) — 拆 `.markdown`:
+
+```typescript
+  private async renderListDir(userId: string): Promise<void> {
+    // PR 7.5.2 C3 fix: handleCommandListDir 改返结构后, 这里取 .markdown
+    const data = await this.handleCommandListDir(userId);
+    await this.client.sdk.sendMessage(userId, {
+      msgtype: 'markdown',
+      markdown: { content: data.markdown },
+    });
+  }
+```
+
+> **C3 实施影响 3 处同步改**:
+> 1. `handleCommandListDir` 签名: `Promise<string>` → `Promise<DirListData>`
+> 2. `renderListDir` (bot.ts:847-853) 拆 `.markdown`
+> 3. handleCommand case 'listdir' (Task 2.2 Step 2) 拆 `.markdown` + 用结构喂 builder
+> 三处必须在同一 PR (PR 7.5.2) 一起改, 避免编译失败.
 ```
 
 - [ ] **Step 3: handleCommandAgents 拆分 (PR 7.5.2 I4 fix)**
@@ -861,30 +883,28 @@ Expected: FAIL (case 'select_dir' 等还未实现)
 **Files:**
 - Modify: `src/wecom/bot.ts`
 
-- [ ] **Step 1: 改造 handleCommand case 'list'**
+- [ ] **Step 1: 改造 handleCommand case 'list' (PR 7.5.2 C1 fix)**
 
-打开 `src/wecom/bot.ts`，找到现有 `case 'list':` (line 414 附近)，**替换为**：
+**关键**: `case 'list':` (bot.ts:420-423) 是 **unreachable code** — 上面 `if (parsed.cmd === 'list')` (bot.ts:409-412) 早期 return 已拦截。**改早期 return 块，不是 unreachable case**:
+
+打开 `src/wecom/bot.ts`，找到现有早期 return 块 (lines 409-412)，**替换为**：
 
 ```typescript
-        case 'list': {
-          // PR 7.5.2: 替换模式 - 推 buildListCard 卡片代替 markdown 列表
-          const entries = Object.entries(this.registryManager?.sessions ?? {})
-            .filter(([_, s]) => s.status === 'active')
-            .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
-            .slice(0, 10)
-            .map(([sessionUuid, s]) => ({
-              sessionUuid,
-              title: s.title ?? '(无标题)',
-              messageCount: s.message_count ?? 0,
-              lastActive: s.last_active ?? '',
-            }));
-          const totalActive = Object.values(this.registryManager?.sessions ?? {})
-            .filter(s => s.status === 'active').length;
-          const card = buildListCard({ entries, totalActive });
-          await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
-          this.spoolQueue.markDone(msg.messageId, msg.serialKey);
-          break;
-        }
+    if (parsed.cmd === 'list') {
+      // PR 7.5.2 C1 fix: 推 buildListCard 卡片代替 markdown 列表 (PR 6.11 改造路径)
+      //   Task 2.0 拆分后 handleCommandListCard 改返 ListCardData 结构
+      const data = await this.handleCommandListCard(msg);
+      // 空 entries 已经在 Task 2.0 内部改 textNotice 路径, 这里无脑推卡
+      const card = buildListCard(data);
+      await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+      return;  // 保持早期 return, 跳外层 sendMessage 路径 (PR 6.11 既有行为)
+    }
+```
+
+**附带改动**: 删 unreachable `case 'list':` (lines 420-423), 避免 subagent 跟着 plan 改错位置。
+
+> **C1 修法依据**: bot.ts:409-412 早期 return 是真正改造点; line 420-423 case 'list' 是 PR 6.9 引入的 unreachable 占位 (注释明确说 "PR 6.9: unreachable — 上面 if (parsed.cmd === 'list') 已拦截走 handleCommandListCard"). PR 7.5.2 必须删掉这个 unreachable 块, 防止后续误改.
 ```
 
 > **实施注意**：变量 `s.title` / `s.message_count` / `s.last_active` 字段名以现有 `registryManager.sessions` 类型为准，实施时验证。
@@ -895,46 +915,28 @@ Expected: FAIL (case 'select_dir' 等还未实现)
 
 ```typescript
         case 'listdir': {
-          // PR 7.5.2: 替换模式 - 推 buildDirListCard 卡片代替 markdown 列表
-          const markdown = await this.handleCommandListDir(msg.userId);
-          // handleCommandListDir 返回 "❌ 目录不存在" 时, 不发卡片, 直接发 markdown
-          if (markdown.startsWith('❌')) {
+          // PR 7.5.2 C3 fix: handleCommandListDir 已改返 DirListData 结构 (Task 2.0 Step 2)
+          const data = await this.handleCommandListDir(msg.userId);
+          if (data.markdown.startsWith('❌')) {
+            // 错误路径: 推 markdown 错误提示 (保持 PR 6.13 行为, 不发卡片)
             await this.client.sdk.sendMessage(resolveReceiveId(msg), {
               msgtype: 'markdown',
-              markdown: { content: markdown },
+              markdown: { content: data.markdown },
             });
           } else {
-            // 解析 markdown 提取 dirs + parent (从 handleCommandListDir 输出)
-            //   实现: 简化 - 调 handleCommandListDir 拿到 dirs, 构造 ctx
-            const ctx = this.buildDirListCardCtxFromMsg(msg);
-            const card = buildDirListCard(ctx);
+            // 正常路径: 推 buildDirListCard 卡片 (从结构直接喂 builder, 不反向解析 markdown)
+            const card = buildDirListCard({
+              cwd: data.cwd,
+              parent: data.parent,
+              dirs: data.dirs,
+              hasMore: data.hasMore,
+            });
             await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
           }
           this.spoolQueue.markDone(msg.messageId, msg.serialKey);
           break;
         }
 ```
-
-需要新增 private helper `buildDirListCardCtxFromMsg(msg)`：从 `msg.metadata.cwd` 读 cwd + 调 `handleCommandListDir` 拿到 dirs 数组。**实施时**必须从 `handleCommandListDir` 实现 (bot.ts:803-851) 提取 dirs 数组（不要重复 readdirSync 逻辑）。
-
-> **PR 7.5.2 review fix**: handleCommandListDir 当前**返回 string 不返回结构**，要么 (a) 改造 handleCommandListDir 返回 `{markdown, dirs, parent, hasMore}` 双形态，或 (b) 新增 private helper 单独 readdirSync 拿 dirs。推荐 (a) — 改 handleCommandListDir 返回结构 + 渲染函数负责 markdown 字符串拼接。
-
-实际实施：
-
-```typescript
-  /**
-   * PR 7.5.2: 改造返回结构 (从 string → DirListResult) 让 builder 跟 markdown 共用数据
-   */
-  private async handleCommandListDir(userId: string): Promise<string> {
-    // 现有逻辑保留, 但内部走 _handleCommandListDirInternal 拿结构 + 渲染 markdown
-    const result = await this._handleCommandListDirInternal(userId);
-    return this._renderDirListMarkdown(result);
-  }
-  // 拆分 _handleCommandListDirInternal 返回 DirListResult (结构)
-  // 拆分 _renderDirListMarkdown(result) 渲染 markdown (提取原 readdirSync + 拼接逻辑)
-```
-
-> 实施时按 PR 7.3 fix #7 双推送防御: 命令路径走 responseText → 外层 sendMessage (现状), 卡片路径走 sender.send (新增), **不双推**。
 
 - [ ] **Step 3: 改造 handleCommand case 'model' (无 alias 走 builder)**
 
