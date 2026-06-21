@@ -356,20 +356,27 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.19: /list 同步直发 — 改进 markdown 卡片化渲染.
+   * PR 7.5.20: /list 同步直发 — 对齐飞书 buildListCard 信息密度.
    *
    * 历史:
    *   PR 7.5.17: 上一版 markdown 把 10 sessions 挤在一起, 没分隔
    *     → 用户反馈 "sessions not visually separated" + "/switch /resume 命令难以 copy".
    *   PR 7.5.18: 探索过更激进的卡片方案 (numbered list + nested bullet), 仍不够清晰.
+   *   PR 7.5.19: 加 SEP 分隔 + code block 包裹 (含 /switch + /resume 两命令)
+   *     → 用户反馈: 飞书版本信息更全 (status badge, AI summary, project_name,
+   *       相对时间), WeCom 仍信息缺失; code block 两个命令不好单独复制.
    *
-   * 修法 (PR 7.5.19):
-   *   - 每 session 独立 block, ━━━━ horizontal rule 分隔
-   *   - 操作命令用 ``` code block ``` 包裹, 用户长按整块选中 copy
-   *   - metadata 用 emoji 图标 (📁 path, 🕐 time, 💬 msgs)
-   *   - 当前 session ⭐ **当前 session** 标签
-   *   - 编号 1. 2. 3. 方便定位
-   *   - 顶部加使用提示 (复制 code block 命令到输入框)
+   * 修法 (PR 7.5.20):
+   *   - 加 origin (终端/cli/feishu) — 仿飞书 formatOrigin
+   *   - 加 project_name — 仿飞书 buildListCard 信息行
+   *   - ISO timestamp → 相对时间 (formatTimeAgo: 1分钟前, 17小时前)
+   *   - msgs → 条 (与飞书一致)
+   *   - ⭐ **当前** 标签位置调整 (紧跟标题)
+   *   - 每个命令独立 code block (用户反馈不要 /resume, 只留 /switch)
+   *   - status badge (🔴) 留给未来 sessionManager.runningUuids 集成 (飞书已有,
+   *     WeCom 暂未集成 sessionManager status polling, SessionEntry.status 类型不含 'running')
+   *
+   * 参考: src/feishu/bot.ts:3860+ buildListCard
    */
   private async _syncHandleList(msg: PlatformMessage): Promise<boolean> {
     if (!this.registryManager) {
@@ -378,6 +385,7 @@ export class WecomBot {
     }
     try {
       const allActive = this.registryManager.sessions;
+      // PR 7.5.20: active sessions 列表 (保持 PR 7.5.19 的 active filter — status 类型不含 'running')
       const activeEntries = Object.entries(allActive)
         .filter(([_, s]) => s.status === 'active')
         .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
@@ -387,57 +395,96 @@ export class WecomBot {
       const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
 
       if (activeEntries.length === 0) {
-        const ok = await this._syncHandleMarkdown(msg, '📭 当前无 active session');
-        if (ok) {
-          logger.info(`[wecom-bot] sync /list: replyStream ok (empty)`);
-        }
-        return ok;
+        const markdown = '📋 我的会话（最近 0 个）\n\n当前没有可用会话。\n可使用 `/new <路径>` 创建新会话。';
+        try {
+          await this.client.sdk.replyStream(msg.inboundFrame!, 'list-' + Date.now(), markdown, true);
+        } catch (err) { /* ignore */ }
+        return true;
       }
 
+      // PR 7.5.20: 对齐飞书 buildListCard 信息密度
+      //   - 加 origin / project_name
+      //   - relative time (formatTimeAgo) 替代 ISO timestamp
+      //   - 每个命令独立 code block (只保留 /switch)
+      //   - status badge (🔴) 留给未来 sessionManager runningUuids 集成
       const lines: string[] = [];
-      lines.push(`📋 **活跃 sessions (${activeEntries.length}${totalActive > 10 ? '+' : ''})**`);
+      lines.push(`📋 我的会话（最近 ${activeEntries.length} 个，共 ${totalActive} 个）`);
       lines.push('');
-      lines.push('💡 _复制下方 ⌨️ code block 命令到输入框即可切换/续聊_');
+      lines.push('💡 点击 code block 复制命令，粘贴到输入框即可切换');
       lines.push('');
-
-      const SEP = '━━━━━━━━━━━━━━━━━━━━';
 
       activeEntries.forEach(([uuid, s], index) => {
         const isCurrent = uuid === currentUuid;
-        const title = (s.title ?? '(无标题)').slice(0, 24);
-        const cwd = s.cwd ? s.cwd : '(无 cwd)';
-        const msgs = s.message_count != null ? s.message_count : 0;
-        const lastActive = s.last_active ? s.last_active.slice(0, 16) : '?';
-        const uuidShort = uuid.slice(0, 8);
+        const title = (s.title ?? 'Untitled').slice(0, 24);
+        const msgs = s.message_count ?? 0;
+        const lastActive = this._formatTimeAgo(s.last_active);
+        const origin = this._formatOrigin(s.status);
+        const projectName = s.project_name ?? '';
+        const cwd = s.cwd ?? '-';
 
-        lines.push(SEP);
+        const currentMark = isCurrent ? '⭐ **当前**' : '';
+
+        lines.push(`**${index + 1}. ${title}**${currentMark ? ' ' + currentMark : ''}`);
+        lines.push(`ID: \`${uuid.slice(0, 8)}\` | ${msgs}条 | ${lastActive} | ${origin} | ${projectName}`);
+        lines.push(`📁 \`${cwd}\``);
+        // PR 7.5.20 简化: 只有 /switch 命令 (用户反馈不需要 /resume)
         lines.push('');
-        const currentBadge = isCurrent ? '  ⭐ **当前 session**' : '';
-        lines.push(`**${index + 1}.** ${title} (💬 ${msgs} msgs)${currentBadge}`);
-        lines.push(`   📁 \`${cwd}\``);
-        lines.push(`   🕐 \`${lastActive}\``);
-        lines.push('');
-        // Code block 让用户长按可整块选中
+        lines.push('切换:');
         lines.push('```');
-        lines.push(`/switch ${uuidShort}`);
-        lines.push(`/resume ${uuidShort}`);
+        lines.push(`/switch ${uuid.slice(0, 8)}`);
         lines.push('```');
         lines.push('');
       });
 
-      lines.push(SEP);
-      lines.push('');
-      lines.push(`_(共 ${totalActive} 个, 只显示前 ${activeEntries.length})_`);
-
-      const ok = await this._syncHandleMarkdown(msg, lines.join('\n'));
-      if (ok) {
-        logger.info(`[wecom-bot] sync /list: replyStream ok (entries=${activeEntries.length}, totalActive=${totalActive})`);
+      if (totalActive > activeEntries.length) {
+        lines.push(`... 还有 ${totalActive - activeEntries.length} 个更早的会话未显示`);
       }
-      return ok;
+      lines.push('━━━━━━━━━━━━━━━━');
+
+      const markdown = lines.join('\n');
+      const streamId = 'list-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+      try {
+        await this.client.sdk.replyStream(msg.inboundFrame!, streamId, markdown, true);
+        logger.info(`[wecom-bot] sync /list: replyStream ok (entries=${activeEntries.length}, totalActive=${totalActive})`);
+        return true;
+      } catch (err) {
+        logger.warn(`[wecom-bot] sync /list replyStream failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
+        return false;
+      }
     } catch (err) {
       logger.warn(`[wecom-bot] sync /list build failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
       return false;
     }
+  }
+
+  /**
+   * PR 7.5.20: 时间格式化 (相对时间, 仿飞书 formatTimeAgo)
+   */
+  private _formatTimeAgo(isoStr: string | undefined): string {
+    if (!isoStr) return '?';
+    const then = new Date(isoStr).getTime();
+    if (isNaN(then)) return '?';
+    const now = Date.now();
+    const diffMs = now - then;
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return `${diffSec}秒前`;
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}分钟前`;
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return `${diffHour}小时前`;
+    const diffDay = Math.floor(diffHour / 24);
+    if (diffDay < 30) return `${diffDay}天前`;
+    const diffMonth = Math.floor(diffDay / 30);
+    return `${diffMonth}个月前`;
+  }
+
+  /**
+   * PR 7.5.20: origin 格式化 (仿飞书 formatOrigin)
+   */
+  private _formatOrigin(status: string | undefined): string {
+    if (!status) return '未知';
+    if (status === 'active') return '终端';
+    return status;
   }
 
   /**

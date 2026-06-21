@@ -121,20 +121,24 @@ describe('PR 7.5.17: handleCommandSynchronously', () => {
       // 验证传入的 frame 是 fresh 的 inboundFrame
       const callArgs = mockClient.sdk.replyStream.mock.calls[0];
       expect(callArgs[0]).toEqual({ headers: { req_id: 'fresh-req-id' }, body: { msgid: 'msg-1' } });
-      // streamId 是 sync- 开头的 random id
-      expect(callArgs[1]).toMatch(/^sync-\d+-[a-z0-9]+$/);
+      // streamId 是 list- 开头的 random id (PR 7.5.20)
+      expect(callArgs[1]).toMatch(/^list-\d+-[a-z0-9]+$/);
       // finish=true (第 4 个参数)
       expect(callArgs[3]).toBe(true);
-      // markdown content 包含 active session 信息
+      // markdown content 包含 active session 信息 (PR 7.5.20 对齐飞书风格)
       const markdown = callArgs[2] as string;
-      expect(markdown).toContain('📋');
+      expect(markdown).toContain('📋 我的会话（最近');
       expect(markdown).toContain('Project A');
       expect(markdown).toContain('Project B');
+      expect(markdown).toContain('**1.');
+      expect(markdown).toContain('**2.');
+      // 单 command code block, 只有 /switch
       expect(markdown).toContain('/switch uuid-a');
-      expect(markdown).toContain('/resume uuid-b');
+      // /resume 不再出现 (PR 7.5.20 删除)
+      expect(markdown).not.toContain('/resume');
     });
 
-    it('sync /list empty 走 replyStream 推 "📭 当前无 active session"', async () => {
+    it('sync /list empty 走 replyStream 推 "📋 我的会话（最近 0 个）"', async () => {
       const registryManager = { sessions: {} };
       (bot as any).registryManager = registryManager;
 
@@ -153,7 +157,7 @@ describe('PR 7.5.17: handleCommandSynchronously', () => {
       expect(handled).toBe(true);
       expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
       const callArgs = mockClient.sdk.replyStream.mock.calls[0];
-      expect(callArgs[2]).toContain('📭 当前无 active session');
+      expect(callArgs[2]).toContain('📋 我的会话（最近 0 个）');
       expect(callArgs[3]).toBe(true);
     });
 
@@ -263,30 +267,31 @@ describe('PR 7.5.17: handleCommandSynchronously', () => {
       const markdown = mockClient.sdk.replyStream.mock.calls[0][2] as string;
 
       // 1. Visual separator (horizontal rule)
-      expect(markdown).toContain('━━━━━━━━━━━━━━━━━━━━');
+      expect(markdown).toContain('━━━━━━━━━━━━━━━━');
 
       // 2. Numbered sessions (1, 2, 3)
-      expect(markdown).toContain('**1.**');
-      expect(markdown).toContain('**2.**');
-      expect(markdown).toContain('**3.**');
+      expect(markdown).toContain('**1.');
+      expect(markdown).toContain('**2.');
+      expect(markdown).toContain('**3.');
 
-      // 3. Current session badge (⭐ 当前 session)
-      expect(markdown).toContain('⭐ **当前 session**');
+      // 3. Current session badge (⭐ 当前) - PR 7.5.20 简化标签
+      expect(markdown).toContain('⭐ **当前**');
 
       // 4. Code blocks for easy copy (triple backticks)
       expect(markdown).toContain('```');
       // uuid.slice(0, 8) of uuid-current-1234 → "uuid-cur"
       expect(markdown).toContain('/switch uuid-cur');
-      // uuid.slice(0, 8) of others → "uuid-oth"
-      expect(markdown).toContain('/resume uuid-oth');
+      // PR 7.5.20: /resume 不再出现在 /list 输出
+      expect(markdown).not.toContain('/resume');
 
-      // 5. Metadata with emojis
-      expect(markdown).toContain('💬');
+      // 5. Metadata with emoji + 飞书风格信息行 (PR 7.5.20)
       expect(markdown).toContain('📁');
-      expect(markdown).toContain('🕐');
+      expect(markdown).toContain('ID: `');
+      // 条 而不是 msgs
+      expect(markdown).toMatch(/\d+条/);
 
-      // 6. Footer with total count
-      expect(markdown).toContain('共 3 个');
+      // 6. Header with total count
+      expect(markdown).toContain('我的会话（最近 3 个，共 3 个）');
     });
   });
 
