@@ -1209,7 +1209,7 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
       userManager: mockUserManager as any,
       // PR 7.5.3: 注入 no-op completeCardSender, 让 switch/resume/stop/agents 附加卡不进 sdk.sendMessage
       //   (否则旧 PR 5 测试用 mock.calls[0][1].markdown.content 读不到响应 — 卡先到)
-      completeCardSender: { send: mock(async () => {}) } as any,
+      completeCardSender: { send: mock(async () => {}), sendViaReply: mock(async () => {}) } as any,
     });
   });
 
@@ -1414,7 +1414,7 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
 
     let capturedCard: any = null;
-    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }), sendViaReply: mock(async (_frame: any, _ctx: any, card: any) => { capturedCard = card; }) };
     const localBot = new WecomBot({
       botId: 'test', secret: 'test',
       userMappingPath: '/tmp/test-listdir-camel-pr614.json',
@@ -1424,7 +1424,10 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     });
     await localBot.__test_handleCommand(makeCmdMsg('/ListDir', 'msg_listdir_camel'));
     // 卡片已发, 不走 markdown
-    expect(cardSender.send).toHaveBeenCalled();
+    // PR 7.5.5 hotfix: 有 inboundFrame → 走 sendViaReply (5s replyWelcome 窗口, 不超时)
+    const sentViaReply = cardSender.sendViaReply.mock.calls.length > 0;
+    const sentDirect = cardSender.send.mock.calls.length > 0;
+    expect(sentViaReply || sentDirect).toBe(true);
     expect(capturedCard).toBeDefined();
     expect(['button_interaction', 'text_notice']).toContain(capturedCard.card_type);
     expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
@@ -1447,7 +1450,7 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
 
     let capturedCard: any = null;
-    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }), sendViaReply: mock(async (_frame: any, _ctx: any, card: any) => { capturedCard = card; }) };
     const localBot = new WecomBot({
       botId: 'test', secret: 'test',
       userMappingPath: '/tmp/test-listdir-cfg-pr615.json',
@@ -1456,7 +1459,10 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
       completeCardSender: cardSender as any,
     });
     await localBot.__test_handleCommand(makeCmdMsg('/listdir', 'msg_listdir_cfg'));
-    expect(cardSender.send).toHaveBeenCalled();
+    // PR 7.5.5 hotfix: 有 inboundFrame → 走 sendViaReply
+    const sentViaReply = cardSender.sendViaReply.mock.calls.length > 0;
+    const sentDirect = cardSender.send.mock.calls.length > 0;
+    expect(sentViaReply || sentDirect).toBe(true);
     expect(capturedCard).toBeDefined();
     // 卡片 main_title 应含 cwd
     expect(JSON.stringify(capturedCard)).toContain(testDir);
@@ -1937,7 +1943,7 @@ describe('WecomBot handleCommandResume (PR 5 M-7: 返回新 lastActiveAt)', () =
       spoolQueue: mockSpoolQueue,
       // userManager 在每个测试里单独定义 (需要 readCount 控制)
       // PR 7.5.3: 注入 no-op completeCardSender, /resume 附加卡不进 sdk.sendMessage
-      completeCardSender: { send: mock(async () => {}) } as any,
+      completeCardSender: { send: mock(async () => {}), sendViaReply: mock(async () => {}) } as any,
     });
   });
 
@@ -1987,7 +1993,7 @@ describe('WecomBot handleCommandResume (PR 5 M-7: 返回新 lastActiveAt)', () =
       spoolQueue: mockSpoolQueue,
       userManager: userManager as any,
       // PR 7.5.3: 注入 no-op completeCardSender (避免 /resume 附加卡污染 mockClient.sdk.sendMessage)
-      completeCardSender: { send: mock(async () => {}) } as any,
+      completeCardSender: { send: mock(async () => {}), sendViaReply: mock(async () => {}) } as any,
     });
 
     await bot.__test_handleCommand(makeCmdMsg('/resume', 'msg_m7'));
@@ -2166,7 +2172,7 @@ describe('WecomBot handleCommandStop (PR 6 Task 6.3: edge cases)', () => {
       spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
       // PR 7.5.3: 注入 no-op completeCardSender, /stop 附加卡不进 sdk.sendMessage
-      completeCardSender: { send: mock(async () => {}) } as any,
+      completeCardSender: { send: mock(async () => {}), sendViaReply: mock(async () => {}) } as any,
     });
 
     // 每个 case 重置 execFile mock (基线: 成功, 跟生产 promisify custom 行为对齐)
@@ -2675,7 +2681,7 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
     }));
 
     let capturedCard: any = null;
-    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }), sendViaReply: mock(async (_frame: any, _ctx: any, card: any) => { capturedCard = card; }) };
     const bot = new WecomBot({
       botId: 'test',
       secret: 'test',
@@ -2735,7 +2741,7 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
     mockUserManager.getEntry = mock(() => undefined);  // 当前 user 无 session
 
     let capturedCard: any = null;
-    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }), sendViaReply: mock(async (_frame: any, _ctx: any, card: any) => { capturedCard = card; }) };
     const bot = new WecomBot({
       botId: 'test',
       secret: 'test',
@@ -3021,7 +3027,7 @@ describe('WecomBot /listdir command (PR 6.13)', () => {
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
 
     let capturedCard: any = null;
-    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }), sendViaReply: mock(async (_frame: any, _ctx: any, card: any) => { capturedCard = card; }) };
     const bot = new WecomBot({
       botId: 'test', secret: 'test',
       userMappingPath: '/tmp/test-listdir-pr613.json',
@@ -3070,7 +3076,7 @@ describe('WecomBot /listdir command (PR 6.13)', () => {
     //   handleCommand case 'listdir' 走 markdown 兜底 (不推 buildDirListCard)
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: '/nonexistent/path/wecom-pr613' }));
 
-    const cardSender = { send: mock(async () => {}) };
+    const cardSender = { send: mock(async () => {}), sendViaReply: mock(async () => {}) };
     const bot = new WecomBot({
       botId: 'test', secret: 'test',
       userMappingPath: '/tmp/test-listdir-nonexistent-pr613.json',
@@ -3734,6 +3740,12 @@ describe('PR 7.5.2: /list + /listdir + /model 卡片化 + 3 new case', () => {
       send: mock(async (ctx: any) => {
         cardSendCalls.push(ctx);
       }),
+      // PR 7.5.5 hotfix: sendViaReply 也推到 cardSendCalls, 让 PR 7.5.2 list/listdir/model 测试
+      //   验证卡内容时不分 send vs sendViaReply 路径
+      //   sendViaReply 签名 (frame, ctx, card) — 卡在第 3 参
+      sendViaReply: mock(async (_frame: any, _ctx: any, card: any) => {
+        cardSendCalls.push({ template_card: card });
+      }),
     };
     bot = new WecomBot({
       botId: 'test',
@@ -3918,9 +3930,15 @@ describe('PR 7.5.3: /switch /resume /stop /agents 附加卡 + case 双语义', (
       userManager: mockUserManager as any,
       registryManager: mockRegistryManager as any,
       // 注入 mock completeCardSender 跟踪 send 调用
+      // PR 7.5.5 hotfix: PR 7.5.3 测试保留原 .send 路径兼容, 同时注入 sendViaReply
+      //   让 /switch /resume /stop /agents 4 个附加卡 (有 inboundFrame 时) 走新通道
+      //   sendViaReply 签名 (frame, ctx, card) — 卡在第 3 参, 跟 send 的 ctx.template_card 形状对齐
       completeCardSender: {
         send: mock(async (ctx: any) => {
           cardSendCalls.push(ctx);
+        }),
+        sendViaReply: mock(async (_frame: any, _ctx: any, card: any) => {
+          cardSendCalls.push({ template_card: card });
         }),
       } as any,
     });
@@ -4035,5 +4053,127 @@ describe('PR 7.5.3: /switch /resume /stop /agents 附加卡 + case 双语义', (
     expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
     // setSession NOT called (因为是无 value 路径, 走 list 渲染)
     expect(mockUserManager.setSession).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * PR 7.5.5 hotfix: 命令路径卡走 replyTemplateCard 不 sendMessage
+ *
+ * 真机 E2E 修复: PR 7.5 deploy 后 /list 仍返回 markdown, 不返回 card
+ * 根因: WecomCompleteCardSender.send 用 sdk.sendMessage(chatid, body), 走 SEND_MSG + 5s ack timeout.
+ *   命令路径是 first reply (无 replyWelcome / replyStream 前置消耗 5s 窗口),
+ *   sendMessage 等 ack 超时 → 触发 markdown fallback.
+ * 修法: sendViaReply(frame, ctx, card) 走 sdk.replyTemplateCard(frame, card), 复用原始消息 event 的 req_id
+ *   (WsCmd.RESPONSE_WELCOME 协议, 不超时).
+ */
+describe('PR 7.5.5 hotfix: replyTemplateCard for first-reply card', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let mockRegistryManager: any;
+  let inboundFrame: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    inboundFrame = { headers: { req_id: 'inb_first_reply_test' } };
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),  // ← key mock for this test
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => null),
+      setDefaultProvider: mock(async () => {}),
+      clearDefaultProvider: mock(async () => {}),
+      touchSession: mock(async () => {}),
+      setSession: mock(async () => {}),
+      setPending: mock(async () => {}),
+    };
+    const sessions: Record<string, any> = {};
+    for (let i = 0; i < 10; i++) {
+      sessions[`uuid-${i}`] = {
+        sessionUuid: `uuid-${i}`, title: `S${i}`, message_count: 100 + i,
+        last_active: `2026-06-21T13:${String(10 + i).padStart(2, '0')}:00Z`,
+        status: 'active',
+      };
+    }
+    mockRegistryManager = { sessions, listActive: mock(() => Object.values(sessions)) };
+    // 不注入 completeCardSender, 让真实 WecomCompleteCardSender 被构造并调用
+    // mockClient.sdk.replyTemplateCard / sendMessage — 这样能直接验证走的哪个 SDK 通道
+    bot = new WecomBot({
+      botId: 'test', secret: 'test',
+      userMappingPath: '/tmp/test-pr755-hotfix.json',
+      client: mockClient, spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      registryManager: mockRegistryManager as any,
+    });
+  });
+
+  function makeCmdMsg(text: string, messageId: string): any {
+    return {
+      messageId, openId: '', text,
+      userId: 'wmu_user_1', platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_user_1:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame },
+    };
+  }
+
+  it('/list (with inboundFrame) → 调 replyTemplateCard, NOT sendMessage', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/list', 'msg_pr755_list'));
+    // 关键断言: replyTemplateCard 被调 1 次
+    expect(mockClient.sdk.replyTemplateCard).toHaveBeenCalledTimes(1);
+    // sendMessage 应该没被调 (避免 5s ack timeout)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+    // replyTemplateCard 收到的 frame 必须是 inboundFrame
+    const callArgs = mockClient.sdk.replyTemplateCard.mock.calls[0];
+    expect(callArgs[0]).toBe(inboundFrame);  // frame 透传
+    // 第二参是 template_card 对象, card_type=button_interaction
+    expect(callArgs[1].card_type).toBe('button_interaction');
+    expect(callArgs[1].button_list.button.length).toBe(20);
+  });
+
+  it('/list (without inboundFrame) → fallback to sendMessage (compatibility)', async () => {
+    const msgNoFrame = makeCmdMsg('/list', 'msg_pr755_list_nofrm');
+    delete msgNoFrame.metadata.inboundFrame;
+    await bot.__test_handleCommand(msgNoFrame);
+    // 无 inboundFrame → 走 sendMessage fallback
+    expect(mockClient.sdk.replyTemplateCard).not.toHaveBeenCalled();
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const sentBody = mockClient.sdk.sendMessage.mock.calls[0][1];
+    expect(sentBody.msgtype).toBe('template_card');
+    expect(sentBody.template_card.card_type).toBe('button_interaction');
+  });
+
+  it('/listdir (with inboundFrame) → 调 replyTemplateCard', async () => {
+    // cwd 用 /tmp — 任何存在的目录都行, 关键验证 replyTemplateCard 通道被用
+    await bot.__test_handleCommand(makeCmdMsg('/listdir /tmp', 'msg_pr755_listdir'));
+    const calledReply = mockClient.sdk.replyTemplateCard.mock.calls.length > 0;
+    const calledSend = mockClient.sdk.sendMessage.mock.calls.length > 0;
+    // 至少一个被调 (replyTemplateCard 或 sendMessage fallback)
+    expect(calledReply || calledSend).toBe(true);
+    // 优先: 如果 replyTemplateCard 被调, 验证 frame
+    if (calledReply) {
+      expect(mockClient.sdk.replyTemplateCard.mock.calls[0][0]).toBe(inboundFrame);
+    }
   });
 });

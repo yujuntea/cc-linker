@@ -142,4 +142,31 @@ export class WecomCompleteCardSender {
     const taskId = (card as unknown as CompleteCardPayload).task_id;
     logger.info(`[wecom-complete-card] sent: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
   }
+
+  /**
+   * PR 7.5.5 hotfix: 用 replyTemplateCard 推卡片 (不走 sendMessage 的 5s ack 路径)
+   *
+   * 背景: 命令路径 (/list /listdir /model) 是用户消息的 FIRST reply, 此时 SDK 的
+   *   5s replyWelcome 窗口需要用原始消息 event 的 inboundFrame (含 req_id) 才能 ack.
+   *   sendMessage 走 WsCmd.SEND_MSG 协议, 等的 ack 路径不同 → 5s 超时.
+   *
+   * 修法: 用 SDK 的 replyTemplateCard(frame, card) — 它走 WsCmd.RESPONSE_WELCOME 路径,
+   *   复用原始消息的 req_id, 不需要新 ack.
+   *
+   * @param frame 原始消息 event 的 WebSocket frame (msg.metadata.inboundFrame)
+   * @param ctx 卡片上下文, 必填 userId / chatId (跟 send 一致), sessionTitle 等其他字段忽略
+   * @param card 可选 — 预构造好的 template_card (跟 send 的 template_card 字段同语义)
+   */
+  async sendViaReply(
+    frame: any,
+    ctx: CompleteCardContext,
+    card?: WecomTemplateCard,
+  ): Promise<void> {
+    const finalCard = card ?? ctx.template_card ?? buildCompleteCard(ctx);
+    // replyTemplateCard(frame, templateCard, feedback) — frame 必传, 第二参是 template_card 对象 (不是 wrapped body)
+    await this.sdk.replyTemplateCard(frame, finalCard as unknown as CompleteCardPayload);
+    const taskId = (finalCard as unknown as CompleteCardPayload).task_id;
+    const receiveId = ctx.chatId ?? ctx.userId;
+    logger.info(`[wecom-complete-card] sent via reply: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
+  }
 }

@@ -479,21 +479,37 @@ export class WecomBot {
     // 修法: case 'list' 直接 await handleCommandListCard (内部 sendMessage markdown + markDone),
     //   跳过后续统一 sendMessage 推送路径 (return 跳出 handleCommand)
     if (parsed.cmd === 'list') {
+      // PR 7.5.5 hotfix: 推卡用 replyTemplateCard (不用 sendMessage 的 5s ack 路径)
       // PR 7.5.2: 推 buildListCard 卡片代替 markdown
       if (!this.registryManager) {
         // registryManager 未注入 → 走 markdown 兜底 (跟 Task 2.0 fallback 路径一致)
         await this.handleCommandListCard(msg);
         return;
       }
+      let data: Omit<ListCardData, 'markdown'>;
       try {
-        const data = await this._handleCommandListCardInternal(msg);
-        const card = buildListCard({
-          entries: data.entries,
-          totalActive: data.totalActive,
-        });
-        await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+        data = await this._handleCommandListCardInternal(msg);
       } catch (err) {
-        logger.error(`[wecom-bot] list card build/send failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
+        logger.error(`[wecom-bot] list card data fetch failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
+        await this.handleCommandListCard(msg);
+        return;
+      }
+      const card = buildListCard({
+        entries: data.entries,
+        totalActive: data.totalActive,
+      });
+      const inboundFrame = msg.metadata?.inboundFrame;
+      const receiveId = resolveReceiveId(msg);
+      try {
+        if (inboundFrame) {
+          // 优选 replyTemplateCard (5s replyWelcome 窗口, 不超时)
+          await this.wecomCompleteCardSender.sendViaReply(inboundFrame, { userId: msg.userId, chatId: receiveId }, card);
+        } else {
+          // fallback: sendMessage (无 inboundFrame 时, 比如续聊 session path)
+          await this.wecomCompleteCardSender.send({ userId: msg.userId, chatId: receiveId, template_card: card });
+        }
+      } catch (err) {
+        logger.error(`[wecom-bot] list card send failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
         await this.handleCommandListCard(msg);
         return;
       }
@@ -522,6 +538,7 @@ export class WecomBot {
           responseText = await this.handleCommandSwitch(msg.userId, parsed.args);
           // PR 7.5.3: 切换成功后附加 PR 7 完成卡 (复用 buildCompleteCard, 3 主按钮 + 4 action_menu)
           //   异步发, 不阻塞 responseText 推回
+          // PR 7.5.5 hotfix: 优选 replyTemplateCard (5s replyWelcome 窗口, 不超时)
           if (responseText.startsWith('✅') && parsed.args.length > 0) {
             const targetUuid = parsed.args[0];
             const sessionEntry = this.registryManager?.sessions?.[targetUuid];
@@ -532,40 +549,67 @@ export class WecomBot {
               sessionUuid: targetUuid,
               cwd: this.userManager.getEntry(msg.userId)?.cwd,
             });
-            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
-              .catch(err => logger.warn(`[wecom-bot] complete card after switch failed: ${err instanceof Error ? err.message : String(err)}`));
+            const inboundFrame = msg.metadata?.inboundFrame;
+            if (inboundFrame) {
+              this.wecomCompleteCardSender.sendViaReply(inboundFrame, { userId: msg.userId }, card)
+                .catch(err => logger.warn(`[wecom-bot] complete card after switch failed: ${err instanceof Error ? err.message : String(err)}`));
+            } else {
+              this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+                .catch(err => logger.warn(`[wecom-bot] complete card after switch failed: ${err instanceof Error ? err.message : String(err)}`));
+            }
           }
           break;
         }
         case 'resume':
           responseText = await this.handleCommandResume(msg.userId, parsed.args);
           // PR 7.5.3: 附加 buildResumeCard (text_notice + 1 switch 按钮, no value 走 list 语义)
+          // PR 7.5.5 hotfix: 优选 replyTemplateCard
           {
             const entry = this.userManager.getEntry(msg.userId);
             const card = buildResumeCard({ sessionUuid: entry?.sessionUuid ?? '' });
-            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
-              .catch(err => logger.warn(`[wecom-bot] resume card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            const inboundFrame = msg.metadata?.inboundFrame;
+            if (inboundFrame) {
+              this.wecomCompleteCardSender.sendViaReply(inboundFrame, { userId: msg.userId }, card)
+                .catch(err => logger.warn(`[wecom-bot] resume card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            } else {
+              this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+                .catch(err => logger.warn(`[wecom-bot] resume card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            }
           }
           break;
         case 'agents': {
           // PR 7.5.2 Task 2.0: handleCommandAgents 改返 AgentsData 结构, 取 .markdown 喂统一推送
           // PR 7.5.3: 同时附加 buildAgentsRefreshCard (text_notice + agents-refresh action_menu)
+          // PR 7.5.5 hotfix: 优选 replyTemplateCard
           const agentsData = await this.handleCommandAgents(msg.userId, parsed.args);
           responseText = agentsData.markdown;
           {
             const card = buildAgentsRefreshCard({ bgCount: agentsData.bgCount });
-            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
-              .catch(err => logger.warn(`[wecom-bot] agents card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            const inboundFrame = msg.metadata?.inboundFrame;
+            if (inboundFrame) {
+              this.wecomCompleteCardSender.sendViaReply(inboundFrame, { userId: msg.userId }, card)
+                .catch(err => logger.warn(`[wecom-bot] agents card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            } else {
+              this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+                .catch(err => logger.warn(`[wecom-bot] agents card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            }
           }
           break;
         }
         case 'stop': {
           responseText = await this.handleCommandStop(msg.userId, parsed.args);
           // PR 7.5.3: 附加 buildStopCard (text_notice + 1 switch 按钮, no value 走 list 语义)
+          // PR 7.5.5 hotfix: 优选 replyTemplateCard
           if (parsed.args.length > 0 && responseText.startsWith('✅')) {
             const card = buildStopCard({ shortId: parsed.args[0] });
-            this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
-              .catch(err => logger.warn(`[wecom-bot] stop card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            const inboundFrame = msg.metadata?.inboundFrame;
+            if (inboundFrame) {
+              this.wecomCompleteCardSender.sendViaReply(inboundFrame, { userId: msg.userId }, card)
+                .catch(err => logger.warn(`[wecom-bot] stop card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            } else {
+              this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card })
+                .catch(err => logger.warn(`[wecom-bot] stop card send failed: ${err instanceof Error ? err.message : String(err)}`));
+            }
           }
           break;
         }
@@ -585,8 +629,14 @@ export class WecomBot {
               : undefined;
             const providers = this.providerManager.list().map(p => ({ alias: p.alias, name: p.name }));
             const card = buildModelCard({ providers, currentAlias });
+            // PR 7.5.5 hotfix: 优选 replyTemplateCard (5s replyWelcome 窗口, 不超时)
+            const inboundFrame = msg.metadata?.inboundFrame;
             try {
-              await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+              if (inboundFrame) {
+                await this.wecomCompleteCardSender.sendViaReply(inboundFrame, { userId: msg.userId }, card);
+              } else {
+                await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+              }
               this.spoolQueue.markDone(msg.messageId, msg.serialKey);
               return;  // 卡片已发, 跳外层 sendMessage
             } catch (sendErr) {
@@ -618,8 +668,14 @@ export class WecomBot {
               dirs: data.dirs,
               hasMore: data.hasMore,
             });
+            // PR 7.5.5 hotfix: 优选 replyTemplateCard (5s replyWelcome 窗口, 不超时)
+            const inboundFrame = msg.metadata?.inboundFrame;
             try {
-              await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+              if (inboundFrame) {
+                await this.wecomCompleteCardSender.sendViaReply(inboundFrame, { userId: msg.userId }, card);
+              } else {
+                await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+              }
               this.spoolQueue.markDone(msg.messageId, msg.serialKey);
               return;  // 卡片已发, 跳外层 sendMessage
             } catch (sendErr) {
