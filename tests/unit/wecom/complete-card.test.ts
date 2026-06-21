@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, mock } from 'bun:test';
 import { buildCompleteCard, WecomCompleteCardSender, COMPLETE_CARD_MAIN_BUTTONS, COMPLETE_CARD_ACTION_MENU } from '../../../src/wecom/complete-card';
-import type { WecomTemplateCard } from '../../../src/wecom/card';
+import { WecomCardBuilder, type WecomTemplateCard } from '../../../src/wecom/card';
 
 describe('buildCompleteCard', () => {
   it('builds button_interaction card with 3 main buttons + action_menu (4 items)', () => {
@@ -87,5 +87,106 @@ describe('WecomCompleteCardSender', () => {
     };
     const sender = new WecomCompleteCardSender(mockSdk as any);
     await expect(sender.send({ userId: 'wmu_test' })).rejects.toThrow('mock network error');
+  });
+});
+
+describe('PR 7.5.6: wire shape transformation', () => {
+  it('send() converts button_list[].{action_tag, action_title, button_type} → {key, text, style}', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: '测试',
+      description: 'desc',
+      buttons: [
+        { tag: 'switch', text: '切换', type: 'primary' },
+        { tag: 'stop', text: '停止', type: 'danger' },
+        { tag: 'listdir', text: '列表', type: 'default' },
+      ],
+    });
+    const capturedPayload: any[] = [];
+    const mockSdk = {
+      sendMessage: mock(async (_chatid: string, body: any) => {
+        capturedPayload.push(body);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    await sender.send({
+      userId: 'test-user',
+      template_card: card,
+    });
+    expect(capturedPayload.length).toBe(1);
+    const wire = capturedPayload[0].template_card;
+    expect(wire.button_list.button.length).toBe(3);
+    // shape: { text, key, style? }
+    expect(wire.button_list.button[0]).toEqual({ text: '切换', key: 'switch', style: 2 });
+    expect(wire.button_list.button[1]).toEqual({ text: '停止', key: 'stop', style: 4 });
+    expect(wire.button_list.button[2]).toEqual({ text: '列表', key: 'listdir', style: 1 });
+    // 必须没有遗留 action_tag/action_title
+    expect(wire.button_list.button[0].action_tag).toBeUndefined();
+    expect(wire.button_list.button[0].action_title).toBeUndefined();
+  });
+
+  it('send() converts action_menu.action_list[].{action_tag, action_title} → {text, key}', async () => {
+    const card = WecomCardBuilder.textNotice({
+      title: 'BG Sessions',
+      content: 'content',
+      actionMenu: [{ tag: 'agents-refresh', text: '🔄 刷新' }],
+    });
+    const capturedPayload: any[] = [];
+    const mockSdk = {
+      sendMessage: mock(async (_chatid: string, body: any) => {
+        capturedPayload.push(body);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    await sender.send({
+      userId: 'test-user',
+      template_card: card,
+    });
+    const wire = capturedPayload[0].template_card;
+    expect(wire.action_menu.action_list.length).toBe(1);
+    expect(wire.action_menu.action_list[0]).toEqual({ text: '🔄 刷新', key: 'agents-refresh' });
+    expect(wire.action_menu.action_list[0].action_tag).toBeUndefined();
+  });
+
+  it('send() sanitizes task_id (max 128 bytes, only [a-zA-Z0-9_-@])', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't',
+      description: 'd',
+      buttons: [{ tag: 'k', text: 't' }],
+    });
+    // 注入一个超长 task_id (200 字符) + 含非法字符
+    (card as any).task_id = 'x'.repeat(200) + ':::' + 'bad-chars';
+    const capturedPayload: any[] = [];
+    const mockSdk = {
+      sendMessage: mock(async (_chatid: string, body: any) => {
+        capturedPayload.push(body);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    await sender.send({ userId: 'test-user', template_card: card });
+    const wire = capturedPayload[0].template_card;
+    expect(wire.task_id).toBeDefined();
+    expect(wire.task_id.length).toBeLessThanOrEqual(128);
+    expect(wire.task_id).not.toContain(':');
+    // 只含合法字符
+    expect(wire.task_id).toMatch(/^[a-zA-Z0-9_\-@]+$/);
+  });
+
+  it('sendViaReply() also applies wire transformation', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't',
+      description: 'd',
+      buttons: [{ tag: 'switch', text: '切换', type: 'primary' }],
+    });
+    const capturedPayload: any[] = [];
+    const mockSdk = {
+      replyTemplateCard: mock(async (_frame: any, card: any) => {
+        capturedPayload.push(card);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    const fakeFrame = { headers: { req_id: 'fake_req' } };
+    await sender.sendViaReply(fakeFrame, { userId: 'u', chatId: 'u' }, card);
+    const wire = capturedPayload[0];
+    expect(wire.button_list.button[0]).toEqual({ text: '切换', key: 'switch', style: 2 });
   });
 });

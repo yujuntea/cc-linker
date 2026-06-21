@@ -8,6 +8,84 @@ import type { WSClient, TemplateCard } from '@wecom/aibot-node-sdk';
 import { WecomCardBuilder, type WecomTemplateCard } from './card';
 import { logger } from '../utils/logger';
 
+/**
+ * PR 7.5.6 hotfix: 把内部 card shape (action_tag/action_title/button_type) 转换成
+ *   aibot 服务端 wire format (key/text/style)
+ *
+ * 背景: src/wecom/card.ts WecomCardBuilder 用 Feishu 风格的 {action_tag, action_title, button_type}
+ *   字段命名 (历史遗留, PR 2 v1.2.1+ 一直这样写). 但 aibot 服务端 (1.0.7) 期望
+ *   {key, text, style: 1|2|3/4} (官方 SDK 类型 TemplateCardButton / TemplateCardActionMenu).
+ *
+ *   服务端校验严格: action_menu.action_list[].text missing → 拒收 + 5s 后 fallback.
+ *   PR 7.5.5 部署后真机 E2E 仍 fallback → 修复在 wire 边界统一转 shape.
+ *
+ * 修法: 在 WecomCompleteCardSender.send/sendViaReply wire 边界统一转 shape, 不动 WecomCardBuilder
+ *   (避免破坏 9 个 builder 单测 + 未来 PR 7.x 兼容性).
+ *
+ * @see /Users/wuyujun/.bun/install/cache/@wecom/aibot-node-sdk@1.0.7@@@1/dist/types/api.d.ts
+ *   TemplateCardButton: { text, style?: 1|2|3|4, key }
+ *   TemplateCardActionMenu.action_list[]: { text, key } (length 1-3)
+ *   task_id: 数字+字母+_-@, 最长 128 字节
+ */
+type WireButton = { text: string; style?: number; key: string };
+type WireActionMenuItem = { text: string; key: string };
+
+function mapButtonTypeToStyle(t: string | undefined): number {
+  // aibot style: 1=default, 2=primary, 3=something, 4=danger (Feishu 推测对齐)
+  // PR 7.5.6 验证: primary → 2, danger → 4, default/undefined → 1
+  if (t === 'primary') return 2;
+  if (t === 'danger') return 4;
+  return 1;
+}
+
+function transformButtonToWire(btn: any): WireButton {
+  return {
+    text: btn.action_title?.text ?? btn.text ?? '',
+    key: btn.action_tag ?? btn.key ?? '',
+    ...(btn.button_type !== undefined ? { style: mapButtonTypeToStyle(btn.button_type) } : {}),
+  };
+}
+
+function transformActionMenuItemToWire(item: any): WireActionMenuItem {
+  return {
+    text: item.action_title?.text ?? item.text ?? '',
+    key: item.action_tag ?? item.key ?? '',
+  };
+}
+
+function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
+  const wire: any = { ...card };
+
+  // 1. button_list.button[]
+  if (card.card_type === 'button_interaction' && card.button_list?.button) {
+    wire.button_list = {
+      button: card.button_list.button.map(transformButtonToWire),
+    };
+  }
+
+  // 2. action_menu.action_list[]
+  if ((card as any).action_menu?.action_list) {
+    wire.action_menu = {
+      desc: (card as any).action_menu.desc ?? '操作',
+      action_list: (card as any).action_menu.action_list.map(transformActionMenuItemToWire),
+    };
+  }
+
+  // 3. task_id: 限 128 字节 + 数字/字母/_-@ (跟 PR 7 genCompleteCardTaskId 对齐)
+  if (wire.task_id) {
+    const sanitized = String(wire.task_id)
+      .replace(/[^a-zA-Z0-9_\-@]/g, '')
+      .slice(0, 128);
+    if (sanitized.length === 0) {
+      delete wire.task_id;
+    } else {
+      wire.task_id = sanitized;
+    }
+  }
+
+  return wire as WecomTemplateCard;
+}
+
 export type CompleteCardContext = {
   userId: string;
   /** PR 7 final cleanup: 群聊 chatId, 优先于 userId。
@@ -54,9 +132,11 @@ export const COMPLETE_CARD_ACTION_MENU: ReadonlyArray<{ tag: string; text: strin
  *   避免多实例 / 多 daemon 并发不安全 + 测试间状态泄露
  */
 function genCompleteCardTaskId(userId: string): string {
+  // PR 7.5.6: sanitize userId to only allowed chars (a-zA-Z0-9_-@), 防 userId 含 : 等非法字符触发 server 42014
+  const safeUserId = userId.replace(/[^a-zA-Z0-9_\-@]/g, '').slice(0, 12);
   // 6 字符随机后缀 (base36), 保证唯一性 + stateless
   const rand = Math.random().toString(36).slice(2, 8);
-  return `ccdone-${Date.now()}-${rand}-${userId.slice(0, 12)}`;
+  return `ccdone-${Date.now()}-${rand}-${safeUserId}`.slice(0, 128);
 }
 
 /**
@@ -129,17 +209,20 @@ export class WecomCompleteCardSender {
     // PR 7.5.2: ctx.template_card 优先 — 命令路径推 buildListCard / buildDirListCard / buildModelCard
     // 走 sender 共用 sendMessage 通道, 不重写 wire 格式 (msgtype=template_card + payload 结构)
     const card = ctx.template_card ?? buildCompleteCard(ctx);
+    // PR 7.5.6: 转换内部 shape (action_tag/action_title/button_type) → wire (key/text/style)
+    //   + 验证 task_id 长度/字符 (防 server 40058/42014 拒收 + 5s fallback)
+    const wireCard = transformToWireShape(card);
     // PR 7.1 I-3: 单次 cast 到 SDK wire-shape (WecomTemplateCard → TemplateCard),
     //   buildCompleteCard 内部的 (card as any).action_menu / task_id 注入保留 —
     //   这两字段在 WecomTemplateCard union 下 optional, 需要 mutable 注入, 留 cast。
     const payload = {
       msgtype: 'template_card' as const,
-      template_card: card as unknown as CompleteCardPayload,
+      template_card: wireCard as unknown as CompleteCardPayload,
     };
     // PR 7 final cleanup: 群聊场景下 chatId 优先 — 单聊 chatId === userId 无影响
     const receiveId = ctx.chatId ?? ctx.userId;
     await this.sdk.sendMessage(receiveId, payload);
-    const taskId = (card as unknown as CompleteCardPayload).task_id;
+    const taskId = (wireCard as unknown as CompleteCardPayload).task_id;
     logger.info(`[wecom-complete-card] sent: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
   }
 
@@ -163,9 +246,11 @@ export class WecomCompleteCardSender {
     card?: WecomTemplateCard,
   ): Promise<void> {
     const finalCard = card ?? ctx.template_card ?? buildCompleteCard(ctx);
+    // PR 7.5.6: wire shape 转换 (同 send) — action_tag→key, action_title.text→text, button_type→style + task_id sanitize
+    const wireCard = transformToWireShape(finalCard);
     // replyTemplateCard(frame, templateCard, feedback) — frame 必传, 第二参是 template_card 对象 (不是 wrapped body)
-    await this.sdk.replyTemplateCard(frame, finalCard as unknown as CompleteCardPayload);
-    const taskId = (finalCard as unknown as CompleteCardPayload).task_id;
+    await this.sdk.replyTemplateCard(frame, wireCard as unknown as CompleteCardPayload);
+    const taskId = (wireCard as unknown as CompleteCardPayload).task_id;
     const receiveId = ctx.chatId ?? ctx.userId;
     logger.info(`[wecom-complete-card] sent via reply: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
   }
