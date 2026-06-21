@@ -1196,6 +1196,9 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
       setPending: mock(async () => {}),
       setSession: mock(async () => {}),
       touchSession: mock(async () => {}),
+      // PR 7.5.1: handleCommandModel 集成 ProviderManager, 旧 mock 也要补这两个 no-op
+      setDefaultProvider: mock(async (_uid: string, _alias: string) => {}),
+      clearDefaultProvider: mock(async (_uid: string) => {}),
     };
     bot = new WecomBot({
       botId: 'test',
@@ -1360,7 +1363,8 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
     const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
     expect(content).toContain('sonnet');
-    expect(content).toContain('model');
+    // PR 7.5.1: handleCommandModel 已集成 ProviderManager, 消息格式改为"默认模型已设置为 <alias>"
+    expect(content).toContain('默认模型已设置为');
   });
 
   it('/model 缺参数 → 返回用法错误', async () => {
@@ -3486,5 +3490,107 @@ describe('PR 7.3 集成: handleChat → updater.complete → completeCardSender.
     // 这里锁住的是 I-7 接线 — chatId 字段从 completeCtx 透传到 sender.send ctx, 不被吞。
     expect(senderCalls[0]).toHaveProperty('chatId');
     expect(senderCalls[0].chatId).toBeUndefined();
+  });
+});
+
+/**
+ * PR 7.5.1: handleCommandModel 集成 ProviderManager
+ * 覆盖 3 路径:
+ * - alias = "opus" → 调 setDefaultProvider 写 entry
+ * - alias = "--clear" → 调 clearDefaultProvider
+ * - alias = "unknown" → 返回错误, 不调 setDefaultProvider
+ */
+describe('PR 7.5.1: handleCommandModel 集成 ProviderManager', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let mockProviderManager: any;
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      setDefaultProvider: mock(async (_uid: string, _alias: string) => {}),
+      clearDefaultProvider: mock(async (_uid: string) => {}),
+    };
+    mockProviderManager = {
+      resolve: mock((alias: string) => {
+        if (alias === 'opus' || alias === 'sonnet') {
+          return { alias, name: alias, path: `/fake/${alias}.json`, isTemp: false };
+        }
+        return null;
+      }),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr751-model.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      providerManager: mockProviderManager as any,
+    });
+  });
+
+  function makeCmdMsg(text: string, messageId: string): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'wmu_user_1',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_user_1:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: `inb_${messageId}` } } },
+    };
+  }
+
+  it('alias = "opus" → 调 setDefaultProvider 写 entry', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/model opus', 'msg_model_set'));
+    expect(mockProviderManager.resolve).toHaveBeenCalledWith('opus');
+    expect(mockUserManager.setDefaultProvider).toHaveBeenCalledWith('wmu_user_1', 'opus');
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const sentContent = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(sentContent).toContain('已设置为 opus');
+  });
+
+  it('alias = "--clear" → 调 clearDefaultProvider', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/model --clear', 'msg_model_clear'));
+    expect(mockUserManager.clearDefaultProvider).toHaveBeenCalledWith('wmu_user_1');
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const sentContent = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(sentContent).toContain('已清除');
+  });
+
+  it('alias = "unknown" → 返回错误, 不调 setDefaultProvider', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/model unknown', 'msg_model_unknown'));
+    expect(mockProviderManager.resolve).toHaveBeenCalledWith('unknown');
+    expect(mockUserManager.setDefaultProvider).not.toHaveBeenCalled();
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const sentContent = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(sentContent).toContain('未知 model alias');
   });
 });

@@ -18,6 +18,7 @@ import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spo
 import type { ClaudeSessionManager } from '../proxy/session';
 import type { StreamChunk } from '../proxy/stream-parser';
 import { RegistryManager } from '../registry/registry';
+import { ProviderManager } from '../utils/providers';
 
 /**
  * PR 7 m-2 + PR 6.20 + PR 6.21: appendChunk 累加器 — 把 handleChat onProgress 闭包里的累加逻辑
@@ -131,6 +132,12 @@ export type WecomBotConfig = {
    *   所以显式要求上游 (CLI 启动入口) 注入, 单测场景通过 mock 验证。
    */
   registryManager?: RegistryManager;
+  /**
+   * PR 7.5.1: ProviderManager 注入 - /model 命令持久化 defaultProvider 用
+   * 飞书侧 feishu/bot.ts:34 import ProviderManager from '../utils/providers'
+   * 企微侧 PR 7.5.1 镜像实现. 必须实际集成, 不是只注入.
+   */
+  providerManager?: ProviderManager;
 };
 
 export class WecomBot {
@@ -151,6 +158,11 @@ export class WecomBot {
    * 未注入 → 静默 (logger.warn, 不发 sendMessage), 跟 confirm-stop 一致。
    */
   private registryManager?: RegistryManager;
+  /**
+   * PR 7.5.1: ProviderManager 注入 - /model 集成用
+   * 未注入时 /model 命令仍走 PR 5 stub (返回 '已设置 model: <name>' 占位 markdown)
+   */
+  private providerManager?: ProviderManager;
   private running = false;
   /**
    * PR 7 Task 7.5 (M-2): dispatch loop 的可中断 timer handle。
@@ -189,6 +201,7 @@ export class WecomBot {
     this.sessionManager = config.sessionManager;
     this.imageHandler = config.imageHandler;
     this.registryManager = config.registryManager;
+    this.providerManager = config.providerManager;
   }
 
   start(): void {
@@ -765,17 +778,30 @@ export class WecomBot {
   }
 
   /**
-   * PR 5: /model <model> - 切换 model alias
-   *
-   * 简化版：仅返回成功消息，不持久化
-   * TODO PR 6+: 持久化 model choice 到 PlatformMappingEntry (需要加 model 字段 + ProviderManager 集成)
+   * PR 7.5.1 + C1 fix: handleCommandModel 实际集成 ProviderManager
+   * 旧版 (PR 5 stub): 只 log + 返回 markdown 占位 "已设置 model: <name>"
+   * 新版:
+   * - alias = '--clear' → 调 userManager.clearDefaultProvider(userId) + 返回"已清除"
+   * - alias = '<name>'  → ProviderManager.resolve(alias) 验证 → userManager.setDefaultProvider → 返回"已设置"
+   *   - PR 7.5 C1 fix: ProviderManager.resolve 返回 null (不抛错), 必须显式 null 检查返回错误
+   * - 无 alias → handleCommand case 'model' 入口拦截, 走 buildModelCard 路径 (PR 7.5.2)
+   *   这里保留兜底返回 (防止未来直调 bypass case 'model')
    */
-  private async handleCommandModel(_userId: string, args: string[]): Promise<string> {
+  private async handleCommandModel(userId: string, args: string[]): Promise<string> {
     if (args.length === 0 || !args[0]) {
       return '❌ 用法: /model <model-alias> (例如: /model sonnet)';
     }
-    const model = args[0];
-    return `✅ 已设置 model: ${model}\n\n_(注: 当前 PR 5 临时实现, model 持久化推 PR 6+ 配合 ProviderManager)_`;
+    const alias = args[0];
+    if (alias === '--clear') {
+      await this.userManager.clearDefaultProvider(userId);
+      return '✅ 已清除默认模型';
+    }
+    // PR 7.5 C1 fix: resolve 返回 null (utils/providers.ts:38-49), 不抛错
+    if (this.providerManager && !this.providerManager.resolve(alias)) {
+      return `❌ 未知 model alias: ${alias}`;
+    }
+    await this.userManager.setDefaultProvider(userId, alias);
+    return `✅ 默认模型已设置为 ${alias}`;
   }
 
   /**
