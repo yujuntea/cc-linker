@@ -48,8 +48,19 @@ function makeButton(text: string, tag: string, value?: { sessionUuid: string }):
 /**
  * /list 命令卡片
  * - 空列表 → text_notice (📭 0/N)
- * - 否则 button_interaction (2 按钮/session: switch / resume) + action_menu 刷新
+ * - 否则 button_interaction (1 按钮/session: switch,限 6 按钮) + action_menu 刷新
+ *
+ * PR 7.5.10 fix: aibot SDK TemplateCardButton[] 列表长度上限是 6 (api.d.ts:344)
+ *   原 PR 7.5.2 设计 10 sessions × 2 buttons = 20 → 超 SDK 限制
+ *   server 拒收并返 errcode=42014 "taskid has existed or empty or exceed max len"
+ *   (通用 wrong-json-format 错误,task_id 是误导,真根因是 button 数量超限)
+ *
+ *   修法: 限前 6 sessions × 1 button (切换) = 6 buttons (符合 SDK max)
+ *     desc 显示 "还有 N 个未显示" 告知用户被截断
+ *     /switch <uuid> 仍可访问剩余 session (listdir-style 分页留作未来 PR)
  */
+const LIST_CARD_MAX_BUTTONS = 6;
+
 export function buildListCard(ctx: ListCardContext): WecomTemplateCard {
   if (ctx.entries.length === 0) {
     return WecomCardBuilder.textNotice({
@@ -58,18 +69,26 @@ export function buildListCard(ctx: ListCardContext): WecomTemplateCard {
     });
   }
 
+  // PR 7.5.10: 截断到 SDK 允许的 6 按钮上限
+  const visibleEntries = ctx.entries.slice(0, LIST_CARD_MAX_BUTTONS);
+  const moreCount = ctx.entries.length - visibleEntries.length;
+
   const buttonValues: Array<{ sessionUuid: string } | undefined> = [];
   const buttons: any[] = [];
-  for (const e of ctx.entries) {
+  for (const e of visibleEntries) {
     const v = { sessionUuid: e.sessionUuid };
-    buttonValues.push(v, v);
-    buttons.push(makeButton('🔄 切换', 'switch', v));
-    buttons.push(makeButton('📖 恢复', 'resume', v));
+    buttonValues.push(v);
+    // 按钮文本用 title 前 8 字符 (PR 7.5 E2 makeButton cast 接受任意文本)
+    buttons.push(makeButton(`🔄 ${e.title.slice(0, 8)}`, 'switch', v));
   }
 
+  const desc = moreCount > 0
+    ? `💡 显示前 ${LIST_CARD_MAX_BUTTONS} 个,还有 ${moreCount} 个未显示 (用 /switch <uuid> 切换)`
+    : `💡 点按下方按钮切换 session`;
+
   const card = WecomCardBuilder.buttonInteraction({
-    title: `📋 我的会话 (${ctx.entries.length}/${ctx.totalActive})`,
-    description: '💡 点按下方按钮切换/恢复 session',
+    title: `📋 我的会话 (${visibleEntries.length}/${ctx.totalActive})`,
+    description: desc,
     buttons,
   });
 

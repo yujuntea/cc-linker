@@ -2713,8 +2713,8 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
     expect(cardSender.send).toHaveBeenCalledTimes(1);
     expect(capturedCard).toBeDefined();
     expect(capturedCard.card_type).toBe('button_interaction');
-    // 2 个 active session × 2 按钮 (switch + resume) = 4 buttons
-    expect(capturedCard.button_list.button.length).toBe(4);
+    // PR 7.5.10: 2 个 active session × 1 按钮 (switch) = 2 buttons (SDK 限 6 按钮)
+    expect(capturedCard.button_list.button.length).toBe(2);
     // 按钮 value 注入 uuid
     const btnJson = JSON.stringify(capturedCard);
     expect(btnJson).toContain('uuid-aaaa-bbbb-cccc-dddd-1111');
@@ -3776,12 +3776,13 @@ describe('PR 7.5.2: /list + /listdir + /model 卡片化 + 3 new case', () => {
     };
   }
 
-  it('/list → sender.send 收到 card with 20 buttons (10 sessions × 2)', async () => {
+  it('/list → sender.send 收到 card with 6 buttons (10 sessions × 1, SDK 限 6 按钮 PR 7.5.10)', async () => {
     await bot.__test_handleCommand(makeCmdMsg('/list', 'msg_list_card'));
     expect(cardSendCalls.length).toBe(1);
     const sentCard = cardSendCalls[0].template_card;
     expect(sentCard.card_type).toBe('button_interaction');
-    expect(sentCard.button_list.button.length).toBe(20);  // 10 × 2
+    // PR 7.5.10: SDK TemplateCardButton[] 上限 6 (api.d.ts:344), buildListCard 限前 6 sessions × 1 button
+    expect(sentCard.button_list.button.length).toBe(6);  // SDK max
   });
 
   it('/listdir /tmp → sender.send 收到 card with dir buttons (depends on /tmp contents)', async () => {
@@ -4154,7 +4155,8 @@ describe('PR 7.5.5 hotfix: replyWelcome for first-reply card', () => {
     // 第二参是 wrapped body {msgtype: 'template_card', template_card: ...}
     expect(callArgs[1].msgtype).toBe('template_card');
     expect(callArgs[1].template_card.card_type).toBe('button_interaction');
-    expect(callArgs[1].template_card.button_list.button.length).toBe(20);
+    // PR 7.5.10: SDK 限 6 buttons (api.d.ts:344)
+    expect(callArgs[1].template_card.button_list.button.length).toBe(6);
   });
 
   it('PR 7.5.9: /list → replyWelcome fails 846605 → fallback to sendMessage', async () => {
@@ -4170,7 +4172,8 @@ describe('PR 7.5.5 hotfix: replyWelcome for first-reply card', () => {
     const sentBody = mockClient.sdk.sendMessage.mock.calls[0][1];
     expect(sentBody.msgtype).toBe('template_card');
     expect(sentBody.template_card.card_type).toBe('button_interaction');
-    expect(sentBody.template_card.button_list.button.length).toBe(20);
+    // PR 7.5.10: SDK 限 6 buttons (api.d.ts:344)
+    expect(sentBody.template_card.button_list.button.length).toBe(6);
   });
 
   it('PR 7.5.9: /list → replyWelcome succeeds → sendMessage NOT called', async () => {

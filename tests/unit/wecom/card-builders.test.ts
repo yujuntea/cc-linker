@@ -16,7 +16,7 @@ import {
 import type { WecomTemplateCard } from '../../../src/wecom/card';
 
 describe('buildListCard', () => {
-  it('builds button_interaction with 2 buttons per entry + action_menu', () => {
+  it('builds button_interaction with 1 switch button per entry + action_menu (PR 7.5.10: SDK 6-button limit)', () => {
     const ctx: ListCardContext = {
       entries: [
         { sessionUuid: 'uuid-1', title: 'Analyze AI coding attribution', messageCount: 768, lastActive: '2026-06-21T13:24:00Z' },
@@ -27,15 +27,14 @@ describe('buildListCard', () => {
     const card: WecomTemplateCard = buildListCard(ctx);
     expect(card.card_type).toBe('button_interaction');
     if (card.card_type !== 'button_interaction') throw new Error('unreachable');
-    expect(card.button_list.button.length).toBe(4);  // 2 entries × 2 buttons
+    // PR 7.5.10: 每个 session 1 个 button (switch) — 不再 2 buttons/session
+    expect(card.button_list.button.length).toBe(2);  // 2 entries × 1 button
     expect(card.button_list.button[0].action_tag).toBe('switch');
     expect((card.button_list.button[0] as any).value?.sessionUuid).toBe('uuid-1');
-    expect(card.button_list.button[1].action_tag).toBe('resume');
-    expect((card.button_list.button[1] as any).value?.sessionUuid).toBe('uuid-1');
-    expect(card.button_list.button[2].action_tag).toBe('switch');
-    expect((card.button_list.button[2] as any).value?.sessionUuid).toBe('uuid-2');
-    expect(card.button_list.button[3].action_tag).toBe('resume');
-    expect((card.button_list.button[3] as any).value?.sessionUuid).toBe('uuid-2');
+    expect(card.button_list.button[1].action_tag).toBe('switch');
+    expect((card.button_list.button[1] as any).value?.sessionUuid).toBe('uuid-2');
+    // 按钮文本含 title 前缀 (makeButton 接任意文本)
+    expect(card.button_list.button[0].action_title.text).toContain('Analyze');
     expect(card.main_title.title).toContain('2/777');
     expect(card.action_menu?.action_list[0].action_tag).toBe('list-refresh');
   });
@@ -46,6 +45,27 @@ describe('buildListCard', () => {
     expect(card.card_type).toBe('text_notice');
     expect(card.main_title.title).toContain('0/0');
     expect(card.main_title.desc).toContain('📭');
+  });
+
+  it('PR 7.5.10: limits to 6 buttons total (aibot SDK TemplateCardButton[] max) + truncation desc', () => {
+    const ctx: ListCardContext = {
+      entries: Array.from({ length: 10 }, (_, i) => ({
+        sessionUuid: `uuid-${i}`,
+        title: `Session ${i}`,
+        messageCount: 100 + i,
+        lastActive: `2026-06-21T13:${String(10 + i).padStart(2, '0')}:00Z`,
+      })),
+      totalActive: 778,
+    };
+    const card = buildListCard(ctx);
+    expect(card.card_type).toBe('button_interaction');
+    if (card.card_type !== 'button_interaction') throw new Error('unreachable');
+    // SDK 上限: 6 buttons (api.d.ts:344 '按钮列表, 列表长度不超过 6')
+    expect(card.button_list.button.length).toBe(6);
+    // desc 提示用户还有未显示的
+    expect(card.main_title.desc).toContain('还有 4 个未显示');
+    // 截断但 totalActive 仍报告总数 (title 显示 6/778)
+    expect(card.main_title.title).toContain('6/778');
   });
 });
 
