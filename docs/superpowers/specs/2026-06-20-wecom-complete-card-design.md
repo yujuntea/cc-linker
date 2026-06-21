@@ -157,7 +157,7 @@ async complete(response, tokensIn, tokensOut, durationMs, numTurns,
   // 防御: sendMessage 失败不能影响已发流式 (兜底 markdown 已经显示给用户了)
   if (this.completeCardSender) {
     try {
-      await this.completeCardSender({
+      await this.completeCardSender.send({
         userId: this.lastUserId,  // 需新增字段记录
         sessionTitle: ...,
         sessionUuid: ...,

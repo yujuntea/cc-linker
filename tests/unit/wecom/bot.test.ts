@@ -3481,5 +3481,10 @@ describe('PR 7.3 集成: handleChat → updater.complete → completeCardSender.
     expect(senderCalls[0].sessionTitle).toBe('集成测试 session');
     expect(senderCalls[0].sessionUuid).toBe('uuid-integration');
     expect(senderCalls[0].cwd).toBe('/tmp');
+    // PR 7 chatId fix: 集成测试场景 completeCtx 不传 chatId, 流式 updater 直接透传 undefined;
+    //   sender.send 内部用 ctx.chatId ?? ctx.userId 解析 receiveId, 所以即便 chatId 是 undefined 也不会崩。
+    // 这里锁住的是 I-7 接线 — chatId 字段从 completeCtx 透传到 sender.send ctx, 不被吞。
+    expect(senderCalls[0]).toHaveProperty('chatId');
+    expect(senderCalls[0].chatId).toBeUndefined();
   });
 });
