@@ -388,7 +388,7 @@ PR 7.5.1: 企微命令路径交互式卡片公共框架
 - buildResumeCard: text_notice + switch action_menu (no value → list semantics, PR 7.5 E1)
 - buildStopCard: text_notice + switch action_menu (no value)
 
-8 单测覆盖: 字段正确性 + sessionUuid 命名一致性 + value 注入 (PR 7.5 E2)
+**9 单测覆盖** (PR 7.5 M1 fix): 字段正确性 + sessionUuid 命名一致性 + value 注入 (PR 7.5 E2)
 - value 字段 SDK 类型无声明但运行时工作 (aibot-client.ts:168 实证)"
 ```
 
