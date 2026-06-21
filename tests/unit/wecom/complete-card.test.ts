@@ -33,21 +33,9 @@ describe('buildCompleteCard', () => {
     expect(card.main_title.desc).toBe('💡 点按下方按钮继续');
   });
 
-  it('generates unique task_id each call (ccdone- prefix + userId slice)', () => {
-    const c1 = buildCompleteCard({ userId: 'wmu_user_abc' }) as any;
-    const c2 = buildCompleteCard({ userId: 'wmu_user_abc' }) as any;
-    // task_id 不同 (Math.random() 后缀 + Date.now() 不同)
-    expect(c1.task_id).not.toBe(c2.task_id);
-    // 都是 ccdone- 开头, 含 userId 前 12 字符
-    expect(c1.task_id.startsWith('ccdone-')).toBe(true);
-    expect(c1.task_id).toContain('wmu_user_abc');
-  });
-
-  it('truncates task_id to <=128 bytes for userId safety', () => {
-    const longUserId = 'wmu_' + 'a'.repeat(200);
-    const card = buildCompleteCard({ userId: longUserId }) as any;
-    // userId slice(0, 12) 限制 → task_id 必 ≤ "ccdone-" + 13digits + "-" + 6rand + "-" + 12chars = ~37 字符
-    expect(card.task_id.length).toBeLessThanOrEqual(128);
+  it('PR 7.5.7: does NOT set task_id on card (avoids server 42014)', () => {
+    const card = buildCompleteCard({ userId: 'wmu_user_abc' }) as any;
+    expect(card.task_id).toBeUndefined();
   });
 
   it('exposes COMPLETE_CARD_MAIN_BUTTONS constant with expected keys', () => {
@@ -147,30 +135,6 @@ describe('PR 7.5.6: wire shape transformation', () => {
     expect(wire.action_menu.action_list[0].action_tag).toBeUndefined();
   });
 
-  it('send() sanitizes task_id (max 128 bytes, only [a-zA-Z0-9_-@])', async () => {
-    const card = WecomCardBuilder.buttonInteraction({
-      title: 't',
-      description: 'd',
-      buttons: [{ tag: 'k', text: 't' }],
-    });
-    // 注入一个超长 task_id (200 字符) + 含非法字符
-    (card as any).task_id = 'x'.repeat(200) + ':::' + 'bad-chars';
-    const capturedPayload: any[] = [];
-    const mockSdk = {
-      sendMessage: mock(async (_chatid: string, body: any) => {
-        capturedPayload.push(body);
-      }),
-    } as any;
-    const sender = new WecomCompleteCardSender(mockSdk);
-    await sender.send({ userId: 'test-user', template_card: card });
-    const wire = capturedPayload[0].template_card;
-    expect(wire.task_id).toBeDefined();
-    expect(wire.task_id.length).toBeLessThanOrEqual(128);
-    expect(wire.task_id).not.toContain(':');
-    // 只含合法字符
-    expect(wire.task_id).toMatch(/^[a-zA-Z0-9_\-@]+$/);
-  });
-
   it('sendViaReply() also applies wire transformation', async () => {
     const card = WecomCardBuilder.buttonInteraction({
       title: 't',
@@ -188,5 +152,72 @@ describe('PR 7.5.6: wire shape transformation', () => {
     await sender.sendViaReply(fakeFrame, { userId: 'u', chatId: 'u' }, card);
     const wire = capturedPayload[0];
     expect(wire.button_list.button[0]).toEqual({ text: '切换', key: 'switch', style: 2 });
+  });
+});
+
+describe('PR 7.5.7: no task_id + error normalization', () => {
+  it('send() does NOT include task_id in wire payload (avoids server 42014)', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't', description: 'd',
+      buttons: [{ tag: 'k', text: 't' }],
+    });
+    const capturedPayload: any[] = [];
+    const mockSdk = {
+      sendMessage: mock(async (_chatid: string, body: any) => {
+        capturedPayload.push(body);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    await sender.send({ userId: 'test-user', template_card: card });
+    const wire = capturedPayload[0].template_card;
+    expect(wire.task_id).toBeUndefined();
+  });
+
+  it('send() normalizes SDK frame error to Error instance (shows errcode/errmsg)', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't', description: 'd',
+      buttons: [{ tag: 'k', text: 't' }],
+    });
+    const mockSdk = {
+      sendMessage: mock(async () => {
+        // SDK 行为: server 拒收时 reject 原始 frame 对象
+        throw { errcode: 42014, errmsg: 'taskid has existed', hint: '1234567890' };
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    let thrownErr: any;
+    try {
+      await sender.send({ userId: 'test-user', template_card: card });
+    } catch (err) {
+      thrownErr = err;
+    }
+    expect(thrownErr).toBeInstanceOf(Error);
+    expect(thrownErr.message).toContain('errcode=42014');
+    expect(thrownErr.message).toContain('taskid has existed');
+    expect(thrownErr.message).not.toContain('[object Object]');
+  });
+
+  it('sendViaReply() normalizes SDK frame error to Error instance (shows errcode/errmsg)', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't', description: 'd',
+      buttons: [{ tag: 'k', text: 't' }],
+    });
+    const mockSdk = {
+      replyTemplateCard: mock(async () => {
+        throw { errcode: 42014, errmsg: 'taskid has existed', hint: '1234567890' };
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    const fakeFrame = { headers: { req_id: 'fake_req' } };
+    let thrownErr: any;
+    try {
+      await sender.sendViaReply(fakeFrame, { userId: 'u', chatId: 'u' }, card);
+    } catch (err) {
+      thrownErr = err;
+    }
+    expect(thrownErr).toBeInstanceOf(Error);
+    expect(thrownErr.message).toContain('replyTemplateCard');
+    expect(thrownErr.message).toContain('errcode=42014');
+    expect(thrownErr.message).not.toContain('[object Object]');
   });
 });

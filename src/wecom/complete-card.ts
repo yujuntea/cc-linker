@@ -71,19 +71,31 @@ function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
     };
   }
 
-  // 3. task_id: 限 128 字节 + 数字/字母/_-@ (跟 PR 7 genCompleteCardTaskId 对齐)
-  if (wire.task_id) {
-    const sanitized = String(wire.task_id)
-      .replace(/[^a-zA-Z0-9_\-@]/g, '')
-      .slice(0, 128);
-    if (sanitized.length === 0) {
-      delete wire.task_id;
-    } else {
-      wire.task_id = sanitized;
-    }
-  }
+  // PR 7.5.7: 移除 task_id sanitize — first-reply 模板卡不应带 task_id
+  //   PR 7 完成卡也错 (server errcode=42014), 只是 PR 7 没真机测过
 
   return wire as WecomTemplateCard;
+}
+
+/**
+ * PR 7.5.7: 标准化 SDK 错误为 Error 实例
+ *
+ * 背景: aibot SDK 的 WsManager.sendReply 在 server 返回 errcode!=0 时
+ *   reject 原始 frame 对象 ({errcode, errmsg, hint}), 不是 Error 实例.
+ *   上游 logger.error 用 `err instanceof Error ? err.message : String(err)`
+ *   只能看到 "[object Object]" — 失去诊断信息.
+ *
+ * 修法: 把 frame-style err 包成 Error, errcode/errmsg 拼到 message.
+ */
+function normalizeSdkError(err: unknown, op: string): Error {
+  if (err instanceof Error) return err;
+  if (typeof err === 'object' && err !== null) {
+    const frame = err as any;
+    return new Error(
+      `[wecom-complete-card] ${op} failed: errcode=${frame.errcode ?? '?'}, errmsg=${frame.errmsg ?? '?'}, hint=${frame.hint ?? '?'}`,
+    );
+  }
+  return new Error(`[wecom-complete-card] ${op} failed: ${String(err)}`);
 }
 
 export type CompleteCardContext = {
@@ -125,25 +137,12 @@ export const COMPLETE_CARD_ACTION_MENU: ReadonlyArray<{ tag: string; text: strin
 ];
 
 /**
- * PR 7.1: 生成 task_id (aibot SDK 字段, 用于 updateTemplateCard 关联)
- * 限制: 数字、字母、_-@，最长 128 字节
- * 格式: ccdone-{timestamp}-{rand}-{userId 前 12 字符}
- * PR 7.1 I-1: 用 Math.random() 替代 module-level counter — stateless,
- *   避免多实例 / 多 daemon 并发不安全 + 测试间状态泄露
- */
-function genCompleteCardTaskId(userId: string): string {
-  // PR 7.5.6: sanitize userId to only allowed chars (a-zA-Z0-9_-@), 防 userId 含 : 等非法字符触发 server 42014
-  const safeUserId = userId.replace(/[^a-zA-Z0-9_\-@]/g, '').slice(0, 12);
-  // 6 字符随机后缀 (base36), 保证唯一性 + stateless
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `ccdone-${Date.now()}-${rand}-${safeUserId}`.slice(0, 128);
-}
-
-/**
  * PR 7.1: 构造完成卡片
  * - 主卡 button_interaction (3 按钮)
  * - 右上角 action_menu (4 项复用现有 case)
- * - task_id 用于 updateTemplateCard 关联 (本 PR 不调 updateTemplateCard, 留扩展点)
+ *
+ * PR 7.5.7: 移除了 task_id 注入 (留扩展点注释也移除)
+ *   — first-reply 模板卡不应带 task_id
  */
 export function buildCompleteCard(ctx: CompleteCardContext): WecomTemplateCard {
   // 18 字符是主标题留 8 字符 'Claude 处理完成:' 前缀 + 18 字符 session 名（共 26 字符, 跟 SDK main_title.title 26 字上限对齐）
@@ -172,8 +171,10 @@ export function buildCompleteCard(ctx: CompleteCardContext): WecomTemplateCard {
     })),
   };
 
-  // 注入 task_id (aibot SDK 字段, 用 as any 因 card.ts 类型不含 task_id)
-  (card as any).task_id = genCompleteCardTaskId(ctx.userId);
+  // PR 7.5.7: 不再注入 task_id — first-reply 模板卡不应带 task_id
+  //   task_id 是 updateTemplateCard 关联已存在卡片用的, 不是 first reply 必填
+  //   真机 /list 测试发现带 task_id 触发 server errcode=42014
+  //   "taskid has existed or empty or exceed max len" (PR 7 完成卡也错, 只是 PR 7 没真机测过)
 
   return card;
 }
@@ -221,7 +222,13 @@ export class WecomCompleteCardSender {
     };
     // PR 7 final cleanup: 群聊场景下 chatId 优先 — 单聊 chatId === userId 无影响
     const receiveId = ctx.chatId ?? ctx.userId;
-    await this.sdk.sendMessage(receiveId, payload);
+    try {
+      await this.sdk.sendMessage(receiveId, payload);
+    } catch (err) {
+      // PR 7.5.7: SDK 的 sendReply 在 server 拒收时 reject 原始 frame 对象 (errcode/errmsg 字段),
+      //   不是 Error 实例. 标准化为 Error 让上层 instanceof Error 检查正常工作.
+      throw normalizeSdkError(err, 'sendMessage');
+    }
     const taskId = (wireCard as unknown as CompleteCardPayload).task_id;
     logger.info(`[wecom-complete-card] sent: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
   }
@@ -249,7 +256,12 @@ export class WecomCompleteCardSender {
     // PR 7.5.6: wire shape 转换 (同 send) — action_tag→key, action_title.text→text, button_type→style + task_id sanitize
     const wireCard = transformToWireShape(finalCard);
     // replyTemplateCard(frame, templateCard, feedback) — frame 必传, 第二参是 template_card 对象 (不是 wrapped body)
-    await this.sdk.replyTemplateCard(frame, wireCard as unknown as CompleteCardPayload);
+    try {
+      await this.sdk.replyTemplateCard(frame, wireCard as unknown as CompleteCardPayload);
+    } catch (err) {
+      // PR 7.5.7: 标准化 SDK frame-style err 为 Error 实例
+      throw normalizeSdkError(err, 'replyTemplateCard');
+    }
     const taskId = (wireCard as unknown as CompleteCardPayload).task_id;
     const receiveId = ctx.chatId ?? ctx.userId;
     logger.info(`[wecom-complete-card] sent via reply: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
