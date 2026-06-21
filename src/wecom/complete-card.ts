@@ -71,8 +71,16 @@ function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
     };
   }
 
-  // PR 7.5.7: 移除 task_id sanitize — first-reply 模板卡不应带 task_id
-  //   PR 7 完成卡也错 (server errcode=42014), 只是 PR 7 没真机测过
+  // PR 7.5.11: 重新加回 task_id (PR 7.5.7 删除的) — sendMessage 路径必须带 task_id
+  //   背景: PR 7.5.7 假设 task_id 不该发, 但 server 实际需要. PR 7.5.10 6 按钮限制也没解决
+  //   42014 "taskid has existed or empty or exceed max len" — task_id 缺失时 server 也拒收
+  //   replyWelcome 路径不受影响 (fresh req_id 来自 inboundFrame, server 单独关联)
+  //   验证: 给每张 first-reply 卡片生成唯一 task_id (短随机, 用 [a-zA-Z0-9_-@])
+  //   sendMessage 必须 task_id (server 端 taskid empty 拒收)
+  if (!wire.task_id) {
+    const rand = Math.random().toString(36).slice(2, 8);
+    wire.task_id = `wcli${Date.now()}${rand}`.slice(0, 64); // 限 64 字节, 短而唯一
+  }
 
   return wire as WecomTemplateCard;
 }

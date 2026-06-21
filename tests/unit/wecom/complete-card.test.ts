@@ -33,7 +33,7 @@ describe('buildCompleteCard', () => {
     expect(card.main_title.desc).toBe('💡 点按下方按钮继续');
   });
 
-  it('PR 7.5.7: does NOT set task_id on card (avoids server 42014)', () => {
+  it('PR 7.5.11: buildCompleteCard does NOT set task_id on card (sendViaReply/send injects fresh one)', () => {
     const card = buildCompleteCard({ userId: 'wmu_user_abc' }) as any;
     expect(card.task_id).toBeUndefined();
   });
@@ -156,8 +156,8 @@ describe('PR 7.5.6: wire shape transformation', () => {
   });
 });
 
-describe('PR 7.5.7: no task_id + error normalization', () => {
-  it('send() does NOT include task_id in wire payload (avoids server 42014)', async () => {
+describe('PR 7.5.11: add task_id back to wire payload + error normalization', () => {
+  it('send() INCLUDES fresh task_id in wire payload (server requires task_id for sendMessage)', async () => {
     const card = WecomCardBuilder.buttonInteraction({
       title: 't', description: 'd',
       buttons: [{ tag: 'k', text: 't' }],
@@ -171,7 +171,27 @@ describe('PR 7.5.7: no task_id + error normalization', () => {
     const sender = new WecomCompleteCardSender(mockSdk);
     await sender.send({ userId: 'test-user', template_card: card });
     const wire = capturedPayload[0].template_card;
-    expect(wire.task_id).toBeUndefined();
+    // PR 7.5.11: sendMessage 路径必须带 task_id (server 42014 "taskid empty" 拒收)
+    expect(wire.task_id).toBeDefined();
+    expect(wire.task_id).toMatch(/^wcli\d+[a-z0-9]+$/);
+    expect(wire.task_id.length).toBeLessThanOrEqual(64);
+  });
+
+  it('send() generates unique task_id per call (no collision risk on retries)', async () => {
+    const card = WecomCardBuilder.buttonInteraction({
+      title: 't', description: 'd',
+      buttons: [{ tag: 'k', text: 't' }],
+    });
+    const capturedPayload: any[] = [];
+    const mockSdk = {
+      sendMessage: mock(async (_chatid: string, body: any) => {
+        capturedPayload.push(body);
+      }),
+    } as any;
+    const sender = new WecomCompleteCardSender(mockSdk);
+    await sender.send({ userId: 'u1', template_card: card });
+    await sender.send({ userId: 'u2', template_card: card });
+    expect(capturedPayload[0].template_card.task_id).not.toBe(capturedPayload[1].template_card.task_id);
   });
 
   it('send() normalizes SDK frame error to Error instance (shows errcode/errmsg)', async () => {
