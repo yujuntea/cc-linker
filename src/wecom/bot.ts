@@ -356,10 +356,20 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.17: /list 同步直发 — 终极 fallback: 用 replyStream 推卡片化 markdown.
-   * 历史: PR 7.5.16 用 replyTemplateCard → errcode=40016 (server 拒收 first-reply template_card).
-   * 修法: 把 list 渲染为带结构化标签的 markdown (👉 marker + /switch <uuid> 操作指引),
-   *   走 replyStream(finish=true) 一次推完.
+   * PR 7.5.19: /list 同步直发 — 改进 markdown 卡片化渲染.
+   *
+   * 历史:
+   *   PR 7.5.17: 上一版 markdown 把 10 sessions 挤在一起, 没分隔
+   *     → 用户反馈 "sessions not visually separated" + "/switch /resume 命令难以 copy".
+   *   PR 7.5.18: 探索过更激进的卡片方案 (numbered list + nested bullet), 仍不够清晰.
+   *
+   * 修法 (PR 7.5.19):
+   *   - 每 session 独立 block, ━━━━ horizontal rule 分隔
+   *   - 操作命令用 ``` code block ``` 包裹, 用户长按整块选中 copy
+   *   - metadata 用 emoji 图标 (📁 path, 🕐 time, 💬 msgs)
+   *   - 当前 session ⭐ **当前 session** 标签
+   *   - 编号 1. 2. 3. 方便定位
+   *   - 顶部加使用提示 (复制 code block 命令到输入框)
    */
   private async _syncHandleList(msg: PlatformMessage): Promise<boolean> {
     if (!this.registryManager) {
@@ -373,6 +383,8 @@ export class WecomBot {
         .sort(([_, a], [__, b]) => (b.last_active ?? '').localeCompare(a.last_active ?? ''))
         .slice(0, 10);
       const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
+      const currentEntry = this.userManager.getEntry(msg.userId);
+      const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
 
       if (activeEntries.length === 0) {
         const ok = await this._syncHandleMarkdown(msg, '📭 当前无 active session');
@@ -382,28 +394,40 @@ export class WecomBot {
         return ok;
       }
 
-      // Build card-like markdown with structured labels (模仿飞书 buildListCard 风格)
-      const currentEntry = this.userManager.getEntry(msg.userId);
-      const currentUuid = currentEntry?.type === 'session' ? currentEntry.sessionUuid : null;
-
       const lines: string[] = [];
       lines.push(`📋 **活跃 sessions (${activeEntries.length}${totalActive > 10 ? '+' : ''})**`);
       lines.push('');
-      lines.push('💡 _企微 SDK 暂不支持 first-reply template_card (PR 7.5.16 调研确认), 用 markdown 卡片化渲染_');
+      lines.push('💡 _复制下方 ⌨️ code block 命令到输入框即可切换/续聊_');
       lines.push('');
 
-      for (const [uuid, s] of activeEntries) {
-        const marker = uuid === currentUuid ? '👉' : '　';
-        const title = (s.title ?? '(无标题)').slice(0, 18);
-        const cwd = s.cwd ? ` \`${s.cwd}\`` : '';
-        const msgs = s.message_count != null ? ` (${s.message_count} msgs)` : '';
-        const lastActive = s.last_active ? ` _${s.last_active.slice(0, 16)}_` : '';
-        lines.push(`${marker} **${title}**${msgs}${cwd}${lastActive}`);
-        lines.push(`   \`${uuid.slice(0, 8)}…\``);
-        lines.push(`   操作: \`/switch ${uuid.slice(0, 8)}\` 或 \`/resume ${uuid.slice(0, 8)}\``);
-      }
+      const SEP = '━━━━━━━━━━━━━━━━━━━━';
+
+      activeEntries.forEach(([uuid, s], index) => {
+        const isCurrent = uuid === currentUuid;
+        const title = (s.title ?? '(无标题)').slice(0, 24);
+        const cwd = s.cwd ? s.cwd : '(无 cwd)';
+        const msgs = s.message_count != null ? s.message_count : 0;
+        const lastActive = s.last_active ? s.last_active.slice(0, 16) : '?';
+        const uuidShort = uuid.slice(0, 8);
+
+        lines.push(SEP);
+        lines.push('');
+        const currentBadge = isCurrent ? '  ⭐ **当前 session**' : '';
+        lines.push(`**${index + 1}.** ${title} (💬 ${msgs} msgs)${currentBadge}`);
+        lines.push(`   📁 \`${cwd}\``);
+        lines.push(`   🕐 \`${lastActive}\``);
+        lines.push('');
+        // Code block 让用户长按可整块选中
+        lines.push('```');
+        lines.push(`/switch ${uuidShort}`);
+        lines.push(`/resume ${uuidShort}`);
+        lines.push('```');
+        lines.push('');
+      });
+
+      lines.push(SEP);
       lines.push('');
-      lines.push(`_(共 ${totalActive} 个, 只显示前 ${activeEntries.length}; 续聊用 \`/switch <uuid>\`)_`);
+      lines.push(`_(共 ${totalActive} 个, 只显示前 ${activeEntries.length})_`);
 
       const ok = await this._syncHandleMarkdown(msg, lines.join('\n'));
       if (ok) {

@@ -233,6 +233,61 @@ describe('PR 7.5.17: handleCommandSynchronously', () => {
 
       expect(handled).toBe(false);
     });
+
+    it('PR 7.5.19: /list markdown 有 visual separators + copyable code blocks + current badge', async () => {
+      const registryManager = {
+        sessions: {
+          'uuid-current-1234': { status: 'active', title: 'Current Session', message_count: 100, last_active: '2026-06-21T13:00:00Z', cwd: '/tmp/current' },
+          'uuid-other-1111': { status: 'active', title: 'Other Session 1', message_count: 50, last_active: '2026-06-21T12:00:00Z', cwd: '/tmp/other1' },
+          'uuid-other-2222': { status: 'active', title: 'Other Session 2', message_count: 25, last_active: '2026-06-21T11:00:00Z', cwd: '/tmp/other2' },
+        },
+      };
+      (bot as any).registryManager = registryManager;
+      // Mark uuid-current-1234 as user's current session
+      mockUserManager.getEntry = mock((_uid: string) => ({ type: 'session', sessionUuid: 'uuid-current-1234' }));
+
+      const handled = await (bot as any).handleCommandSynchronously({
+        platform: 'wecom',
+        userId: 'wmu_user',
+        chatType: 'p2p',
+        chatId: 'wmu_user',
+        messageId: 'msg-1',
+        text: '/list',
+        timestamp: Date.now(),
+        raw: {},
+        inboundFrame: { headers: { req_id: 'r1' } },
+      });
+
+      expect(handled).toBe(true);
+      expect(mockClient.sdk.replyStream).toHaveBeenCalledTimes(1);
+      const markdown = mockClient.sdk.replyStream.mock.calls[0][2] as string;
+
+      // 1. Visual separator (horizontal rule)
+      expect(markdown).toContain('━━━━━━━━━━━━━━━━━━━━');
+
+      // 2. Numbered sessions (1, 2, 3)
+      expect(markdown).toContain('**1.**');
+      expect(markdown).toContain('**2.**');
+      expect(markdown).toContain('**3.**');
+
+      // 3. Current session badge (⭐ 当前 session)
+      expect(markdown).toContain('⭐ **当前 session**');
+
+      // 4. Code blocks for easy copy (triple backticks)
+      expect(markdown).toContain('```');
+      // uuid.slice(0, 8) of uuid-current-1234 → "uuid-cur"
+      expect(markdown).toContain('/switch uuid-cur');
+      // uuid.slice(0, 8) of others → "uuid-oth"
+      expect(markdown).toContain('/resume uuid-oth');
+
+      // 5. Metadata with emojis
+      expect(markdown).toContain('💬');
+      expect(markdown).toContain('📁');
+      expect(markdown).toContain('🕐');
+
+      // 6. Footer with total count
+      expect(markdown).toContain('共 3 个');
+    });
   });
 
   describe('/status /help /whoami 同步直发 (replyStream markdown)', () => {
