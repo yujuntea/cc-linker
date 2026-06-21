@@ -13,7 +13,7 @@ import { WecomStreamUpdater } from './stream-updater';
 import { WecomUserManager } from './mapping';
 import { WecomCardBuilder, type TemplateCard } from './card';
 import { WecomImageHandler } from './image-handler';
-import { WecomCompleteCardSender, buildCompleteCard } from './complete-card';
+import { WecomCompleteCardSender, buildCompleteCard, transformToWireShape } from './complete-card';
 import {
   buildListCard,
   buildDirListCard,
@@ -264,21 +264,28 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.15: 命令同步直发 — 在 onMessage 内 (5s req_id 窗口内) 直接 replyWelcome,
-   *   不走 SpoolQueue dispatch.
+   * PR 7.5.15 → PR 7.5.16: 命令同步直发 — 在 onMessage 内 (5s req_id 窗口内) 直接
+   *   replyTemplateCard / reply, 不走 SpoolQueue dispatch.
    *
-   * 根因 (经过 14 个 PR 都失败, 真因在 PR 7.5.15 锁定):
+   * 根因演进 (经过 15 个 PR 锁定, PR 7.5.16 终态):
    *   aibot server 用 rendezvous 协议 — inbound event 的 req_id 5s 后过期.
    *   cc-linker SpoolQueue dispatch loop 1-3s + handleCommand 处理时间,
    *   到 sendViaReply 时 req_id 已失效 → server 拒收 (errcode=846605).
-   *   markdown fallback 一直能用 sendMessage 是因为 sendMessage 自己生成 req_id.
-   *   修法: 在 onMessage (fresh inbound frame) 同步调 replyWelcome.
+   *
+   *   PR 7.5.15 修法: 在 onMessage (fresh inbound frame) 同步调 replyWelcome.
+   *     仍失败 (errcode=846605) — SDK 文档明确 replyWelcome 仅 enter_chat 事件用,
+   *     不能用于普通 text 消息 (aibot_msg_callback).
+   *
+   *   PR 7.5.16 修法: text 消息 sync reply 改用 replyTemplateCard (template_card 卡片)
+   *     或 reply (markdown/text) — 都走 WsCmd.RESPONSE = 'aibot_respond_msg' 协议,
+   *     跟 replyStream 同协议. replyWelcome 走 WsCmd.RESPONSE_WELCOME =
+   *     'aibot_respond_welcome_msg', 仅 enter_chat 事件能调.
    *
    * 支持范围:
-   * - /list — 只读 in-memory registryManager.sessions, 同步可处理 (PR 7.5.15 first cut)
-   * - 后续可扩展 /model (providerManager.list 也 in-memory, 同步)
-   *   /status /whoami /help (string 直接返回) /new /switch 等需写 user-mapping 的
-   *   → 仍走 enqueue 路径 (并发安全, SpoolQueue 串行)
+   * - /list — 只读 in-memory registryManager.sessions, 同步可处理, 走 replyTemplateCard
+   * - /status /help /whoami — 同步返回 string, 走 reply (markdown)
+   * - /model /listdir /switch /resume /new /agents /stop /cancel
+   *   → 需要写 user-mapping 或读 cwd 等, 走 enqueue 路径
    *
    * 返回:
    * - true → 已同步处理, 调用方应跳过 enqueue (避免 dispatch 重复推卡)
@@ -316,9 +323,15 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.15: /list 同步直发
-   * 读 registryManager.sessions (in-memory), buildListCard, sendViaReply.
-   * sendViaReply 内 replyWelcome (fresh req_id) → sendMessage fallback.
+   * PR 7.5.16: /list 同步直发 (FINAL fix)
+   * 读 registryManager.sessions (in-memory), buildListCard, transformToWireShape,
+   *   replyTemplateCard (走 WsCmd.RESPONSE = aibot_respond_msg, 配 text 消息 req_id).
+   *
+   * 历史: PR 7.5.15 用 sendViaReply → replyWelcome (WsCmd.RESPONSE_WELCOME),
+   *   仍 errcode=846605 — SDK 文档明确 replyWelcome 仅 enter_chat 事件能调.
+   *   PR 7.5.16: 直接调 client.sdk.replyTemplateCard, 走 WsCmd.RESPONSE 协议.
+   *   (sendViaReply 路径暂未动 — button callback 等场景需保留 replyWelcome fallback.
+   *    后续 PR 可统一收口 sendViaReply 也走 replyTemplateCard.)
    */
   private async _syncHandleList(msg: PlatformMessage): Promise<boolean> {
     if (!this.registryManager) {
@@ -340,13 +353,11 @@ export class WecomBot {
       const totalActive = Object.values(allActive).filter(s => s.status === 'active').length;
 
       const card = buildListCard({ entries: activeEntries, totalActive });
-      const receiveId = msg.chatId || msg.userId;
-      await this.wecomCompleteCardSender.sendViaReply(
-        msg.inboundFrame,
-        { userId: msg.userId, chatId: receiveId },
-        card,
-      );
-      logger.info(`[wecom-bot] sync /list: replyWelcome ok (entries=${activeEntries.length}, totalActive=${totalActive})`);
+      const wireCard = transformToWireShape(card);
+      // PR 7.5.16: replyTemplateCard 走 WsCmd.RESPONSE (aibot_respond_msg) — 配 text 消息 req_id.
+      //   replyWelcome 走 WsCmd.RESPONSE_WELCOME (aibot_respond_welcome_msg) — 仅 enter_chat 事件.
+      await (this.client.sdk as any).replyTemplateCard(msg.inboundFrame, wireCard);
+      logger.info(`[wecom-bot] sync /list: replyTemplateCard ok (entries=${activeEntries.length}, totalActive=${totalActive})`);
       return true;
     } catch (err) {
       logger.warn(`[wecom-bot] sync /list failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
@@ -355,17 +366,19 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.15: /status 同步直发 (无卡片, 纯 markdown 文本).
-   * markdown 用 replyWelcome (fresh req_id, 走 inbound frame, 一次性 ack).
+   * PR 7.5.16: /status 同步直发 (FINAL fix).
+   * markdown 文本用 reply (WsCmd.RESPONSE = aibot_respond_msg), 配 text 消息 req_id.
+   *   历史: PR 7.5.15 用 replyWelcome (WsCmd.RESPONSE_WELCOME) 仍 errcode=846605 —
+   *     replyWelcome 仅 enter_chat 事件能调, 不能用于 aibot_msg_callback text 消息.
    */
   private async _syncHandleStatus(msg: PlatformMessage): Promise<boolean> {
     try {
       const text = this.handleCommandStatus(msg.userId);
-      await this.client.sdk.replyWelcome(msg.inboundFrame, {
+      await this.client.sdk.reply(msg.inboundFrame, {
         msgtype: 'markdown',
         markdown: { content: text },
       } as any);
-      logger.info(`[wecom-bot] sync /status: replyWelcome ok`);
+      logger.info(`[wecom-bot] sync /status: reply (markdown) ok`);
       return true;
     } catch (err) {
       logger.warn(`[wecom-bot] sync /status failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
@@ -374,16 +387,16 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.15: /help 同步直发
+   * PR 7.5.16: /help 同步直发 (FINAL fix)
    */
   private async _syncHandleHelp(msg: PlatformMessage): Promise<boolean> {
     try {
       const text = this.handleCommandHelp();
-      await this.client.sdk.replyWelcome(msg.inboundFrame, {
+      await this.client.sdk.reply(msg.inboundFrame, {
         msgtype: 'markdown',
         markdown: { content: text },
       } as any);
-      logger.info(`[wecom-bot] sync /help: replyWelcome ok`);
+      logger.info(`[wecom-bot] sync /help: reply (markdown) ok`);
       return true;
     } catch (err) {
       logger.warn(`[wecom-bot] sync /help failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
@@ -392,16 +405,16 @@ export class WecomBot {
   }
 
   /**
-   * PR 7.5.15: /whoami 同步直发
+   * PR 7.5.16: /whoami 同步直发 (FINAL fix)
    */
   private async _syncHandleWhoami(msg: PlatformMessage): Promise<boolean> {
     try {
       const text = this.handleCommandWhoami(msg.userId);
-      await this.client.sdk.replyWelcome(msg.inboundFrame, {
+      await this.client.sdk.reply(msg.inboundFrame, {
         msgtype: 'markdown',
         markdown: { content: text },
       } as any);
-      logger.info(`[wecom-bot] sync /whoami: replyWelcome ok`);
+      logger.info(`[wecom-bot] sync /whoami: reply (markdown) ok`);
       return true;
     } catch (err) {
       logger.warn(`[wecom-bot] sync /whoami failed: ${err instanceof Error ? err.message : String(err)}, fall through to enqueue`);
@@ -428,7 +441,8 @@ export class WecomBot {
       const platformMsg = aibotMessageToPlatform(event);
       logger.info(`[wecom-bot] platformMsg: ${JSON.stringify(platformMsg)}`);
 
-      // PR 7.5.15: 命令同步直发 — 在 onMessage 内同步调用 replyWelcome
+      // PR 7.5.15 → PR 7.5.16: 命令同步直发 — 在 onMessage 内同步调
+      //   replyTemplateCard (/list) 或 reply (/status /help /whoami).
       //   拿到 inbound 5s 窗口, 不走 SpoolQueue (1-3s dispatch) → 不超时.
       //   只支持同步可处理的命令 (/list 读 in-memory registry);
       //   异步命令 (handleCommandListDir 等) 返回 false 走原 enqueue 路径.

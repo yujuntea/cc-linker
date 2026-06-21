@@ -53,7 +53,7 @@ function transformActionMenuItemToWire(item: any): WireActionMenuItem {
   };
 }
 
-function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
+export function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
   const wire: any = { ...card };
 
   // 1. button_list.button[]
