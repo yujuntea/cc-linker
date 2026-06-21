@@ -1,7 +1,7 @@
 # cc-linker 企微侧"命令路径交互式卡片"设计
 
 **日期：** 2026-06-21
-**版本：** v1.1（review 8 处修正）
+**版本：** v1.2（最终 review 2 处追加，共 10 处修正）
 **状态：** 待评审
 **作者：** Claude Code（brainstorming + 用户拍板 + Claude review 修复）
 **范围：** 企微智能机器人命令响应加交互式卡片（button_interaction + text_notice），让用户点按钮免去再打字
@@ -200,7 +200,7 @@ PR 7 完成卡 (流式路径)
 **字段定义**：
 ```typescript
 type ListCardContext = {
-  entries: Array<{ uuid: string; title: string; messageCount: number; lastActive: string }>;
+  entries: Array<{ sessionUuid: string; title: string; messageCount: number; lastActive: string }>;
   totalActive: number;
 };
 
@@ -208,9 +208,9 @@ export function buildListCard(ctx: ListCardContext): WecomTemplateCard {
   const buttons: TemplateCardButton[] = [];
   for (const e of ctx.entries) {
     const switchBtn = { text: '🔄 切换', key: 'switch' };
-    (switchBtn as any).value = { sessionUuid: e.uuid };  // PR 7.5 E2: SDK 类型无 value, 运行时注入
+    (switchBtn as any).value = { sessionUuid: e.sessionUuid };  // PR 7.5 E2: SDK 类型无 value, 运行时注入
     const resumeBtn = { text: '📖 恢复', key: 'resume' };
-    (resumeBtn as any).value = { sessionUuid: e.uuid };
+    (resumeBtn as any).value = { sessionUuid: e.sessionUuid };
     buttons.push(switchBtn, resumeBtn);
   }
   return WecomCardBuilder.buttonInteraction({
@@ -347,12 +347,12 @@ export function buildAgentsRefreshCard(ctx: AgentsCardContext): WecomTemplateCar
 
 **字段定义**：
 ```typescript
-type ResumeCardContext = { uuid: string };
+type ResumeCardContext = { sessionUuid: string };
 
 export function buildResumeCard(ctx: ResumeCardContext): WecomTemplateCard {
   return WecomCardBuilder.textNotice({
     title: `✅ Session 已 touch`,
-    content: `uuid: ${ctx.uuid.slice(0, 8)}...`,
+    content: `uuid: ${ctx.sessionUuid.slice(0, 8)}...`,
     actionMenu: [{ tag: 'switch', text: '📂 切换别的 session' }],
   });
 }
@@ -436,37 +436,69 @@ case 'switch': {
 
 ### 5.3 新增依赖注入（PR 7.5 E4 修正：实际实现，不只是注入）
 
+**架构挑战**：现有 `handleCommand` 返回 markdown string，由 `handleClaimed` 末尾统一 `sendMessage(responseText)`。但 PR 7.5 需要**推卡片（template_card msgtype）**，不是 markdown。
+
+**修法**：把"无 alias 时显示 model 选择卡"逻辑**提到 `handleCommand` case 'model' 入口**（不在 handleCommandModel 内部）：
+
 ```typescript
-// WecomBotConfig 新增字段
-providerManager?: ProviderManager;
+// handleCommand case 'model' (bot.ts 现有 switch case):
+case 'model': {
+  if (parsed.args.length === 0 || !parsed.args[0]) {
+    // PR 7.5: 无 alias 时推 model 选择卡 (不走 handleCommandModel, 直接走 builder + sender)
+    const providers = this.providerManager.list();  // 注入后可用
+    const currentAlias = this.userManager.getEntry(msg.userId)?.type === 'session'
+      ? this.userManager.getEntry(msg.userId)?.defaultProvider
+      : undefined;
+    const card = buildModelCard({ providers, currentAlias });
+    await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+    this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+    return;
+  }
+  // PR 7.5: 有 alias, 走 handleCommandModel 实际实现 user-mapping entry.defaultProvider
+  responseText = await this.handleCommandModel(msg.userId, parsed.args);
+  break;
+}
+```
 
-// 构造器注入
-this.providerManager = config.providerManager;
+**handleCommandModel 改造**（PR 7.5.1 集成 ProviderManager）：
 
-// PR 7.5.1 关键: 改写 handleCommandModel 实际集成 ProviderManager
+```typescript
 private async handleCommandModel(userId: string, args: string[]): Promise<string> {
   if (args.length === 0 || !args[0]) {
-    // PR 7.5: 无 alias 时返回 ModelCardContext 给 buildModelCard 用
-    // 不再返回 markdown "用法" 错误, 而是 return 一个 marker 让 handleCommand 调用 buildModelCard
-    // 实际实现: handleCommand 检测到 alias 空 + /model 时调 builder 路径
-    return '__BUILD_MODEL_CARD__';  // signal handleCommand 调 buildModelCard
+    return '❌ 用法: /model <model-alias>';  // 保留作为 case 'model' 没经过 builder 路径时的兜底
   }
   if (args[0] === '--clear') {
-    // PR 7.5: 清除 defaultProvider
+    // PR 7.5: 清除 entry.defaultProvider (通过 user-mapping)
+    const entry = this.userManager.getEntry(userId);
+    if (entry?.type === 'session') {
+      // TODO: PR 7.5.1 加 userManager.clearDefaultProvider 方法
+    }
     return '✅ 已清除默认模型';
   }
   const alias = args[0];
   // PR 7.5: 实际写 user-mapping entry.defaultProvider
-  const entry = this.userManager.getEntry(userId);
-  if (entry?.type === 'session') {
-    // session 已建立: 改 user-mapping
-    // ...
-  }
-  return `✅ 默认模型已设置为 ${alias}`;
+  //   TODO: PR 7.5.1 加 userManager.setDefaultProvider 方法
+  //   现在 PR 5 stub 只 log + 返回 "已设置" 占位 markdown
+  return `✅ 默认模型已设置为 ${alias}\n\n_(注: PR 7.5 临时实现, 持久化推后续 PR)_`;
 }
 ```
 
-> **PR 7.5 E4 强调**：飞书侧 `feishu/bot.ts:3148` `providerManager.list()` 已 work，企微侧**完全没实现**（bot.ts:773-779 注释明确 "model 持久化推 PR 6+"）。PR 7.5.1 必须实际写 user-mapping 集成 + ProviderManager，**不只是注入**。
+**WecomBotConfig + 构造器**：
+
+```typescript
+// WecomBotConfig 新增字段
+providerManager?: ProviderManager;
+wecomCompleteCardSender?: WecomCompleteCardSender;  // PR 7 已注入 sender, 提为构造器可选
+
+// 构造器注入
+this.providerManager = config.providerManager ?? new ProviderManager();
+this.wecomCompleteCardSender = config.wecomCompleteCardSender ?? new WecomCompleteCardSender(this.client.sdk);
+```
+
+> **PR 7.5 E4 强调**：飞书侧 `feishu/bot.ts:3148` `providerManager.list()` 已 work，企微侧**完全没实现**（bot.ts:773-779 注释明确 "model 持久化推 PR 6+"）。PR 7.5.1 必须：
+> 1. 实现 `userManager.setDefaultProvider(userId, alias)` + `clearDefaultProvider(userId)`
+> 2. 实现 ProviderManager 集成进 handleCommandModel
+> 3. case 'model' 无 alias 时走 builder 路径（不调 handleCommandModel）
 
 ---
 
