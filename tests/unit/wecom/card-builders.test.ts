@@ -16,7 +16,7 @@ import {
 import type { WecomTemplateCard } from '../../../src/wecom/card';
 
 describe('buildListCard', () => {
-  it('builds button_interaction with 1 switch button per entry + action_menu (PR 7.5.10: SDK 6-button limit)', () => {
+  it('builds button_interaction with 1 switch button (first entry only) + NO action_menu (PR 7.5.12: 40016 isolation)', () => {
     const ctx: ListCardContext = {
       entries: [
         { sessionUuid: 'uuid-1', title: 'Analyze AI coding attribution', messageCount: 768, lastActive: '2026-06-21T13:24:00Z' },
@@ -27,16 +27,15 @@ describe('buildListCard', () => {
     const card: WecomTemplateCard = buildListCard(ctx);
     expect(card.card_type).toBe('button_interaction');
     if (card.card_type !== 'button_interaction') throw new Error('unreachable');
-    // PR 7.5.10: 每个 session 1 个 button (switch) — 不再 2 buttons/session
-    expect(card.button_list.button.length).toBe(2);  // 2 entries × 1 button
+    // PR 7.5.12: 最小化 — 只 1 button (即使多 entries), 验证最小 wire shape 能过 server
+    expect(card.button_list.button.length).toBe(1);
     expect(card.button_list.button[0].action_tag).toBe('switch');
     expect((card.button_list.button[0] as any).value?.sessionUuid).toBe('uuid-1');
-    expect(card.button_list.button[1].action_tag).toBe('switch');
-    expect((card.button_list.button[1] as any).value?.sessionUuid).toBe('uuid-2');
     // 按钮文本含 title 前缀 (makeButton 接任意文本)
     expect(card.button_list.button[0].action_title.text).toContain('Analyze');
-    expect(card.main_title.title).toContain('2/777');
-    expect(card.action_menu?.action_list[0].action_tag).toBe('list-refresh');
+    expect(card.main_title.title).toContain('1/777');
+    // PR 7.5.12: action_menu 暂时不注入 — 隔离 40016 真因
+    expect((card as any).action_menu).toBeUndefined();
   });
 
   it('handles empty entries (0 buttons + 📭 desc)', () => {
@@ -47,7 +46,7 @@ describe('buildListCard', () => {
     expect(card.main_title.desc).toContain('📭');
   });
 
-  it('PR 7.5.10: limits to 6 buttons total (aibot SDK TemplateCardButton[] max) + truncation desc', () => {
+  it('PR 7.5.12: limits to 1 button (server 40016 isolation) + truncation desc', () => {
     const ctx: ListCardContext = {
       entries: Array.from({ length: 10 }, (_, i) => ({
         sessionUuid: `uuid-${i}`,
@@ -60,12 +59,12 @@ describe('buildListCard', () => {
     const card = buildListCard(ctx);
     expect(card.card_type).toBe('button_interaction');
     if (card.card_type !== 'button_interaction') throw new Error('unreachable');
-    // SDK 上限: 6 buttons (api.d.ts:344 '按钮列表, 列表长度不超过 6')
-    expect(card.button_list.button.length).toBe(6);
+    // PR 7.5.12: 1 button 隔离 (不是 SDK 文档 6 上限, 服务端可能更严)
+    expect(card.button_list.button.length).toBe(1);
     // desc 提示用户还有未显示的
-    expect(card.main_title.desc).toContain('还有 4 个未显示');
-    // 截断但 totalActive 仍报告总数 (title 显示 6/778)
-    expect(card.main_title.title).toContain('6/778');
+    expect(card.main_title.desc).toContain('还有 9 个未显示');
+    // 截断但 totalActive 仍报告总数 (title 显示 1/778)
+    expect(card.main_title.title).toContain('1/778');
   });
 });
 

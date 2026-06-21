@@ -2713,18 +2713,17 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
     expect(cardSender.send).toHaveBeenCalledTimes(1);
     expect(capturedCard).toBeDefined();
     expect(capturedCard.card_type).toBe('button_interaction');
-    // PR 7.5.10: 2 个 active session × 1 按钮 (switch) = 2 buttons (SDK 限 6 按钮)
-    expect(capturedCard.button_list.button.length).toBe(2);
-    // 按钮 value 注入 uuid
+    // PR 7.5.12: 最小化 — 只 1 button (first entry only) 隔离 40016
+    expect(capturedCard.button_list.button.length).toBe(1);
+    // 按钮 value 注入 uuid (first entry)
     const btnJson = JSON.stringify(capturedCard);
     expect(btnJson).toContain('uuid-aaaa-bbbb-cccc-dddd-1111');
-    expect(btnJson).toContain('uuid-eeee-ffff-gggg-hhhh-2222');
+    // PR 7.5.12: 第 2 个 session 不渲染 (1 button 截断)
+    expect(btnJson).not.toContain('uuid-eeee-ffff-gggg-hhhh-2222');
     // archived 不出现
     expect(btnJson).not.toContain('uuid-archived-3333');
-    // 当前 user session 按钮标 (当前) — 通过 makeButton 文本含 👉 (mock _renderListCard 行为)
-    // 实际上 buildListCard 不标 👉, 标 🎯 (provider 当前); 这里是 switch/resume button, 不标当前.
-    // 验证: 卡片 main_title 含数量
-    expect(capturedCard.main_title.title).toContain('2');
+    // 验证: 卡片 main_title 含数量 (1/N)
+    expect(capturedCard.main_title.title).toContain('1');
     // 2. sendMessage 没被调 (不调通用 markdown)
     expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
     // 3. markDone 被调
@@ -3776,13 +3775,13 @@ describe('PR 7.5.2: /list + /listdir + /model 卡片化 + 3 new case', () => {
     };
   }
 
-  it('/list → sender.send 收到 card with 6 buttons (10 sessions × 1, SDK 限 6 按钮 PR 7.5.10)', async () => {
+  it('/list → sender.send 收到 card with 1 button (PR 7.5.12: 40016 isolation, 最小化 wire shape)', async () => {
     await bot.__test_handleCommand(makeCmdMsg('/list', 'msg_list_card'));
     expect(cardSendCalls.length).toBe(1);
     const sentCard = cardSendCalls[0].template_card;
     expect(sentCard.card_type).toBe('button_interaction');
-    // PR 7.5.10: SDK TemplateCardButton[] 上限 6 (api.d.ts:344), buildListCard 限前 6 sessions × 1 button
-    expect(sentCard.button_list.button.length).toBe(6);  // SDK max
+    // PR 7.5.12: 6 按钮 + action_menu 真机仍 40016, 临时改 1 按钮 + 无 action_menu 隔离真因
+    expect(sentCard.button_list.button.length).toBe(1);
   });
 
   it('/listdir /tmp → sender.send 收到 card with dir buttons (depends on /tmp contents)', async () => {
@@ -4155,8 +4154,8 @@ describe('PR 7.5.5 hotfix: replyWelcome for first-reply card', () => {
     // 第二参是 wrapped body {msgtype: 'template_card', template_card: ...}
     expect(callArgs[1].msgtype).toBe('template_card');
     expect(callArgs[1].template_card.card_type).toBe('button_interaction');
-    // PR 7.5.10: SDK 限 6 buttons (api.d.ts:344)
-    expect(callArgs[1].template_card.button_list.button.length).toBe(6);
+    // PR 7.5.12: 最小化 — 1 button 隔离 40016
+    expect(callArgs[1].template_card.button_list.button.length).toBe(1);
   });
 
   it('PR 7.5.9: /list → replyWelcome fails 846605 → fallback to sendMessage', async () => {
@@ -4172,8 +4171,8 @@ describe('PR 7.5.5 hotfix: replyWelcome for first-reply card', () => {
     const sentBody = mockClient.sdk.sendMessage.mock.calls[0][1];
     expect(sentBody.msgtype).toBe('template_card');
     expect(sentBody.template_card.card_type).toBe('button_interaction');
-    // PR 7.5.10: SDK 限 6 buttons (api.d.ts:344)
-    expect(sentBody.template_card.button_list.button.length).toBe(6);
+    // PR 7.5.12: 1 button 隔离
+    expect(sentBody.template_card.button_list.button.length).toBe(1);
   });
 
   it('PR 7.5.9: /list → replyWelcome succeeds → sendMessage NOT called', async () => {

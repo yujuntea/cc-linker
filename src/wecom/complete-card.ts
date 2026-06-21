@@ -82,6 +82,18 @@ function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
     wire.task_id = `wcli${Date.now()}${rand}`.slice(0, 64); // 限 64 字节, 短而唯一
   }
 
+  // PR 7.5.12: 诊断日志 — 真机 40016 后需看真发的 JSON 形状 (button count / action_menu count / task_id)
+  //   40016 "invalid button size" 真根因可能不是 button 数量, 而是 action_menu 算 button, 或 button.text 超 10 字
+  //   用 info 级 (真机部署后我们 grep log 立即看), 不打完整 JSON (避免日志噪音)
+  const btnCount = (wire.button_list?.button ?? []).length;
+  const amCount = ((wire as any).action_menu?.action_list ?? []).length;
+  const btnTexts = (wire.button_list?.button ?? []).map((b: any) => `${b.text}(${(b.text ?? '').length})`).join(',');
+  const amTexts = ((wire as any).action_menu?.action_list ?? []).map((a: any) => `${a.text}(${(a.text ?? '').length})`).join(',');
+  logger.info(
+    `[wecom-complete-card] wire: card_type=${wire.card_type} btn=${btnCount}[${btnTexts}] ` +
+    `action_menu=${amCount}[${amTexts}] task_id=${wire.task_id?.slice(0, 24)} title_len=${(wire.main_title?.title ?? '').length} desc_len=${(wire.main_title?.desc ?? '').length}`,
+  );
+
   return wire as WecomTemplateCard;
 }
 

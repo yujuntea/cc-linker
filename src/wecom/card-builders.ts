@@ -58,8 +58,14 @@ function makeButton(text: string, tag: string, value?: { sessionUuid: string }):
  *   修法: 限前 6 sessions × 1 button (切换) = 6 buttons (符合 SDK max)
  *     desc 显示 "还有 N 个未显示" 告知用户被截断
  *     /switch <uuid> 仍可访问剩余 session (listdir-style 分页留作未来 PR)
+ *
+ * PR 7.5.12 fix: 6 按钮 + action_menu 真机仍返 40016 "invalid button size".
+ *   SDK 文档说 TemplateCardButton[] 最长 6 — 但服务端对 first-reply 卡片可能更严, 或把
+ *   action_menu.action_list 内的每一项也算 button.
+ *   隔离根因: buildListCard 暂时只生成 1 button + 无 action_menu, 验证最小 wire shape 能否通过.
+ *   后续若仍失败 → 排查 button text 超 10 字 / main_title 超 26 字 / task_id 字符.
  */
-const LIST_CARD_MAX_BUTTONS = 6;
+const LIST_CARD_MAX_BUTTONS = 1;
 
 export function buildListCard(ctx: ListCardContext): WecomTemplateCard {
   if (ctx.entries.length === 0) {
@@ -97,16 +103,9 @@ export function buildListCard(ctx: ListCardContext): WecomTemplateCard {
     if (buttonValues[i]) btn.value = buttonValues[i];
   });
 
-  // 注入 action_menu (PR 7 m-9 ACTION_MENU_DESC 默认 '操作')
-  (card as any).action_menu = {
-    desc: WecomCardBuilder.ACTION_MENU_DESC,
-    action_list: [
-      {
-        action_tag: 'list-refresh',
-        action_title: { tag: 'list-refresh', text: '🔄 刷新' },
-      },
-    ],
-  };
+  // PR 7.5.12: 暂时不注入 action_menu — 隔离 40016 真因
+  //   之前 (6 button + 1 action_menu) 真机 40016; 现 1 button + 0 action_menu 验证是否 action_menu 是元凶
+  // (card as any).action_menu = { ... };  // 注释掉 — PR 7.5.12 隔离测试
 
   return card;
 }
