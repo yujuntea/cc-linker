@@ -14,6 +14,7 @@ import { WecomUserManager } from './mapping';
 import { WecomCardBuilder, type TemplateCard } from './card';
 import { WecomImageHandler } from './image-handler';
 import { WecomCompleteCardSender } from './complete-card';
+import { buildListCard, buildDirListCard, buildModelCard } from './card-builders';
 import { SpoolQueue, type SpoolMessage, type TargetSnapshot } from '../queue/spool';
 import type { ClaudeSessionManager } from '../proxy/session';
 import type { StreamChunk } from '../proxy/stream-parser';
@@ -138,6 +139,11 @@ export type WecomBotConfig = {
    * 企微侧 PR 7.5.1 镜像实现. 必须实际集成, 不是只注入.
    */
   providerManager?: ProviderManager;
+  /**
+   * PR 7.5.2: WecomCompleteCardSender 注入点 — 命令响应推卡片用 (buildListCard/buildDirListCard/buildModelCard)
+   * 默认 new WecomCompleteCardSender(this.client.sdk) — 跟 PR 7 完成卡 sender 风格一致
+   */
+  completeCardSender?: WecomCompleteCardSender;
 };
 
 /**
@@ -201,6 +207,12 @@ export class WecomBot {
    * 未注入时 /model 命令仍走 PR 5 stub (返回 '已设置 model: <name>' 占位 markdown)
    */
   private providerManager?: ProviderManager;
+  /**
+   * PR 7.5.2: 完成卡片 sender — 命令路径推卡片用 (/list /listdir /model)
+   * 跟 PR 7 流式完成卡 sender 共享同一类 (WecomCompleteCardSender.send),
+   *   但这里用 buildListCard / buildDirListCard / buildModelCard 而非 buildCompleteCard
+   */
+  private wecomCompleteCardSender: WecomCompleteCardSender;
   private running = false;
   /**
    * PR 7 Task 7.5 (M-2): dispatch loop 的可中断 timer handle。
@@ -240,6 +252,8 @@ export class WecomBot {
     this.imageHandler = config.imageHandler;
     this.registryManager = config.registryManager;
     this.providerManager = config.providerManager;
+    // PR 7.5.2: 注入完成卡片 sender (默认 new, 跟 PR 7 流式完成卡 sender 同源)
+    this.wecomCompleteCardSender = config.completeCardSender ?? new WecomCompleteCardSender(this.client.sdk);
   }
 
   start(): void {
@@ -458,7 +472,25 @@ export class WecomBot {
     // 修法: case 'list' 直接 await handleCommandListCard (内部 sendMessage markdown + markDone),
     //   跳过后续统一 sendMessage 推送路径 (return 跳出 handleCommand)
     if (parsed.cmd === 'list') {
-      await this.handleCommandListCard(msg);
+      // PR 7.5.2: 推 buildListCard 卡片代替 markdown
+      if (!this.registryManager) {
+        // registryManager 未注入 → 走 markdown 兜底 (跟 Task 2.0 fallback 路径一致)
+        await this.handleCommandListCard(msg);
+        return;
+      }
+      try {
+        const data = await this._handleCommandListCardInternal(msg);
+        const card = buildListCard({
+          entries: data.entries,
+          totalActive: data.totalActive,
+        });
+        await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+      } catch (err) {
+        logger.error(`[wecom-bot] list card build/send failed: ${err instanceof Error ? err.message : String(err)}, fallback to markdown`);
+        await this.handleCommandListCard(msg);
+        return;
+      }
+      this.spoolQueue.markDone(msg.messageId, msg.serialKey);
       return;
     }
 
@@ -495,18 +527,63 @@ export class WecomBot {
         case 'cancel':
           responseText = await this.handleCommandCancel(msg.userId, parsed.args);
           break;
-        case 'model':
+        case 'model': {
+          if (parsed.args.length === 0 || !parsed.args[0]) {
+            // PR 7.5.2 F2 fix: 无 alias 走 buildModelCard, 不调 handleCommandModel
+            if (!this.providerManager) {
+              responseText = '❌ 用法: /model <model-alias> (providerManager 未注入)';
+              break;
+            }
+            const currentEntry = this.userManager.getEntry(msg.userId);
+            const currentAlias = currentEntry?.type === 'session' || currentEntry?.type === 'pending_new_session'
+              ? (currentEntry as any).defaultProvider
+              : undefined;
+            const providers = this.providerManager.list().map(p => ({ alias: p.alias, name: p.name }));
+            const card = buildModelCard({ providers, currentAlias });
+            try {
+              await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+              this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+              return;  // 卡片已发, 跳外层 sendMessage
+            } catch (sendErr) {
+              logger.error(`[wecom-bot] model card send failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+              responseText = '❌ 模型卡片发送失败, 请重试';
+            }
+            break;
+          }
+          // 有 alias → 走 handleCommandModel (Task 1.4 集成, 实际写 user-mapping)
           responseText = await this.handleCommandModel(msg.userId, parsed.args);
           break;
+        }
         // PR 6.13: /listdir 命令 — 列 cwd 下子目录 (仿飞书 doListDir 但简化无 CardKit)
         // 历史: 飞书 /listdir 渲染 CardKit 模板卡片 (buildDirListCard); wecom 推 markdown 列表
         // PR 7.3 fix #7: 保持原样 (responseText 由 handleCommandListDir 返回)
         //   走外层 sendMessage (bot.ts:478-483), 避免双推送
         //   按钮路径 (executeCardAction case 'listdir') 走 renderListDir
-        case 'listdir':
-          // PR 7.5.2 Task 2.0: handleCommandListDir 改返 DirListData 结构, 取 .markdown 喂统一推送
-          responseText = (await this.handleCommandListDir(msg.userId)).markdown;
+        case 'listdir': {
+          // PR 7.5.2: 推 buildDirListCard (Task 2.0 拆 DirListData 结构)
+          const data = await this.handleCommandListDir(msg.userId);
+          if (data.markdown.startsWith('❌')) {
+            // 错误路径 (目录不存在 / 读目录失败) → 走 markdown 兜底 (PR 6.13 既有行为)
+            responseText = data.markdown;
+          } else {
+            // 正常路径: 推卡片
+            const card = buildDirListCard({
+              cwd: data.cwd,
+              parent: data.parent,
+              dirs: data.dirs,
+              hasMore: data.hasMore,
+            });
+            try {
+              await this.wecomCompleteCardSender.send({ userId: msg.userId, template_card: card });
+              this.spoolQueue.markDone(msg.messageId, msg.serialKey);
+              return;  // 卡片已发, 跳外层 sendMessage
+            } catch (sendErr) {
+              logger.error(`[wecom-bot] listdir card send failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}, fallback to markdown`);
+              responseText = data.markdown;
+            }
+          }
           break;
+        }
         // PR 6.14: /whoami 命令 — 显示当前 user externalUserId + 配置提示
         // 仿飞书 feishu/bot.ts:1009 case 'whoami', 帮助用户诊断 owner 配置
         case 'whoami':
@@ -1414,6 +1491,40 @@ export class WecomBot {
       }
       case 'listdir': {
         await this.renderListDir(event.externalUserId);
+        break;
+      }
+      case 'select_dir': {
+        // PR 7.5.2: /listdir 卡片按钮回调 — 路径存在则调 handleCommandNew(userId, [path])
+        const path = event.actionValue?.sessionUuid;
+        if (!path) {
+          logger.warn(`[wecom-bot] select_dir: missing sessionUuid (path) in actionValue`);
+          break;
+        }
+        // 路径校验 (handleCommandNew 没 existsSync 检查, case 内自己校验)
+        const { existsSync } = await import('fs');
+        if (!existsSync(path)) {
+          await this.client.sdk.sendMessage(event.externalUserId, {
+            msgtype: 'markdown',
+            markdown: { content: `❌ 路径不存在: \`${path}\`` },
+          });
+          break;
+        }
+        await this.handleCommandNew(event.externalUserId, [path]);
+        break;
+      }
+      case 'select_model': {
+        // PR 7.5.2: /model 卡片按钮回调 — 实际写 user-mapping entry.defaultProvider
+        const alias = event.actionValue?.sessionUuid;
+        if (!alias) {
+          logger.warn(`[wecom-bot] select_model: missing sessionUuid (alias) in actionValue`);
+          break;
+        }
+        await this.handleCommandModel(event.externalUserId, [alias]);
+        break;
+      }
+      case 'clear_model': {
+        // PR 7.5.2: /model 卡片清除默认按钮 — 调 handleCommandModel(['--clear'])
+        await this.handleCommandModel(event.externalUserId, ['--clear']);
         break;
       }
       case 'retry': {

@@ -18,6 +18,11 @@ export type CompleteCardContext = {
   cwd?: string;
   /** 流式总耗时（用于主标题 desc 显示） */
   durationMs?: number;
+  /**
+   * PR 7.5.2: 预构造好的 template_card — 走 buildListCard / buildDirListCard / buildModelCard 的路径
+   * 设置后, buildCompleteCard 不被调, 直接用传入的 card. 让命令路径复用 sender 类而不用重写 wire 格式
+   */
+  template_card?: WecomTemplateCard;
 };
 
 /**
@@ -121,7 +126,9 @@ export class WecomCompleteCardSender {
    *   - durationMs: 可选。desc "耗时 Xs" 段。
    */
   async send(ctx: CompleteCardContext): Promise<void> {
-    const card = buildCompleteCard(ctx);
+    // PR 7.5.2: ctx.template_card 优先 — 命令路径推 buildListCard / buildDirListCard / buildModelCard
+    // 走 sender 共用 sendMessage 通道, 不重写 wire 格式 (msgtype=template_card + payload 结构)
+    const card = ctx.template_card ?? buildCompleteCard(ctx);
     // PR 7.1 I-3: 单次 cast 到 SDK wire-shape (WecomTemplateCard → TemplateCard),
     //   buildCompleteCard 内部的 (card as any).action_menu / task_id 注入保留 —
     //   这两字段在 WecomTemplateCard union 下 optional, 需要 mutable 注入, 留 cast。
@@ -133,6 +140,6 @@ export class WecomCompleteCardSender {
     const receiveId = ctx.chatId ?? ctx.userId;
     await this.sdk.sendMessage(receiveId, payload);
     const taskId = (card as unknown as CompleteCardPayload).task_id;
-    logger.info(`[wecom-complete-card] sent: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId}`);
+    logger.info(`[wecom-complete-card] sent: receiveId=${receiveId.slice(0, 12)}... taskId=${taskId ?? '(none)'}`);
   }
 }

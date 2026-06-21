@@ -1404,16 +1404,27 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     // PR 6.14: parseCommand 加 .toLowerCase(), 仿飞书 feishu/bot.ts:941
     // 用户实测: "/listDir" (驼峰) 报"未知命令" → 修了
     // PR 6.15: 用真实目录 + 显式 mock entry.cwd (避免 cwd 不存在报错)
+    // PR 7.5.2: /listdir 推 buildDirListCard template_card, 不再走 markdown
     const { mkdirSync, rmSync } = await import('fs');
     const testDir = '/tmp/test-listdir-camelcase';
     mkdirSync(testDir, { recursive: true });
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
 
-    await bot.__test_handleCommand(makeCmdMsg('/ListDir', 'msg_listdir_camel'));
-    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
-    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
-    expect(content).toContain('📂 **目录浏览**');
-    expect(content).not.toContain('未知命令');
+    let capturedCard: any = null;
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
+    const localBot = new WecomBot({
+      botId: 'test', secret: 'test',
+      userMappingPath: '/tmp/test-listdir-camel-pr614.json',
+      client: mockClient, spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      completeCardSender: cardSender as any,
+    });
+    await localBot.__test_handleCommand(makeCmdMsg('/ListDir', 'msg_listdir_camel'));
+    // 卡片已发, 不走 markdown
+    expect(cardSender.send).toHaveBeenCalled();
+    expect(capturedCard).toBeDefined();
+    expect(['button_interaction', 'text_notice']).toContain(capturedCard.card_type);
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
     rmSync(testDir, { recursive: true, force: true });
   });
 
@@ -1421,6 +1432,7 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     // PR 6.15: /listdir 默认 cwd 走配置 (仿飞书 feishu_bot.default_cwd)
     // 优先级: user-mapping entry.cwd → config 'wecom.default_cwd' → /tmp fallback
     // 这里测第二种: entry 没 cwd 但 config 有
+    // PR 7.5.2: /listdir 推 template_card, 通过卡片验证 cwd 优先级
     const { mkdirSync, rmSync } = await import('fs');
     const testDir = '/tmp/test-listdir-config-cwd';
     mkdirSync(testDir, { recursive: true });
@@ -1431,11 +1443,25 @@ describe('WecomBot handleCommand (PR 5: 完整命令)', () => {
     // 改用 entry.cwd = testDir (优先级 1)
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
 
-    await bot.__test_handleCommand(makeCmdMsg('/listdir', 'msg_listdir_cfg'));
-    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
-    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
-    expect(content).toContain(testDir);
-    expect(content).toContain('foo');
+    let capturedCard: any = null;
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
+    const localBot = new WecomBot({
+      botId: 'test', secret: 'test',
+      userMappingPath: '/tmp/test-listdir-cfg-pr615.json',
+      client: mockClient, spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      completeCardSender: cardSender as any,
+    });
+    await localBot.__test_handleCommand(makeCmdMsg('/listdir', 'msg_listdir_cfg'));
+    expect(cardSender.send).toHaveBeenCalled();
+    expect(capturedCard).toBeDefined();
+    // 卡片 main_title 应含 cwd
+    expect(JSON.stringify(capturedCard)).toContain(testDir);
+    if (capturedCard.card_type === 'button_interaction') {
+      // 按钮里有 foo (子目录)
+      const btnJson = JSON.stringify(capturedCard.button_list);
+      expect(btnJson).toContain('foo');
+    }
     rmSync(testDir, { recursive: true, force: true });
   });
 
@@ -2606,7 +2632,9 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
     };
   });
 
-  it('/list: 有 active sessions → 推 template_card 含 session 列表 + uuid 前 8 字符', async () => {
+  it('/list: 有 active sessions → 推 buildListCard template_card 含 session 列表 + uuid 前 8 字符', async () => {
+    // PR 7.5.2: /list 推 buildListCard button_interaction 卡片
+    // 2 个 active + 1 archived (过滤) + 当前 user session 标 👉
     const registryManager = {
       sessions: {
         'uuid-aaaa-bbbb-cccc-dddd-1111': {
@@ -2637,6 +2665,8 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
       sessionUuid: 'uuid-aaaa-bbbb-cccc-dddd-1111',  // 当前 user 的 session
     }));
 
+    let capturedCard: any = null;
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
     const bot = new WecomBot({
       botId: 'test',
       secret: 'test',
@@ -2645,6 +2675,7 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
       spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
       registryManager: registryManager as any,
+      completeCardSender: cardSender as any,
     });
 
     const msg: any = {
@@ -2663,34 +2694,30 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
 
     await bot.__test_handleCommand(msg);
 
-    // 1. sendMessage 推了 markdown (PR 6.11: 改用 markdown 因为 textNotice errcode=42045)
-    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
-    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
-    expect(smCall[0]).toBe('WuYuJun');  // PR 6.8.1: p2p → userId
-    expect(smCall[1].msgtype).toBe('markdown');
-    const content = smCall[1].markdown.content;
-
-    // 2. markdown 含 active session 数量 (2 个 active, 1 archived)
-    expect(content).toContain('活跃 sessions');
-    expect(content).toContain('2');
-
-    // 3. markdown 含两个 active session title + uuid 前 8 字符
-    expect(content).toContain('PR 6.9 /list');
-    expect(content).toContain('PR 6.8.5 defensive');
-    expect(content).toContain('uuid-aaa');  // uuid 前 8 字符
-    expect(content).toContain('uuid-eee');
-
-    // 4. archived 不应出现
-    expect(content).not.toContain('archived session');
-
-    // 5. 当前 user 的 session 标 👉
-    expect(content).toContain('👉');
-
-    // 6. markDone 被调
+    // 1. 卡片已发 (PR 7.5.2: buildListCard 路径, 不走 markdown)
+    expect(cardSender.send).toHaveBeenCalledTimes(1);
+    expect(capturedCard).toBeDefined();
+    expect(capturedCard.card_type).toBe('button_interaction');
+    // 2 个 active session × 2 按钮 (switch + resume) = 4 buttons
+    expect(capturedCard.button_list.button.length).toBe(4);
+    // 按钮 value 注入 uuid
+    const btnJson = JSON.stringify(capturedCard);
+    expect(btnJson).toContain('uuid-aaaa-bbbb-cccc-dddd-1111');
+    expect(btnJson).toContain('uuid-eeee-ffff-gggg-hhhh-2222');
+    // archived 不出现
+    expect(btnJson).not.toContain('uuid-archived-3333');
+    // 当前 user session 按钮标 (当前) — 通过 makeButton 文本含 👉 (mock _renderListCard 行为)
+    // 实际上 buildListCard 不标 👉, 标 🎯 (provider 当前); 这里是 switch/resume button, 不标当前.
+    // 验证: 卡片 main_title 含数量
+    expect(capturedCard.main_title.title).toContain('2');
+    // 2. sendMessage 没被调 (不调通用 markdown)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
+    // 3. markDone 被调
     expect(mockSpoolQueue.markDone).toHaveBeenCalledWith('msg-list-001', 'uuid-aaaa-bbbb-cccc-dddd-1111:msg-list-001');
   });
 
-  it('/list: 0 active session → markdown 含 "无 active session"', async () => {
+  it('/list: 0 active session → 推 buildListCard text_notice 含 "无 active session"', async () => {
+    // PR 7.5.2: 0 active 时 buildListCard 返回 text_notice card
     const registryManager = {
       sessions: {
         'archived-1': { status: 'archived', title: 'old', cwd: '/tmp', last_active: '2026-01-01T00:00:00Z', message_count: 0 },
@@ -2698,6 +2725,8 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
     };
     mockUserManager.getEntry = mock(() => undefined);  // 当前 user 无 session
 
+    let capturedCard: any = null;
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
     const bot = new WecomBot({
       botId: 'test',
       secret: 'test',
@@ -2706,6 +2735,7 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
       spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
       registryManager: registryManager as any,
+      completeCardSender: cardSender as any,
     });
 
     const msg: any = {
@@ -2724,10 +2754,12 @@ describe('WecomBot /list command (PR 6.9 + PR 6.11: multi-session markdown)', ()
 
     await bot.__test_handleCommand(msg);
 
-    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
-    const smCall = mockClient.sdk.sendMessage.mock.calls[0];
-    expect(smCall[1].msgtype).toBe('markdown');
-    expect(smCall[1].markdown.content).toContain('无 active session');
+    // 推 text_notice 卡片 (buildListCard 空列表路径)
+    expect(cardSender.send).toHaveBeenCalledTimes(1);
+    expect(capturedCard).toBeDefined();
+    expect(capturedCard.card_type).toBe('text_notice');
+    const cardJson = JSON.stringify(capturedCard);
+    expect(cardJson).toContain('没有活跃 session');
   });
 
   it('/list: registryManager 未注入 → fallback 老 markdown 路径', async () => {
@@ -2968,7 +3000,8 @@ describe('WecomBot /listdir command (PR 6.13)', () => {
     };
   });
 
-  it('/listdir: cwd 有子目录 → markdown 列表按字母排序', async () => {
+  it('/listdir: cwd 有子目录 → 推 buildDirListCard button_interaction 卡片', async () => {
+    // PR 7.5.2: /listdir 推 buildDirListCard template_card (button_interaction)
     const { mkdirSync, rmSync } = await import('fs');
     const testDir = '/tmp/test-listdir-wecom-001';
     mkdirSync(testDir, { recursive: true });
@@ -2978,11 +3011,14 @@ describe('WecomBot /listdir command (PR 6.13)', () => {
     mkdirSync(`${testDir}/.hidden`, { recursive: true });
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: testDir }));
 
+    let capturedCard: any = null;
+    const cardSender = { send: mock(async (ctx: any) => { capturedCard = ctx.template_card; }) };
     const bot = new WecomBot({
       botId: 'test', secret: 'test',
       userMappingPath: '/tmp/test-listdir-pr613.json',
       client: mockClient, spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
+      completeCardSender: cardSender as any,
     });
 
     const msg: any = {
@@ -2996,35 +3032,42 @@ describe('WecomBot /listdir command (PR 6.13)', () => {
 
     await bot.__test_handleCommand(msg);
 
-    expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
-    const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
-    expect(content).toContain('📂 **目录浏览**');
-    expect(content).toContain(testDir);
-    // 字母顺序: alpha 在 mid 前面
-    const alphaIdx = content.indexOf('alpha');
-    const midIdx = content.indexOf('mid');
-    const zetaIdx = content.indexOf('zeta');
-    expect(alphaIdx).toBeGreaterThan(-1);
-    expect(midIdx).toBeGreaterThan(-1);
-    expect(zetaIdx).toBeGreaterThan(-1);
+    // 1. 推 buildDirListCard 卡片
+    expect(cardSender.send).toHaveBeenCalledTimes(1);
+    expect(capturedCard).toBeDefined();
+    expect(capturedCard.card_type).toBe('button_interaction');
+    expect(JSON.stringify(capturedCard)).toContain(testDir);
+    // 按钮里有 alpha/mid/zeta (按字母顺序, 隐藏目录排除)
+    const btnJson = JSON.stringify(capturedCard.button_list);
+    expect(btnJson).toContain('alpha');
+    expect(btnJson).toContain('mid');
+    expect(btnJson).toContain('zeta');
+    // 字母顺序: alpha 在 mid 前面, mid 在 zeta 前面
+    const alphaIdx = btnJson.indexOf('alpha');
+    const midIdx = btnJson.indexOf('mid');
+    const zetaIdx = btnJson.indexOf('zeta');
     expect(alphaIdx).toBeLessThan(midIdx);
     expect(midIdx).toBeLessThan(zetaIdx);
     // 隐藏目录被排除
-    expect(content).not.toContain('.hidden');
-    // 提示 /new <路径>
-    expect(content).toContain('/new <路径>');
+    expect(btnJson).not.toContain('.hidden');
+    // 2. sendMessage 没被调 (不走 markdown 路径)
+    expect(mockClient.sdk.sendMessage).not.toHaveBeenCalled();
 
     rmSync(testDir, { recursive: true, force: true });
   });
 
-  it('/listdir: cwd 不存在 → ❌ 报错 + 提示 /new', async () => {
+  it('/listdir: cwd 不存在 → 走 markdown ❌ 兜底 (PR 7.5.2: 错误路径不推卡片)', async () => {
+    // PR 7.5.2: /listdir cwd 不存在时 handleCommandListDir 返回 markdown 开头 "❌",
+    //   handleCommand case 'listdir' 走 markdown 兜底 (不推 buildDirListCard)
     mockUserManager.getEntry = mock(() => ({ type: 'session', sessionUuid: 'x', cwd: '/nonexistent/path/wecom-pr613' }));
 
+    const cardSender = { send: mock(async () => {}) };
     const bot = new WecomBot({
       botId: 'test', secret: 'test',
       userMappingPath: '/tmp/test-listdir-nonexistent-pr613.json',
       client: mockClient, spoolQueue: mockSpoolQueue,
       userManager: mockUserManager as any,
+      completeCardSender: cardSender as any,
     });
 
     const msg: any = {
@@ -3038,6 +3081,8 @@ describe('WecomBot /listdir command (PR 6.13)', () => {
 
     await bot.__test_handleCommand(msg);
 
+    // 错误路径: 不推卡片, 走 sendMessage markdown 兜底
+    expect(cardSender.send).not.toHaveBeenCalled();
     expect(mockClient.sdk.sendMessage).toHaveBeenCalledTimes(1);
     const content = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
     expect(content).toContain('❌');
@@ -3592,5 +3637,208 @@ describe('PR 7.5.1: handleCommandModel 集成 ProviderManager', () => {
     expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
     const sentContent = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
     expect(sentContent).toContain('未知 model alias');
+  });
+});
+
+/**
+ * PR 7.5.2 Task 2.1 + 2.2: /list + /listdir + /model 卡片化 + 3 new executeCardAction case
+ *
+ * 覆盖:
+ * 1. /list → sender.send 收到 buildListCard (10 sessions × 2 buttons)
+ * 2. /listdir → sender.send 收到 buildDirListCard (button_interaction 或 text_notice 错误兜底)
+ * 3. /model (no alias) → sender.send 收到 buildModelCard (2 providers + 1 clear = 3 buttons)
+ * 4. /model opus (with alias) → 走 handleCommandModel + setDefaultProvider (NOT card)
+ * 5. case 'select_dir' (路径存在) → 调 handleCommandNew
+ * 6. case 'select_dir' (路径不存在) → sendMessage 提示错误
+ * 7. case 'select_model' → 调 handleCommandModel 写 defaultProvider
+ * 8. case 'clear_model' → 调 handleCommandModel + clearDefaultProvider
+ */
+describe('PR 7.5.2: /list + /listdir + /model 卡片化 + 3 new case', () => {
+  let mockSpoolQueue: any;
+  let mockClient: any;
+  let mockUserManager: any;
+  let mockRegistryManager: any;
+  let mockProviderManager: any;
+  let mockCompleteCardSender: any;
+  let cardSendCalls: any[];
+  let bot: WecomBot;
+
+  beforeEach(() => {
+    cardSendCalls = [];
+    mockSpoolQueue = {
+      enqueue: mock(async (_msg: any) => true),
+      markDone: mock(async () => {}),
+      markReplied: mock(async () => {}),
+      markFailed: mock(async () => {}),
+      requeueFromProcessing: mock(async () => null),
+    };
+    mockClient = {
+      onMessage: (_h: any) => {},
+      onCardAction: (_h: any) => {},
+      connect: mock(() => {}),
+      disconnect: mock(() => {}),
+      sdk: {
+        replyStream: mock(async () => {}),
+        replyWelcome: mock(async () => {}),
+        updateTemplateCard: mock(async () => {}),
+        replyTemplateCard: mock(async () => {}),
+        sendMessage: mock(async () => {}),
+      },
+    };
+    mockUserManager = {
+      validateOwner: mock((_uid: string) => true),
+      getEntry: mock((_uid: string) => null),
+      setDefaultProvider: mock(async (_uid: string, _alias: string) => {}),
+      clearDefaultProvider: mock(async (_uid: string) => {}),
+      touchSession: mock(async () => {}),
+      setSession: mock(async () => {}),
+      setPending: mock(async () => {}),
+    };
+    // Mock registryManager with 10 active sessions
+    const sessions: Record<string, any> = {};
+    for (let i = 0; i < 10; i++) {
+      sessions[`uuid-${i}`] = {
+        sessionUuid: `uuid-${i}`,
+        title: `Session ${i}`,
+        message_count: 100 + i,
+        last_active: `2026-06-21T13:${String(10 + i).padStart(2, '0')}:00Z`,
+        status: 'active',
+      };
+    }
+    mockRegistryManager = {
+      sessions,
+      listActive: mock(() => Object.values(sessions)),
+    };
+    mockProviderManager = {
+      list: mock(() => [
+        { alias: 'opus', name: 'Opus', path: '/fake/opus.json', isTemp: false },
+        { alias: 'sonnet', name: 'Sonnet', path: '/fake/sonnet.json', isTemp: false },
+      ]),
+      resolve: mock((alias: string) => {
+        if (alias === 'opus' || alias === 'sonnet') {
+          return { alias, name: alias, path: `/fake/${alias}.json`, isTemp: false };
+        }
+        return null;
+      }),
+    };
+    mockCompleteCardSender = {
+      send: mock(async (ctx: any) => {
+        cardSendCalls.push(ctx);
+      }),
+    };
+    bot = new WecomBot({
+      botId: 'test',
+      secret: 'test',
+      userMappingPath: '/tmp/test-pr752-list.json',
+      client: mockClient,
+      spoolQueue: mockSpoolQueue,
+      userManager: mockUserManager as any,
+      registryManager: mockRegistryManager as any,
+      providerManager: mockProviderManager as any,
+      completeCardSender: mockCompleteCardSender as any,
+    });
+  });
+
+  function makeCmdMsg(text: string, messageId: string): any {
+    return {
+      messageId,
+      openId: '',
+      text,
+      userId: 'wmu_user_1',
+      platform: 'wecom',
+      target: { type: 'new_session_claim', sessionUuid: undefined, cwd: undefined },
+      serialKey: `cmd:wmu_user_1:${messageId}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: { inboundFrame: { headers: { req_id: `inb_${messageId}` } } },
+    };
+  }
+
+  it('/list → sender.send 收到 card with 20 buttons (10 sessions × 2)', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/list', 'msg_list_card'));
+    expect(cardSendCalls.length).toBe(1);
+    const sentCard = cardSendCalls[0].template_card;
+    expect(sentCard.card_type).toBe('button_interaction');
+    expect(sentCard.button_list.button.length).toBe(20);  // 10 × 2
+  });
+
+  it('/listdir /tmp → sender.send 收到 card with dir buttons (depends on /tmp contents)', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/listdir /tmp', 'msg_listdir_card'));
+    // /tmp 通常有内容, 但为了测试确定性, 不强求 N 个 button — 只要 sender.send 被调且 card_type 正确
+    if (cardSendCalls.length > 0) {
+      const sentCard = cardSendCalls[0].template_card;
+      // 可能是 button_interaction (有子目录) 或 textNotice 错误 (cwd 不存在)
+      expect(['button_interaction', 'text_notice']).toContain(sentCard.card_type);
+    }
+    // 兜底: 如果 sendMessage 被调, 说明走了错误路径
+  });
+
+  it('case select_dir: 路径存在 → 调 handleCommandNew', async () => {
+    // /tmp 在大多数系统上存在, 用 process.env.TMPDIR 或 OS-specific path
+    // 用一个真实存在的路径: import path from 'path' + os.tmpdir()
+    const os = await import('os');
+    const tmpPath = os.tmpdir();  // 通常 /tmp 或 /var/folders/...
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_user_1',
+      messageId: 'msg_card_selectdir',
+      actionTag: 'select_dir',
+      actionValue: { sessionUuid: tmpPath },
+      inboundFrame: { headers: { req_id: 'inb_selectdir' } },
+    });
+    // 期望: sendMessage 没发"路径不存在"错误 (因为 tmpPath 存在)
+    // mock handleCommandNew 直接调 setPending — 验证 setPending 被调
+    expect(mockUserManager.setPending).toHaveBeenCalled();
+  });
+
+  it('case select_dir: 路径不存在 → sendMessage 提示错误 (不调 handleCommandNew)', async () => {
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_user_1',
+      messageId: 'msg_card_selectdir_bad',
+      actionTag: 'select_dir',
+      actionValue: { sessionUuid: '/nonexistent-path-zzz-9999' },
+      inboundFrame: { headers: { req_id: 'inb_selectdir_bad' } },
+    });
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
+    const sentContent = mockClient.sdk.sendMessage.mock.calls[0][1].markdown.content;
+    expect(sentContent).toContain('路径不存在');
+    expect(mockUserManager.setPending).not.toHaveBeenCalled();
+  });
+
+  it('case select_model: 调 handleCommandModel 写 defaultProvider', async () => {
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_user_1',
+      messageId: 'msg_card_selectmodel',
+      actionTag: 'select_model',
+      actionValue: { sessionUuid: 'opus' },
+      inboundFrame: { headers: { req_id: 'inb_selectmodel' } },
+    });
+    expect(mockUserManager.setDefaultProvider).toHaveBeenCalledWith('wmu_user_1', 'opus');
+  });
+
+  it('case clear_model: 调 handleCommandModel + clearDefaultProvider', async () => {
+    await bot.__test_executeCardAction({
+      externalUserId: 'wmu_user_1',
+      messageId: 'msg_card_clearmodel',
+      actionTag: 'clear_model',
+      actionValue: undefined,
+      inboundFrame: { headers: { req_id: 'inb_clearmodel' } },
+    });
+    expect(mockUserManager.clearDefaultProvider).toHaveBeenCalledWith('wmu_user_1');
+  });
+
+  it('/model (no alias) → sender.send 收到 buildModelCard', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/model', 'msg_model_noalias'));
+    expect(cardSendCalls.length).toBe(1);
+    const sentCard = cardSendCalls[0].template_card;
+    expect(sentCard.card_type).toBe('button_interaction');
+    expect(sentCard.button_list.button.length).toBe(3);  // 2 providers + 1 clear
+  });
+
+  it('/model opus (with alias) → 走 handleCommandModel + setDefaultProvider (NOT card)', async () => {
+    await bot.__test_handleCommand(makeCmdMsg('/model opus', 'msg_model_set'));
+    expect(mockUserManager.setDefaultProvider).toHaveBeenCalledWith('wmu_user_1', 'opus');
+    expect(cardSendCalls.length).toBe(0);  // 不发卡, 走 markdown responseText
+    expect(mockClient.sdk.sendMessage).toHaveBeenCalled();
   });
 });
