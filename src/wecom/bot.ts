@@ -406,27 +406,51 @@ export class WecomBot {
       //   - 加 origin / project_name
       //   - relative time (formatTimeAgo) 替代 ISO timestamp
       //   - 每个命令独立 code block (只保留 /switch)
-      //   - status badge (🔴) 留给未来 sessionManager runningUuids 集成
+      // PR 7.5.21: 加 AI 预览 + 运行中 badge (对齐飞书)
+      //   - 🤖 last_assistant_preview (SessionEntry 已有, scanner 已 populate)
+      //   - 🔴 运行中 (从 sessionManager.listSessions() 拿活跃 sessionId 集合)
       const lines: string[] = [];
       lines.push(`📋 我的会话（最近 ${activeEntries.length} 个，共 ${totalActive} 个）`);
       lines.push('');
       lines.push('💡 点击 code block 复制命令，粘贴到输入框即可切换');
       lines.push('');
 
+      // PR 7.5.21: 收集 running session UUID 集合 (从 sessionManager.activeProcesses)
+      const runningUuids = new Set<string>();
+      if (this.sessionManager && typeof this.sessionManager.listSessions === 'function') {
+        try {
+          for (const sess of this.sessionManager.listSessions()) {
+            if (sess && sess.sessionId) runningUuids.add(sess.sessionId);
+          }
+        } catch (err) {
+          logger.warn(`[wecom-bot] sessionManager.listSessions() failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
       activeEntries.forEach(([uuid, s], index) => {
         const isCurrent = uuid === currentUuid;
+        const isRunning = runningUuids.has(uuid);
         const title = (s.title ?? 'Untitled').slice(0, 24);
         const msgs = s.message_count ?? 0;
         const lastActive = this._formatTimeAgo(s.last_active);
         const origin = this._formatOrigin(s.status);
         const projectName = s.project_name ?? '';
         const cwd = s.cwd ?? '-';
+        // PR 7.5.21: AI 最后消息预览 (限 60 字符 + markdown esc)
+        const aiPreview = s.last_assistant_preview
+          ? this._formatAIPreview(s.last_assistant_preview)
+          : null;
 
         const currentMark = isCurrent ? '⭐ **当前**' : '';
+        const runningMark = isRunning ? ' 🔴 **运行中**' : '';
 
-        lines.push(`**${index + 1}. ${title}**${currentMark ? ' ' + currentMark : ''}`);
+        lines.push(`**${index + 1}. ${title}**${runningMark}${currentMark ? ' ' + currentMark : ''}`);
         lines.push(`ID: \`${uuid.slice(0, 8)}\` | ${msgs}条 | ${lastActive} | ${origin} | ${projectName}`);
         lines.push(`📁 \`${cwd}\``);
+        // PR 7.5.21: AI 预览行 (对齐飞书 🤖)
+        if (aiPreview) {
+          lines.push(`🤖 ${aiPreview}`);
+        }
         // PR 7.5.20 简化: 只有 /switch 命令 (用户反馈不需要 /resume)
         lines.push('');
         lines.push('切换:');
@@ -485,6 +509,25 @@ export class WecomBot {
     if (!status) return '未知';
     if (status === 'active') return '终端';
     return status;
+  }
+
+  /**
+   * PR 7.5.21: 格式化 AI 最后消息预览 (对齐飞书 esc() + 限 60 字符)
+   *   - 取第一非空行 (避免多行 markdown 干扰 code block / 列表渲染)
+   *   - 转义 markdown 特殊字符 (避免渲染问题)
+   *   - 截断到 60 字符 (跟飞书 preview() 一致)
+   */
+  private _formatAIPreview(raw: string): string {
+    const firstLine = raw.split('\n').find(l => l.trim().length > 0) ?? '';
+    const escaped = firstLine
+      .replace(/\\/g, '\\\\')
+      .replace(/\*/g, '\\*')
+      .replace(/_/g, '\\_')
+      .replace(/\[/g, '\\[')
+      .replace(/\]/g, '\\]')
+      .replace(/`/g, '\\`')
+      .trim();
+    return escaped.length > 60 ? escaped.slice(0, 57) + '...' : escaped;
   }
 
   /**
