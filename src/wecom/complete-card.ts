@@ -82,6 +82,22 @@ function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
     wire.task_id = `wcli${Date.now()}${rand}`.slice(0, 64); // 限 64 字节, 短而唯一
   }
 
+  // PR 7.5.14: 自动注入 source 字段 (TemplateCardSource) 到所有 first-reply 卡片.
+  //   背景: 12 个 PR 都失败, 审计确认 wire shape 完全符合 SDK TemplateCard 类型.
+  //   SDK 类型把 source 标为 OPTIONAL (api.d.ts:319), 但 aibot 服务端对 first-reply
+  //   template_card 可能 REQUIRE source — 这能解释为什么最小 1 按钮 + 0 action_menu
+  //   仍 40016 "invalid button size" (server 内部字段校验报错, errcode 通用化).
+  //   template_card_newsNotice 已用 card_source, button_interaction/text_notice
+  //   都不带. 修法: 统一注入 source (desc 13字内 + url 必填, 占位 https URL).
+  //   如果 hypothesis 错, 集成测试 (tests/integration/wecom/wecom-card-wire.test.ts)
+  //   dump 的 wire payload 可对比 PR 7 spec §4.1 找真实差异.
+  if (!wire.source) {
+    wire.source = {
+      desc: 'Claude Code',
+      url: 'https://example.com/cc-linker',
+    };
+  }
+
   // PR 7.5.12: 诊断日志 — 真机 40016 后需看真发的 JSON 形状 (button count / action_menu count / task_id)
   //   40016 "invalid button size" 真根因可能不是 button 数量, 而是 action_menu 算 button, 或 button.text 超 10 字
   //   用 info 级 (真机部署后我们 grep log 立即看), 不打完整 JSON (避免日志噪音)
@@ -89,9 +105,11 @@ function transformToWireShape(card: WecomTemplateCard): WecomTemplateCard {
   const amCount = ((wire as any).action_menu?.action_list ?? []).length;
   const btnTexts = (wire.button_list?.button ?? []).map((b: any) => `${b.text}(${(b.text ?? '').length})`).join(',');
   const amTexts = ((wire as any).action_menu?.action_list ?? []).map((a: any) => `${a.text}(${(a.text ?? '').length})`).join(',');
+  const hasSource = !!(wire as any).source;
   logger.info(
     `[wecom-complete-card] wire: card_type=${wire.card_type} btn=${btnCount}[${btnTexts}] ` +
-    `action_menu=${amCount}[${amTexts}] task_id=${wire.task_id?.slice(0, 24)} title_len=${(wire.main_title?.title ?? '').length} desc_len=${(wire.main_title?.desc ?? '').length}`,
+    `action_menu=${amCount}[${amTexts}] task_id=${wire.task_id?.slice(0, 24)} ` +
+    `source=${hasSource} title_len=${(wire.main_title?.title ?? '').length} desc_len=${(wire.main_title?.desc ?? '').length}`,
   );
 
   return wire as WecomTemplateCard;
