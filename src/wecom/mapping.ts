@@ -69,6 +69,74 @@ export class WecomUserManager extends PlatformUserManager {
   }
 
   /**
+   * PR 7.5.1 Task 1.3: 写用户级 defaultProvider (跨 session 保留的 /model 配置)
+   *
+   * 背景: 平台无关字段 PlatformMappingEntry.defaultProvider (platform/mapping-types.ts:33)
+   *   已存在, 飞书侧 handleSelectModel/doSelectModel 走类似路径持久化 user-level 默认 model.
+   *   企微侧本 PR 新增本方法, 让 doSelectModel 写 /model 命令的 alias 选择.
+   * 设计: 同 userId 多次 /model 后, 最新 alias 覆盖, 跨 session 保留 (跟飞书侧行为对齐).
+   * 防御: 当 user 尚无 entry 时, 先建一个 pending_new_session 占位 (跟 setPending 同样的
+   *   占位策略), 避免首次 /model 就跳过用户注册流程. 实际生产中 setPending 总在
+   *   setDefaultProvider 之前被调, 但兜底逻辑防 undefined entry 崩.
+   *
+   * @param externalUserId 企微 external_userid (跟 setPending 锁文件粒度一致)
+   * @param alias model alias 字符串 (e.g. "opus" / "sonnet" / "haiku")
+   */
+  async setDefaultProvider(externalUserId: string, alias: string): Promise<void> {
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const now = new Date().toISOString();
+      const existing = mapping.entries[externalUserId];
+      mapping.entries[externalUserId] = {
+        // 无 entry 时给一个 pending_new_session 占位 (type 后续 /new 流程覆盖)
+        type: existing?.type ?? 'pending_new_session',
+        sessionUuid: existing?.sessionUuid ?? null,
+        createdAt: existing?.createdAt ?? now,
+        cwd: existing?.cwd,
+        lastActiveAt: now,
+        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        defaultProvider: alias,
+      };
+      mapping.version++;
+      this.saveMapping(mapping);
+    });
+  }
+
+  /**
+   * PR 7.5.1 Task 1.3: 清用户级 defaultProvider (对应飞书侧 doClearModel / "默认" 选项)
+   *
+   * 背景: /model 命令菜单有 "默认" 选项, 让用户清除 custom alias 回退到系统默认.
+   *   飞书侧 doClearModel 走类似路径. 企微侧本 PR 新增本方法.
+   * 设计: 用解构删 defaultProvider 字段 (而非设为 undefined) — 这样 saveMapping 后
+   *   loadMapping 拿到的 entry 完全没有这个 key, entry?.defaultProvider === undefined 行为
+   *   更干净 (TypeScript optional field delete semantics). 跟 setSession 已用 explicit
+   *   undefined 清理 claimed 字段的 2 套风格兼容 (本方法用 destructure 更显式).
+   * 防御: 无 entry 时静默 no-op, 不创建空 entry (clear 语义不该产生副作用).
+   *
+   * @param externalUserId 企微 external_userid
+   */
+  async clearDefaultProvider(externalUserId: string): Promise<void> {
+    await withLock(this.mappingPath, async () => {
+      this.ensureFile();
+      const mapping = this.loadMapping();
+      const current = mapping.entries[externalUserId];
+      if (!current) return;  // 无 entry: no-op, clear 不该创建副作用
+      if (current.defaultProvider === undefined) return;  // 已无 defaultProvider: 跳过写盘
+      const { defaultProvider, ...rest } = current;
+      // destructure 后 rest 不含 defaultProvider; 但仍需刷 lastActiveAt/casToken/version
+      //   表达 "此 entry 被访问过" 的痕迹 (跟 touchSession 风格一致)
+      mapping.entries[externalUserId] = {
+        ...rest,
+        lastActiveAt: new Date().toISOString(),
+        casToken: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      };
+      mapping.version++;
+      this.saveMapping(mapping);
+    });
+  }
+
+  /**
    * 企微特有 claimPending（与飞书 claimPendingNewSession 行为对齐：
    * pending → claimed 转换，命中 unauthorized/no_pending/creating/claimed 4 个状态）
    *

@@ -203,4 +203,34 @@ describe('WecomUserManager', () => {
     expect(src).toMatch(/setSession[\s\S]{0,2000}lockKey/s);
     expect(src).toMatch(/touchSession[\s\S]{0,2000}lockKey/s);
   });
+
+  // PR 7.5.1 Task 1.3: defaultProvider 方法 (持久化 /model 命令的 user-level 默认 model alias)
+  // 平台无关字段 PlatformMappingEntry.defaultProvider (mapping-types.ts:33) 已存在,
+  // 企微侧本 PR 新增写/清 2 个方法, 跟飞书侧 doSelectModel/doClearModel 行为对齐.
+  describe('PR 7.5.1: defaultProvider methods', () => {
+    it('setDefaultProvider writes entry.defaultProvider', async () => {
+      const fs = await import('fs/promises');
+      const path = await import('path');
+      const tmpFile = path.join('/tmp', `test-mapping-pr751-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+      const mgr = new WecomUserManager(tmpFile);
+      await mgr.setPending('user-test-1', { cwd: '/tmp' });
+      await mgr.setDefaultProvider('user-test-1', 'opus');
+      const entry = mgr.getEntry('user-test-1');
+      expect(entry?.defaultProvider).toBe('opus');
+      await fs.unlink(tmpFile);
+    });
+
+    it('clearDefaultProvider removes defaultProvider field', async () => {
+      const fs = await import('fs/promises');
+      const path = await import('path');
+      const tmpFile = path.join('/tmp', `test-mapping-pr751-clr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
+      const mgr = new WecomUserManager(tmpFile);
+      await mgr.setPending('user-test-1', { cwd: '/tmp' });
+      await mgr.setDefaultProvider('user-test-1', 'sonnet');
+      await mgr.clearDefaultProvider('user-test-1');
+      const entry = mgr.getEntry('user-test-1');
+      expect(entry?.defaultProvider).toBeUndefined();
+      await fs.unlink(tmpFile);
+    });
+  });
 });
