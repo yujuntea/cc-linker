@@ -17,18 +17,37 @@ import { resolveLiveSession } from './fork-resolver';
 const MAX_CARD_BYTES = 25_000;
 /** 列表 fallback 文本:卡超 25KB 时降级。 */
 const LIST_FALLBACK_TEXT = (n: number) => `📋 Agent View · ${n} sessions · /agents to refresh`;
-/** v2.3.2 截断策略:completed 组的最多行数。waiting/busy/idle 不受此限,优先展示。 */
+/** v2.3.2 截断策略:completed 组的最多行数。 */
 const MAX_COMPLETED_ITEMS = 5;
+/**
+ * v2.7.5 截断策略:active 组(busy + waiting)的最多行数。
+ * v2.7.4 给所有 status 加 Reply 按钮后,每 session 多 1 button →
+ * 25+ active sessions 直接爆 25KB,触发 LIST_FALLBACK_TEXT 降级,用户
+ * 看不到任何 session 详情。
+ *
+ * 之前 v2.3.2 设计是 "waiting/busy 全部进",但前提是每个 session 只有 3 个
+ * button (Peek/Attach/+ waiting-only Reply)。v2.7.4 后 busy/waiting 也是 3-4
+ * 个 button,加上 cwd 可能很长,实测 7 busy + 5 waiting + 长 cwd 已经
+ * 25KB。降到 7 是实测 25 个 mixed sessions 长 cwd 仍留 4KB 余量。
+ */
+const MAX_ACTIVE_ITEMS = 7;
+/** v2.7.5 截断策略:idle 组的最多行数。idle 是历史 session,价值低。 */
+const MAX_IDLE_ITEMS = 4;
 
 /**
  * v2.3.2 截断:旧 `slice(0, 10)` 在 groupByStatus 前一刀切,completed 组"重"挤掉
  * working(例如 1+7 active + 11 completed = 19 → 前 10 里有 5 个 completed,
  * working 只剩 4 个,3 个被推到 ... N more 后面,跟 TUI 看到的 7 working
  * 不一致)。新策略:先 groupByStatus → 各 group 内按 startedAt 倒序 → waiting/busy
- * 全部进,completed 限额到 MAX_COMPLETED_ITEMS(5)。剩余 completed 计 hasMore。
+ * 限额到 MAX_ACTIVE_ITEMS(7),idle 限额到 MAX_IDLE_ITEMS(4),completed 限额到
+ * MAX_COMPLETED_ITEMS(5)。剩余 sessions 计 hasMore。
  *
  * v2.6: fork 续接过滤 — 有 liveFork 的 session 自身已死,新 fork 已通过 jobs/
  * 出现在列表里。隐藏原 session 避免重复展示。
+ *
+ * v2.7.5: 加 busy/waiting/idle 上限 — 飞书 card 25KB 硬限制 + v2.7.4 全 status
+ * 加 Reply 按钮后 29 sessions 必爆 → 走 fallback 用户看不到任何 session。
+ * 配合 truncateCwd(40 chars)进一步降低单 session 体积。
  */
 function buildCappedCard(sessions: AgentSession[], totalSessions: number): {
   card: string;
@@ -42,19 +61,20 @@ function buildCappedCard(sessions: AgentSession[], totalSessions: number): {
   const groupsAll = groupByStatus(filteredSessions);
   const sortByRecency = (arr: AgentSession[]) =>
     [...arr].sort((a, b) => b.startedAt - a.startedAt);
-  const busySorted = sortByRecency(groupsAll.busy);
-  const waitingSorted = sortByRecency(groupsAll.waiting);
+  const busySorted = sortByRecency(groupsAll.busy).slice(0, MAX_ACTIVE_ITEMS);
+  const waitingSorted = sortByRecency(groupsAll.waiting).slice(0, MAX_ACTIVE_ITEMS);
+  const idleSorted = sortByRecency(groupsAll.idle).slice(0, MAX_IDLE_ITEMS);
   const completedSorted = sortByRecency(groupsAll.completed);
   const completedCapped = completedSorted.slice(0, MAX_COMPLETED_ITEMS);
   const groups: AgentSessionGroup = {
     busy: busySorted,
     waiting: waitingSorted,
-    idle: groupsAll.idle,
+    idle: idleSorted,
     completed: completedCapped,
   };
   const hasMore = Math.max(
     0,
-    totalSessions - liveForkCount - busySorted.length - waitingSorted.length - groupsAll.idle.length - completedCapped.length,
+    totalSessions - liveForkCount - busySorted.length - waitingSorted.length - idleSorted.length - completedCapped.length,
   );
   return {
     card: buildListCard(groups, new Date().toLocaleTimeString(), hasMore),

@@ -4,6 +4,54 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.5] - 2026-07-02
+
+### Fixed
+
+- **Agent View /agents 在 29 sessions 时只显示 fallback 文本** —
+  v2.7.4 给所有 status 加 Reply 按钮后,每 session 多 1 button →
+  配合未限制的 busy/waiting/idle,29 sessions 必超飞书 25KB 卡上限
+  → `sendOrFallback` 触发 → 用户看到 `"📋 Agent View · 29 sessions ·
+  /agents to refresh"` 这条 fallback 文本,而不是真正的 list 卡(含
+  Peek/Reply/Stop 按钮)。
+  - `src/agent-view/manager.ts:33-44` — `buildCappedCard` 新增
+    `MAX_ACTIVE_ITEMS = 7` (busy/waiting 各上限)、`MAX_IDLE_ITEMS = 4`,
+    溢出进 `hasMore`。
+  - `src/agent-view/card.ts:166-173` — `truncateCwd` 加 40 字符绝对上限
+    (保留尾段 project 名),降低单 session 体积,留出 4-20KB 余量给
+    long-cwd 场景。
+  - 实测: 1 busy + 28 idle (用户场景) 30.8KB → 5.3KB (有 19.7KB 余量);
+    50 sessions 极端 24.2KB → 18.1KB。
+- **deploy-local.js 读 818MB log 撞 V8 string 限制崩溃** —
+  `verifyNewVersion` 用 `readFileSync(LOG_FILE, 'utf8')` 把 818MB log
+  整文件读进内存,V8 单 string 限制 0x1fffffe8 (~512MB) → 抛
+  `"Cannot create a string longer than 0x1fffffe8 characters"` →
+  整个 deploy 误判失败 → 触发 rollback no-op(脚本 bug 报"已恢复
+  backup"但 backup 已不存在)。
+  - `scripts/deploy-local.js:273-299` — 改用 `grep -E` 流式读 banner,
+    7s on 780MB log(可接受)。**不用** `readFileSync`。
+- **deploy-local.js banner 选取逻辑错** — daemon logger 非 append-only
+  (重启时新内容写到文件头),`grep ... | tail -1` 拿的是行号最大的
+  banner,可能是文件中段的某条历史 broken banner(缺 timestamp),
+  regex `\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]` 不匹配 → 误报
+  "没找到 banner"。
+  - `scripts/deploy-local.js:289-296` — 改为 grep 全文件,过滤出带
+    合法 timestamp 前缀的 banner,按 timestamp 字符串字典序(YYYY-MM-DD
+    HH:MM:SS 排序等价于时间序)取最新。
+
+### Tests
+
+- 新增 `tests/unit/agent-view/manager.test.ts` regression test —
+  v2.7.5: 29 mixed sessions (用户场景) → 渲染不超 25KB,无 fallback。
+  模拟用户实际分布 (7 busy + 5 waiting + 6 idle + 11 completed) + 长
+  cwd,断言 `cardReplyFn` 收到卡(不是 fallback text)、卡大小 < 25KB、
+  hasMore 非 0、各 status group 至少展示 1 个 session。
+- 更新 `v2.3.2: active 优先 — busy 全进,completed 限额 5` 测试 —
+  25 busy 现 cap 到 7 rows + hasMore=18(原契约 25 全进已不成立)。
+- 更新 `exceeds 25KB triggers text fallback` 测试 — 用 30 sessions ×
+  5KB name 仍能触发 fallback(原 10 × 3KB 测试在 v2.7.5 后只渲染 7
+  sessions = 21KB < 25KB,不再触发 fallback)。
+
 ## [0.7.3] - 2026-07-02
 
 ### Added

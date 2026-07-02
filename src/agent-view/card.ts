@@ -165,7 +165,11 @@ function humanizeElapsed(ms: number): string {
 
 function truncateCwd(cwd: string): string {
   const home = process.env.HOME || '/';
-  return cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
+  const tilde = cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
+  // v2.7.5: 飞书 card 25KB 上限 + 大量 session 时 cwd 是主要体积来源。
+  // 截到 40 字符(保留尾段,project 名通常在最右)。
+  const MAX = 40;
+  return tilde.length <= MAX ? tilde : '…' + tilde.slice(tilde.length - MAX + 1);
 }
 
 /** 列表卡每行的副标题:waiting → needs(或 detail / intent 兜底),busy/done → detail,fallback → intent。
