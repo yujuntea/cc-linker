@@ -4,6 +4,65 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.3] - 2026-07-02
+
+### Added
+
+- **多平台 IM 抽象层**（wecom 集成 PR 1）— 新增 `src/platform/` 子目录,
+  抽出与具体 IM 平台解耦的 4 个模块,飞书之外的平台（企微/钉钉/Slack 等）
+  可以基于这套接口实现 adapter,不需改 bot 主流程:
+  - `src/platform/types.ts` (`PlatformAdapter` / `PlatformMessage` /
+    `PlatformUser` / `PlatformStreamUpdater` 接口) — 统一消息模型,
+    `userId` + `platform` 字段一起做 serialKey。
+  - `src/platform/command-handler.ts` — `isCommandMessage()` /
+    `extractCommand()` 静态 helper,把"是否命令"判定从飞书专属逻辑
+    中抽出来,任何平台都可复用。
+  - `src/platform/stream-updater.ts` — `PlatformStreamUpdater` 抽象类,
+    封装 throttled 卡片更新 + 状态机 (processing → streaming → complete
+    /error)。
+  - `src/platform/user-state.ts` — 平台无关的 `PendingReply` 描述,
+    `userId + platform` 取代纯 `openId` 作为 user-mapping key。
+- **`src/feishu/stream-updater.ts`** — 从 `src/feishu/bot.ts` 抽出
+  `FeishuStreamUpdater` (继承 `PlatformStreamUpdater`),保持原有
+  CardUpdater 行为不变,bot 主流程代码减少约 20 行。
+
+### Changed
+
+- **`src/feishu/bot.ts`** — `handleChatStreaming` 改用新抽象的
+  `PlatformStreamUpdater`,原先在 bot.ts 里的 stream 卡片更新逻辑
+  下沉到 `FeishuStreamUpdater`。bot.ts 净减约 20 行。
+- **`src/feishu/mapping.ts`** — UserManager key 拼接 `userId` 和
+  `platform`,为后续多平台并存做准备;旧的纯 `openId` key 仍兼容
+  读取。
+
+### Fixed
+
+- **legacy spool 文件 userId/platform 字段缺失** (`src/queue/spool.ts`) —
+  v0.7.x 之前的 spool 消息没有 `userId` / `platform` 字段,worker
+  pool claim 时会因找不到 key 而无法分发。现在 enqueue 时自动
+  backfill 默认值 (`userId = openId`, `platform = 'feishu'`),
+  旧 spool 文件可正常 drain。
+- **`[STREAM-5]` / `[STREAM-7]` plan spec args index 拼写错误** —
+  plan 文档把 `args[index]` 写成了 `args[0]`,plan reviewer 之前漏检。
+  修复后对齐真实实现 (`args[3]` / `args[5]`)。
+
+### Refactored
+
+- **`src/feishu/bot.ts` 复用 `platform/command-handler`** — 删掉
+  本地的 `isCommandMessage` 实现,改为 `import { isCommandMessage }
+  from '../platform/command-handler'`。与新抽象层对齐。
+
+### Tests
+
+- 新增 `tests/unit/platform/types.test.ts` (104 行) — PlatformAdapter /
+  PlatformMessage 等接口的 contract 测试。
+- 新增 `tests/unit/platform/user-state.test.ts` (44 行)。
+- 新增 `tests/unit/platform/command-handler.test.ts` (55 行)。
+- 新增 `tests/unit/platform/stream-updater.test.ts` (44 行)。
+- 新增 `tests/unit/feishu/stream-updater.test.ts` (71 行) — 验证抽
+  出后的 FeishuStreamUpdater 行为与原 inline 实现一致。
+- 新增 `tests/unit/feishu/bot-stream-updater.test.ts` (58 行)。
+
 ## [0.7.1] - 2026-06-17
 
 ### Added
