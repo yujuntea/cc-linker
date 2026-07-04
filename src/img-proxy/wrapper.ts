@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
+import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 
 export const WRAPPER_START_MARKER = '# >>> cc-linker img-proxy wrapper (do not edit this block) >>>';
@@ -114,6 +115,6 @@ export function detectShell(): 'zsh' | 'bash' | null {
 
 /** 获取指定 shell 的 rc 文件路径。 */
 export function getRcFilePath(shell: 'zsh' | 'bash', home?: string): string {
-  const h = home ?? process.env.HOME ?? '';
+  const h = home ?? process.env.HOME ?? homedir();
   return join(h, shell === 'zsh' ? '.zshrc' : '.bashrc');
 }

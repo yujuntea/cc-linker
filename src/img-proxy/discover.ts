@@ -1,11 +1,10 @@
 import { readFileSync, readdirSync, existsSync, mkdirSync } from 'fs';
 import { join, basename } from 'path';
 import { classifyModel, type ModelKind } from './classify';
-import { discoverShellAliases } from './aliases';
 import type { ProviderFileInfo } from './types';
 
 export interface Candidate extends ProviderFileInfo {
-  source: 'manual' | 'auto' | 'alias' | 'cc-switch';
+  source: 'manual' | 'auto';
   kind: ModelKind;
 }
 
@@ -22,17 +21,10 @@ export interface DiscoverOpts {
  * 🔴 Fix #5:source 类型统一 'cc-switch'(连字符)
  */
 export function discoverCandidates(opts: DiscoverOpts): Candidate[] {
-  const { manualDir, autoDir, aliasRcFiles, extraPatterns } = opts;
+  const { manualDir, autoDir, extraPatterns } = opts;
 
   const manualFiles = scanDir(manualDir);
   const autoFiles = scanDir(autoDir);
-
-  // alias → file hint
-  const aliases = discoverShellAliases(aliasRcFiles);
-  const aliasByProvider = new Map<string, string>();
-  for (const a of aliases) {
-    if (a.providerAlias) aliasByProvider.set(a.providerAlias, a.name);
-  }
 
   // file dedup:manual 覆盖 auto
   const byAlias = new Map<string, ProviderFileInfo>();
@@ -43,7 +35,6 @@ export function discoverCandidates(opts: DiscoverOpts): Candidate[] {
   const candidates: Candidate[] = [];
   for (const [alias, file] of byAlias) {
     const isAuto = !manualFiles.some(m => m.alias === alias);
-    const shellName = aliasByProvider.get(alias);
     candidates.push({
       ...file,
       source: isAuto ? 'auto' : 'manual',
@@ -54,12 +45,10 @@ export function discoverCandidates(opts: DiscoverOpts): Candidate[] {
   // 🔴 过滤无 BASE_URL(同现有 install 语义)
   const withBaseUrl = candidates.filter(c => c.baseUrl);
 
-  // 排序:manual(0) < cc-switch(1) < auto(2) < alias(3)
+  // 排序:manual(0) < auto(1)
   const sourcePriority: Record<Candidate['source'], number> = {
     manual: 0,
-    'cc-switch': 1,
-    auto: 2,
-    alias: 3,
+    auto: 1,
   };
   withBaseUrl.sort((a, b) => {
     const dp = sourcePriority[a.source] - sourcePriority[b.source];

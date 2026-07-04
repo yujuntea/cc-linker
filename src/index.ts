@@ -197,7 +197,7 @@ imgProxyCmd.command('install')
   .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
   .option('--all', '全部 provider(dumb 模式)')
   .option('--yes', 'smart 默认预选,不交互')
-  .option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)', 'smart')
+  .option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)')
   .action((opts) => { imgProxyInstall(opts); });
 imgProxyCmd.command('uninstall')
   .description('还原 provider 的 BASE_URL')

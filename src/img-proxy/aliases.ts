@@ -20,8 +20,10 @@ export function discoverShellAliases(rcFiles?: string[]): DiscoveredAlias[] {
 
   for (const file of files) {
     const lines = safeReadLines(file);
-    for (const line of lines) {
-      if (line.trim().startsWith('#')) continue;
+    for (const rawLine of lines) {
+      if (rawLine.trim().startsWith('#')) continue;
+      // Strip trailing # comment(忽略 # 出现在引号外的场景)
+      const line = rawLine.replace(/\s+#.*$/, '');
       const m = line.match(ALIAS_LINE_RE);
       if (!m) continue;
       const name = m[1]!;
