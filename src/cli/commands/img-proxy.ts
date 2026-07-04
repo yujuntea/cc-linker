@@ -208,6 +208,19 @@ export async function imgProxyStatus(): Promise<void> {
     for (const p of missing) console.log(chalk.gray(`   · ${p.alias}`));
   }
 
+  // Wrapper 状态
+  const shell = detectShell();
+  if (shell) {
+    const rcFile = getRcFilePath(shell);
+    console.log(chalk.cyan('\nwrapper:'));
+    if (isWrapperInstalled(rcFile)) {
+      console.log(chalk.green(`   ✅ 已装 (${shell}, ${rcFile})`));
+      console.log(chalk.gray(`   提示: 跑 cc-linker-proxy 替代 claude`));
+    } else {
+      console.log(chalk.gray(`   ⚠️ 未装 (cc-linker img-proxy wrapper-install)`));
+    }
+  }
+
   if (platform() === 'darwin') {
     console.log(chalk.cyan('\n开机自启:'));
     console.log(existsSync(launchdPlistPath()) ? chalk.green('   ✅ launchd 已配置') : chalk.gray('   未配置 (cc-linker img-proxy daemon install)'));
