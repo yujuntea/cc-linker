@@ -13,7 +13,7 @@ import {
   IMG_PROXY_PID_FILE, IMG_PROXY_LOG_FILE, CLAUDE_PROVIDERS_DIR,
 } from '../../utils/paths';
 import { installProvider, uninstallProvider, isProviderInstalled } from '../../img-proxy/provider-config';
-import { loadRoutes, removeRoute } from '../../img-proxy/routes';
+import { loadRoutes, removeRoute, resolveProxyByUpstream } from '../../img-proxy/routes';
 import { scanProviderFiles, hasCcSwitch } from '../../img-proxy/provider-scan';
 import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
@@ -215,6 +215,16 @@ export async function imgProxyCurrentUrl(): Promise<void> {
     process.exit(1);
   }
   if (url) console.log(url);
+  // 空 stdout = "没找到" — wrapper 检测用
+}
+
+// ---------- resolve ----------
+// upstream 由 Commander 的 <upstream>(尖括号 = 必填)传入,这里类型就是 string
+export async function imgProxyResolve(opts: { upstream: string }): Promise<void> {
+  const port = config.get<number>('img_proxy.port', 8765);
+  const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
+  const proxyUrl = resolveProxyByUpstream(IMG_PROXY_ROUTES_PATH, port, hostname, opts.upstream);
+  if (proxyUrl) console.log(proxyUrl);
   // 空 stdout = "没找到" — wrapper 检测用
 }
 
