@@ -62,3 +62,9 @@ export const IMG_PROXY_CACHE_DIR = join(IMG_PROXY_DIR, 'cache');
 export const IMG_PROXY_ROUTES_PATH = join(IMG_PROXY_DIR, 'routes.json');
 export const IMG_PROXY_PID_FILE = join(IMG_PROXY_DIR, 'img-proxy.pid');
 export const IMG_PROXY_LOG_FILE = join(IMG_PROXY_DIR, 'img-proxy.log');
+
+// Wrapper 安装时的 rc 文件备份目录
+export const IMG_PROXY_WRAPPER_BACKUP_DIR = join(IMG_PROXY_DIR, 'wrapper-backups');
+
+// CC Switch 同步出来的 provider 文件目录(共享 ProviderManager)
+export const AUTO_PROVIDERS_DIR = join(CC_LINKER_DIR, 'auto-providers');

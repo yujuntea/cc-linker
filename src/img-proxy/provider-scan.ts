@@ -1,11 +1,10 @@
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, statSync } from 'fs';
 import { join, basename } from 'path';
 import { Database } from 'bun:sqlite';
-import { CLAUDE_PROVIDERS_DIR, CC_LINKER_DIR, HOME } from '../utils/paths';
+import { CLAUDE_PROVIDERS_DIR, HOME, AUTO_PROVIDERS_DIR } from '../utils/paths';
 import type { ProviderFileInfo } from './types';
 
 const CC_SWITCH_DB = join(HOME, '.cc-switch', 'cc-switch.db');
-const AUTO_PROVIDERS_DIR = join(CC_LINKER_DIR, 'auto-providers');
 
 /**
  * 扫所有可用的 provider,合并两路:
