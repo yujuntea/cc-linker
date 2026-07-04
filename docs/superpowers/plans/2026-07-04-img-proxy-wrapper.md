@@ -1,6 +1,8 @@
 # cc-linker img-proxy Wrapper Mode — Spec
 
 > **Status:** Draft for review · **Branch:** `feat/cli-image-proxy` · **Plan owner:** img-proxy maintainers
+>
+> **Updated:** Added §13 Model Classification (smart text-only vs multimodal detection) + §14 Shell Alias Discovery (auto-detect existing `cc-*` aliases) + §15 Smart Install flow.
 
 ## 1. Goals & Non-Goals
 
@@ -9,6 +11,8 @@
 - **Support CC Switch users** who run `claude` directly (without our custom aliases). They never read `~/.claude/providers/*.json` — they read `~/.claude/settings.json`.
 - **Don't conflict with CC Switch.** CC Switch writes to `~/.claude/settings.json` and `~/.cc-switch/cc-switch.db`. We touch neither.
 - **Don't conflict with the existing file-modify mode.** Both modes coexist; users pick based on their workflow.
+- **Skip multimodal models.** Don't run image-capable models through proxy (would lose their image-understanding capability). Detect by model name patterns.
+- **Auto-discover existing shell aliases.** Detect user's existing `cc-*` aliases in `~/.zshrc` / `~/.bashrc`, map to providers, pre-select for install. No need for user to specify `--providers`.
 - **Zero external dependencies.** No `jq`, no Node inline scripts in the shell wrapper — all logic goes through `cc-linker` subcommands.
 - **Idempotent + safe.** `wrapper-install` can run multiple times without duplicating; backs up the rc file before modification.
 
@@ -475,3 +479,391 @@ Step 6 (optional): 检测用户是否用 CC Switch,推荐 wrapper-install
 3. **Should `wrapper-status` be a separate subcommand or merged into `status`?** v1: merged (less command surface).
 4. **What about bash completion?** Out of scope; zsh has good completion out of the box.
 5. **Should we expose a `proxy` alias as a setup wizard option?** E.g., `cc-linker setup --proxy-mode=wrapper`. v1: detect-and-ask during setup wizard.
+
+---
+
+## 13. Model Classification (text-only vs multimodal)
+
+### Motivation
+
+If we proxy ALL providers through img-proxy, multimodal models (Claude 3+, GPT-4, etc.) **lose their image understanding** — they get a text path instead of the actual image. That's a regression for users who chose those models for their multimodal capabilities.
+
+**Smart install** classifies each provider by model name and:
+- **Multimodal models** (vision-capable): **skip** proxy — keep their image understanding
+- **Text-only models**: **proxy** — they need it for image acceptance
+- **Unknown models**: default to **proxy** (conservative: prefer false-positive over false-negative)
+
+### Classification is by MODEL name, not provider file name
+
+Important: `~/.claude/providers/minimax-m2.7.json` (provider filename `m2.7`) might use `MiniMax-M3[1m]` model. We classify by `env.ANTHROPIC_MODEL` field, **not** by provider filename.
+
+### Pattern lists (built-in, case-insensitive regex)
+
+**Multimodal (skip proxy):**
+
+```typescript
+const MULTIMODAL_PATTERNS = [
+  // Claude family (3/4 all have vision)
+  /^claude-3/i,
+  /^claude-opus/i,                 // claude-opus-4, claude-opus-4-1, ...
+  /^claude-sonnet/i,               // claude-sonnet-4, ...
+  /^claude-haiku/i,
+
+  // OpenAI gpt-4 family (all vision-capable since gpt-4-turbo / gpt-4o)
+  /^gpt-4/i,                        // gpt-4, gpt-4o, gpt-4-turbo, gpt-4-vision
+
+  // Gemini
+  /^gemini-.*vision/i,
+  /^gemini-1\.5-pro/i,             // gemini-1.5-pro has vision
+
+  // GLM vision variants (only 4v / 4-plus, NOT 5.x or 4.5/4.6)
+  /^glm-4v/i,                       // glm-4v, glm-4v-plus
+  /^glm-4-plus/i,                   // glm-4-plus has vision
+
+  // Qwen vision variants
+  /^qwen-vl/i,                      // qwen-vl, qwen2-vl, qwen-vl-plus
+  /^qwen3\.\d+(\.\d+)?-plus/i,     // qwen3.6-plus, qwen3.7-plus (per user)
+
+  // Kimi (per user: all kimi variants are multimodal)
+  /^kimi/i,                         // kimi, kimi-for-coding, kimi-vl, kimi-k2
+
+  // MiniMax M3 (per user)
+  /^MiniMax-M3/i,                   // MiniMax-M3[1m]
+
+  // Generic vision markers (fallback for unknown models)
+  /-vision$/i,                      // ends with -vision
+  /-vl-/i,                          // contains -vl-
+  /-vlm/i,                          // contains -vlm
+];
+```
+
+**Text-only (proxy):**
+
+```typescript
+const TEXT_ONLY_PATTERNS = [
+  // GLM text-only (5.x, 4.5, 4.6 — NOT 4v / 4-plus, those are multimodal)
+  /^glm-\d/i,                       // glm-5.2, glm-4.5, glm-4.6
+
+  // DeepSeek family (text-only until proven otherwise)
+  /^deepseek/i,                     // deepseek-chat, deepseek-v3, deepseek-v4
+
+  // Qwen text variants (NOT -plus per user, NOT -vl)
+  /^qwen-turbo/i,
+  /^qwen-max/i,                     // qwen-max, qwen3.7-max
+  /^qwen-long/i,
+  /^qwen-coder/i,
+  /^qwen3\.\d+(\.\d+)?-max/i,      // qwen3.7-max (NOT -plus)
+
+  // Moonshot / Kimi base variants — note: `kimi` is now multimodal per user
+  /^moonshot-/i,                    // moonshot-v1-* (legacy text-only)
+
+  // Chinese LLM families (text)
+  /^baichuan/i,
+  /^yi-/i,
+
+  // MiniMax M2 (text — M3 is multimodal above)
+  /^abab6/i,                        // abab6.5s (MiniMax M2)
+
+  // OpenAI older (text)
+  /^(gpt-3|gpt-3\.5)/i,             // gpt-3.5-turbo etc
+];
+```
+
+### Decision algorithm
+
+```typescript
+function classifyModel(modelName: string): 'multimodal' | 'text-only' | 'unknown' {
+  const name = modelName.trim();
+
+  // 1. Check multimodal FIRST (more specific / safer)
+  if (MULTIMODAL_PATTERNS.some(p => p.test(name))) return 'multimodal';
+
+  // 2. Check text-only
+  if (TEXT_ONLY_PATTERNS.some(p => p.test(name))) return 'text-only';
+
+  // 3. Unknown — default safe behavior
+  return 'unknown';
+}
+```
+
+**Default behavior for unknown**: `install` will proxy them (with a visible hint "unknown model, defaulting to proxy"). User can override per-provider with `--force-multimodal <alias>` flag.
+
+### Config extensibility
+
+In `~/.cc-linker/config.toml`:
+
+```toml
+[img_proxy]
+# 智能模式:跳过已知多模态模型,只 proxy 文本模型
+smart_mode = true
+
+# 追加自定义多模态 patterns(也会被跳过)
+vision_model_patterns_extra = [
+  "my-custom-vision-*",
+]
+
+# 追加自定义文本 patterns(也会被 proxy)
+text_only_model_patterns_extra = [
+  "my-custom-text-*",
+]
+```
+
+`config.get<string[]>('img_proxy.vision_model_patterns_extra', [])` appended to `MULTIMODAL_PATTERNS` at startup.
+
+### Test plan
+
+| Test | Input | Expected |
+|------|-------|----------|
+| Claude 3 | `claude-3-5-sonnet-20241022` | multimodal |
+| Claude 4 opus | `claude-opus-4[1m]` | multimodal |
+| GPT-4o | `gpt-4o` | multimodal |
+| Gemini vision | `gemini-1.5-pro-vision` | multimodal |
+| Qwen VL | `qwen-vl-plus` | multimodal |
+| Qwen 3.6 plus | `qwen3.6-plus[1m]` | multimodal |
+| Qwen 3.7 plus | `qwen3.7-plus[1m]` | multimodal |
+| Kimi coding | `kimi-for-coding[256k]` | multimodal |
+| MiniMax M3 | `MiniMax-M3[1m]` | multimodal |
+| GLM 5.2 | `glm-5.2[1m]` | text-only |
+| GLM 4.5 | `glm-4.5` | text-only |
+| DeepSeek V4 | `deepseek-v4-pro[1m]` | text-only |
+| Qwen 3.7 max | `qwen3.7-max[1m]` | text-only |
+| MiniMax M2 | `abab6.5s-chat` | text-only |
+| Unknown | `some-new-model[1m]` | unknown (defaults to proxy) |
+
+---
+
+## 14. Shell Alias Discovery
+
+### Motivation
+
+Users with custom `cc-byte-agent` style aliases already have a workflow. `install` should auto-detect these aliases and pre-select the corresponding providers — no need to specify `--providers byte-agent-glm` manually.
+
+### Discovery algorithm
+
+```typescript
+function discoverShellAliases(rcFiles?: string[]): DiscoveredAlias[] {
+  const files = rcFiles ?? [
+    join(HOME, '.zshrc'),
+    join(HOME, '.bashrc'),
+    join(HOME, '.zprofile'),         // macOS zsh login
+    join(HOME, '.bash_profile'),     // bash login
+  ].filter(existsSync);
+
+  const aliases: DiscoveredAlias[] = [];
+  for (const file of files) {
+    const lines = readFileSync(file, 'utf8').split('\n');
+    for (const line of lines) {
+      // Match: alias cc-XYZ='claude --settings /path/to/XYZ.json ...'
+      // or:     alias cc-XYZ="claude --settings /path/to/XYZ.json ..."
+      const m = line.match(/^alias\s+(cc-[\w-]+)\s*=\s*['"]?([^'"]*?)['"]?\s*$/);
+      if (!m) continue;
+      const name = m[1]!;                  // "cc-byte-agent"
+      const cmd = m[2]!;                  // "claude --settings /path/to/byte-agent-glm.json ..."
+      // Extract --settings <file> arg
+      const settingsMatch = cmd.match(/--settings\s+(\S+\.json)/);
+      const providerPath = settingsMatch ? settingsMatch[1]! : null;
+      const providerAlias = providerPath ? basename(providerPath, '.json') : null;
+      aliases.push({ name, command: cmd, providerPath, providerAlias });
+    }
+  }
+  return aliases;
+}
+```
+
+### What we extract
+
+| Alias | Command | Extracted |
+|-------|---------|-----------|
+| `alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json'` | → | name=cc-byte-agent, providerPath=`.../byte-agent-glm.json`, providerAlias=byte-agent-glm |
+| `alias cc-glm='claude --settings ~/.claude/providers/glm-5.2.json'` | → | name=cc-glm, providerAlias=glm-5.2 |
+| `alias claude='cc-linker-proxy'` | → | name=claude, providerPath=null (no --settings) |
+
+### What we DON'T do (v1)
+
+- We don't modify user's aliases (e.g., replace `cc-byte-agent` with `cc-linker-proxy`). User can do that manually.
+- We don't parse complex shell constructs (functions, conditional aliases, sourced files).
+- We only look at top-level `alias` lines in rc files.
+
+### Integration with install
+
+In smart install (next section), discovered aliases are used as hints:
+- For each discovered alias with `providerPath`, the corresponding provider is pre-selected in the install list.
+- The status output shows: "Discovered 3 cc-* aliases → 3 providers pre-selected"
+
+### Test plan
+
+| Test | Setup | Expected |
+|------|-------|----------|
+| Empty rc file | `~/.zshrc` empty | `[]` |
+| One alias | `alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json'` | `[{name: 'cc-byte-agent', providerAlias: 'byte-agent-glm', ...}]` |
+| Double quotes | `alias cc-x="claude --settings /tmp/foo.json"` | parsed correctly |
+| No --settings | `alias cc-y='echo hi'` | name=cc-y, providerPath=null |
+| Comment line | `# alias cc-z='...'` | ignored |
+| Multi-line continuation | `alias cc-w=\` followed by newline | skipped (v1 limitation) |
+| Non-cc alias | `alias ls='ls -la'` | ignored |
+| Non-existent rc file | `~/.zshrc` missing | `[]` |
+| Multiple rc files | both `~/.zshrc` and `~/.bashrc` exist | union of both |
+
+---
+
+## 15. Smart Install Flow
+
+### Goals
+
+- One command (`cc-linker img-proxy install`) does the right thing for all user types.
+- Auto-detects user's situation (CC Switch, custom aliases, both, neither).
+- Auto-classifies each provider (text-only vs multimodal).
+- Pre-selects sensible defaults; user can adjust.
+
+### Algorithm
+
+```
+1. Discover all candidate providers from 4 sources:
+   a. ~/.claude/providers/*.json           (manual)
+   b. ~/.cc-linker/auto-providers/*.json   (CC Switch sync, post P0-1)
+   c. ~/.cc-switch/cc-switch.db            (raw CC Switch DB)
+   d. ~/.zshrc ~/.bashrc cc-* aliases      (user's existing shortcuts)
+
+2. Merge + dedupe by provider file path or alias:
+   - file content is source of truth
+   - alias discovery is a hint (user explicitly references this provider)
+   - cc-switch DB contributes aliases not yet in file
+
+3. For each provider:
+   - Read model name from env.ANTHROPIC_MODEL field
+   - Classify: text-only / multimodal / unknown
+   - Mark source: 'manual' | 'auto' | 'cc-switch' | 'alias'
+
+4. Smart pre-selection:
+   - multimodal → SKIP (don't pre-select)
+   - text-only → SELECT
+   - unknown → SELECT with hint "(unknown model, will proxy by default; override with --no-smart)"
+
+5. Interactive checkbox (user can adjust):
+   - Shows source tag: [alias] glm-5.2[1m]     (from ~/.zshrc cc-glm)
+   - Shows classification: ⏭ multimodal or ✅ text-only
+   - Default selection per above rules
+
+6. Per selected provider, call installProvider:
+   - Reads file (manual or auto-providers)
+   - Modifies BASE_URL → proxy URL
+   - Writes back atomically (tmp + rename)
+
+7. Auto-install wrapper if CC Switch detected:
+   - If any provider source includes 'cc-switch' or 'alias' (custom aliases that may be replaced), call imgProxyWrapperInstall.
+   - User gets a one-liner reminder: "Run `source ~/.zshrc` or open a new shell to use cc-linker-proxy"
+
+8. Start daemon (if not already running).
+
+9. Print summary:
+   - Installed: N providers
+   - Skipped: M multimodal
+   - Wrapper: installed / already-installed / skipped
+   - Daemon: started / already-running
+```
+
+### CLI flags
+
+```bash
+cc-linker img-proxy install [flags]
+
+# Smart defaults (no flag = auto-detect everything)
+--all                            # install all detected (ignore multimodal classification)
+--providers <aliases>            # explicit provider selection (overrides smart detection)
+--mode={file|wrapper|both}       # force mode (default: smart detect)
+--no-smart                        # don't skip multimodal (proxy everything)
+--no-wrapper                      # skip wrapper installation
+--dry-run                         # show what would be done, don't modify
+```
+
+### Example output
+
+```
+$ cc-linker img-proxy install
+
+🔍 发现 16 个 claude providers:
+   4 来自 ~/.claude/providers/ (manual)
+   12 来自 CC Switch (已同步到 ~/.cc-linker/auto-providers/)
+
+🔍 发现 3 个 cc-* aliases in ~/.zshrc:
+   cc-byte-agent → ~/.claude/providers/byte-agent-glm.json
+   cc-byte-glm   → ~/.claude/providers/byte-glm.json
+   cc-glm        → ~/.claude/providers/glm-5.2.json
+
+🧠 智能分类(已跳过已知多模态):
+
+  来源              alias             model                     状态
+  ──────────────────────────────────────────────────────────────────
+  [alias]          byte-agent-glm   glm-5.2[1m]                ✅ 文本 → 选
+  [alias]          byte-glm         glm-5.2[1m]                ✅ 文本 → 选
+  [alias]          glm-5.2          glm-5.2[1m]                ✅ 文本 → 选
+  [cc-switch]      qwen3.6-plus     qwen3.6-plus[1m]           ⏭ 多模态 → 跳
+  [cc-switch]      qwen3.7-plus     qwen3.7-plus[1m]           ⏭ 多模态 → 跳
+  [cc-switch]      kimi-for-coding  kimi-for-coding[256k]      ⏭ 多模态 → 跳
+  [cc-switch]      minimax-m2.7     MiniMax-M3[1m]             ⏭ 多模态 → 跳
+  [cc-switch]      qwen3.7-max      qwen3.7-max[1m]            ✅ 文本 → 选
+  ... (其余 8 个文本模型)
+
+按 space 勾选要装的(已预选 12 个文本模型):
+
+> enter (确认预选)
+
+✅ 已装 12 个,跳过 4 个多模态
+✅ 检测到 CC Switch,自动装 wrapper 到 ~/.zshrc
+✅ 启动 daemon (PID 19234)
+
+用法:
+  cc-linker-proxy "看这个图"    ← 走 proxy(适用于 CC Switch 切到任何已装 provider 时)
+  cc-byte-agent "看这个图"      ← 走 proxy(因为 ~/.claude/providers/byte-agent-glm.json 已改)
+
+⚠️ wrapper 改动 ~/.zshrc,运行 source ~/.zshrc 或重开 shell 激活
+```
+
+### Test plan
+
+| Test | Setup | Expected |
+|------|-------|----------|
+| Empty user (no providers, no cc-switch) | clean state | error: "未找到任何 provider 配置" (existing) |
+| Manual only | `~/.claude/providers/X.json` only | install via file modification, no wrapper |
+| CC Switch only | `~/.cc-switch/cc-switch.db` only | install via auto-providers, wrapper installed |
+| Both | manual + cc-switch | install both, wrapper installed |
+| With aliases | `~/.zshrc` has `cc-*` aliases | aliases pre-select corresponding providers |
+| --all flag | mix of multimodal + text | all selected regardless of classification |
+| --no-smart flag | mix | multimodal also selected |
+| --dry-run | any | shows what would happen, no modifications |
+
+---
+
+## 16. Updated Implementation Order
+
+(P0/P1 already shipped. P2-x are new tasks added in this revision.)
+
+1. **P2-A: Model Classification** (~1.5h)
+   - `src/img-proxy/classify.ts`: regex patterns + classifyModel()
+   - Unit tests covering all built-in patterns + config override
+2. **P2-B: Shell Alias Discovery** (~1.5h)
+   - `src/img-proxy/aliases.ts`: discoverShellAliases() with rc file parsing
+   - Unit tests covering zsh/bash syntax, comments, edge cases
+3. **P2-1: resolve subcommand** (~30 min)
+4. **P2-2: wrapper install/uninstall** (~1h)
+5. **P2-3: wrapper generation tests** (~30 min)
+6. **P2-C: Smart install flow** (~2h, depends on P2-A + P2-B)
+   - Modify `imgProxyInstall` to use 4-source discovery + classification
+   - Integrate classifyModel + discoverShellAliases
+7. **P2-5: status with wrapper state** (~20 min)
+8. **P2-4: docs** (~20 min)
+9. **Manual smoke** (~20 min)
+10. **Deploy + push** (~10 min)
+
+**Total: ~9 hours** (was 3.5, now expanded for smart install features)
+
+---
+
+## 17. Updated Open Questions
+
+1. **Should wrapper also handle `--settings <file>` arg?** v1: no. (env var wins anyway.)
+2. **Should setup wizard auto-create `cc` alias?** v1: ask user during setup ("Want `cc` = `cc-linker-proxy`? Y/n").
+3. **Should `install --mode=file` skip multimodal entirely (not even show)?** v1: still show multimodal in UI, just skip by default. User can override with --all.
+4. **qwen3.7-max**: user didn't specify multimodal. Conservative: classify as text-only (proxy). User can add `vision_model_patterns_extra` if needed.
+5. **mimo-v2.5-pro**: Xiaomi MiMo. User didn't specify. Conservative: classify as unknown (proxy by default).
+6. **deepseek-v4-pro**: User didn't specify. Conservative: classify as text-only (proxy). Newer DeepSeek versions may gain vision — user can adjust.
