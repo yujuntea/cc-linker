@@ -661,3 +661,398 @@ cc-linker-proxy "echo test"    # 应该设置 env var
 - 现有 `src/img-proxy/provider-scan.ts` — 4 路扫描器(P0-1 cc-switch 支持)
 - 现有 `src/img-proxy/provider-config.ts` — `installProvider` 3 态机
 - 现有 `src/cli/commands/img-proxy.ts` — 当前 CLI 结构
+
+---
+
+## 14. 用户场景 & 验收测试标准(重要!)
+
+**这是实施前必须明确的"什么算成功"。每个场景都有具体的输入/操作/预期/验证步骤,可直接转成自动化测试。**
+
+### 14.1 用户画像
+
+| 画像 | 描述 | 典型场景 |
+|------|------|---------|
+| **A. 纯 CC Switch 用户** | 只有 CC Switch,`~/.claude/providers/` 为空 | 多数中国 LLM 用户现状 |
+| **B. 自定义 alias 用户** | `~/.claude/providers/` 有文件,`~/.zshrc` 有 `cc-X='claude --settings ...'` | 老 cc-linker 用户 |
+| **C. 混合用户** | CC Switch + 自定义 alias 都有 | 重度用户 |
+| **D. 全新 cold-start** | 刚装 cc-linker,没 CC Switch 也没 manual | 新用户 |
+| **E. 官方 API 直连** | 不用 CC Switch,`~/.claude/settings.json` 指 `api.anthropic.com` | 少数派 |
+
+---
+
+### 14.2 场景 A:纯 CC Switch 用户(最常见)
+
+#### 14.2.1 前置条件
+
+```bash
+# 用户的 ~/.claude/providers/ 不存在或为空
+ls ~/.claude/providers/  # Empty or No such file
+# CC Switch 已装
+ls ~/.cc-switch/cc-switch.db  # exists
+# CC Switch DB 含 glm-5.2 + kimi-for-coding + qwen3.6-plus 等
+# 用户跑 cc-switch use glm-5.2 时,~/.claude/settings.json 被更新
+```
+
+#### 14.2.2 操作流程
+
+```bash
+# 用户跑(最简):
+$ cc-linker img-proxy install
+
+# 期望输出(简化):
+🔍 发现 12 个 claude providers(来自 CC Switch):
+  ❯ ◯ [auto]  glm-5.2           ✅ text-only        glm-5.2[1m]
+    ◯ [auto]  kimi-for-coding   ⏭ multimodal-skip  kimi-for-coding[256k]
+    ◯ [auto]  qwen3.6-plus      ⏭ multimodal-skip  qwen3.6-plus[1m]
+    ◯ [auto]  minimax-m2.7      ✅ text-only        MiniMax-M3[1m]
+    ... (8 more)
+
+(已预选 4 个 text-only;multimodal 默认跳过)
+
+> a (全选 text-only)
+> enter
+
+✅ 已装 4 个(smart 模式)
+✅ 检测到 CC Switch,装 wrapper 到 ~/.zshrc?
+
+> y
+> enter
+
+✅ wrapper 已装到 ~/.zshrc
+   运行 source ~/.zshrc 或重开 shell 激活 cc-linker-proxy
+
+完成: cc-linker img-proxy start --daemon
+```
+
+#### 14.2.3 验收标准
+
+| # | 验证项 | 期望 |
+|---|--------|------|
+| A1 | `~/.cc-linker/auto-providers/` 存在并有 12 个 `.json` 文件(从 CC Switch 同步) | ✓ |
+| A2 | 4 个 text-only 的 auto-providers 文件 BASE_URL 被改成 `http://127.0.0.1:8765/<alias>` | ✓ |
+| A3 | 4 个 multimodal 的 auto-providers 文件**未被修改** | ✓ |
+| A4 | `~/.cc-linker/img-proxy/routes.json` 有 4 个 entry,每个 `upstream` 是真实 CC Switch URL(不是 proxy URL) | ✓ |
+| A5 | `~/.zshrc` 末尾追加了 `cc-linker-proxy()` 函数(在 marker 之间) | ✓ |
+| A6 | `~/.zshrc` 的修改前内容备份到 `~/.cc-linker/img-proxy/wrapper-backup-<ts>` | ✓ |
+| A7 | daemon 启动,PID 文件在 `~/.cc-linker/img-proxy/img-proxy.pid` | ✓ |
+| A8 | `curl http://127.0.0.1:8765/<alias>/v1/models` 返回 401(代理转发,upstream 拒 auth,符合预期) | ✓ |
+
+#### 14.2.4 日常使用流程
+
+```bash
+# 用户 source 一次
+$ source ~/.zshrc
+
+# 日常:用 CC Switch 切模型,跑 cc-linker-proxy
+$ cc-switch use glm-5.2
+$ cc-linker-proxy "看这个图"
+# 期望:
+# 1. 读 ~/.claude/settings.json → https://open.bigmodel.cn/api/anthropic
+# 2. 调 cc-linker img-proxy resolve → http://127.0.0.1:8765/glm-5.2
+# 3. ANTHROPIC_BASE_URL=http://127.0.0.1:8765/glm-5.2 command claude "看这个图"
+# 4. claude 请求到 proxy
+# 5. proxy 剥 image 块,落盘,替换成路径 text
+# 6. 转发到 https://open.bigmodel.cn/api/anthropic/v1/messages
+# 7. upstream 收到纯文本,处理
+
+# 切到 kimi
+$ cc-switch use kimi-for-coding
+$ cc-linker-proxy "看图"
+# 期望:cc-linker-proxy 报错"kimi-for-coding 没在 img-proxy 里,hint: cc-linker img-proxy install"
+#  因为 kimi 是 multimodal,我们没装
+```
+
+#### 14.2.5 验收标准(日常使用)
+
+| # | 验证项 | 期望 |
+|---|--------|------|
+| A9 | `cc-linker-proxy "echo test"` 设置 `ANTHROPIC_BASE_URL` 后 exec `claude` | exit code 0 |
+| A10 | 切换 CC Switch 后 `cc-linker-proxy` 跟随,调不同的 proxy URL | ✓ |
+| A11 | 切换到未装的 provider,kimi/multimodal → 报错,exit 1 | ✓ |
+| A12 | `claude` 直跑(不用 `cc-linker-proxy`)走原 URL(不 proxy) | ✓(verify via env) |
+
+---
+
+### 14.3 场景 B:自定义 alias 用户
+
+#### 14.3.1 前置条件
+
+```bash
+# 用户有 ~/.claude/providers/byte-agent-glm.json
+cat ~/.claude/providers/byte-agent-glm.json
+# {
+#   "model": "opus",
+#   "env": {
+#     "ANTHROPIC_BASE_URL": "https://ark.cn-beijing.volces.com/api/plan",
+#     ...
+#   }
+# }
+
+# ~/.zshrc:
+# alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json'
+
+# CC Switch 未装
+ls ~/.cc-switch/cc-switch.db  # No such file
+```
+
+#### 14.3.2 操作流程
+
+```bash
+$ cc-linker img-proxy install
+
+🔍 发现 1 个 provider(来自 manual + alias):
+  ❯ ◯ [alias]  byte-agent-glm   ✅ text-only        glm-5.2[1m]
+
+(1 个候选,已预选)
+
+> enter
+
+✅ 已装 1 个(smart 模式)
+
+# 注意:没问 wrapper —— 因为没 CC Switch
+# 用户继续用 cc-byte-agent alias,不需要 wrapper
+
+完成
+```
+
+#### 14.3.3 验收标准
+
+| # | 验证项 | 期望 |
+|---|--------|------|
+| B1 | `~/.claude/providers/byte-agent-glm.json` 的 `ANTHROPIC_BASE_URL` 被改成 `http://127.0.0.1:8765/byte-agent-glm` | ✓ |
+| B2 | `byte-agent-glm.json.bak` 创建,内容是原始(ark URL) | ✓ |
+| B3 | `routes.json` 有 `byte-agent-glm` entry,`upstream = ark URL`(不是 proxy URL) | ✓ |
+| B4 | **不**追加 wrapper 到 `~/.zshrc`(因为没 CC Switch) | ✓ |
+| B5 | `cc-byte-agent "看图"` 走 proxy(因为 alias 指向的文件 BASE_URL 已改) | ✓ |
+
+---
+
+### 14.4 场景 C:混合用户
+
+#### 14.4.1 前置条件
+
+```bash
+# 既有 CC Switch 又有 manual 文件和 alias
+ls ~/.claude/providers/  # 4 个文件
+ls ~/.cc-switch/cc-switch.db  # exists
+cat ~/.zshrc | grep "alias cc-"
+# alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json'
+# alias cc-byte-glm='claude --settings ~/.claude/providers/byte-glm.json'
+# alias cc-glm='claude --settings ~/.claude/providers/glm-5.2.json'
+```
+
+#### 14.4.2 操作流程
+
+```bash
+$ cc-linker img-proxy install
+
+🔍 发现 16 个 candidate(4 manual + 12 auto + 3 alias → dedup by alias):
+  ❯ ◯ [manual]  byte-agent-glm    ✅ text-only        glm-5.2[1m]
+    ◯ [manual]  byte-glm         ✅ text-only        glm-5.2[1m]
+    ◯ [manual]  glm-5.2          ✅ text-only        glm-5.2[1m]
+    ◯ [alias]   kimi-for-coding   ✅ text-only        kimi-for-coding[256k]
+    ◯ [auto]    MiniMax-m2.7     ✅ text-only        MiniMax-M3[1m]
+    ◯ [auto]    qwen3.6-plus     ⏭ multimodal-skip  qwen3.6-plus[1m]
+    ... (10 more, deduped)
+
+# 注意:[manual] 和 [alias] 同 alias 时,manual 优先(sourcePriority: manual=0, alias=3)
+# 但 dedup 后只剩一个 entry,source 显示 [manual] 或 [alias](取决于谁先被处理)
+
+> a (全选 text-only)
+> enter
+
+✅ 已装 6 个
+✅ 检测到 CC Switch,装 wrapper?
+
+> y
+
+✅ wrapper 已装
+```
+
+#### 14.4.3 验收标准
+
+| # | 验证项 | 期望 |
+|---|--------|------|
+| C1 | dedup 后 unique candidate 数 = union(manual, auto) | 16 - dedup = 实际数 |
+| C2 | source 列正确区分 manual/auto/alias | ✓ |
+| C3 | 同 alias 多源时,只显示一个(优先级最高的) | ✓ |
+| C4 | 安装数量 = 选中的 text-only | ✓ |
+
+---
+
+### 14.5 场景 D:全新 cold-start 用户
+
+#### 14.5.1 前置条件
+
+```bash
+ls ~/.claude/providers/  # No such file
+ls ~/.cc-switch/  # No such file or directory
+```
+
+#### 14.5.2 操作流程
+
+```bash
+$ cc-linker img-proxy install
+
+❌ 未找到任何可用的 provider 配置
+
+  已扫描的位置:
+    • ~/.claude/providers/ (manual)
+    • ~/.cc-switch/cc-switch.db (未安装)
+
+  解决方案(任选其一):
+    1. 装 CC Switch (https://github.com/farion1231/cc-switch)
+       — GUI 管理 provider,装好后 Claude Code 自动可用,img-proxy 也会自动识别
+    2. 手动创建 provider 文件:
+       ~/.claude/providers/my-provider.json
+       内容参考 docs/img-proxy.md "冷启动" 一节
+
+错误 [E_IMG_PROXY_NO_PROVIDERS]
+```
+
+#### 14.5.3 验收标准
+
+| # | 验证项 | 期望 |
+|---|--------|------|
+| D1 | exit code 1 | ✓ |
+| D2 | stderr 给出可操作建议(装 CC Switch 或手写文件) | ✓ |
+| D3 | 没有创建 routes.json / wrapper / daemon | ✓(no side effects) |
+
+---
+
+### 14.6 场景 E:官方 API 直连用户
+
+#### 14.6.1 前置条件
+
+```bash
+cat ~/.claude/settings.json
+# { "env": { "ANTHROPIC_BASE_URL": "https://api.anthropic.com" } }
+```
+
+#### 14.6.2 操作流程
+
+```bash
+$ cc-linker img-proxy install
+# 同场景 D(没 CC Switch,没 manual)
+# 报错:未找到任何可用的 provider 配置
+
+# 或者用户装了 CC Switch 选了 ByteDance/Moonshot,但 settings.json 默认是 Anthropic
+# 这种情况:用户在 CC Switch GUI 里选其他 provider 后,settings.json 才会更新
+```
+
+#### 14.6.3 验收标准
+
+| # | 验证项 | 期望 |
+|---|--------|------|
+| E1 | 跑 `cc-linker-proxy` 时,settings.json 的 `https://api.anthropic.com` 在 routes.json 找不到匹配 | wrapper 报错 "未在 img-proxy 里" |
+| E2 | 错误信息清晰:用户知道装什么或换 provider | ✓ |
+
+---
+
+### 14.7 边缘场景 + 验收标准(15 个)
+
+| # | 场景 | 输入 | 操作 | 预期 |
+|---|------|------|------|------|
+| E1 | **Install 幂等** | 已装 glm-5.2 | 再跑 `install` | routes.json 不重复(还是 1 个 entry),provider 文件不被覆盖(token 保持),`已装 N, 跳过 M` 提示 |
+| E2 | **跨 port 重装** | 装了 8765,config 改 8766 | 跑 `install` | BASE_URL 改成 8766,`.bak` 不变(原 upstream),routes.json 的 `upstream` 仍是原始 ark URL(不是 8765 proxy) |
+| E3 | **Unknown model** | provider model `some-new-model[1m]` | 跑 `install` | 默认按 text-only 预选 + 安装(conservative default) |
+| E4 | **Wrapper 幂等** | 已装 wrapper | 再跑 `wrapper-install` | 输出"wrapper 已装(idempotent)",rc 文件**不**重复 |
+| E5 | **CC Switch 切换** | CC Switch 切到 glm-5.2 | 跑 `cc-linker-proxy` | 读 settings.json 拿新 URL,resolve 到 proxy,转发到新 provider 的 proxy URL |
+| E6 | **Provider 未装** | CC Switch 切到没装过的 | 跑 `cc-linker-proxy` | stderr: "X 没在 img-proxy 里,hint: cc-linker img-proxy install",exit 1 |
+| E7 | **递归 wrapper** | `cc` alias = `cc-linker-proxy` | 跑 `cc` | 检测 `ANTHROPIC_BASE_URL` 已是 proxy URL,跳过 resolve,直接 exec `claude` |
+| E8 | **Model 带 bracket** | `glm-5.2[1m]` | classify | 剥 `[1m]` → `glm-5.2` → 匹配 text-only |
+| E9 | **并发 install** | 两个 terminal 同时跑 | 跑 `install` | routes.json 写锁防 race(可选 v1;v1 接受 last-write-wins) |
+| E10 | **Config extra patterns** | `vision_model_patterns_extra = ["my-vl-*"]` | 装 `my-vl-test` | 按 multimodal 跳过 |
+| E11 | **wrapper-uninstall + 还在用** | 装好 wrapper,跑 `cc-linker-proxy`,然后 `wrapper-uninstall` | 跑 `cc-linker-proxy` | 当前 shell 仍能用(函数已 load),新 shell 不行(函数被移除) |
+| E12 | **stale PID** | daemon 被 kill -9 | 跑 `status` | 检测 PID 文件 → dead,提示清理 |
+| E13 | **CC Switch 加新 provider** | CC Switch GUI 加新 provider | 跑 `install` | mtime check 触发 re-sync,新 provider 出现在 install 列表 |
+| E14 | **手动改 token** | install 后用户改 provider 文件的 `ANTHROPIC_AUTH_TOKEN` | 跑 `install` | token 保留(.bak 不动),`isProviderInstalled` 仍 true |
+| E15 | **Multimodal 误判** | 模型名不在任何 pattern | 跑 `install` | 按 unknown → 默认 proxy(可能误判为可 proxy,但不崩) |
+
+---
+
+### 14.8 配置模板(给用户参考)
+
+#### 14.8.1 默认 config(纯 CC Switch 用户)
+
+```toml
+# ~/.cc-linker/config.toml
+[img_proxy]
+enabled = true
+port = 8765
+hostname = "127.0.0.1"
+cache_max_age_hours = 168
+prompt_template = '[用户粘贴的图片已保存到本地: {path}] ...'
+console_enabled = false
+# smart_mode 默认 true
+```
+
+#### 14.8.2 自定义多模态 patterns(用户有特殊模型)
+
+```toml
+[img_proxy]
+smart_mode = true
+# 用户用某个特殊多模态模型,内置没覆盖
+vision_model_patterns_extra = [
+  "doubao-pro-vision",       # 假设有这个模型
+  "my-custom-multimodal-*",
+]
+```
+
+#### 14.8.3 关闭 smart(全装)
+
+```toml
+[img_proxy]
+smart_mode = false  # 关闭智能模式,所有 model 都按 text-only 走
+```
+
+#### 14.8.4 换 wrapper 名字(如果 cc-linker-proxy 跟用户工具冲突)
+
+```toml
+[img_proxy]
+# (wrapper 名字目前是硬编码 cc-linker-proxy,config 不支持改)
+# 如果用户想换名字,需要手动编辑 ~/.zshrc,删我们的 wrapper 后手动加
+```
+
+---
+
+### 14.9 实施后必须跑的烟测(5 个)
+
+实施完成后,按顺序跑这 5 个烟测:
+
+| # | 烟测 | 命令 | 预期 |
+|---|------|------|------|
+| S1 | 纯 CC Switch 用户 install | `cc-linker img-proxy install` | 看输出符合 14.2.2 流程,文件状态符合 14.2.3 表格 |
+| S2 | Wrapper daily use | `source ~/.zshrc; cc-linker-proxy "echo test"` | ANTHROPIC_BASE_URL 设置,claude 被 exec |
+| S3 | Unknown model default | 临时在 provider 文件改 model 名到不存在的,跑 install | 装成功,按 text-only |
+| S4 | Wrapper idempotency | 连跑 2 次 `wrapper-install` | 第二次输出"已装",rc 文件不重复 |
+| S5 | E1 验证(已装后 reinstall) | install 装 glm-5.2 → 再 install | routes.json 还是 1 个 entry,文件 token 不变 |
+
+---
+
+### 14.10 失败模式汇总
+
+实施时必须考虑这些失败模式,每个都有兜底:
+
+| 失败 | 兜底 |
+|------|------|
+| `~/.claude/settings.json` 读不到 | `current-url` 输出空,wrapper 报错 "no current provider" |
+| `~/.claude/settings.json` JSON 损坏 | `current-url` exit 1 + stderr,wrapper 报错 |
+| `routes.json` 读不到 | `resolve` 输出空,wrapper 报错 "未在 img-proxy 里" |
+| `routes.json` 写失败(权限) | `install` 报错,daemon 不启动 |
+| rc 文件写失败(权限) | `wrapper-install` 报错,提示手动编辑 |
+| `cc-linker` binary 不在 PATH | wrapper 函数报错 "command not found" |
+| CC Switch DB 锁/损坏 | `syncCcSwitchToAutoProviders` 静默忽略,manual 路径仍可用 |
+| inquirer prompt 用户 Ctrl+C | process exit,已装部分保留(不 rollback) |
+| 并发 `install`(两个 terminal) | v1 接受 last-write-wins;v2 加 lock |
+
+---
+
+## 15. (原 §13) 参考
+
+- `docs/superpowers/plans/2026-07-04-cli-image-proxy.md` — Phase 1 实施 plan
+- `docs/superpowers/plans/2026-07-04-img-proxy-wrapper.md` — Wrapper 内部(wrapper 函数生成、marker 常量、边界)
+- `docs/img-proxy.md` — 用户使用 doc
+- 现有 `src/img-proxy/provider-scan.ts` — 4 路扫描器(P0-1 cc-switch 支持)
+- 现有 `src/img-proxy/provider-config.ts` — `installProvider` 3 态机
+- 现有 `src/cli/commands/img-proxy.ts` — 当前 CLI 结构
