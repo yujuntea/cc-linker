@@ -645,20 +645,133 @@ text_only_model_patterns_extra = []
    - `imgProxyWrapperInstall` / `imgProxyWrapperUninstall` / `imgProxyWrapperStatus`(1 h)
    - 在 `src/index.ts` 注册(15 min)
 8. **修改 `imgProxyInstall`** — 加 smart 流程、4 路发现、模型分类、wrapper 提示(1.5 h)
-9. **🔴 修改 `src/cli/commands/setup.ts`** — 让 setup wizard 走 smart install(20 min)
-   - **问题**:`runImgProxyWizard()` 当前调 `imgProxyInstall({ providers: picks.join(',') })`,`--providers` 触发 **dumb 模式**(全装,不过滤 multimodal)。新用户跑 setup 会装到 multimodal 模型上,破坏图片能力,正是 P0 要避免的。
-   - **修复**:
-     1. 删 setup wizard 里的 multi-select inquirer(setup.ts line 261-270 的 picks prompt)
-     2. 改调 `imgProxyInstall({})`(smart 模式,内部 inquirer 会接管)
-     3. 保留前一个 "configure?" 询问(让用户能 skip 整个 img-proxy)
-   - 验证:跑 `cc-linker setup --skip-feishu --skip-hook` 到 img-proxy 步 → 看到 smart install 的 inquirer(带 [auto]/[manual]/[alias] tag 和 multimodal ⏭ 标记)
+9. **🔴 修改 `src/cli/commands/setup.ts`** — 让 setup wizard 走 smart install(35 min)
+
+   **问题**:`runImgProxyWizard()` 当前调 `imgProxyInstall({ providers: picks.join(',') })`,`--providers` 触发 **dumb 模式**(全装,不过滤 multimodal)。新用户跑 setup 会装到 multimodal 模型上,破坏图片能力,正是 P0 要避免的。
+
+   **修复清单(8 项)**:
+
+   **9.1** 删 setup wizard 里的 multi-select inquirer(setup.ts line 261-270 的 picks prompt)
+   - 替换为 `imgProxyInstall({})` 调用(smart 模式,内部 inquirer 会接管 provider 选择)
+
+   **9.2** 保留前一个 "configure?" 询问(setup.ts line 246-256),让用户能 skip 整个 img-proxy
+
+   **9.3** `ImgProxyWizardResult` 接口扩展(`src/cli/commands/setup.ts` line 54-60):
+   ```typescript
+   interface ImgProxyWizardResult {
+     configured: boolean;
+     installedCount: number;        // 改成从 routes.json 读(不是 picks.length)
+     started: boolean;
+     autoStart: boolean;
+     wrapperInstalled: boolean;    // 新增:true=smart install 自动装了 wrapper(检测到 CC Switch)
+     wrapperSkipped: boolean;      // 新增:true=用户拒绝 wrapper 提示
+   }
+   ```
+   - 三种 wrapper 状态:installed(装了)、skipped(提示但拒绝)、none(没提示,没 CC Switch)
+
+   **9.4** 装完后从 routes.json 读 installedCount(setup.ts `runImgProxyWizard` line 277 后):
+   ```typescript
+   const { loadRoutes } = await import('../../img-proxy/routes');
+   result.installedCount = Object.keys(loadRoutes(IMG_PROXY_ROUTES_PATH).routes ?? {}).length;
+   ```
+   - **不要**用 `picks.length` —— 删了 multi-select 后 picks 没了
+   - 读 routes.json 反映真实状态(smart install 可能跳过 multimodal,装的不等于发现的)
+
+   **9.5** 检测 wrapper 状态(smart install 期间可能装了 wrapper,见 §6 line 335-345):
+   ```typescript
+   const { isWrapperInstalled, detectShell, getRcFilePath } = await import('../../img-proxy/wrapper');
+   const shell = detectShell();
+   if (shell) {
+     result.wrapperInstalled = isWrapperInstalled(getRcFilePath(shell));
+   }
+   ```
+   - 注意:`isWrapperInstalled` 返回 true 既包括 smart install 刚装的,也包括之前手动装的
+   - wrapperSkipped 需要 `imgProxyInstall` 内部追踪用户是否拒绝 prompt,返回这个信息(扩展 `imgProxyInstall` 返回值:`{ wrapperInstalled: boolean; wrapperSkipped: boolean }`)
+   - 或者:用 `isWrapperInstalled` + `hasCcSwitch` 联合判断——如果 CC Switch 有但 wrapper 没装,推断是用户拒绝
+
+   **9.6** `printSummary` 扩展(setup.ts line 582-590)—— 加 wrapper 状态显示:
+   ```typescript
+   if (imgProxy?.configured) {
+     console.log(chalk.gray(`  图片代理:     ✅ 已启用 (${imgProxy.installedCount} 个 provider)`));
+     console.log(chalk.gray(`  img-proxy 状态: ${imgProxy.started ? '✅ 运行中' : '⏸️  未启动 (cc-linker img-proxy start --daemon)'}`));
+     if (imgProxy.autoStart) console.log(chalk.gray('  开机自启:     ✅ launchd 已配置'));
+     // 新增:
+     if (imgProxy.wrapperInstalled) {
+       console.log(chalk.gray('  img-proxy wrapper: ✅ 已装 (用 cc-linker-proxy 替代 claude)'));
+     } else if (imgProxy.wrapperSkipped) {
+       console.log(chalk.gray('  img-proxy wrapper: ⏭️  跳过(用户拒绝 — cc-linker-proxy 不可用)'));
+     }
+     // else: 没 CC Switch,没提示过 wrapper,不显示这行
+   }
+   ```
+
+   **9.7** step description 增强(setup.ts line 79-80):
+   ```typescript
+   // 旧: '  ${stepNum}. 启用图片代理 (img-proxy,让纯文本模型也能接收粘贴图片)'
+   console.log(chalk.gray(`  ${stepNum}. 启用图片代理 (img-proxy,自动识别纯文本模型 / 多模态 / CC Switch)`));
+   ```
+   - 让用户在 setup 开头就知道这个步骤会"自动"做事,不只 dumb install
+
+   **9.8** 空状态文案精确化(setup.ts line 231-237)—— 区分"未装 CC Switch"vs"装了但没 claude provider":
+   ```typescript
+   if (allProviders.length === 0) {
+     const ccSwitch = hasCcSwitch();
+     if (ccSwitch) {
+       console.log(chalk.yellow('  ⚠️ 检测到 CC Switch 但没找到 claude provider'));
+       console.log(chalk.gray('     检查 cc-switch.db 里是否有 app_type=claude 的记录'));
+     } else {
+       console.log(chalk.yellow('  ⚠️ 未扫描到任何 provider 配置'));
+       console.log(chalk.gray('     装 CC Switch 或手写 ~/.claude/providers/*.json 后再跑 setup'));
+     }
+     return result;
+   }
+   ```
+   - 现有文案"未扫描到"对 cold-start 用户和 CC Switch 损坏用户都是同一句,模糊
+   - 参考现有 `imgProxyInstall` line 217-234 的错误信息结构
+
+   **迁移说明(给升级用户,加到 docs/img-proxy.md "升级" 章节)**:
+
+   升级前跑过旧 setup wizard 的用户需要迁移:
+
+   - **轻量迁移**:`cc-linker img-proxy install` 重跑(smart 模式)
+     - 会跳过 multimodal、可能装 wrapper
+     - **但已装的 multimodal 不会被自动卸载**(smart install 只加新路由,不删旧路由)
+
+   - **严格迁移**:
+     ```bash
+     cc-linker img-proxy uninstall --all
+     cc-linker img-proxy install
+     ```
+     - `uninstall --all` 会还原所有 provider 的 BASE_URL 到 .bak 里的 upstream,清 routes.json
+     - `install`(smart 模式)重新挑选,跳过 multimodal
+     - **会丢失 routes.json 里的 `installed_at` 时间戳**(审计场景不重要)
+
+   - **回滚**:如果新行为有问题:
+     ```bash
+     cc-linker img-proxy uninstall --all  # 还原所有
+     # 之后跑 dumb install:
+     cc-linker img-proxy install --all   # 旧行为
+     ```
+
+   **验证步骤**:
+   1. 跑 `cc-linker setup --skip-feishu --skip-hook` 到 img-proxy 步
+   2. 看到 smart install 的 inquirer(带 [auto]/[manual]/[alias] tag 和 multimodal ⏭ 标记)
+   3. 选完后看到 wrapper 提示(如果检测到 CC Switch)
+   4. setup summary 显示:
+      ```
+      图片代理:     ✅ 已启用 (N 个 provider)
+      img-proxy 状态: ✅ 运行中
+      开机自启:     ✅ launchd 已配置
+      img-proxy wrapper: ✅ 已装 (用 cc-linker-proxy 替代 claude)  ← 新增
+      ```
+   5. 跑 `cc-linker img-proxy status`,确认 routes.json 里有 N 个 entry,且 multimodal 不在里面
 10. **修改 `imgProxyStatus`** — 加 wrapper 状态 + 分类(30 min)
 11. **`src/utils/config.ts`** — 加 3 个新字段(smart_mode, vision_model_patterns_extra, text_only_model_patterns_extra)+ defaults(15 min,**别忘同步 `loadEnv()` 里的 env mappings:`CC_LINKER_IMG_PROXY_SMART_MODE` / `CC_LINKER_IMG_PROXY_VISION_PATTERNS_EXTRA` / `CC_LINKER_IMG_PROXY_TEXT_ONLY_PATTERNS_EXTRA`**)
 12. **`docs/img-proxy.md`** — 新 "CC Switch 用户怎么用" 章节 + 提 smart_mode 默认行为(30 min)
 13. **手动 smoke** — 真实 shell wrapper 调用 + setup wizard 走 smart install(30 min)
 14. **Deploy + push**(15 min)
 
-**总:约 9.5 小时**(原 9h + setup wizard 20min)
+**总:约 9.7 小时**(原 9h + setup wizard 35min,包含 6 项数据流/接口/文案扩展)
 
 ## 11. 测试计划
 
