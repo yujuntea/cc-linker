@@ -503,34 +503,49 @@ Important: `~/.claude/providers/minimax-m2.7.json` (provider filename `m2.7`) mi
 
 ```typescript
 const MULTIMODAL_PATTERNS = [
-  // Claude family (3/4 all have vision)
-  /^claude-3/i,
-  /^claude-opus/i,                 // claude-opus-4, claude-opus-4-1, ...
-  /^claude-sonnet/i,               // claude-sonnet-4, ...
-  /^claude-haiku/i,
+  // === Anthropic Claude ===
+  /^claude-3/i,                     // claude-3-opus, claude-3-5-sonnet, ...
+  /^claude-opus/i,                  // claude-opus-4 (all 4-series have vision)
+  /^claude-sonnet/i,                // claude-sonnet-4
+  /^claude-haiku/i,                 // claude-haiku-4
 
-  // OpenAI gpt-4 family (all vision-capable since gpt-4-turbo / gpt-4o)
-  /^gpt-4/i,                        // gpt-4, gpt-4o, gpt-4-turbo, gpt-4-vision
+  // === OpenAI GPT-4 ===
+  /^gpt-4/i,                         // gpt-4, gpt-4o, gpt-4-turbo, gpt-4-vision
 
-  // Gemini
-  /^gemini-.*vision/i,
-  /^gemini-1\.5-pro/i,             // gemini-1.5-pro has vision
+  // === Google Gemini ===
+  /^gemini-.*vision/i,              // gemini-*-vision*
+  /^gemini-1\.5-pro/i,              // gemini-1.5-pro has vision
 
-  // GLM vision variants (only 4v / 4-plus, NOT 5.x or 4.5/4.6)
-  /^glm-4v/i,                       // glm-4v, glm-4v-plus
-  /^glm-4-plus/i,                   // glm-4-plus has vision
+  // === Alibaba Qwen (通义千问) ===
+  /^qwen.*-vl/i,                    // qwen-vl, qwen2-vl, qwen3-vl (all generations)
+  /^qwen.*-omni/i,                  // qwen3.5-omni, future omni variants
+  /^qwen3\.\d+(\.\d+)?-plus/i,     // qwen3.6-plus, qwen3.7-plus native multimodal
 
-  // Qwen vision variants
-  /^qwen-vl/i,                      // qwen-vl, qwen2-vl, qwen-vl-plus
-  /^qwen3\.\d+(\.\d+)?-plus/i,     // qwen3.6-plus, qwen3.7-plus (per user)
+  // === Zhipu GLM (智谱) ===
+  /^glm-.*-?v/i,                    // glm-4v, glm-4.5v (42榜单 41 SOTA), glm-4.1v, glm-5v, glm-5.1v
+  /^glm-5/i,                        // GLM-5 系列 multimodal(GLM-5.1 首个支持图片的 GLM)
 
-  // Kimi (per user: all kimi variants are multimodal)
-  /^kimi/i,                         // kimi, kimi-for-coding, kimi-vl, kimi-k2
+  // === Moonshot Kimi (月之暗面) — all variants multimodal ===
+  /^kimi/i,                         // kimi-k2, kimi-k2.5, kimi-k2.6, kimi-for-coding, kimi-vl (MoonViT 视觉编码器)
 
-  // MiniMax M3 (per user)
-  /^MiniMax-M3/i,                   // MiniMax-M3[1m]
+  // === MiniMax ===
+  /^MiniMax-M3/i,                   // MiniMax-M3[1m] multimodal(per user)
 
-  // Generic vision markers (fallback for unknown models)
+  // === ByteDance Doubao (字节豆包) ===
+  /^doubao.*-vision/i,              // doubao-vision-pro
+  /^seed.*-vision/i,                // seed-vision
+
+  // === Stepfun (阶跃星辰) ===
+  /^step-1v/i,
+  /^step.*-vision/i,
+
+  // === Tencent Hunyuan (腾讯混元) ===
+  /^hunyuan.*-vision/i,
+
+  // === Baidu ERNIE (文心) ===
+  /^ernie-.*-vision/i,
+
+  // === Generic vision markers (fallback for unknown models) ===
   /-vision$/i,                      // ends with -vision
   /-vl-/i,                          // contains -vl-
   /-vlm/i,                          // contains -vlm
@@ -541,33 +556,100 @@ const MULTIMODAL_PATTERNS = [
 
 ```typescript
 const TEXT_ONLY_PATTERNS = [
-  // GLM text-only (5.x, 4.5, 4.6 — NOT 4v / 4-plus, those are multimodal)
-  /^glm-\d/i,                       // glm-5.2, glm-4.5, glm-4.6
+  // === GLM text-only (NOT 4v/4.5v/5.x — those are multimodal above) ===
+  /^glm-\d+(\.\d+)?$/i,            // glm-4.5, glm-4.6 (exact, no v suffix)
+  /^glm-4-(air|turbo)/i,           // glm-4-air, glm-4-turbo (text)
 
-  // DeepSeek family (text-only until proven otherwise)
-  /^deepseek/i,                     // deepseek-chat, deepseek-v3, deepseek-v4
+  // === DeepSeek (text historically) ===
+  /^deepseek/i,                     // deepseek-chat, deepseek-v3, deepseek-v4-pro
 
-  // Qwen text variants (NOT -plus per user, NOT -vl)
+  // === Qwen text variants (NOT -plus per research, NOT -vl) ===
   /^qwen-turbo/i,
-  /^qwen-max/i,                     // qwen-max, qwen3.7-max
+  /^qwen-max/i,                     // qwen-max, qwen3.5-max (NOT multimodal until confirmed)
   /^qwen-long/i,
   /^qwen-coder/i,
-  /^qwen3\.\d+(\.\d+)?-max/i,      // qwen3.7-max (NOT -plus)
+  /^qwen3.*-coder/i,
+  /^qwen3\.\d+(\.\d+)?-max/i,      // qwen3.7-max (NOT -plus which is multimodal)
 
-  // Moonshot / Kimi base variants — note: `kimi` is now multimodal per user
-  /^moonshot-/i,                    // moonshot-v1-* (legacy text-only)
+  // === Moonshot legacy (Kimi K-series is multimodal above) ===
+  /^moonshot-v1-/i,                 // moonshot-v1-8k/32k/128k (legacy text)
 
-  // Chinese LLM families (text)
-  /^baichuan/i,
-  /^yi-/i,
+  // === Chinese LLM families (text) ===
+  /^baichuan/i,                     // baichuan-4, baichuan-3
+  /^yi-/i,                          // yi-34b, yi-1.5
 
-  // MiniMax M2 (text — M3 is multimodal above)
-  /^abab6/i,                        // abab6.5s (MiniMax M2)
+  // === MiniMax M2 (text — M3 is multimodal above) ===
+  /^MiniMax-M2/i,                  // MiniMax-M2, M2.1, M2.5 (all text per research)
+  /^MiniMax-Text-/i,               // older text models
+  /^abab/i,                         // abab5.5s, abab6.5s (legacy text)
 
-  // OpenAI older (text)
-  /^(gpt-3|gpt-3\.5)/i,             // gpt-3.5-turbo etc
+  // === OpenAI older ===
+  /^(gpt-3|gpt-3\.5)/i,             // gpt-3.5-turbo
 ];
 ```
+
+### Detection order matters
+
+Multimodal patterns are checked **first**. If a model matches multimodal, it's classified multimodal regardless of text-only patterns. So:
+- `glm-5.1` → matches multimodal `/^glm-5/i` → multimodal ✓
+- `glm-4.5` → no multimodal match → matches text-only `/^glm-\d+(\.\d+)?$/i` → text-only ✓
+- `MiniMax-M3` → matches multimodal `/^MiniMax-M3/i` → multimodal ✓
+- `MiniMax-M2.5` → no multimodal match → matches text-only `/^MiniMax-M2/i` → text-only ✓
+
+### Config extensibility
+
+Users can extend via `~/.cc-linker/config.toml`:
+
+```toml
+[img_proxy]
+# 智能模式:跳过已知多模态模型,只 proxy 文本模型
+smart_mode = true
+
+# 追加自定义多模态 patterns(也会被跳过)
+vision_model_patterns_extra = [
+  "my-custom-vision-*",
+]
+
+# 追加自定义文本 patterns(也会被 proxy)
+text_only_model_patterns_extra = [
+  "my-custom-text-*",
+]
+```
+
+`config.get<string[]>('img_proxy.vision_model_patterns_extra', [])` appended to `MULTIMODAL_PATTERNS` at startup.
+
+### Test plan (verified against user's actual provider files)
+
+| Test | Input model | Expected |
+|------|-------------|----------|
+| Claude 3 | `claude-3-5-sonnet-20241022` | multimodal |
+| Claude 4 opus | `claude-opus-4[1m]` | multimodal |
+| GPT-4o | `gpt-4o` | multimodal |
+| Gemini vision | `gemini-1.5-pro-vision` | multimodal |
+| Qwen VL | `qwen-vl-plus` | multimodal |
+| Qwen3 VL | `qwen3-vl-72b-instruct` | multimodal |
+| Qwen3.6 plus | `qwen3.6-plus[1m]` | multimodal |
+| Qwen3.7 plus | `qwen3.7-plus[1m]` | multimodal |
+| Qwen3.7 max | `qwen3.7-max[1m]` | text-only |
+| Qwen3.6-35B-A3B | `qwen3.6-35b-a3b` (open source variant) | unknown (defaults to proxy) |
+| Qwen3.5-Omni | `qwen3.5-omni[1m]` | multimodal |
+| Kimi coding | `kimi-for-coding[256k]` | multimodal |
+| Kimi K2.6 | `kimi-k2.6` | multimodal |
+| Kimi K2.5 | `kimi-k2.5-thinking` | multimodal |
+| GLM 5.2 | `glm-5.2[1m]` | text-only |
+| GLM 5.1 | `glm-5.1` | multimodal (GLM-5 series) |
+| GLM 4.5 | `glm-4.5` | text-only |
+| GLM 4.5V | `glm-4.5v` | multimodal |
+| GLM 4V plus | `glm-4v-plus` | multimodal |
+| DeepSeek V4 | `deepseek-v4-pro[1m]` | text-only |
+| MiniMax M3 | `MiniMax-M3[1m]` | multimodal |
+| MiniMax M2.5 | `MiniMax-M2.5` | text-only |
+| Doubao vision | `doubao-1.5-vision-pro` | multimodal |
+| MiMo v2.5 | `mimo-v2.5-pro[1m]` | unknown (defaults to proxy) |
+| Hunyuan vision | `hunyuan-vision-pro` | multimodal |
+| ERNIE vision | `ernie-4.0-vision` | multimodal |
+| Step-1V | `step-1v-32k` | multimodal |
+| Unknown | `some-new-model[1m]` | unknown (defaults to proxy) |
 
 ### Decision algorithm
 
