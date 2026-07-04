@@ -57,6 +57,8 @@ interface ImgProxyWizardResult {
   installedCount: number;
   started: boolean;
   autoStart: boolean;
+  wrapperInstalled: boolean;
+  wrapperSkipped: boolean;
 }
 
 export async function setup(registry: RegistryManager, opts: SetupOptions = {}): Promise<void> {
@@ -77,7 +79,7 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
     stepNum++;
   }
   if (!opts.skipImgProxy) {
-    console.log(chalk.gray(`  ${stepNum}. 启用图片代理 (img-proxy,让纯文本模型也能接收粘贴图片)`));
+    console.log(chalk.gray(`  ${stepNum}. 启用图片代理 (img-proxy,自动识别纯文本模型 / 多模态 / CC Switch)`));
   }
   console.log('');
 
@@ -197,7 +199,14 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
   }
 
   // ===== Step (last): img-proxy setup =====
-  let imgProxyResult: ImgProxyWizardResult = { configured: false, installedCount: 0, started: false, autoStart: false };
+  let imgProxyResult: ImgProxyWizardResult = {
+    configured: false,
+    installedCount: 0,
+    started: false,
+    autoStart: false,
+    wrapperInstalled: false,
+    wrapperSkipped: false,
+  };
 
   if (!opts.skipImgProxy) {
     console.log(chalk.cyan(`── Step ${totalSteps}/${totalSteps} ── 启用图片代理 (img-proxy)`));
@@ -223,16 +232,27 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
 }
 
 async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
-  const result: ImgProxyWizardResult = { configured: false, installedCount: 0, started: false, autoStart: false };
+  const result: ImgProxyWizardResult = {
+    configured: false,
+    installedCount: 0,
+    started: false,
+    autoStart: false,
+    wrapperInstalled: false,
+    wrapperSkipped: false,
+  };
   const { scanProviderFiles, hasCcSwitch } = await import('../../img-proxy/provider-scan');
 
   const allProviders = scanProviderFiles().filter(p => p.baseUrl);
 
   if (allProviders.length === 0) {
-    console.log(chalk.yellow('  ⚠️ 未扫描到任何 provider 配置'));
-    console.log(chalk.gray('     img-proxy 需要 ~/.claude/providers/*.json 或 ~/.cc-switch/cc-switch.db'));
-    console.log(chalk.gray('     才能工作。请先安装 CC Switch 或手写 provider 文件,然后再跑 setup。'));
-    console.log(chalk.gray('     详见 docs/img-proxy.md "冷启动" 一节。'));
+    const ccSwitch = hasCcSwitch();
+    if (ccSwitch) {
+      console.log(chalk.yellow('  ⚠️ 检测到 CC Switch 但没找到 claude provider'));
+      console.log(chalk.gray('     检查 cc-switch.db 里是否有 app_type=claude 的记录'));
+    } else {
+      console.log(chalk.yellow('  ⚠️ 未扫描到任何 provider 配置'));
+      console.log(chalk.gray('     装 CC Switch 或手写 ~/.claude/providers/*.json 后再跑 setup'));
+    }
     return result;
   }
 
@@ -255,31 +275,14 @@ async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
     return result;
   }
 
-  // 交互式选 provider
-  const choices = allProviders.map(p => ({
-    name: `${p.alias}  ${chalk.gray(p.baseUrl.slice(0, 50))}${p.baseUrl.length > 50 ? '...' : ''}`,
-    value: p.alias,
-    short: p.alias,
-  }));
-  const { picks } = await inquirer.prompt([{
-    type: 'checkbox',
-    name: 'picks',
-    message: '选择要启用图片代理的 provider (空格勾选,回车确认):',
-    choices,
-    pageSize: 20,
-  }]);
-
-  if (picks.length === 0) {
-    console.log(chalk.gray('  未选择任何 provider'));
-    return result;
-  }
-
-  // 安装
+  // 调用 smart install：自动过滤多模态、按需提示 wrapper
   const { imgProxyInstall, imgProxyStart } = await import('./img-proxy');
   try {
-    await imgProxyInstall({ providers: picks.join(',') });
-    result.installedCount = picks.length;
+    const installResult = await imgProxyInstall({});
+    result.installedCount = installResult.installedCount;
     result.configured = true;
+    result.wrapperInstalled = installResult.wrapperInstalled;
+    result.wrapperSkipped = installResult.wrapperSkipped;
   } catch (err) {
     console.log(chalk.red(`  ❌ 安装失败: ${err}`));
     return result;
@@ -584,6 +587,11 @@ function printSummary(sessionCount: number, hookInstalled: boolean, feishu: Feis
       console.log(chalk.gray(`  图片代理:     ✅ 已启用 (${imgProxy.installedCount} 个 provider)`));
       console.log(chalk.gray(`  img-proxy 状态: ${imgProxy.started ? '✅ 运行中' : '⏸️  未启动 (cc-linker img-proxy start --daemon)'}`));
       if (imgProxy.autoStart) console.log(chalk.gray('  开机自启:     ✅ launchd 已配置'));
+      if (imgProxy.wrapperInstalled) {
+        console.log(chalk.gray('  img-proxy wrapper: ✅ 已装 (用 cc-linker-proxy 替代 claude)'));
+      } else if (imgProxy.wrapperSkipped) {
+        console.log(chalk.gray('  img-proxy wrapper: ⏭️  跳过(用户拒绝 — cc-linker-proxy 不可用)'));
+      }
     } else {
       console.log(chalk.gray('  图片代理:     ⏸️  未启用（可稍后 cc-linker img-proxy install）'));
     }
