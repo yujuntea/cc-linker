@@ -24,6 +24,7 @@ import {
   imgProxyStart, imgProxyStop, imgProxyStatus,
   imgProxyInstall, imgProxyUninstall,
   imgProxyDaemonInstall, imgProxyDaemonUninstall,
+  imgProxyCurrentUrl,
 } from './cli/commands/img-proxy';
 import { createRequire } from 'node:module';
 
@@ -205,6 +206,7 @@ imgProxyCmd.command('start')
   .action((opts) => imgProxyStart(opts));
 imgProxyCmd.command('stop').description('停止代理').action(() => imgProxyStop());
 imgProxyCmd.command('status').description('查看代理状态').action(() => imgProxyStatus());
+imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL').action(() => imgProxyCurrentUrl());
 const imgProxyDaemonCmd = imgProxyCmd.command('daemon').description('开机自启管理 (macOS launchd)');
 imgProxyDaemonCmd.command('install').description('配置开机自启').action(() => imgProxyDaemonInstall());
 imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());

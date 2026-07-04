@@ -7,6 +7,7 @@ import inquirer from 'inquirer';
 import { config } from '../../utils/config';
 import { CCLinkerError } from '../../utils/errors';
 import { getExecutablePath } from '../../utils/executable';
+import { readCurrentUpstreamFromSettings } from '../../img-proxy/resolve';
 import {
   IMG_PROXY_DIR, IMG_PROXY_CACHE_DIR, IMG_PROXY_ROUTES_PATH,
   IMG_PROXY_PID_FILE, IMG_PROXY_LOG_FILE, CLAUDE_PROVIDERS_DIR,
@@ -204,6 +205,17 @@ export async function imgProxyStatus(): Promise<void> {
     console.log(chalk.cyan('\n开机自启:'));
     console.log(existsSync(launchdPlistPath()) ? chalk.green('   ✅ launchd 已配置') : chalk.gray('   未配置 (cc-linker img-proxy daemon install)'));
   }
+}
+
+// ---------- current-url ----------
+export async function imgProxyCurrentUrl(): Promise<void> {
+  const { url, parseError } = readCurrentUpstreamFromSettings();
+  if (parseError) {
+    console.error(chalk.red(`❌ settings.json 解析失败: ${parseError.message}`));
+    process.exit(1);
+  }
+  if (url) console.log(url);
+  // 空 stdout = "没找到" — wrapper 检测用
 }
 
 // ---------- install / uninstall ----------
