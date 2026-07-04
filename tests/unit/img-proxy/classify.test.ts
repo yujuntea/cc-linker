@@ -59,6 +59,9 @@ describe('classifyModel — 内置 patterns', () => {
   test('MiniMax-M2.5[1m] 是 text-only', () => {
     expect(classifyModel('MiniMax-M2.5[1m]')).toBe('text-only');
   });
+  test('mimo-v2.5-pro-plus 是 text-only(adversarial)', () => {
+    expect(classifyModel('mimo-v2.5-pro-plus')).toBe('text-only');
+  });
 
   // Unknown
   test('some-new-model[1m] 是 unknown', () => {
@@ -90,5 +93,8 @@ describe('classifyModel — 后缀剥离', () => {
   });
   test('大小写不敏感', () => {
     expect(classifyModel('GLM-5.2[1M]')).toBe('text-only');
+  });
+  test('multimodal 大小写不敏感', () => {
+    expect(classifyModel('CLAUDE-OPUS-4')).toBe('multimodal');
   });
 });

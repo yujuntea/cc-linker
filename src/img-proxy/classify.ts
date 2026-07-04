@@ -17,6 +17,8 @@ const MULTIMODAL_PATTERNS: RegExp[] = [
   // === MiniMax ===
   /^MiniMax-M3/i,
   // === Xiaomi MiMo(只有 base,不带 pro)===
+  // 用 $ 锚定而非 (?!-pro) 负向 lookahead:pro 变体由下方 /mimo-.*-pro/ 显式拦截
+  // spec 原版 (?!-pro) 有 bug —— backtrack 会跳过 pro 前缀,导致 mimo-v2.5-pro 被误判 multimodal
   /^mimo-v\d+(\.\d+)?$/i,
   // === ByteDance ===
   /^doubao.*-vision/i, /^seed.*-vision/i,
