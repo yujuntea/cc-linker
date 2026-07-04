@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { discoverShellAliases } from '../../../src/img-proxy/aliases';
-import { writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { writeFileSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 

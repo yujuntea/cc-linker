@@ -46,6 +46,10 @@ function defaultRcFiles(): string[] {
   return SHELL_RC_FILES.map(f => join(HOME, f));
 }
 
+/**
+ * Silent on missing/unreadable file — discovery function tolerates individual file failures.
+ * If file is unreadable due to permissions, treat as empty (don't crash discovery).
+ */
 function safeReadLines(file: string): string[] {
   try { return readFileSync(file, 'utf8').split('\n'); }
   catch { return []; }
