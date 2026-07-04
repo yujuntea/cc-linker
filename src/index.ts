@@ -20,6 +20,11 @@ import { initFeishu } from './cli/commands/init-feishu';
 import { setup } from './cli/commands/setup';
 import { activityHook } from './cli/commands/activity-hook';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
+import {
+  imgProxyStart, imgProxyStop, imgProxyStatus,
+  imgProxyInstall, imgProxyUninstall,
+  imgProxyDaemonInstall, imgProxyDaemonUninstall,
+} from './cli/commands/img-proxy';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -182,6 +187,27 @@ const daemonCmd = program.command('daemon').description('管理后台 Bot 服务
 daemonCmd.command('install').description('配置开机自动启动').action(() => installDaemon());
 daemonCmd.command('uninstall').description('移除开机自动启动').action(() => uninstallDaemon());
 daemonCmd.command('status').description('查看后台服务状态').action(() => daemonServiceStatus());
+
+const imgProxyCmd = program.command('img-proxy').description('管理图片剥离代理 (让纯文本模型接受粘贴图片)');
+imgProxyCmd.command('install')
+  .description('把选定 provider 的 BASE_URL 改写为指向本地代理')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部 provider')
+  .action((opts) => imgProxyInstall(opts));
+imgProxyCmd.command('uninstall')
+  .description('还原 provider 的 BASE_URL')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部已 install 的 provider')
+  .action((opts) => imgProxyUninstall(opts));
+imgProxyCmd.command('start')
+  .description('启动代理 (前台;加 --daemon 后台)')
+  .option('-d, --daemon', '后台运行')
+  .action((opts) => imgProxyStart(opts));
+imgProxyCmd.command('stop').description('停止代理').action(() => imgProxyStop());
+imgProxyCmd.command('status').description('查看代理状态').action(() => imgProxyStatus());
+const imgProxyDaemonCmd = imgProxyCmd.command('daemon').description('开机自启管理 (macOS launchd)');
+imgProxyDaemonCmd.command('install').description('配置开机自启').action(() => imgProxyDaemonInstall());
+imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());
 
 program
   .command('setup')
