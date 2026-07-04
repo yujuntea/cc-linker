@@ -19,6 +19,11 @@ import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
 import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
 import { escapePlistString } from '../../utils/plist';
+import {
+  detectShell, getRcFilePath, isWrapperInstalled,
+  installWrapper, uninstallWrapper,
+} from '../../img-proxy/wrapper';
+import { IMG_PROXY_WRAPPER_BACKUP_DIR } from '../../utils/paths';
 
 // ---------- 运行状态 ----------
 function isRunning(): boolean {
@@ -226,6 +231,60 @@ export async function imgProxyResolve(opts: { upstream: string }): Promise<void>
   const proxyUrl = resolveProxyByUpstream(IMG_PROXY_ROUTES_PATH, port, hostname, opts.upstream);
   if (proxyUrl) console.log(proxyUrl);
   // 空 stdout = "没找到" — wrapper 检测用
+}
+
+// ---------- wrapper-install ----------
+export async function imgProxyWrapperInstall(): Promise<void> {
+  const shell = detectShell();
+  if (!shell) {
+    console.log(chalk.red('当前 shell 不支持(zsh/bash 之外)'));
+    return;
+  }
+  const rcFile = getRcFilePath(shell);
+  const result = installWrapper(rcFile, IMG_PROXY_WRAPPER_BACKUP_DIR);
+  if (!result.installed) {
+    console.log(chalk.yellow(`✅ ${result.reason}`));
+    console.log(chalk.gray(`   (${result.rcFile})`));
+    return;
+  }
+  console.log(chalk.green(`✅ wrapper 已装到 ${result.rcFile}`));
+  if (result.backupPath) console.log(chalk.gray(`   备份: ${result.backupPath}`));
+  console.log(chalk.cyan('   运行 source ~/.zshrc 或重开 shell 激活 cc-linker-proxy'));
+}
+
+// ---------- wrapper-uninstall ----------
+export async function imgProxyWrapperUninstall(): Promise<void> {
+  const shell = detectShell();
+  if (!shell) {
+    console.log(chalk.red('当前 shell 不支持(zsh/bash 之外)'));
+    return;
+  }
+  const rcFile = getRcFilePath(shell);
+  const result = uninstallWrapper(rcFile, IMG_PROXY_WRAPPER_BACKUP_DIR);
+  if (!result.removed) {
+    console.log(chalk.yellow('⚠️ wrapper 未装(无 marker)'));
+    return;
+  }
+  console.log(chalk.green(`✅ 已从 ${result.rcFile} 移除 wrapper`));
+  if (result.backupPath) console.log(chalk.gray(`   备份: ${result.backupPath}`));
+}
+
+// ---------- wrapper-status ----------
+export async function imgProxyWrapperStatus(): Promise<void> {
+  const shell = detectShell();
+  if (!shell) {
+    console.log(chalk.red('当前 shell 不支持'));
+    return;
+  }
+  const rcFile = getRcFilePath(shell);
+  if (isWrapperInstalled(rcFile)) {
+    console.log(chalk.green(`✅ wrapper 已装`));
+    console.log(chalk.gray(`   shell: ${shell}`));
+    console.log(chalk.gray(`   rc:    ${rcFile}`));
+  } else {
+    console.log(chalk.yellow('⚠️ wrapper 未装'));
+    console.log(chalk.gray('   hint: cc-linker img-proxy wrapper-install'));
+  }
 }
 
 // ---------- install / uninstall ----------

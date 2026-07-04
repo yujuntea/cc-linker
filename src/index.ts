@@ -26,6 +26,7 @@ import {
   imgProxyDaemonInstall, imgProxyDaemonUninstall,
   imgProxyCurrentUrl,
   imgProxyResolve,
+  imgProxyWrapperInstall, imgProxyWrapperUninstall, imgProxyWrapperStatus,
 } from './cli/commands/img-proxy';
 import { createRequire } from 'node:module';
 
@@ -209,6 +210,10 @@ imgProxyCmd.command('stop').description('停止代理').action(() => imgProxySto
 imgProxyCmd.command('status').description('查看代理状态').action(() => imgProxyStatus());
 imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL').action(() => imgProxyCurrentUrl());
 imgProxyCmd.command('resolve <upstream>').description('按真实 upstream URL 查 proxy URL').action((upstream) => imgProxyResolve({ upstream }));
+const wrapperCmd = imgProxyCmd.command('wrapper').description('管理 shell wrapper (cc-linker-proxy)');
+wrapperCmd.command('install').description('装 wrapper 到 ~/.zshrc').action(() => imgProxyWrapperInstall());
+wrapperCmd.command('uninstall').description('从 ~/.zshrc 移除 wrapper').action(() => imgProxyWrapperUninstall());
+wrapperCmd.command('status').description('查看 wrapper 状态').action(() => imgProxyWrapperStatus());
 const imgProxyDaemonCmd = imgProxyCmd.command('daemon').description('开机自启管理 (macOS launchd)');
 imgProxyDaemonCmd.command('install').description('配置开机自启').action(() => imgProxyDaemonInstall());
 imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());
