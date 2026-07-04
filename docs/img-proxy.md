@@ -212,6 +212,30 @@ rm -rf ~/.cc-linker/img-proxy/cache
 ## 限制 / 已知问题
 
 1. **URL 形式的 image block 不处理**(`source.type === 'url'`)。Claude Code 通常把 URL 转 base64,如果是纯 URL,代理会原样转发,模型能不能 fetch 看上游能力。
+
+### ⚠️ Gotcha: `cc-byte-glm` ≠ `cc-byte-agent-glm`(name collision 陷阱)
+
+如果你的 `~/.claude/providers/` 里有多个文件名相近的 provider,shell alias 用的是哪个文件决定了图片会不会被剥离。常见陷阱:
+
+```bash
+# ~/.zshrc 里:
+alias cc-byte-glm='claude --settings ~/.claude/providers/byte-glm.json'        # ← 没装!
+alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json' # ← 装了
+```
+
+你可能以为 `cc-byte-glm` 走的是 byte-agent 那个 provider,其实它们是**两个独立的 provider 文件**。即使你 install 了 `byte-agent-glm.json`,`cc-byte-glm` 仍然加载没装的 `byte-glm.json`,图片直接发到原 upstream。
+
+**症状**:粘贴图片 → `API Error: 400 Model only support text input`。看 `~/.cc-linker/img-proxy/img-proxy.log` 发现**没有任何该 alias 的请求记录**——proxy 完全没被 hit。
+
+**修复**(`cc-linker img-proxy` 工具已帮你装这个):
+
+```bash
+# 把所有相近名字的都装上,或直接装全部:
+cc-linker img-proxy install --providers byte-glm,byte-agent-glm
+cc-linker img-proxy install --all
+```
+
+**预防**:安装前先看 `cc-linker img-proxy status` 的 "未纳入代理的 provider" 列表,确保你日常用的每个 shell alias 对应的 provider 文件都在装过的列表里。
 2. **清理 cache 是定时的**(启动 + 每小时),不会"立刻清"。如果磁盘敏感,手动 `rm` 即可。
 3. **没自动迁移其他 provider 来源**(cc-switch 的 `auto-providers/` 目录)——目前只扫 `~/.claude/providers/`。
 4. **`mcp__MiniMax__understand_image` 是硬编码到默认 prompt template**——如果你用别的 MCP,改 `prompt_template`。
