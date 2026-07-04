@@ -15,6 +15,8 @@
 - [常见问题](#常见问题)
 - [故障排除](#故障排除)
 - [卸载](#卸载)
+- [升级 / 迁移 (v2 智能安装)](#升级--迁移-v2-智能安装)
+- [智能模式 (smart_mode)](#智能模式-smart_mode)
 - [限制 / 已知问题](#限制--已知问题)
 
 ---
@@ -253,6 +255,70 @@ rm -rf ~/.cc-linker/img-proxy/cache
 ```
 
 `uninstall` 会把 provider 文件的 `BASE_URL` 还原(如果是我们装上去的),`routes.json` 清空,`.bak` 删除。**注意**:`uninstall` 会清掉 `.bak`,token 不会丢但需要手动管理(默认 `uninstall --all` 后下次 install 会重新生成 `.bak`)。
+
+---
+
+## 升级 / 迁移 (v2 智能安装)
+
+从 v1 dumb install 升级到 v2 smart install:
+
+### 轻量迁移
+
+```bash
+cc-linker img-proxy install
+```
+
+smart 模式会跳过 multimodal、可能装 wrapper。**已装的 multimodal 不会被自动卸载**。
+
+### 严格迁移(推荐)
+
+```bash
+cc-linker img-proxy uninstall --all
+cc-linker img-proxy install
+```
+
+`uninstall --all` 还原所有 provider 的 BASE_URL 到原始 upstream,清 routes.json。`install`(smart)重新挑选。
+
+### 回滚
+
+如果新行为有问题:
+
+```bash
+cc-linker img-proxy uninstall --all
+cc-linker img-proxy install --all   # dumb 模式(旧行为)
+```
+
+---
+
+## 智能模式 (smart_mode)
+
+v2 默认 smart 模式:`install` 自动分类模型,跳过 multimodal(避免破坏图片能力)。
+
+### 配置自定义 patterns
+
+```toml
+[img_proxy]
+smart_mode = true
+
+# 额外标 multimodal(也会被跳过)
+vision_model_patterns_extra = [
+  "my-custom-vl-*",
+]
+
+# 额外标 text-only(也会被 proxy)
+text_only_model_patterns_extra = [
+  "my-custom-text-*",
+]
+```
+
+### 关闭 smart(全装)
+
+```toml
+[img_proxy]
+smart_mode = false
+```
+
+或 CLI:`cc-linker img-proxy install --all`(dumb 模式,不过滤)。
 
 ---
 
