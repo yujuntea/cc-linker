@@ -13,7 +13,7 @@
 
 import { existsSync, appendFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
-import { resolveUpstream } from './routes';
+import { getUpstreamByAlias } from './routes';
 import { stripImagesToPaths } from './transform';
 import { IMG_PROXY_LOG_FILE } from '../utils/paths';
 
@@ -35,7 +35,7 @@ export interface ProxyServer {
 }
 
 /** 从 pathname 提取第一段作 alias。空段返回 null。
- *  不做"已知路径"denylist —— 让 `resolveUpstream` 当唯一 gate:
+ *  不做"已知路径"denylist —— 让 `getUpstreamByAlias` 当唯一 gate:
  *  路由表里没有就 502 'unknown alias',而不是 blanket 拒绝整个段。
  *  这样 `v1.json`/`api.json` 等用户起的 provider 文件名也能正确路由(只要 install 过)。
  */
@@ -91,10 +91,10 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       if (!alias) {
         return new Response('cc-linker img-proxy: missing provider alias in path', { status: 502 });
       }
-      // alias gate is `resolveUpstream` only — no hardcoded reserved-prefix denylist.
+      // alias gate is `getUpstreamByAlias` only — no hardcoded reserved-prefix denylist.
       // 上游的 /v1/*, /health, /metrics 等路径若真存在,只需 install 对应的 provider
       // (alias = 文件名 stem);没 install 就 502 提示,而不是 blanket 拒绝整个段。
-      const upstream = resolveUpstream(routesPath, alias);
+      const upstream = getUpstreamByAlias(routesPath, alias);
       if (!upstream) {
         appendLog(`WARN alias=${alias} path=${url.pathname} unresolved`);
         return new Response(

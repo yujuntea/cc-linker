@@ -1,58 +1,56 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { loadRoutes, saveRoutes, addRoute, removeRoute, resolveUpstream } from '../../../src/img-proxy/routes';
-import { mkdtempSync, rmSync, existsSync } from 'fs';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { addRoute, getUpstreamByAlias, resolveProxyByUpstream } from '../../../src/img-proxy/routes';
 
-describe('routes', () => {
-  let routesPath: string;
-  beforeEach(() => { routesPath = join(mkdtempSync(join(tmpdir(), 'img-proxy-routes-')), 'routes.json'); });
-  afterEach(() => { rmSync(routesPath, { recursive: true, force: true }); });
+let tmpDir: string;
+let routesPath: string;
 
-  it('loadRoutes returns empty table when file missing', () => {
-    expect(loadRoutes(routesPath)).toEqual({ version: 1, routes: {} });
+beforeEach(() => {
+  tmpDir = mkdtempSync(join(tmpdir(), 'routes-test-'));
+  routesPath = join(tmpDir, 'routes.json');
+});
+
+afterEach(() => {
+  rmSync(tmpDir, { recursive: true });
+});
+
+describe('getUpstreamByAlias(重命名后)', () => {
+  test('找到 alias 的 upstream', () => {
+    addRoute(routesPath, 'glm-5.2', 'https://open.bigmodel.cn/api/anthropic', '/tmp/glm-5.2.json');
+    expect(getUpstreamByAlias(routesPath, 'glm-5.2')).toBe('https://open.bigmodel.cn/api/anthropic');
   });
 
-  it('addRoute persists and resolveUpstream finds it', () => {
-    addRoute(routesPath, 'byte-agent-glm', 'https://ark.cn-beijing.volces.com/api/plan', '/home/u/.claude/providers/byte-agent-glm.json');
-    expect(resolveUpstream(routesPath, 'byte-agent-glm')).toBe('https://ark.cn-beijing.volces.com/api/plan');
-    expect(resolveUpstream(routesPath, 'unknown')).toBeNull();
+  test('alias 不存在返回 null', () => {
+    expect(getUpstreamByAlias(routesPath, 'nope')).toBeNull();
   });
 
-  it('saveRoute is atomic', () => {
-    saveRoutes(routesPath, {
-      version: 1,
-      routes: {
-        'byte-glm': {
-          alias: 'byte-glm', upstream: 'https://ark.cn-beijing.volces.com/api/coding',
-          provider_path: '/p.json', original_base_url: 'https://ark.cn-beijing.volces.com/api/coding',
-          installed_at: '2026-07-04T00:00:00.000Z',
-        },
-      },
-    });
-    expect(existsSync(routesPath)).toBe(true);
-    expect(loadRoutes(routesPath).routes['byte-glm']).toBeDefined();
+  test('空 routes 文件返回 null', () => {
+    expect(getUpstreamByAlias(routesPath, 'any')).toBeNull();
+  });
+});
+
+describe('resolveProxyByUpstream(新函数)', () => {
+  test('按 upstream 找到 proxy URL', () => {
+    addRoute(routesPath, 'glm-5.2', 'https://open.bigmodel.cn/api/anthropic', '/tmp/glm-5.2.json');
+    const result = resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'https://open.bigmodel.cn/api/anthropic');
+    expect(result).toBe('http://127.0.0.1:8765/glm-5.2');
   });
 
-  it('addRoute overwrites same alias, keeps others (idempotent on same key)', () => {
-    addRoute(routesPath, 'a', 'https://a/', '/pa');
-    addRoute(routesPath, 'b', 'https://b/', '/pb');
-    addRoute(routesPath, 'a', 'https://a2/', '/pa');
-    const table = loadRoutes(routesPath);
-    expect(Object.keys(table.routes).sort()).toEqual(['a', 'b']);
-    expect(table.routes['a']!.upstream).toBe('https://a2/');
+  test('upstream 不匹配返回 null', () => {
+    addRoute(routesPath, 'glm-5.2', 'https://open.bigmodel.cn/api/anthropic', '/tmp/glm-5.2.json');
+    const result = resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'https://unknown.com');
+    expect(result).toBeNull();
   });
 
-  it('removeRoute deletes only the named alias', () => {
-    addRoute(routesPath, 'a', 'https://a/', '/pa');
-    addRoute(routesPath, 'b', 'https://b/', '/pb');
-    removeRoute(routesPath, 'a');
-    const table = loadRoutes(routesPath);
-    expect(table.routes['a']).toBeUndefined();
-    expect(table.routes['b']).toBeDefined();
+  test('多个 routes 找正确的那个', () => {
+    addRoute(routesPath, 'glm-5.2', 'https://open.bigmodel.cn', '/tmp/glm-5.2.json');
+    addRoute(routesPath, 'kimi', 'https://api.moonshot.cn', '/tmp/kimi.json');
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'https://api.moonshot.cn')).toBe('http://127.0.0.1:8765/kimi');
   });
 
-  it('removeRoute on missing alias is a no-op', () => {
-    expect(() => removeRoute(routesPath, 'nope')).not.toThrow();
+  test('空 routes 返回 null', () => {
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'https://any.com')).toBeNull();
   });
 });

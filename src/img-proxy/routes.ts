@@ -38,8 +38,25 @@ export function removeRoute(path: string, alias: string): void {
   }
 }
 
-export function resolveUpstream(path: string, alias: string): string | null {
+// 重命名:resolveUpstream → getUpstreamByAlias(语义更清晰)
+export function getUpstreamByAlias(path: string, alias: string): string | null {
   return loadRoutes(path).routes[alias]?.upstream ?? null;
+}
+
+// 新加:按 upstream 查 proxy URL(wrapper 调用)
+export function resolveProxyByUpstream(
+  routesPath: string,
+  port: number,
+  hostname: string,
+  upstream: string
+): string | null {
+  const table = loadRoutes(routesPath);
+  for (const [alias, entry] of Object.entries(table.routes)) {
+    if (entry.upstream === upstream) {
+      return `http://${hostname}:${port}/${alias}`;
+    }
+  }
+  return null;
 }
 
 export function listRoutes(path: string = IMG_PROXY_ROUTES_PATH): RouteEntry[] {
