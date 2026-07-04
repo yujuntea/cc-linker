@@ -45,12 +45,12 @@ export function getUpstreamByAlias(path: string, alias: string): string | null {
 
 // 新加:按 upstream 查 proxy URL(wrapper 调用)
 export function resolveProxyByUpstream(
-  routesPath: string,
+  path: string,
   port: number,
   hostname: string,
   upstream: string
 ): string | null {
-  const table = loadRoutes(routesPath);
+  const table = loadRoutes(path);
   for (const [alias, entry] of Object.entries(table.routes)) {
     if (entry.upstream === upstream) {
       return `http://${hostname}:${port}/${alias}`;
