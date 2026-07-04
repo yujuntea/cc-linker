@@ -1,5 +1,15 @@
 # cc-linker img-proxy Wrapper Mode — Spec
 
+> **⛔ SUPERSEDED (2026-07-04):** 本文档已被 [`docs/superpowers/specs/2026-07-04-img-proxy-smart-install-design.md`](../specs/2026-07-04-img-proxy-smart-install-design.md) 取代。
+>
+> **冲突点**(请勿再参考本文档):
+> - **GLM-5 系列分类**:本文档 §13 写 `/^glm-5/i` → multimodal,**错的**;NEW spec 改为 `/^glm-\d+(\.\d+)?$/i` → text-only(GLM-5.1 是文本模型,用户已确认)
+> - **resolve 函数命名**:本文档 §5 命名为 `resolveUpstream(routesPath, port, hostname, upstream)`,**会与 `routes.ts` 现有同名函数冲突**;NEW spec 改为重命名旧函数为 `getUpstreamByAlias` + 新加 `resolveProxyByUpstream`
+> - **resolve 函数位置**:本文档 §5 放 `src/img-proxy/resolve.ts`,NEW spec 合并到 `routes.ts`(职责内聚)
+>
+> **保留原因**:历史 commit + §7 wrapper 函数生成细节(NEW spec §7 也覆盖了,但本文档有更详细的 shell 语法说明可参考)
+>
+> ---
 > **Status:** Draft for review · **Branch:** `feat/cli-image-proxy` · **Plan owner:** img-proxy maintainers
 >
 > **Updated:** Added §13 Model Classification (smart text-only vs multimodal detection) + §14 Shell Alias Discovery (auto-detect existing `cc-*` aliases) + §15 Smart Install flow.

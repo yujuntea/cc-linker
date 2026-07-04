@@ -3,7 +3,7 @@
 > **日期:** 2026-07-04
 > **状态:** 等待用户 review
 > **分支:** `feat/cli-image-proxy`
-> **补充:** 与 `docs/superpowers/plans/2026-07-04-img-proxy-wrapper.md` 配合使用(后者覆盖 wrapper 内部细节;本文档覆盖更广的 install + discovery 流程)
+> **取代:** 本文档已取代 `docs/superpowers/plans/2026-07-04-img-proxy-wrapper.md`(后者标 SUPERSEDED;GLM-5 分类 / 函数命名 / 函数位置 都以本文档为准)
 
 ## 1. 目标 & 非目标
 
@@ -80,6 +80,12 @@ export function resolveProxyByUpstream(
 ```
 
 全项目搜索 `resolveUpstream` 调用方,改成 `getUpstreamByAlias`。
+
+**🟡 Step 0(必做):** 改名之前先跑:
+```bash
+grep -rn "resolveUpstream" src/ tests/
+```
+如果有任何调用方(包括注释、字符串字面量),必须**全部**同步改成 `getUpstreamByAlias`。盲点会导致编译通过但运行时行为错乱(比如 tests 还在调老 API)。
 
 ## 4. 模型分类
 
@@ -418,14 +424,19 @@ async function discoverCandidates(opts: { port: number; hostname: string }): Pro
     });
   }
 
+  // 🔴 过滤无 BASE_URL 的(同现有 `imgProxyInstall` 的 `all.filter(p => p.baseUrl)` 语义)
+  // —— 否则 auto-providers 里 CC Switch 配置不完整的记录会被装上去,
+  //    routes.json 的 upstream 是空字符串,resolve 永远失败
+  const withBaseUrl = candidates.filter(c => c.baseUrl);
+
   // 排序:按 source 优先级,然后 alias
-  const sourcePriority: Record<Candidate['source'], number> = { manual: 0, cc_switch: 1, auto: 2, alias: 3 };
-  candidates.sort((a, b) => {
+  const sourcePriority: Record<Candidate['source'], number> = { manual: 0, 'cc-switch': 1, auto: 2, alias: 3 };
+  withBaseUrl.sort((a, b) => {
     const dp = sourcePriority[a.source] - sourcePriority[b.source];
     if (dp !== 0) return dp;
     return a.alias.localeCompare(b.alias);
   });
-  return candidates;
+  return withBaseUrl;
 }
 
 function getExtraPatterns(): { visionPatterns: string[]; textOnlyPatterns: string[] } {
@@ -484,6 +495,9 @@ export async function imgProxyWrapperInstall(): Promise<void> {
   }
   
   // 备份
+  // 🔴 实施时需先在 src/utils/paths.ts 加常量:
+  //   export const IMG_PROXY_WRAPPER_BACKUP_DIR = join(IMG_PROXY_DIR, 'wrapper-backups');
+  // wrapper-uninstall 时也要从这里找最近备份(对比 timestamp 看是不是本次的)
   mkdirSync(dirname(IMG_PROXY_WRAPPER_BACKUP_DIR), { recursive: true });
   const backup = join(IMG_PROXY_WRAPPER_BACKUP_DIR, `wrapper-backup-${Date.now()}`);
   if (content) copyFileSync(rcFile, backup);
@@ -509,7 +523,19 @@ export const WRAPPER_END_MARKER = '# <<< cc-linker img-proxy wrapper <<<';
 export function generateWrapperBlock(): string {
   return `${WRAPPER_START_MARKER}
 cc-linker-proxy() {
-  local real_url="\${ANTHROPIC_BASE_URL:-\$(command cc-linker img-proxy current-url)}"
+  # === 递归防护(验收 §14.7 E7) ===
+  # 如果 ANTHROPIC_BASE_URL 已设(被 wrapper 自己设的,或用户已配的),
+  # 直接 exec claude,不走 resolve 逻辑。避免:
+  #   1. cc='cc-linker-proxy' alias 链 → resolve(proxy_url) 永远空 → 报错
+  #   2. 多余的 sub-shell 调用
+  # Trade-off:用户手动设的 ANTHROPIC_BASE_URL 也会被直通,这是符合直觉的
+  # (用户显式设的 env var 应该被尊重,不强行改写)
+  if [ -n "\${ANTHROPIC_BASE_URL:-}" ]; then
+    command claude "\$@"
+    return \$?
+  fi
+
+  local real_url="\$(command cc-linker img-proxy current-url)"
   if [ -z "\$real_url" ]; then
     echo "cc-linker-proxy: 找不到当前 provider URL" >&2
     echo "  检查 ~/.claude/settings.json 是否含 env.ANTHROPIC_BASE_URL" >&2
@@ -528,6 +554,8 @@ ${WRAPPER_END_MARKER}
 `;
 }
 ```
+
+**注意**:这版 wrapper **不再用 `${VAR:-default}` 语法回退到 ANTHROPIC_BASE_URL**(因为我们已经在前面 guard 跳过了)。改成只读 `current-url`。
 
 ### 新子命令:`cc-linker img-proxy wrapper-install|wrapper-uninstall|wrapper-status`
 
@@ -592,6 +620,17 @@ vision_model_patterns_extra = []
 text_only_model_patterns_extra = []
 ```
 
+**🟡 实施时同步更新 `src/utils/config.ts`:**
+
+1. 在 `ConfigData.img_proxy` 类型加这 3 个字段
+2. 在 `DEFAULTS.img_proxy` 加默认值
+3. 在 `loadEnv()` 的 mappings 数组加:
+   - `CC_LINKER_IMG_PROXY_SMART_MODE` → boolean(注意 `value.toLowerCase() === 'true'`)
+   - `CC_LINKER_IMG_PROXY_VISION_PATTERNS_EXTRA` → string[](`split(',')`)
+   - `CC_LINKER_IMG_PROXY_TEXT_ONLY_PATTERNS_EXTRA` → string[]
+
+类型转换逻辑要小心:`smart_mode` 走 generic mapping 的 boolean 分支(会判断 `typeof target[key] === 'boolean'`),但 `*_extra` 是 string[],要走 `CC_LINKER_CLAUDE_ALLOWED_TOOLS` 那种"split(',')"特殊分支(见 `config.ts` line 320-327)。
+
 ## 10. 实施顺序
 
 1. **重命名 `resolveUpstream` → `getUpstreamByAlias`** + 加 `resolveProxyByUpstream` 在 `src/img-proxy/routes.ts`(15 min)
@@ -606,13 +645,20 @@ text_only_model_patterns_extra = []
    - `imgProxyWrapperInstall` / `imgProxyWrapperUninstall` / `imgProxyWrapperStatus`(1 h)
    - 在 `src/index.ts` 注册(15 min)
 8. **修改 `imgProxyInstall`** — 加 smart 流程、4 路发现、模型分类、wrapper 提示(1.5 h)
-9. **修改 `imgProxyStatus`** — 加 wrapper 状态 + 分类(30 min)
-10. **`src/utils/config.ts`** — 加 3 个新字段 + defaults(15 min)
-11. **`docs/img-proxy.md`** — 新 "CC Switch 用户怎么用" 章节(30 min)
-12. **手动 smoke** — 真实 shell wrapper 调用(30 min)
-13. **Deploy + push**(15 min)
+9. **🔴 修改 `src/cli/commands/setup.ts`** — 让 setup wizard 走 smart install(20 min)
+   - **问题**:`runImgProxyWizard()` 当前调 `imgProxyInstall({ providers: picks.join(',') })`,`--providers` 触发 **dumb 模式**(全装,不过滤 multimodal)。新用户跑 setup 会装到 multimodal 模型上,破坏图片能力,正是 P0 要避免的。
+   - **修复**:
+     1. 删 setup wizard 里的 multi-select inquirer(setup.ts line 261-270 的 picks prompt)
+     2. 改调 `imgProxyInstall({})`(smart 模式,内部 inquirer 会接管)
+     3. 保留前一个 "configure?" 询问(让用户能 skip 整个 img-proxy)
+   - 验证:跑 `cc-linker setup --skip-feishu --skip-hook` 到 img-proxy 步 → 看到 smart install 的 inquirer(带 [auto]/[manual]/[alias] tag 和 multimodal ⏭ 标记)
+10. **修改 `imgProxyStatus`** — 加 wrapper 状态 + 分类(30 min)
+11. **`src/utils/config.ts`** — 加 3 个新字段(smart_mode, vision_model_patterns_extra, text_only_model_patterns_extra)+ defaults(15 min,**别忘同步 `loadEnv()` 里的 env mappings:`CC_LINKER_IMG_PROXY_SMART_MODE` / `CC_LINKER_IMG_PROXY_VISION_PATTERNS_EXTRA` / `CC_LINKER_IMG_PROXY_TEXT_ONLY_PATTERNS_EXTRA`**)
+12. **`docs/img-proxy.md`** — 新 "CC Switch 用户怎么用" 章节 + 提 smart_mode 默认行为(30 min)
+13. **手动 smoke** — 真实 shell wrapper 调用 + setup wizard 走 smart install(30 min)
+14. **Deploy + push**(15 min)
 
-**总:约 9 小时**
+**总:约 9.5 小时**(原 9h + setup wizard 20min)
 
 ## 11. 测试计划
 
@@ -781,10 +827,10 @@ $ cc-linker-proxy "看图"
 # 用户有 ~/.claude/providers/byte-agent-glm.json
 cat ~/.claude/providers/byte-agent-glm.json
 # {
-#   "model": "opus",
 #   "env": {
 #     "ANTHROPIC_BASE_URL": "https://ark.cn-beijing.volces.com/api/plan",
-#     ...
+#     "ANTHROPIC_MODEL": "glm-5.2",
+#     "ANTHROPIC_AUTH_TOKEN": "..."
 #   }
 # }
 
@@ -961,7 +1007,7 @@ $ cc-linker img-proxy install
 | E6 | **Provider 未装** | CC Switch 切到没装过的 | 跑 `cc-linker-proxy` | stderr: "X 没在 img-proxy 里,hint: cc-linker img-proxy install",exit 1 |
 | E7 | **递归 wrapper** | `cc` alias = `cc-linker-proxy` | 跑 `cc` | 检测 `ANTHROPIC_BASE_URL` 已是 proxy URL,跳过 resolve,直接 exec `claude` |
 | E8 | **Model 带 bracket** | `glm-5.2[1m]` | classify | 剥 `[1m]` → `glm-5.2` → 匹配 text-only |
-| E9 | **并发 install** | 两个 terminal 同时跑 | 跑 `install` | routes.json 写锁防 race(可选 v1;v1 接受 last-write-wins) |
+| E9 | **并发 install** | 两个 terminal 同时跑 | 跑 `install` | `saveRoutes()` 用 `tmp + rename` 原子写(`src/img-proxy/routes.ts:17-22`),POSIX `rename(2)` 原子保证,**无 race**;后写的赢但内容完整 |
 | E10 | **Config extra patterns** | `vision_model_patterns_extra = ["my-vl-*"]` | 装 `my-vl-test` | 按 multimodal 跳过 |
 | E11 | **wrapper-uninstall + 还在用** | 装好 wrapper,跑 `cc-linker-proxy`,然后 `wrapper-uninstall` | 跑 `cc-linker-proxy` | 当前 shell 仍能用(函数已 load),新 shell 不行(函数被移除) |
 | E12 | **stale PID** | daemon 被 kill -9 | 跑 `status` | 检测 PID 文件 → dead,提示清理 |
