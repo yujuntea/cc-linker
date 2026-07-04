@@ -543,14 +543,15 @@ git commit -m "refactor(img-proxy): rename resolveUpstream → getUpstreamByAlia
 
 ## Phase C: Wrapper 模块 + 路径
 
-### Task 4: paths.ts 加新常量(WRAPPER_BACKUP_DIR + AUTO_PROVIDERS_DIR)
+### Task 4: paths.ts 加新常量 + provider-scan.ts 同步去重
 
 **Files:**
 - Modify: `src/utils/paths.ts`
+- Modify: `src/img-proxy/provider-scan.ts`
 
 **依赖:** 无
 
-- [ ] **Step 1: 加常量**
+- [ ] **Step 1: paths.ts 加常量**
 
 在 `src/utils/paths.ts` 末尾加:
 
@@ -562,21 +563,39 @@ export const IMG_PROXY_WRAPPER_BACKUP_DIR = join(IMG_PROXY_DIR, 'wrapper-backups
 export const AUTO_PROVIDERS_DIR = join(CC_LINKER_DIR, 'auto-providers');
 ```
 
-注:当前 `AUTO_PROVIDERS_DIR` 在 `provider-scan.ts` 里是私有 const,smart install 跨模块需要它所以提到 paths.ts。
+- [ ] **Step 2: provider-scan.ts 去重(避免重复定义)**
 
-- [ ] **Step 2: 验证编译**
+修改 `src/img-proxy/provider-scan.ts:1-8`:
+
+**第 4 行**(`import` 块)的 imports 加 `AUTO_PROVIDERS_DIR`:
+
+```typescript
+import { CLAUDE_PROVIDERS_DIR, CC_LINKER_DIR, HOME, AUTO_PROVIDERS_DIR } from '../utils/paths';
+```
+
+**第 8 行**删本地 const:
+
+```typescript
+// 删除:
+const AUTO_PROVIDERS_DIR = join(CC_LINKER_DIR, 'auto-providers');
+```
+
+这样 smart install 跨模块引用 `AUTO_PROVIDERS_DIR` 时不会有两个定义(避免后续重构混淆)。
+
+- [ ] **Step 3: 验证编译 + 现有 test**
 
 ```bash
 bun run typecheck
+bun test tests/unit/img-proxy/provider-scan 2>/dev/null || bun test --test-name-pattern="provider.scan|cc.switch"
 ```
 
-Expected: 无 error
+Expected: typecheck 无 error;现有 provider-scan 相关 test 全过(因为常量值相同)
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/utils/paths.ts
-git commit -m "feat(img-proxy): add IMG_PROXY_WRAPPER_BACKUP_DIR + AUTO_PROVIDERS_DIR path constants"
+git add src/utils/paths.ts src/img-proxy/provider-scan.ts
+git commit -m "feat(img-proxy): add IMG_PROXY_WRAPPER_BACKUP_DIR + AUTO_PROVIDERS_DIR path constants (dedup from provider-scan)"
 ```
 
 ---
@@ -1066,15 +1085,11 @@ import { resolveProxyByUpstream } from '../../img-proxy/routes';
 
 ```typescript
 // ---------- resolve ----------
-export async function imgProxyResolve(opts: { upstream?: string }): Promise<void> {
-  const upstream = opts.upstream ?? '';
-  if (!upstream) {
-    console.error(chalk.red('❌ upstream 参数必填'));
-    process.exit(1);
-  }
+// upstream 由 Commander 的 <upstream>(尖括号 = 必填)传入,这里类型就是 string
+export async function imgProxyResolve(opts: { upstream: string }): Promise<void> {
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
-  const proxyUrl = resolveProxyByUpstream(IMG_PROXY_ROUTES_PATH, port, hostname, upstream);
+  const proxyUrl = resolveProxyByUpstream(IMG_PROXY_ROUTES_PATH, port, hostname, opts.upstream);
   if (proxyUrl) console.log(proxyUrl);
   // 空 stdout = "没找到" — wrapper 检测用
 }
@@ -1600,6 +1615,20 @@ import { AUTO_PROVIDERS_DIR } from '../../utils/paths';
 import { discoverCandidates, type Candidate } from '../../img-proxy/discover';
 ```
 
+- [ ] **Step 4.5: src/index.ts 加 `--yes` 和 `--mode` flag 注册**
+
+`imgProxyInstall` 函数签名支持 `opts.yes` 和 `opts.mode`,但 `src/index.ts:192-196` 的 install 子命令注册只有 `--providers` 和 `--all`,需要补:
+
+```typescript
+imgProxyCmd.command('install')
+  .description('把选定 provider 的 BASE_URL 改写为指向本地代理 (smart 默认,自动跳过多模态)')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部 provider(dumb 模式)')
+  .option('--yes', 'smart 默认预选,不交互')
+  .option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)', 'smart')
+  .action((opts) => imgProxyInstall(opts));
+```
+
 - [ ] **Step 5: 跑 typecheck**
 
 ```bash
@@ -1730,13 +1759,11 @@ if (allProviders.length === 0) {
 }
 ```
 
-- [ ] **Step 4: 删 multi-select inquirer,改调 smart install**
+- [ ] **Step 4: 完全替换 line 258-286(删 multi-select inquirer + 改调 smart install)**
 
-修改 `runImgProxyWizard` line 258-282(把整个 picks inquirer + install 调用替换):
+修改 `src/cli/commands/setup.ts`,**完全替换** `runImgProxyWizard` 中 line 258-286 的代码块(原本是 multi-select inquirer + dumb `imgProxyInstall({providers})` 调用):
 
 ```typescript
-// 删除 line 258-275(整个 picks inquirer 段)
-// 替换 line 277-286 的 imgProxyInstall 调用为:
 const { imgProxyInstall } = await import('./img-proxy');
 try {
   const installResult = await imgProxyInstall({});
@@ -1749,6 +1776,8 @@ try {
   return result;
 }
 ```
+
+注意:`imgProxyInstall` 内部已经处理 routes.json 读写 + wrapper 检测,通过返回值传出。setup.ts 不需要自己读 routes.json。
 
 - [ ] **Step 5: printSummary 扩展**
 
