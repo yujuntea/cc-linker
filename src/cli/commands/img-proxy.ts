@@ -215,6 +215,8 @@ export async function imgProxyInstall(opts: { providers?: string; all?: boolean 
 }
 
 export async function imgProxyUninstall(opts: { providers?: string; all?: boolean }): Promise<void> {
+  const port = config.get<number>('img_proxy.port', 8765);
+  const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
   const installedRoutes = Object.values(loadRoutes(IMG_PROXY_ROUTES_PATH).routes);
   let targets: { alias: string; path: string }[];
   if (opts.all) {
@@ -231,7 +233,7 @@ export async function imgProxyUninstall(opts: { providers?: string; all?: boolea
   }
   for (const t of targets) {
     try {
-      uninstallProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH });
+      uninstallProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH, port, hostname });
       console.log(chalk.green(`  ✅ 还原 ${t.alias}`));
     } catch (err) {
       removeRoute(IMG_PROXY_ROUTES_PATH, t.alias);
