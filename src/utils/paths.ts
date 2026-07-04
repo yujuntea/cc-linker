@@ -53,3 +53,12 @@ export const CLAUDE_PROJECTS_DIR = join(HOME, '.claude', 'projects');
 export const CLAUDE_SETTINGS_PATH = join(HOME, '.claude', 'settings.json');
 /** ~/.claude/jobs/<short>/state.json — Claude CLI's authoritative bg-job state machine (v2.3+ Agent View primary source). */
 export const CLAUDE_JOBS_DIR = join(HOME, '.claude', 'jobs');
+// Claude providers 目录(用于 img-proxy 扫描)
+export const CLAUDE_PROVIDERS_DIR = join(HOME, '.claude', 'providers');
+
+// Image Proxy (CLI image-block stripping reverse proxy)
+export const IMG_PROXY_DIR = join(CC_LINKER_DIR, 'img-proxy');
+export const IMG_PROXY_CACHE_DIR = join(IMG_PROXY_DIR, 'cache');
+export const IMG_PROXY_ROUTES_PATH = join(IMG_PROXY_DIR, 'routes.json');
+export const IMG_PROXY_PID_FILE = join(IMG_PROXY_DIR, 'img-proxy.pid');
+export const IMG_PROXY_LOG_FILE = join(IMG_PROXY_DIR, 'img-proxy.log');

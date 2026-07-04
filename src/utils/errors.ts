@@ -33,6 +33,10 @@ export function handleError(err: unknown): never {
         '安装 Claude Code CLI: npm install -g @anthropic-ai/claude-code',
         '或在 config.toml 的 [sdk] section 显式设置 claude_executable',
       ],
+      'E_IMG_PROXY_RUNNING': ['代理已在运行,如需重启先执行 cc-linker img-proxy stop'],
+      'E_IMG_PROXY_NOT_RUNNING': ['代理未运行,执行 cc-linker img-proxy start --daemon'],
+      'E_IMG_PROXY_NO_PROVIDERS': ['未扫描到 provider (~/.claude/providers/*.json)'],
+      'E_IMG_PROXY_UNKNOWN_ALIAS': ['该 alias 未 install,执行 cc-linker img-proxy install'],
     };
 
     if (suggestions[err.code]) {

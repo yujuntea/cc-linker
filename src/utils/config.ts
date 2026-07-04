@@ -80,6 +80,14 @@ interface ConfigData {
     max_size_bytes: number;
     cleanup_max_age_hours: number;
   };
+  img_proxy: {
+    enabled: boolean;
+    port: number;
+    hostname: string;
+    cache_max_age_hours: number;
+    prompt_template: string;
+    console_enabled: boolean;
+  };
   agent_view: AgentViewConfig;
 }
 
@@ -176,6 +184,14 @@ const DEFAULTS: ConfigData = {
     max_size_bytes: 10 * 1024 * 1024,
     cleanup_max_age_hours: 24,
   },
+  img_proxy: {
+    enabled: true,
+    port: 8765,
+    hostname: '127.0.0.1',
+    cache_max_age_hours: 24 * 7,
+    prompt_template: '[用户粘贴的图片已保存到本地: {path}] 当前模型为纯文本模型,无法直接查看图片内容。如需识别这张图片,请调用 mcp__MiniMax__understand_image 工具,image_source 参数传上述本地路径。',
+    console_enabled: false, // Phase 2: Web 控制台
+  },
   agent_view: {
     enabled: true,
     refresh_min_interval_ms: 2000,
@@ -206,6 +222,7 @@ function cloneDefaults(): ConfigData {
     claude: { ...DEFAULTS.claude },
     sdk: { ...DEFAULTS.sdk },
     images: { ...DEFAULTS.images },
+    img_proxy: { ...DEFAULTS.img_proxy },
     agent_view: { ...DEFAULTS.agent_view },
   };
 }
@@ -292,6 +309,11 @@ export class ConfigManager {
       ['CC_LINKER_AGENT_VIEW_BACKGROUND_ONLY', 'agent_view', 'background_only'],
       ['CC_LINKER_AGENT_VIEW_STOP_REQUIRES_CONFIRM', 'agent_view', 'stop_requires_confirm'],
       ['CC_LINKER_AGENT_VIEW_REPLY_THROTTLE_MS', 'agent_view', 'reply_throttle_ms'],
+      ['CC_LINKER_IMG_PROXY_ENABLED', 'img_proxy', 'enabled'],
+      ['CC_LINKER_IMG_PROXY_PORT', 'img_proxy', 'port'],
+      ['CC_LINKER_IMG_PROXY_HOSTNAME', 'img_proxy', 'hostname'],
+      ['CC_LINKER_IMG_PROXY_CACHE_HOURS', 'img_proxy', 'cache_max_age_hours'],
+      ['CC_LINKER_IMG_PROXY_PROMPT_TEMPLATE', 'img_proxy', 'prompt_template'],
     ];
 
     // Parse array env vars for Claude tools
