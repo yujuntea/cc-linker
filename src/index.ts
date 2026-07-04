@@ -211,9 +211,10 @@ imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(
 
 program
   .command('setup')
-  .description('一键配置向导（初始化 + 安装钩子 + 配置飞书 Bot）')
+  .description('一键配置向导（初始化 + 安装钩子 + 配置飞书 Bot + 启用图片代理）')
   .option('--skip-feishu', '跳过飞书 Bot 配置')
   .option('--skip-hook', '跳过 Claude Code 钩子安装')
+  .option('--skip-img-proxy', '跳过图片代理 (img-proxy) 配置')
   .action((opts) => withSync(async (registry) => {
     await setup(registry, opts);
   }, true));
