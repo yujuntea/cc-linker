@@ -528,6 +528,10 @@ const MULTIMODAL_PATTERNS = [
   // === Moonshot Kimi (月之暗面) — all variants multimodal ===
   /^kimi/i,                         // kimi-k2, kimi-k2.5, kimi-k2.6, kimi-for-coding, kimi-vl (MoonViT 视觉编码器)
 
+  // === Xiaomi MiMo (小米) ===
+  /^mimo-v\d+(\.\d+)?(?!-pro)/i,   // mimo-v2.5 multimodal(base vision model)
+                                   // mimo-v2.5-pro is TEXT (negative lookahead excludes -pro)
+
   // === MiniMax ===
   /^MiniMax-M3/i,                   // MiniMax-M3[1m] multimodal(per user)
 
@@ -583,10 +587,43 @@ const TEXT_ONLY_PATTERNS = [
   /^MiniMax-Text-/i,               // older text models
   /^abab/i,                         // abab5.5s, abab6.5s (legacy text)
 
+  // === Xiaomi MiMo (text variant) ===
+  /^mimo-.*-pro/i,                  // mimo-v2.5-pro text (base mimo-v2.5 is multimodal)
+
   // === OpenAI older ===
   /^(gpt-3|gpt-3\.5)/i,             // gpt-3.5-turbo
 ];
 ```
+
+### Suffix-stripping preprocessing (重要!)
+
+Many model names carry a `[suffix]` quantifier — `[1m]` (1M context), `[256k]` (256K context), etc. Real examples from user's setup:
+
+- `glm-5.2[1m]`
+- `qwen3.7-plus[1m]`
+- `kimi-for-coding[256k]`
+- `mimo-v2.5-pro[1m]`
+- `MiniMax-M3[1m]`
+
+**The `[suffix]` must be stripped before pattern matching**, otherwise `$`-anchored patterns fail and text-vs-multimodal misclassifications occur.
+
+```typescript
+function classifyModel(modelName: string): 'multimodal' | 'text-only' | 'unknown' {
+  // Strip trailing [quantifier]: [1m], [256k], [128k], [32k], etc.
+  const baseName = modelName.replace(/\[[^\]]*\]\s*$/, '').trim();
+
+  // 1. Check multimodal FIRST
+  if (MULTIMODAL_PATTERNS.some(p => p.test(baseName))) return 'multimodal';
+
+  // 2. Check text-only
+  if (TEXT_ONLY_PATTERNS.some(p => p.test(baseName))) return 'text-only';
+
+  // 3. Unknown → default to text (proxy)
+  return 'unknown';
+}
+```
+
+**Important:** Stripping order matters. `kimi-for-coding[256k]` → strips to `kimi-for-coding` → matches multimodal `/^kimi/i` → multimodal ✓. Without strip, `kimi-for-coding[256k]` would still match `/^kimi/i` (no `$` anchor), but `$`-anchored patterns like `/^glm-\d+(\.\d+)?$/i` would fail. Always strip.
 
 ### Detection order matters
 
@@ -637,15 +674,16 @@ text_only_model_patterns_extra = [
 | Kimi K2.6 | `kimi-k2.6` | multimodal |
 | Kimi K2.5 | `kimi-k2.5-thinking` | multimodal |
 | GLM 5.2 | `glm-5.2[1m]` | text-only |
-| GLM 5.1 | `glm-5.1` | multimodal (GLM-5 series) |
+| GLM 5.1 | `glm-5.1` | **text-only** (per user correction) |
 | GLM 4.5 | `glm-4.5` | text-only |
 | GLM 4.5V | `glm-4.5v` | multimodal |
 | GLM 4V plus | `glm-4v-plus` | multimodal |
 | DeepSeek V4 | `deepseek-v4-pro[1m]` | text-only |
 | MiniMax M3 | `MiniMax-M3[1m]` | multimodal |
-| MiniMax M2.5 | `MiniMax-M2.5` | text-only |
+| MiniMax M2.5 | `MiniMax-M2.5[1m]` | text-only |
+| MiMo v2.5 (base) | `mimo-v2.5[1m]` | **multimodal** (per user) |
+| MiMo v2.5 Pro | `mimo-v2.5-pro[1m]` | **text-only** (per user) |
 | Doubao vision | `doubao-1.5-vision-pro` | multimodal |
-| MiMo v2.5 | `mimo-v2.5-pro[1m]` | unknown (defaults to proxy) |
 | Hunyuan vision | `hunyuan-vision-pro` | multimodal |
 | ERNIE vision | `ernie-4.0-vision` | multimodal |
 | Step-1V | `step-1v-32k` | multimodal |
@@ -667,6 +705,8 @@ function classifyModel(modelName: string): 'multimodal' | 'text-only' | 'unknown
   return 'unknown';
 }
 ```
+
+**Note**: The full implementation includes suffix-stripping (see §"Suffix-stripping preprocessing" above). This code block shows the pattern-matching logic only.
 
 **Default behavior for unknown**: `install` will proxy them (with a visible hint "unknown model, defaulting to proxy"). User can override per-provider with `--force-multimodal <alias>` flag.
 
@@ -947,5 +987,6 @@ $ cc-linker img-proxy install
 2. **Should setup wizard auto-create `cc` alias?** v1: ask user during setup ("Want `cc` = `cc-linker-proxy`? Y/n").
 3. **Should `install --mode=file` skip multimodal entirely (not even show)?** v1: still show multimodal in UI, just skip by default. User can override with --all.
 4. **qwen3.7-max**: user didn't specify multimodal. Conservative: classify as text-only (proxy). User can add `vision_model_patterns_extra` if needed.
-5. **mimo-v2.5-pro**: Xiaomi MiMo. User didn't specify. Conservative: classify as unknown (proxy by default).
+5. **mimo-v2.5-pro**: Xiaomi MiMo text variant (per user correction). mimo-v2.5 base is multimodal, mimo-v2.5-pro is text. Implemented via negative lookahead in multimodal pattern.
+6. **GLM-5 series**: User confirmed GLM-5.1 is text-only (not multimodal). Removed `/^glm-5/i` from multimodal patterns; only vision variants (`glm-4v`, `glm-4.5v`, etc.) are multimodal.
 6. **deepseek-v4-pro**: User didn't specify. Conservative: classify as text-only (proxy). Newer DeepSeek versions may gain vision — user can adjust.
