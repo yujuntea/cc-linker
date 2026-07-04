@@ -1,4 +1,4 @@
-import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, statSync } from 'fs';
+import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'fs';
 import { join, basename } from 'path';
 import { Database } from 'bun:sqlite';
 import { CLAUDE_PROVIDERS_DIR, HOME, AUTO_PROVIDERS_DIR } from '../utils/paths';
@@ -93,33 +93,52 @@ function syncCcSwitchToAutoProviders(
     ).all();
 
     mkdirSync(autoProvidersDir, { recursive: true, mode: 0o700 });
-    const seenAliases = new Set<string>();
+
+    // First pass: compute every alias that *should* exist (handles collisions),
+    // so the cleanup pass can match against DB reality even before any writes.
+    const seenAliasesInDb = new Set<string>();
+    const resolvedRows: Array<{ alias: string; cfg: any; rowName: string }> = [];
     for (const row of rows) {
       try {
         const cfg = JSON.parse(row.settings_config);
-        // alias 优先用配置里 explicit 的,fallback 到 DB name;
-        // 如果冲突(同名两条),自动加 -2/-3 后缀
         let baseAlias = String(cfg.alias ?? row.name).trim() || row.name;
         let alias = baseAlias;
         let counter = 2;
-        while (seenAliases.has(alias)) {
+        while (seenAliasesInDb.has(alias)) {
           alias = `${baseAlias}-${counter}`;
           counter++;
         }
-        seenAliases.add(alias);
-
-        const filePath = join(autoProvidersDir, `${alias}.json`);
-        if (existsSync(filePath)) continue;  // 已存在就不覆盖
-        const tmpPath = filePath + '.tmp';
-        writeFileSync(
-          tmpPath,
-          JSON.stringify({ ...cfg, name: row.name, alias }, null, 2),
-          { mode: 0o600 },
-        );
-        renameSync(tmpPath, filePath);
+        seenAliasesInDb.add(alias);
+        resolvedRows.push({ alias, cfg, rowName: row.name });
       } catch {
         // 单条记录损坏就跳过,不影响其他
       }
+    }
+
+    // Cleanup stale entries:删除 auto-providers 中已不在当前 DB 里的 alias。
+    // 之前 existsSync(filePath) continue 会保留旧文件 → 用户从 CC Switch 删 provider 后
+    // auto-providers 残留 stale 条目,这次顺手清掉。
+    if (existsSync(autoProvidersDir)) {
+      for (const file of readdirSync(autoProvidersDir)) {
+        if (!file.endsWith('.json')) continue;
+        const alias = basename(file, '.json');
+        if (!seenAliasesInDb.has(alias)) {
+          try { unlinkSync(join(autoProvidersDir, file)); } catch { /* ignore */ }
+        }
+      }
+    }
+
+    // Second pass: write/refresh current entries (skip if already up to date).
+    for (const { alias, cfg, rowName } of resolvedRows) {
+      const filePath = join(autoProvidersDir, `${alias}.json`);
+      if (existsSync(filePath)) continue;  // 已存在就不覆盖
+      const tmpPath = filePath + '.tmp';
+      writeFileSync(
+        tmpPath,
+        JSON.stringify({ ...cfg, name: rowName, alias }, null, 2),
+        { mode: 0o600 },
+      );
+      renameSync(tmpPath, filePath);
     }
   } catch {
     // DB 损坏 / 锁定 / 不可读 → 静默忽略,manual 路径仍可用

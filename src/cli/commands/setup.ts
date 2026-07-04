@@ -280,9 +280,14 @@ async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
   try {
     const installResult = await imgProxyInstall({});
     result.installedCount = installResult.installedCount;
-    result.configured = true;
+    // 只在至少装上 1 个 provider 时才算 configured,避免出现
+    // "✅ 已启用 (0 个 provider)" 这种自相矛盾的 summary。
+    result.configured = installResult.installedCount > 0;
     result.wrapperInstalled = installResult.wrapperInstalled;
     result.wrapperSkipped = installResult.wrapperSkipped;
+    if (installResult.installedCount === 0) {
+      console.log(chalk.yellow('  ⚠️ 0 个 provider 被安装(全部跳过 / 多模态 / 用户跳选)'));
+    }
   } catch (err) {
     console.log(chalk.red(`  ❌ 安装失败: ${err}`));
     return result;

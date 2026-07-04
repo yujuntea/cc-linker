@@ -155,5 +155,31 @@ describe('provider-scan with cc-switch', () => {
 
       expect(readdirSync(autoDir)).toEqual(['good.json']);  // 跳过 bad,只留 good
     });
+
+    it('cleans up stale auto-provider files not in current DB (I-4)', () => {
+      // Pre-seed two auto-provider files including a stale one
+      const { mkdirSync } = require('fs');
+      mkdirSync(autoDir, { recursive: true });
+      writeFileSync(join(autoDir, 'glm-5.2.json'), JSON.stringify({
+        name: 'old glm-5.2',
+        alias: 'glm-5.2',
+        env: { ANTHROPIC_BASE_URL: 'https://old.example/api' },
+      }));
+      writeFileSync(join(autoDir, 'old-provider.json'), JSON.stringify({
+        name: 'will be deleted',
+        alias: 'old-provider',
+        env: { ANTHROPIC_BASE_URL: 'https://stale.example/api' },
+      }));
+
+      // DB has only glm-5.2 now (user deleted old-provider from CC Switch)
+      seedCcSwitch([{ name: 'glm-5.2', settings_config: { env: { ANTHROPIC_BASE_URL: 'https://new.example/api' } } }]);
+
+      _testHooks.syncCcSwitchToAutoProviders(ccDbPath, autoDir);
+
+      const files = readdirSync(autoDir);
+      // Stale entry gone, fresh entry present (or preserved)
+      expect(files).not.toContain('old-provider.json');
+      expect(files).toContain('glm-5.2.json');
+    });
   });
 });
