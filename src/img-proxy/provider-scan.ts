@@ -70,7 +70,7 @@ function readProviderFile(path: string): ProviderFileInfo | null {
  * `name`(显示名)、`settings_config`(JSON 字符串,含 env.ANTHROPIC_BASE_URL 等)、
  * `app_type='claude'` 过滤。
  */
-function syncCcSwitchToAutoProviders(
+export function syncCcSwitchToAutoProviders(
   ccSwitchDbPath: string = CC_SWITCH_DB,
   autoProvidersDir: string = AUTO_PROVIDERS_DIR,
 ): void {

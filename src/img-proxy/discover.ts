@@ -2,6 +2,7 @@ import { readFileSync, readdirSync, existsSync, mkdirSync } from 'fs';
 import { join, basename } from 'path';
 import { classifyModel, type ModelKind } from './classify';
 import type { ProviderFileInfo } from './types';
+import { syncCcSwitchToAutoProviders } from './provider-scan';
 
 export interface Candidate extends ProviderFileInfo {
   source: 'manual' | 'auto';
@@ -22,6 +23,10 @@ export interface DiscoverOpts {
  */
 export function discoverCandidates(opts: DiscoverOpts): Candidate[] {
   const { manualDir, autoDir, extraPatterns } = opts;
+
+  // 🔴 Fix: 触发 CC Switch DB → auto-providers 同步 + stale cleanup(I-4)
+  // 旧路径 scanProviderFiles 有同步逻辑,但 smart install 走 discoverCandidates,绕过了它
+  syncCcSwitchToAutoProviders();
 
   const manualFiles = scanDir(manualDir);
   const autoFiles = scanDir(autoDir);
