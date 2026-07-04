@@ -17,6 +17,7 @@ import { scanProviderFiles } from '../../img-proxy/provider-scan';
 import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
 import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
+import { escapePlistString } from '../../utils/plist';
 
 // ---------- 运行状态 ----------
 function isRunning(): boolean {
@@ -286,6 +287,35 @@ function launchdPlistPath(): string {
 export async function imgProxyDaemonInstall(): Promise<void> {
   if (platform() !== 'darwin') { console.log(chalk.red('目前仅支持 macOS launchd 自启')); process.exit(1); }
   const exe = getExecutablePath();
+  const plistPath = launchdPlistPath();
+
+  // Fix #5: 重装前先停现有 daemon,避免 launchd KeepAlive 重启新 child 时
+  // 旧进程还在 :8765 上导致 EADDRINUSE,服务静默失败
+  if (existsSync(plistPath)) {
+    spawnSync('launchctl', ['stop', 'com.cclinker.img-proxy']);
+    const existingPid = readPid(IMG_PROXY_PID_FILE);
+    if (existingPid !== null && isPidAlive(existingPid)) {
+      console.log(chalk.gray(`  停止旧 daemon (PID: ${existingPid})...`));
+      try {
+        process.kill(existingPid, 'SIGTERM');
+        for (let i = 0; i < 20; i++) {
+          try { process.kill(existingPid, 0); await new Promise(r => setTimeout(r, 300)); }
+          catch { break; }
+        }
+        try { process.kill(existingPid, 0); process.kill(existingPid, 'SIGKILL'); } catch {}
+      } catch {}
+    }
+    spawnSync('launchctl', ['unload', plistPath]);
+    clearPid(IMG_PROXY_PID_FILE);
+  }
+
+  // Fix #3: PATH / homedir / exe 等插入 XML 之前转义,防 & 等特殊字符
+  // 导致 plist 损坏 + launchctl load 静默失败
+  const safePath = escapePlistString(process.env.PATH ?? '');
+  const safeHome = escapePlistString(homedir());
+  const safeExe = escapePlistString(exe);
+  const safeLog = escapePlistString(IMG_PROXY_LOG_FILE);
+
   // ProgramArguments 不带 --daemon,改用 env 注入 CC_LINKER_IMG_PROXY_DAEMON=1
   // → launchd 直接起 child,不双重 fork,KeepAlive 崩溃重拉的也是 child
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -295,30 +325,50 @@ export async function imgProxyDaemonInstall(): Promise<void> {
   <key>Label</key><string>com.cclinker.img-proxy</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${exe}</string>
+    <string>${safeExe}</string>
     <string>img-proxy</string>
     <string>start</string>
   </array>
-  <key>WorkingDirectory</key><string>${homedir()}</string>
+  <key>WorkingDirectory</key><string>${safeHome}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>${IMG_PROXY_LOG_FILE}</string>
-  <key>StandardErrorPath</key><string>${IMG_PROXY_LOG_FILE}</string>
+  <key>StandardOutPath</key><string>${safeLog}</string>
+  <key>StandardErrorPath</key><string>${safeLog}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>CC_LINKER_IMG_PROXY_DAEMON</key><string>1</string>
-    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${process.env.PATH ?? ''}</string>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${safePath}</string>
   </dict>
 </dict>
 </plist>`;
-  mkdirSync(dirname(launchdPlistPath()), { recursive: true });
-  if (existsSync(launchdPlistPath())) spawnSync('launchctl', ['unload', launchdPlistPath()]);
-  writeFileSync(launchdPlistPath(), plist, { mode: 0o644 });
-  spawnSync('launchctl', ['load', launchdPlistPath()]);
-  spawnSync('launchctl', ['start', 'com.cclinker.img-proxy']);
+  mkdirSync(dirname(plistPath), { recursive: true });
+  writeFileSync(plistPath, plist, { mode: 0o644 });
+
+  // Fix #3: 检查 launchctl load 返回码,失败时不静默 ✅
+  // 'already loaded' 是合法的(用户手启动过),其他 stderr 都报出来
+  const loadResult = spawnSync('launchctl', ['load', plistPath]);
+  const loadErr = loadResult.stderr.toString().trim();
+  if (loadResult.status !== 0 && !loadErr.includes('already loaded')) {
+    console.log(chalk.red(`❌ launchctl load 失败 (exit ${loadResult.status})`));
+    console.log(chalk.yellow(`   ${loadErr}`));
+    console.log(chalk.gray(`   检查 plist: ${plistPath}`));
+    process.exit(1);
+  }
+  if (loadErr.includes('already loaded')) {
+    // load 会失败因为 plist 已经在;但我们 unload 过上面的代码块 —— 这种情况
+    // 只在 plist 文件被外部修改时出现,提醒一下
+    console.log(chalk.gray('  (plist 已加载,启动当前 daemon 即可)'));
+  }
+
+  const startResult = spawnSync('launchctl', ['start', 'com.cclinker.img-proxy']);
+  if (startResult.status !== 0) {
+    const err = startResult.stderr.toString().trim();
+    if (err) console.log(chalk.yellow(`⚠️ launchctl start 警告: ${err}`));
+  }
+
   console.log(chalk.green('✅ img-proxy 开机自启已配置 (KeepAlive,崩溃 10s 内自拉起)'));
-  console.log(chalk.cyan(`   ${launchdPlistPath()}`));
+  console.log(chalk.cyan(`   ${plistPath}`));
   console.log(chalk.gray('   卸载: cc-linker img-proxy daemon uninstall'));
 }
 
