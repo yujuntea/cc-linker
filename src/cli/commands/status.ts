@@ -2,7 +2,8 @@ import chalk from 'chalk';
 import { readFileSync, existsSync, statSync } from 'fs';
 import { RegistryManager } from '../../registry';
 import { formatTimeAgo } from '../output';
-import { CLAUDE_SETTINGS_PATH, RUNTIME_OWNER_LOCK_PATH } from '../../utils/paths';
+import { CLAUDE_SETTINGS_PATH, RUNTIME_OWNER_LOCK_PATH, IMG_PROXY_PID_FILE, IMG_PROXY_ROUTES_PATH } from '../../utils/paths';
+import { readPid, isPidAlive } from '../../utils/pid';
 
 export async function status(registry: RegistryManager): Promise<void> {
   const sessions = Object.values(registry.sessions);
@@ -45,10 +46,25 @@ export async function status(registry: RegistryManager): Promise<void> {
   }
   console.log(`  Claude Code hook:   ${hookInstalled ? chalk.green('installed') : chalk.red('not installed')}`);
 
+  // img-proxy 状态
+  console.log('\nimg-proxy (图片代理):');
+  const proxyPid = readPid(IMG_PROXY_PID_FILE);
+  const proxyRunning = proxyPid !== null && isPidAlive(proxyPid);
+  console.log(`  Daemon:         ${proxyRunning ? chalk.green(`running (PID: ${proxyPid})`) : chalk.yellow('not running')}`);
+  let installedCount = 0;
+  if (existsSync(IMG_PROXY_ROUTES_PATH)) {
+    try {
+      const routes = JSON.parse(readFileSync(IMG_PROXY_ROUTES_PATH, 'utf8'));
+      installedCount = Object.keys(routes?.routes ?? {}).length;
+    } catch {}
+  }
+  console.log(`  Installed providers: ${installedCount === 0 ? chalk.yellow('0') : installedCount}`);
+
   // Commands 列表
   console.log('\nCommands:');
-  console.log('  cc-linker start      Launch Feishu bot');
-  console.log('  cc-linker list       List all sessions');
-  console.log('  cc-linker resume     Resume a session');
-  console.log('  cc-linker sync       Sync sessions');
+  console.log('  cc-linker start              Launch Feishu bot');
+  console.log('  cc-linker list               List all sessions');
+  console.log('  cc-linker resume             Resume a session');
+  console.log('  cc-linker sync               Sync sessions');
+  console.log('  cc-linker img-proxy status   Show img-proxy detail');
 }
