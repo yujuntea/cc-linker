@@ -11,10 +11,12 @@ import { readCurrentUpstreamFromSettings } from '../../img-proxy/resolve';
 import {
   IMG_PROXY_DIR, IMG_PROXY_CACHE_DIR, IMG_PROXY_ROUTES_PATH,
   IMG_PROXY_PID_FILE, IMG_PROXY_LOG_FILE, CLAUDE_PROVIDERS_DIR,
+  AUTO_PROVIDERS_DIR,
 } from '../../utils/paths';
 import { installProvider, uninstallProvider, isProviderInstalled } from '../../img-proxy/provider-config';
 import { loadRoutes, removeRoute, resolveProxyByUpstream } from '../../img-proxy/routes';
 import { scanProviderFiles, hasCcSwitch } from '../../img-proxy/provider-scan';
+import { discoverCandidates, type Candidate } from '../../img-proxy/discover';
 import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
 import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
@@ -288,16 +290,36 @@ export async function imgProxyWrapperStatus(): Promise<void> {
 }
 
 // ---------- install / uninstall ----------
-export async function imgProxyInstall(opts: { providers?: string; all?: boolean }): Promise<void> {
+export async function imgProxyInstall(opts: {
+  providers?: string;
+  all?: boolean;
+  yes?: boolean;
+  mode?: 'smart' | 'dumb';
+}): Promise<{ installedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean }> {
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
-  const allRaw = scanProviderFiles();
-  const all = allRaw.filter(p => p.baseUrl);  // 没 BASE_URL 的跳过
-  if (all.length === 0) {
+  const smartModeConfig = config.get<boolean>('img_proxy.smart_mode', true);
+  const extraPatterns = {
+    visionPatterns: config.get<string[]>('img_proxy.vision_model_patterns_extra', []),
+    textOnlyPatterns: config.get<string[]>('img_proxy.text_only_model_patterns_extra', []),
+  };
+
+  const isExplicit = !!opts.providers || !!opts.all;
+  const mode = opts.mode ?? (isExplicit ? 'dumb' : 'smart');
+  const useClassification = mode === 'smart' && smartModeConfig;
+
+  const candidates = discoverCandidates({
+    manualDir: CLAUDE_PROVIDERS_DIR,
+    autoDir: AUTO_PROVIDERS_DIR,
+    extraPatterns,
+  });
+
+  if (candidates.length === 0) {
     const ccSwitch = hasCcSwitch();
     console.log(chalk.red('❌ 未找到任何可用的 provider 配置\n'));
     console.log(chalk.yellow('  已扫描的位置:'));
     console.log(chalk.gray(`    • ${CLAUDE_PROVIDERS_DIR}/ (manual)`));
+    console.log(chalk.gray(`    • ${AUTO_PROVIDERS_DIR}/ (auto)`));
     if (ccSwitch) {
       console.log(chalk.gray(`    • ~/.cc-switch/cc-switch.db (已检测到,但 app_type='claude' 的 provider 都没有 ANTHROPIC_BASE_URL)`));
     } else {
@@ -313,36 +335,54 @@ export async function imgProxyInstall(opts: { providers?: string; all?: boolean 
     console.log('');
     throw new CCLinkerError('E_IMG_PROXY_NO_PROVIDERS', '未找到任何可用的 provider 配置');
   }
-  if (allRaw.length > all.length) {
-    const skipped = allRaw.length - all.length;
-    console.log(chalk.gray(`  ℹ  跳过 ${skipped} 个无 ANTHROPIC_BASE_URL 的 provider\n`));
+
+  // Smart 模式:过滤 multimodal
+  const filtered = useClassification
+    ? candidates.filter(c => c.kind !== 'multimodal')
+    : candidates;
+
+  if (useClassification) {
+    const skippedMultimodal = candidates.length - filtered.length;
+    if (skippedMultimodal > 0) {
+      console.log(chalk.gray(`  ℹ  Smart 模式:跳过 ${skippedMultimodal} 个 multimodal provider (它们不需要图片代理)\n`));
+    }
   }
 
-  let targets: { alias: string; path: string; baseUrl: string }[];
-  if (opts.all) {
-    targets = all.map(p => ({ alias: p.alias, path: p.path, baseUrl: p.baseUrl }));
-  } else if (opts.providers) {
-    const wanted = opts.providers.split(',').map(s => s.trim()).filter(Boolean);
-    targets = wanted.map(a => {
-      const p = all.find(x => x.alias === a);
-      if (!p) throw new CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS', `未找到 provider 文件 ${a}.json`);
-      return { alias: p.alias, path: p.path, baseUrl: p.baseUrl };
-    });
+  // 构造 inquirer choices
+  const choices = filtered.map(c => ({
+    name: buildChoiceLabel(c),
+    value: c.alias,
+    short: c.alias,
+    checked: c.kind !== 'multimodal',
+  }));
+
+  let targets: Candidate[];
+  if (opts.providers) {
+    const wanted = new Set(opts.providers.split(',').map(s => s.trim()).filter(Boolean));
+    targets = filtered.filter(c => wanted.has(c.alias));
+    if (targets.length === 0) {
+      throw new CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS', `未找到 provider 文件 ${opts.providers}`);
+    }
+  } else if (opts.all || opts.yes) {
+    targets = filtered;
   } else {
-    const choices = all.map(p => ({
-      name: `${p.alias}  ${isProviderInstalled(p.path, port, hostname) ? chalk.green('(已 install)') : chalk.gray(p.baseUrl)}`,
-      value: p.alias, short: p.alias,
-    }));
-    const { picks } = await inquirer.prompt([{ type: 'checkbox', name: 'picks', message: '选择要启用图片剥离代理的 provider (空格勾选):', choices, pageSize: 20 }]);
-    if (picks.length === 0) { console.log(chalk.gray('未选择')); return; }
-    targets = (picks as string[]).map(a => { const p = all.find(x => x.alias === a)!; return { alias: p.alias, path: p.path, baseUrl: p.baseUrl }; });
+    const { picks } = await inquirer.prompt([{
+      type: 'checkbox', name: 'picks',
+      message: '选择要启用图片代理的 provider (空格勾选,回车确认):',
+      choices, pageSize: 20,
+    }]);
+    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, wrapperInstalled: false, wrapperSkipped: false }; }
+    const pickedSet = new Set(picks as string[]);
+    targets = filtered.filter(c => pickedSet.has(c.alias));
   }
 
   console.log(chalk.blue(`\n安装图片代理到 ${targets.length} 个 provider...\n`));
   let installed = 0, skipped = 0;
   for (const t of targets) {
     if (isProviderInstalled(t.path, port, hostname)) {
-      console.log(chalk.gray(`  ⊘ ${t.alias}  已 install,跳过`)); skipped++; continue;
+      console.log(chalk.gray(`  ⊘ ${t.alias}  已 install,跳过`));
+      skipped++;
+      continue;
     }
     try {
       installProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH, port, hostname });
@@ -352,7 +392,40 @@ export async function imgProxyInstall(opts: { providers?: string; all?: boolean 
       console.log(chalk.red(`  ❌ ${t.alias}  ${err}`));
     }
   }
+
+  // Smart 模式:检测到 CC Switch 时问 wrapper
+  let wrapperInstalled = false;
+  let wrapperSkipped = false;
+  if (mode === 'smart' && hasCcSwitch()) {
+    const shell = detectShell();
+    if (shell) {
+      const rcFile = getRcFilePath(shell);
+      if (!isWrapperInstalled(rcFile)) {
+        const { wrap } = await inquirer.prompt([{
+          type: 'confirm', name: 'wrap',
+          message: '检测到 CC Switch。是否装 wrapper(让 cc-linker-proxy 命令替代 claude)?',
+          default: true,
+        }]);
+        if (wrap) {
+          await imgProxyWrapperInstall();
+          wrapperInstalled = true;
+        } else {
+          wrapperSkipped = true;
+        }
+      } else {
+        wrapperInstalled = true;
+      }
+    }
+  }
+
   console.log(chalk.green(`\n完成: ${installed} 新装, ${skipped} 已存在。启动: cc-linker img-proxy start --daemon`));
+  return { installedCount: installed + skipped, wrapperInstalled, wrapperSkipped };
+}
+
+function buildChoiceLabel(c: Candidate): string {
+  const sourceTag = `[${c.source}]`.padEnd(11);
+  const kindTag = c.kind === 'multimodal' ? '⏭ multimodal-skip' : `✅ ${c.kind}`;
+  return `${sourceTag} ${c.alias.padEnd(22)} ${kindTag.padEnd(20)} ${c.model || '(no model)'}`;
 }
 
 export async function imgProxyUninstall(opts: { providers?: string; all?: boolean }): Promise<void> {

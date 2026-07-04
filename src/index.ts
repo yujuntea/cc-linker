@@ -193,10 +193,12 @@ daemonCmd.command('status').description('查看后台服务状态').action(() =>
 
 const imgProxyCmd = program.command('img-proxy').description('管理图片剥离代理 (让纯文本模型接受粘贴图片)');
 imgProxyCmd.command('install')
-  .description('把选定 provider 的 BASE_URL 改写为指向本地代理')
+  .description('把选定 provider 的 BASE_URL 改写为指向本地代理 (smart 默认,自动跳过多模态)')
   .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
-  .option('--all', '全部 provider')
-  .action((opts) => imgProxyInstall(opts));
+  .option('--all', '全部 provider(dumb 模式)')
+  .option('--yes', 'smart 默认预选,不交互')
+  .option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)', 'smart')
+  .action((opts) => { imgProxyInstall(opts); });
 imgProxyCmd.command('uninstall')
   .description('还原 provider 的 BASE_URL')
   .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
