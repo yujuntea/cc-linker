@@ -91,6 +91,18 @@ describe('installWrapper', () => {
     expect(result.installed).toBe(false);
     expect(result.reason).toContain('已装');
   });
+
+  test('非空 rc 文件无尾换行:正确插入换行', () => {
+    // 注意:无尾换行
+    writeFileSync(rcFile, 'alias ls="ls -la"');
+    const result = installWrapper(rcFile, backupDir);
+    expect(result.installed).toBe(true);
+    const content = readFileSync(rcFile, 'utf8');
+    expect(content).toContain('alias ls="ls -la"');
+    expect(content).toContain(WRAPPER_START_MARKER);
+    // 原始行 + 换行 + wrapper
+    expect(content.indexOf('alias ls="ls -la"\n' + WRAPPER_START_MARKER)).toBeGreaterThan(-1);
+  });
 });
 
 describe('uninstallWrapper', () => {
@@ -115,5 +127,17 @@ describe('uninstallWrapper', () => {
     uninstallWrapper(rcFile, backupDir);
     const result = uninstallWrapper(rcFile, backupDir);
     expect(result.removed).toBe(false);
+  });
+
+  test('多个 block 时全部移除(全局 regex)', () => {
+    const block1 = generateWrapperBlock();
+    const block2 = generateWrapperBlock();
+    writeFileSync(rcFile, block1 + '\n' + block2 + '\nalias end="ls"');
+    const result = uninstallWrapper(rcFile, backupDir);
+    expect(result.removed).toBe(true);
+    const content = readFileSync(rcFile, 'utf8');
+    expect(content).not.toContain(WRAPPER_START_MARKER);
+    expect(content).not.toContain(WRAPPER_END_MARKER);
+    expect(content).toContain('alias end="ls"');
   });
 });

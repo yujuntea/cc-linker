@@ -1,12 +1,13 @@
 import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
+import { randomUUID } from 'crypto';
 
 export const WRAPPER_START_MARKER = '# >>> cc-linker img-proxy wrapper (do not edit this block) >>>';
 export const WRAPPER_END_MARKER = '# <<< cc-linker img-proxy wrapper <<<';
 
 const WRAPPER_BLOCK_RE = new RegExp(
   `^${escapeRegex(WRAPPER_START_MARKER)}[\\s\\S]*?${escapeRegex(WRAPPER_END_MARKER)}\\n?`,
-  'm',
+  'gm',
 );
 
 function escapeRegex(s: string): string {
@@ -71,7 +72,7 @@ export function installWrapper(
   let backupPath: string | undefined;
   if (content) {
     mkdirSync(backupDir, { recursive: true });
-    backupPath = join(backupDir, `wrapper-backup-${Date.now()}`);
+    backupPath = join(backupDir, `wrapper-backup-${Date.now()}-${randomUUID().slice(0, 8)}`);
     copyFileSync(rcFile, backupPath);
   }
 
@@ -96,7 +97,7 @@ export function uninstallWrapper(
   if (!match) return { removed: false, rcFile };
 
   mkdirSync(backupDir, { recursive: true });
-  const backupPath = join(backupDir, `wrapper-backup-removed-${Date.now()}`);
+  const backupPath = join(backupDir, `wrapper-backup-removed-${Date.now()}-${randomUUID().slice(0, 8)}`);
   copyFileSync(rcFile, backupPath);
 
   const newContent = content.replace(WRAPPER_BLOCK_RE, '');
