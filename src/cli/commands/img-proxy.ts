@@ -67,7 +67,9 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
     const childPid = child.pid;
     let ready = false;
     for (let i = 0; i < 50; i++) {  // 最多 5s,每 100ms 检查
-      if (readPid(IMG_PROXY_PID_FILE) === childPid) { ready = true; break; }
+      // Fix I-7: 检查 PID 文件同时验证 child 进程仍存活,避免 child 因 EADDRINUSE
+      // crash 后 PID 文件碰巧留下导致 parent 误报成功
+      if (readPid(IMG_PROXY_PID_FILE) === childPid && isPidAlive(childPid)) { ready = true; break; }
       await new Promise(r => setTimeout(r, 100));
     }
     if (!ready) {
@@ -256,7 +258,19 @@ export async function imgProxyWrapperInstall(): Promise<void> {
     return;
   }
   const rcFile = getRcFilePath(shell);
-  const result = installWrapper(rcFile, IMG_PROXY_WRAPPER_BACKUP_DIR);
+  let result: { installed: boolean; reason?: string; rcFile: string; backupPath?: string };
+  try {
+    result = installWrapper(rcFile, IMG_PROXY_WRAPPER_BACKUP_DIR);
+  } catch (err: unknown) {
+    // Fix I-13: EACCES / EPERM / EROFS 友好提示,而不是让原始错误直接抛出
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
+      console.log(chalk.red(`❌ ${rcFile} 没写权限`));
+      console.log(chalk.yellow(`   提示: chmod u+w ${rcFile} 或用 sudo 跑`));
+      return;
+    }
+    throw err;
+  }
   if (!result.installed) {
     console.log(chalk.yellow(`✅ ${result.reason}`));
     console.log(chalk.gray(`   (${result.rcFile})`));
@@ -275,7 +289,18 @@ export async function imgProxyWrapperUninstall(): Promise<void> {
     return;
   }
   const rcFile = getRcFilePath(shell);
-  const result = uninstallWrapper(rcFile, IMG_PROXY_WRAPPER_BACKUP_DIR);
+  let result: { removed: boolean; rcFile: string; backupPath?: string };
+  try {
+    result = uninstallWrapper(rcFile, IMG_PROXY_WRAPPER_BACKUP_DIR);
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
+      console.log(chalk.red(`❌ ${rcFile} 没写权限`));
+      console.log(chalk.yellow(`   提示: chmod u+w ${rcFile} 或用 sudo 跑`));
+      return;
+    }
+    throw err;
+  }
   if (!result.removed) {
     console.log(chalk.yellow('⚠️ wrapper 未装(无 marker)'));
     return;
@@ -308,7 +333,7 @@ export async function imgProxyInstall(opts: {
   all?: boolean;
   yes?: boolean;
   mode?: 'smart' | 'dumb';
-}): Promise<{ installedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean }> {
+}): Promise<{ installedCount: number; failedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean }> {
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
   const smartModeConfig = config.get<boolean>('img_proxy.smart_mode', true);
@@ -372,8 +397,18 @@ export async function imgProxyInstall(opts: {
   let targets: Candidate[];
   if (opts.providers) {
     const wanted = new Set(opts.providers.split(',').map(s => s.trim()).filter(Boolean));
-    targets = filtered.filter(c => wanted.has(c.alias));
+    // Fix I-11: 在 candidates(全集)中查找而非 filtered(multimodal 过滤后),
+    // 用户显式指定 alias 时不应受 smart-mode multimodal 过滤影响
+    targets = candidates.filter(c => wanted.has(c.alias));
     if (targets.length === 0) {
+      // 改进错误:如果用户指定的是 multimodal,给出明确指引
+      const multimodalWanted = candidates.filter(c => wanted.has(c.alias) && c.kind === 'multimodal');
+      if (multimodalWanted.length > 0 && useClassification) {
+        throw new CCLinkerError(
+          'E_IMG_PROXY_MULTIMODAL_PROVIDER',
+          `${opts.providers} 是 multimodal 模型,smart 模式会跳过。改用 --mode dumb 或 --all`,
+        );
+      }
       throw new CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS', `未找到 provider 文件 ${opts.providers}`);
     }
   } else if (opts.all || opts.yes) {
@@ -384,13 +419,13 @@ export async function imgProxyInstall(opts: {
       message: '选择要启用图片代理的 provider (空格勾选,回车确认):',
       choices, pageSize: 20,
     }]);
-    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, wrapperInstalled: false, wrapperSkipped: false }; }
+    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, failedCount: 0, wrapperInstalled: false, wrapperSkipped: false }; }
     const pickedSet = new Set(picks as string[]);
     targets = filtered.filter(c => pickedSet.has(c.alias));
   }
 
   console.log(chalk.blue(`\n安装图片代理到 ${targets.length} 个 provider...\n`));
-  let installed = 0, skipped = 0;
+  let installed = 0, skipped = 0, failed = 0;
   for (const t of targets) {
     if (isProviderInstalled(t.path, port, hostname)) {
       console.log(chalk.gray(`  ⊘ ${t.alias}  已 install,跳过`));
@@ -398,11 +433,12 @@ export async function imgProxyInstall(opts: {
       continue;
     }
     try {
-      installProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH, port, hostname });
+      await installProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH, port, hostname });
       console.log(chalk.green(`  ✅ ${t.alias}  ${t.baseUrl}  →  http://${hostname}:${port}/${t.alias}`));
       installed++;
     } catch (err) {
       console.log(chalk.red(`  ❌ ${t.alias}  ${err}`));
+      failed++;
     }
   }
 
@@ -431,14 +467,16 @@ export async function imgProxyInstall(opts: {
     }
   }
 
-  console.log(chalk.green(`\n完成: ${installed} 新装, ${skipped} 已存在。启动: cc-linker img-proxy start --daemon`));
-  return { installedCount: installed + skipped, wrapperInstalled, wrapperSkipped };
+  console.log(chalk.green(`\n完成: ${installed} 新装, ${skipped} 已存在${failed > 0 ? `, ${failed} 失败` : ''}。启动: cc-linker img-proxy start --daemon`));
+  return { installedCount: installed + skipped, failedCount: failed, wrapperInstalled, wrapperSkipped };
 }
 
 function buildChoiceLabel(c: Candidate): string {
-  const sourceTag = `[${c.source}]`.padEnd(11);
-  const kindTag = c.kind === 'multimodal' ? '⏭ multimodal-skip' : `✅ ${c.kind}`;
-  return `${sourceTag} ${c.alias.padEnd(22)} ${kindTag.padEnd(20)} ${c.model || '(no model)'}`;
+  // Fix I-12: 不用固定宽度 padEnd — CJK 字符宽度按 2 计会让 padEnd 算错位
+  // 直接拼接即可,参差不齐但任何语言都正常显示
+  const sourceTag = `[${c.source}]`;
+  const kindTag = c.kind === 'multimodal' ? '⏭ skip' : `✅ ${c.kind}`;
+  return `${sourceTag} ${c.alias} ${kindTag} ${c.model || '(no model)'}`;
 }
 
 export async function imgProxyUninstall(opts: { providers?: string; all?: boolean }): Promise<void> {
@@ -460,11 +498,28 @@ export async function imgProxyUninstall(opts: { providers?: string; all?: boolea
   }
   for (const t of targets) {
     try {
-      uninstallProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH, port, hostname });
+      await uninstallProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH, port, hostname });
       console.log(chalk.green(`  ✅ 还原 ${t.alias}`));
     } catch (err) {
-      removeRoute(IMG_PROXY_ROUTES_PATH, t.alias);
+      await removeRoute(IMG_PROXY_ROUTES_PATH, t.alias);
       console.log(chalk.yellow(`  ⚠ ${t.alias}  ${err} (已清理路由)`));
+    }
+  }
+  // Fix I-6: --all 时如果 wrapper 也装着,问用户是否一并卸载
+  if (opts.all) {
+    const shell = detectShell();
+    if (shell) {
+      const rcFile = getRcFilePath(shell);
+      if (isWrapperInstalled(rcFile)) {
+        const { wrap } = await inquirer.prompt([{
+          type: 'confirm', name: 'wrap',
+          message: '也卸载 wrapper(从 ~/.zshrc 移除 cc-linker-proxy 函数)?',
+          default: false,
+        }]);
+        if (wrap) {
+          await imgProxyWrapperUninstall();
+        }
+      }
     }
   }
   console.log(chalk.green('\n完成。'));

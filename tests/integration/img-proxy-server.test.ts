@@ -49,7 +49,7 @@ describe('img-proxy server', () => {
     });
     upstreamPort = upstreamServer.port;
 
-    saveRoutes(routesPath, {
+    await saveRoutes(routesPath, {
       version: 1,
       routes: {
         'glm-5.2': {

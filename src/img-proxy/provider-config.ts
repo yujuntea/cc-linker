@@ -51,7 +51,7 @@ export function isProviderInstalled(providerPath: string, port: number, hostname
   }
 }
 
-export function installProvider(opts: InstallOpts): void {
+export async function installProvider(opts: InstallOpts): Promise<void> {
   const { providerPath, alias, routesPath, port, hostname } = opts;
   if (!existsSync(providerPath)) throw new Error(`provider 文件不存在: ${providerPath}`);
   const cfg = JSON.parse(readFileSync(providerPath, 'utf8'));
@@ -84,7 +84,7 @@ export function installProvider(opts: InstallOpts): void {
       writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 });
       renameSync(tmp, providerPath);
     }
-    addRoute(routesPath, alias, upstream, providerPath);
+    await addRoute(routesPath, alias, upstream, providerPath);
     return;
   }
 
@@ -97,16 +97,16 @@ export function installProvider(opts: InstallOpts): void {
   const tmp = providerPath + '.tmp';
   writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 });
   renameSync(tmp, providerPath);
-  addRoute(routesPath, alias, currentUrl, providerPath);
+  await addRoute(routesPath, alias, currentUrl, providerPath);
 }
 
-export function uninstallProvider(opts: UninstallOpts): void {
+export async function uninstallProvider(opts: UninstallOpts): Promise<void> {
   const { providerPath, alias, routesPath, port, hostname } = opts;
   const bakPath = providerPath + '.bak';
 
   // 文件不存在:只清路由
   if (!existsSync(providerPath)) {
-    removeRoute(routesPath, alias);
+    await removeRoute(routesPath, alias);
     return;
   }
 
@@ -132,7 +132,7 @@ export function uninstallProvider(opts: UninstallOpts): void {
     }
   }
   // 无论 isOurInstall 与否:清路由 + 删 .bak(清理代理痕迹,避免过期备份)
-  removeRoute(routesPath, alias);
+  await removeRoute(routesPath, alias);
   try { if (existsSync(bakPath)) unlinkSync(bakPath); } catch {}
 }
 
