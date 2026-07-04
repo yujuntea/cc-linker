@@ -37,6 +37,7 @@ export function handleError(err: unknown): never {
       'E_IMG_PROXY_NOT_RUNNING': ['代理未运行,执行 cc-linker img-proxy start --daemon'],
       'E_IMG_PROXY_NO_PROVIDERS': ['未扫描到 provider (~/.claude/providers/*.json)'],
       'E_IMG_PROXY_UNKNOWN_ALIAS': ['该 alias 未 install,执行 cc-linker img-proxy install'],
+      'E_IMG_PROXY_MULTIMODAL_PROVIDER': ['该 provider 是 multimodal 模型,smart 模式默认跳过。改用 --mode dumb 或 --all 强制启用图片代理'],
     };
 
     if (suggestions[err.code]) {

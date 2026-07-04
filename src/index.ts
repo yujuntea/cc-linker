@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import { RegistryManager } from './registry';
 import { syncBeforeCommand } from './scanner';
 import { handleError } from './utils/errors';
@@ -197,7 +197,13 @@ imgProxyCmd.command('install')
   .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
   .option('--all', '全部 provider(dumb 模式)')
   .option('--yes', 'smart 默认预选,不交互')
-  .option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)')
+  // Fix I-8: choices 校验 --mode 只接受 smart/dumb — Commander 在 .option() 之后
+  // .choices() 在 JS 运行时有效(链上 this),但 TS 类型只在 Option 类上声明,
+  // 用 addOption + Option 实例显式表达意图,同时让 TS 类型也满意
+  .addOption(
+    new Option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)')
+      .choices(['smart', 'dumb'] as const),
+  )
   .action((opts) => { imgProxyInstall(opts); });
 imgProxyCmd.command('uninstall')
   .description('还原 provider 的 BASE_URL')
