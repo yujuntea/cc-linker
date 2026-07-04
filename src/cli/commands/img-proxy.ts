@@ -9,11 +9,11 @@ import { CCLinkerError } from '../../utils/errors';
 import { getExecutablePath } from '../../utils/executable';
 import {
   IMG_PROXY_DIR, IMG_PROXY_CACHE_DIR, IMG_PROXY_ROUTES_PATH,
-  IMG_PROXY_PID_FILE, IMG_PROXY_LOG_FILE,
+  IMG_PROXY_PID_FILE, IMG_PROXY_LOG_FILE, CLAUDE_PROVIDERS_DIR,
 } from '../../utils/paths';
 import { installProvider, uninstallProvider, isProviderInstalled } from '../../img-proxy/provider-config';
 import { loadRoutes, removeRoute } from '../../img-proxy/routes';
-import { scanProviderFiles } from '../../img-proxy/provider-scan';
+import { scanProviderFiles, hasCcSwitch } from '../../img-proxy/provider-scan';
 import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
 import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
@@ -210,8 +210,32 @@ export async function imgProxyStatus(): Promise<void> {
 export async function imgProxyInstall(opts: { providers?: string; all?: boolean }): Promise<void> {
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
-  const all = scanProviderFiles().filter(p => p.baseUrl);  // 没 BASE_URL 的跳过
-  if (all.length === 0) throw new CCLinkerError('E_IMG_PROXY_NO_PROVIDERS', '未扫描到带 ANTHROPIC_BASE_URL 的 provider');
+  const allRaw = scanProviderFiles();
+  const all = allRaw.filter(p => p.baseUrl);  // 没 BASE_URL 的跳过
+  if (all.length === 0) {
+    const ccSwitch = hasCcSwitch();
+    console.log(chalk.red('❌ 未找到任何可用的 provider 配置\n'));
+    console.log(chalk.yellow('  已扫描的位置:'));
+    console.log(chalk.gray(`    • ${CLAUDE_PROVIDERS_DIR}/ (manual)`));
+    if (ccSwitch) {
+      console.log(chalk.gray(`    • ~/.cc-switch/cc-switch.db (已检测到,但 app_type='claude' 的 provider 都没有 ANTHROPIC_BASE_URL)`));
+    } else {
+      console.log(chalk.gray(`    • ~/.cc-switch/cc-switch.db (未安装)`));
+    }
+    console.log('');
+    console.log(chalk.yellow('  解决方案(任选其一):'));
+    console.log(chalk.gray('    1. 装 CC Switch (https://github.com/farion1231/cc-switch)'));
+    console.log(chalk.gray('       — GUI 管理 provider,装好后 Claude Code 自动可用,img-proxy 也会自动识别'));
+    console.log(chalk.gray('    2. 手动创建 provider 文件:'));
+    console.log(chalk.gray(`       ${CLAUDE_PROVIDERS_DIR}/my-provider.json`));
+    console.log(chalk.gray('       内容参考 docs/img-proxy.md "冷启动" 一节'));
+    console.log('');
+    throw new CCLinkerError('E_IMG_PROXY_NO_PROVIDERS', '未找到任何可用的 provider 配置');
+  }
+  if (allRaw.length > all.length) {
+    const skipped = allRaw.length - all.length;
+    console.log(chalk.gray(`  ℹ  跳过 ${skipped} 个无 ANTHROPIC_BASE_URL 的 provider\n`));
+  }
 
   let targets: { alias: string; path: string; baseUrl: string }[];
   if (opts.all) {
