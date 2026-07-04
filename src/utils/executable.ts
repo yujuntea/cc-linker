@@ -18,7 +18,7 @@ export function getExecutablePath(): string {
   if (scriptPath.includes('node_modules')) return 'cc-linker';
 
   // 全局 symlink(/usr/local/bin/cc-linker 解析后)
-  if (scriptPath.endsWith('/cc-linker') || scriptPath === 'cc-linker') return 'cc-linker';
+  if (scriptPath.endsWith('/cc-linker')) return 'cc-linker';
 
   // 开发模式(bun run src/index.ts):优先 dist 编译产物,否则用 PATH
   const scriptDir = dirname(scriptPath);
