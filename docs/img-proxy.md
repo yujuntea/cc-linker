@@ -44,6 +44,53 @@ cc-linker img-proxy daemon install
 
 ---
 
+## 冷启动 / CC Switch 用户
+
+`img-proxy install` 默认从 `~/.claude/providers/*.json` 找 provider 文件。**如果你之前没用过 cc-linker(或没用过手工 `~/.claude/providers/*.json`)**,这个目录是空的,install 会直接报错。
+
+**好消息:CC Switch 自动支持**。img-proxy 会在 `scanProviderFiles()` 时**额外**扫 `~/.cc-switch/cc-switch.db`(CC Switch 的 SQLite),如果有 `app_type='claude'` 的 provider,**首次调用时同步到 `~/.cc-linker/auto-providers/<alias>.json`**,然后跟 manual 目录合并展示。
+
+所以 CC Switch 用户**完全不用手动建 provider 文件**——直接 `cc-linker img-proxy install --all`,你会看到所有 CC Switch 里的 provider 都列出来了,选要启用的即可。
+
+### 数据来源优先级
+
+`scanProviderFiles()` 合并两路,manual 优先(同名 alias 时 manual 赢):
+
+```
+~/.claude/providers/*.json   ← manual (你手写 / img-proxy install 改写后)
+   ↓ alias 冲突时覆盖
+~/.cc-linker/auto-providers/*.json  ← cc-switch 同步生成
+```
+
+`~/.cc-linker/auto-providers/` 跟 `ProviderManager`(Bot 那边)共享同一个目录,两边都会读。
+
+### CC Switch 数据库变了怎么办?
+
+每次 `img-proxy status` / `install` / `uninstall` 都会触发 scan,如果 `cc-switch.db` 的 mtime 比 `auto-providers/` 新,就重新同步一次。**不需要手动重启**。
+
+### 在 CC Switch 里加新 provider 后...
+
+下次跑 `cc-linker img-proxy install` 就能看到。**`img-proxy` 不会自动启用新 provider**——需要显式 install,避免"加了 CC Switch provider 自动启用代理"的意外。
+
+### 完全不用 CC Switch,也不想手写?
+
+最简单:**装 CC Switch** (https://github.com/farion1231/cc-switch),用它 GUI 管理所有 provider,img-proxy 自动读。如果不想装 CC Switch,手工创建 `~/.claude/providers/my-provider.json`:
+
+```json
+{
+  "model": "opus",
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-...",
+    "ANTHROPIC_BASE_URL": "https://your-provider.example/anthropic",
+    "ANTHROPIC_MODEL": "your-model-name"
+  }
+}
+```
+
+格式参考已有 provider 文件(任何 Anthropic API 兼容的 endpoint 都可以)。`ANTHROPIC_BASE_URL` 是必需字段,其他 `ANTHROPIC_DEFAULT_*_MODEL` 可选。
+
+---
+
 ## 它做了什么 / 没做什么
 
 | 行为 | |
