@@ -76,9 +76,11 @@ describe('img-proxy server', () => {
 
   beforeEach(() => { lastMethod = ''; lastHeaders = undefined; lastBody = undefined; lastPath = ''; });
 
-  it('parseAliasFromPath extracts first segment', () => {
+  it('parseAliasFromPath extracts first segment (no reserved-prefix denylist)', () => {
+    // 第一段总是返回(让 resolveUpstream 当 gate);空段返回 null。
     expect(parseAliasFromPath('/glm-5.2/v1/messages')).toBe('glm-5.2');
-    expect(parseAliasFromPath('/v1/messages')).toBeNull();
+    expect(parseAliasFromPath('/v1/messages')).toBe('v1');  // 不再 blanket 拒绝;实际路由交给 resolveUpstream
+    expect(parseAliasFromPath('/')).toBeNull();
   });
 
   it('POST /<alias>/v1/messages strips image, forwards text block, passes SSE through, forwards Authorization', async () => {

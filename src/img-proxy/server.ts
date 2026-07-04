@@ -34,16 +34,14 @@ export interface ProxyServer {
   stats: { totalRequests: number; strippedImages: number };  // 内存计数(Phase 2 控制台读)
 }
 
-/** 从 pathname 提取第一段作 alias。无段或为保留前缀返回 null。
- *  保留前缀:Anthropic/OpenAI API 路径段(`v1`、`v2` 等),这些是上游 endpoint 段,
- *  不是 cc-linker 的 provider alias。例如 `/v1/messages` → null,`/glm-5.2/v1/messages` → "glm-5.2"。
+/** 从 pathname 提取第一段作 alias。空段返回 null。
+ *  不做"已知路径"denylist —— 让 `resolveUpstream` 当唯一 gate:
+ *  路由表里没有就 502 'unknown alias',而不是 blanket 拒绝整个段。
+ *  这样 `v1.json`/`api.json` 等用户起的 provider 文件名也能正确路由(只要 install 过)。
  */
-const RESERVED_PREFIXES = new Set(['v1', 'v2', 'v3', 'api', 'health', 'healthz', 'metrics']);
 export function parseAliasFromPath(pathname: string): string | null {
   const seg = pathname.replace(/^\/+/, '').split('/')[0];
-  if (!seg || seg.length === 0) return null;
-  if (RESERVED_PREFIXES.has(seg.toLowerCase())) return null;
-  return seg;
+  return seg && seg.length > 0 ? seg : null;
 }
 
 function appendLog(line: string): void {
@@ -93,6 +91,9 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       if (!alias) {
         return new Response('cc-linker img-proxy: missing provider alias in path', { status: 502 });
       }
+      // alias gate is `resolveUpstream` only — no hardcoded reserved-prefix denylist.
+      // 上游的 /v1/*, /health, /metrics 等路径若真存在,只需 install 对应的 provider
+      // (alias = 文件名 stem);没 install 就 502 提示,而不是 blanket 拒绝整个段。
       const upstream = resolveUpstream(routesPath, alias);
       if (!upstream) {
         appendLog(`WARN alias=${alias} path=${url.pathname} unresolved`);
