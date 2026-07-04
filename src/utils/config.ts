@@ -87,6 +87,10 @@ interface ConfigData {
     cache_max_age_hours: number;
     prompt_template: string;
     console_enabled: boolean;
+    // v2 smart install:
+    smart_mode: boolean;
+    vision_model_patterns_extra: string[];
+    text_only_model_patterns_extra: string[];
   };
   agent_view: AgentViewConfig;
 }
@@ -191,6 +195,10 @@ const DEFAULTS: ConfigData = {
     cache_max_age_hours: 24 * 7,
     prompt_template: '[用户粘贴的图片已保存到本地: {path}] 当前模型为纯文本模型,无法直接查看图片内容。如需识别这张图片,请调用 mcp__MiniMax__understand_image 工具,image_source 参数传上述本地路径。',
     console_enabled: false, // Phase 2: Web 控制台
+    // v2 smart install defaults:
+    smart_mode: true,
+    vision_model_patterns_extra: [],
+    text_only_model_patterns_extra: [],
   },
   agent_view: {
     enabled: true,
@@ -314,6 +322,7 @@ export class ConfigManager {
       ['CC_LINKER_IMG_PROXY_HOSTNAME', 'img_proxy', 'hostname'],
       ['CC_LINKER_IMG_PROXY_CACHE_HOURS', 'img_proxy', 'cache_max_age_hours'],
       ['CC_LINKER_IMG_PROXY_PROMPT_TEMPLATE', 'img_proxy', 'prompt_template'],
+      ['CC_LINKER_IMG_PROXY_SMART_MODE', 'img_proxy', 'smart_mode'],
     ];
 
     // Parse array env vars for Claude tools
@@ -324,6 +333,18 @@ export class ConfigManager {
     const disallowedToolsEnv = process.env.CC_LINKER_CLAUDE_DISALLOWED_TOOLS;
     if (disallowedToolsEnv !== undefined) {
       this.data.claude.disallowed_tools = disallowedToolsEnv.split(',').map(s => s.trim()).filter(Boolean);
+    }
+
+    // Parse array env vars for img-proxy model pattern allowlists (v2 smart install)
+    const visionPatternsEnv = process.env.CC_LINKER_IMG_PROXY_VISION_PATTERNS_EXTRA;
+    if (visionPatternsEnv !== undefined) {
+      this.data.img_proxy.vision_model_patterns_extra =
+        visionPatternsEnv.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    const textOnlyPatternsEnv = process.env.CC_LINKER_IMG_PROXY_TEXT_ONLY_PATTERNS_EXTRA;
+    if (textOnlyPatternsEnv !== undefined) {
+      this.data.img_proxy.text_only_model_patterns_extra =
+        textOnlyPatternsEnv.split(',').map(s => s.trim()).filter(Boolean);
     }
 
     for (const [envKey, section, key] of mappings) {
