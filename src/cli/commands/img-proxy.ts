@@ -16,16 +16,13 @@ import { loadRoutes, removeRoute } from '../../img-proxy/routes';
 import { scanProviderFiles } from '../../img-proxy/provider-scan';
 import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
+import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
 
 // ---------- 运行状态 ----------
 function isRunning(): boolean {
-  if (!existsSync(IMG_PROXY_PID_FILE)) return false;
-  try {
-    process.kill(parseInt(readFileSync(IMG_PROXY_PID_FILE, 'utf8').trim(), 10), 0);
-    return true;
-  } catch { return false; }
+  const pid = readPid(IMG_PROXY_PID_FILE);
+  return pid !== null && isPidAlive(pid);
 }
-function readPid(): number { return parseInt(readFileSync(IMG_PROXY_PID_FILE, 'utf8').trim(), 10); }
 
 // ---------- start ----------
 export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
@@ -39,9 +36,15 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
 
   // 分支 1:parent(用户带 --daemon 且当前不是 child)→ spawn child 后退出
   if (opts.daemon && !isChild) {
-    if (isRunning()) {
-      console.log(chalk.yellow(`⚠️  代理已在运行 (PID: ${readPid()})`));
+    const existingPid = readPid(IMG_PROXY_PID_FILE);
+    if (existingPid !== null && isPidAlive(existingPid)) {
+      console.log(chalk.yellow(`⚠️  代理已在运行 (PID: ${existingPid})`));
       return;
+    }
+    if (existingPid !== null) {
+      // stale PID 文件:上次崩溃 / kill -9 留下
+      console.warn(chalk.gray(`⚠️  发现过期 PID 文件 (stale PID: ${existingPid}),清理后继续`));
+      clearPid(IMG_PROXY_PID_FILE);
     }
     const { spawn } = await import('child_process');
     const child = spawn(getExecutablePath(), ['img-proxy', 'start'], {
@@ -49,24 +52,44 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
       env: { ...process.env, CC_LINKER_IMG_PROXY_DAEMON: '1' },
     });
     child.unref();
-    await new Promise(r => setTimeout(r, 1200));
-    if (!existsSync(IMG_PROXY_PID_FILE)) {
-      console.log(chalk.red('❌ 后台启动失败,查看日志: ' + IMG_PROXY_LOG_FILE));
+    // Poll PID 文件直到 child.pid 写入 — 确定性,替代 1200ms 盲目等待
+    // (Fix #4:避免 parent 在 1200ms 内看着 PID 文件刚被 child 写好就以为是成功,
+    //  但 child 实际是 EADDRINUSE crash 后的"碰巧 PID 文件在了但 child 已死")
+    const childPid = child.pid;
+    let ready = false;
+    for (let i = 0; i < 50; i++) {  // 最多 5s,每 100ms 检查
+      if (readPid(IMG_PROXY_PID_FILE) === childPid) { ready = true; break; }
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (!ready) {
+      console.log(chalk.red(`❌ 后台启动失败,查看日志: ${IMG_PROXY_LOG_FILE}`));
       process.exit(1);
     }
-    console.log(chalk.green(`✅ img-proxy 已在后台启动 (PID: ${readPid()})`));
+    console.log(chalk.green(`✅ img-proxy 已在后台启动 (PID: ${childPid})`));
     console.log(chalk.cyan(`   监听: http://${hostname}:${port}`));
     console.log(chalk.cyan(`   日志: ${IMG_PROXY_LOG_FILE}   停止: cc-linker img-proxy stop`));
     process.exit(0);
   }
 
   // 分支 2/3:child 或前台 → 起 server
-  if (isRunning()) {
-    console.error(chalk.yellow(`⚠️  代理已在运行 (PID: ${readPid()})`));
-    process.exit(0);
+  const existingPid = readPid(IMG_PROXY_PID_FILE);
+  if (existingPid !== null) {
+    if (isPidAlive(existingPid)) {
+      console.error(chalk.yellow(`⚠️  代理已在运行 (PID: ${existingPid})`));
+      process.exit(0);
+    }
+    // stale PID 文件 → 清理
+    console.warn(chalk.gray(`⚠️  发现过期 PID 文件 (stale PID: ${existingPid}),清理后继续`));
+    clearPid(IMG_PROXY_PID_FILE);
   }
   mkdirSync(dirname(IMG_PROXY_PID_FILE), { recursive: true });
-  writeFileSync(IMG_PROXY_PID_FILE, String(process.pid), { mode: 0o600 });
+  // 原子 create-only — 防止并发两个进程都通过 isRunning 检查后互相覆盖 PID
+  if (!writePidAtomic(IMG_PROXY_PID_FILE, process.pid)) {
+    // race:另一进程在我们 cleanup 之后抢先写了
+    const winner = readPid(IMG_PROXY_PID_FILE);
+    console.error(chalk.yellow(`⚠️  代理已被另一进程启动 (PID: ${winner ?? '?'},race condition)`));
+    process.exit(0);
+  }
 
   // 仅 child 重写 console 到日志;前台保留终端输出
   let logWriter: any = null;
@@ -123,29 +146,41 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
 // ---------- stop ----------
 export async function imgProxyStop(): Promise<void> {
   const plistPath = launchdPlistPath();
-  if (existsSync(plistPath)) { try { spawnSync('launchctl', ['unload', plistPath]); } catch {} }
+  if (existsSync(plistPath)) { try { spawnSync('launchctl', ['stop', 'com.cclinker.img-proxy']); } catch {} }
   if (existsSync(IMG_PROXY_PID_FILE)) {
-    const pid = readPid();
-    console.log(chalk.cyan(`正在停止 img-proxy (PID: ${pid})...`));
-    try {
-      process.kill(pid, 'SIGTERM');
-      for (let i = 0; i < 20; i++) {
-        try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 300)); }
-        catch { break; }
-      }
-      try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch {}
-      console.log(chalk.green(`✅ img-proxy (PID: ${pid}) 已停止`));
-    } catch { console.log(chalk.yellow('⚠️  进程不存在,清理 PID 文件')); }
-    try { if (existsSync(IMG_PROXY_PID_FILE)) unlinkSync(IMG_PROXY_PID_FILE); } catch {}
+    const pid = readPid(IMG_PROXY_PID_FILE);
+    if (pid === null) {
+      // 文件存在但内容损坏,直接清掉
+      clearPid(IMG_PROXY_PID_FILE);
+    } else if (isPidAlive(pid)) {
+      console.log(chalk.cyan(`正在停止 img-proxy (PID: ${pid})...`));
+      try {
+        process.kill(pid, 'SIGTERM');
+        for (let i = 0; i < 20; i++) {
+          try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 300)); }
+          catch { break; }
+        }
+        try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch {}
+        console.log(chalk.green(`✅ img-proxy (PID: ${pid}) 已停止`));
+      } catch { console.log(chalk.yellow('⚠️  进程不存在,清理 PID 文件')); }
+      clearPid(IMG_PROXY_PID_FILE);
+    } else {
+      console.log(chalk.yellow(`⚠️  PID 文件指向已死的进程 (PID: ${pid}),清理`));
+      clearPid(IMG_PROXY_PID_FILE);
+    }
   } else {
     console.log(chalk.yellow('⚠️  img-proxy 未在运行'));
   }
+  // Fix #7: plist unload 在 stop+SIGTERM 之后(daemon.ts uninstallMacOS 的顺序)
+  // —— 先卸载 launchd 监督会导致 KeepAlive 在我们杀 PID 的窗口里重启一个新 child,
+  //    status 报"未运行"假阴性。
+  if (existsSync(plistPath)) { try { spawnSync('launchctl', ['unload', plistPath]); } catch {} }
 }
 
 // ---------- status ----------
 export async function imgProxyStatus(): Promise<void> {
   console.log(chalk.blue('=== cc-linker img-proxy 状态 ===\n'));
-  console.log(isRunning() ? chalk.green(`✅ 运行中 (PID: ${readPid()})`) : chalk.yellow('⚠️  未运行 (cc-linker img-proxy start --daemon)'));
+  console.log(isRunning() ? chalk.green(`✅ 运行中 (PID: ${readPid(IMG_PROXY_PID_FILE) ?? '?'})`) : chalk.yellow('⚠️  未运行 (cc-linker img-proxy start --daemon)'));
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
   console.log(chalk.gray(`   监听: http://${hostname}:${port}   日志: ${IMG_PROXY_LOG_FILE}`));
