@@ -172,6 +172,7 @@ The `withSync()` helper in `src/index.ts` wraps this. Some commands skip sync wi
 | `src/registry/registry.ts` | Registry read/write with locking and backups |
 | `src/img-proxy/server.ts` | Image-block stripping reverse proxy (Bun.serve) — lets text-only models accept pasted images |
 | `src/cli/commands/img-proxy.ts` | `cc-linker img-proxy install/uninstall/start/stop/status/daemon` |
+| `docs/img-proxy.md` | User-facing usage doc for `img-proxy` (install / config / FAQ / troubleshooting) |
 | `src/feishu/mapping.ts` | User state with CAS updates |
 | `src/runtime/state-coordinator.ts` | Single-process lock |
 | `src/scanner/index.ts` | Pre-command sync orchestration |
