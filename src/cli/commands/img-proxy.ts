@@ -12,6 +12,7 @@ import {
   IMG_PROXY_DIR, IMG_PROXY_CACHE_DIR, IMG_PROXY_ROUTES_PATH,
   IMG_PROXY_PID_FILE, IMG_PROXY_LOG_FILE, CLAUDE_PROVIDERS_DIR,
   AUTO_PROVIDERS_DIR,
+  CONFIG_PATH, expandPath,
 } from '../../utils/paths';
 import { installProvider, uninstallProvider, isProviderInstalled } from '../../img-proxy/provider-config';
 import { loadRoutes, removeRoute, resolveProxyByUpstream } from '../../img-proxy/routes';
@@ -135,6 +136,9 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
       logPath: IMG_PROXY_LOG_FILE,
       upstreamTimeoutMs: config.get<number>('img_proxy.upstream_timeout_ms', 0),
       streamIdleTimeoutMs: config.get<number>('img_proxy.stream_idle_timeout_ms', 0),
+      // 新增:把 CONFIG_PATH 展开成绝对路径,让 console 能 readFileSync 直接用
+      // (readFileSync 不识别 '~')
+      configPath: expandPath(CONFIG_PATH),
     });
   } catch (err) {
     console.error(chalk.red(`❌ 启动失败: ${err}`));
