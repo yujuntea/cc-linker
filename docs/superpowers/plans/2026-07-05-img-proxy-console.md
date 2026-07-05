@@ -573,7 +573,7 @@ git commit -m "feat(img-proxy-console): routes disable/enable with addRoute race
   - `class LogTail { logPath, readNew(): Promise<LogEntry[]>, offset: number }` — 增量读
   - `getTail(logPath): LogTail` — module-level singleton
   - `resetLogTail(): void` — 测试隔离
-- Consumes: `node:fs` (readFileSync, statSync, open from 'fs/promises'), `console/types.ts` (LogEntry / ParsedLogEntry / ReadRecentOpts)
+- Consumes: `node:fs` (readFileSync, statSync), `fs/promises` (open), `console/types.ts` (LogEntry / ParsedLogEntry / ReadRecentOpts)
 
 ### Steps
 
@@ -665,6 +665,7 @@ Expected: FAIL "Cannot find module"
 ```ts
 // src/img-proxy/console/log-parser.ts
 import { readFileSync, statSync } from 'fs';
+import { open } from 'fs/promises';
 import type { LogEntry, ParsedLogEntry, ReadRecentOpts } from './types';
 
 const LINE_RE = /^\[([^\]]+)\] (?:INFO|WARN|ERROR) (.+)$/;
@@ -726,7 +727,6 @@ export class LogTail {
     if (fileSize < this.offset) this.offset = 0;
     if (fileSize === this.offset) return [];
 
-    const { open } = await import('fs/promises');
     const fh = await open(this.logPath, 'r');
     try {
       const len = fileSize - this.offset;
