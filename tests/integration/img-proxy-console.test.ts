@@ -23,6 +23,7 @@ import { handleConsoleRequest } from '../../src/img-proxy/console/api';
 import { saveRoutes, getUpstreamByAlias } from '../../src/img-proxy/routes';
 import { startProxyServer } from '../../src/img-proxy/server';
 import { config } from '../../src/utils/config';
+import { CCLinkerError } from '../../src/utils/errors';
 
 describe('img-proxy console api', () => {
   let workDir: string;
@@ -94,6 +95,23 @@ describe('img-proxy console api', () => {
     expect(stats.strippedImages).toBe(3);
   });
 
+  // 防 regression (review): Task 6 故意 drop 了这个 test,导致 INDEX_HTML 不可达的
+  // critical bug 跑过了全套。现在补上 — handler 必须返 HTML (text/html) 且包含
+  // 5 tab 标题。
+  it('GET / 返 INDEX_HTML(html, 含 nav 5 tabs) — 防 regression', async () => {
+    const { req, url } = makeReq('/');
+    const r = await handleConsoleRequest(req, url, ctxWith());
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toContain('text/html');
+    const html = await r.text();
+    expect(html).toContain('cc-linker img-proxy console');
+    expect(html).toContain('data-tab="dashboard"');
+    expect(html).toContain('data-tab="log"');
+    expect(html).toContain('data-tab="config"');
+    expect(html).toContain('data-tab="routes"');
+    expect(html).toContain('data-tab="cache"');
+  });
+
   it('POST /admin/api/routes/disable 写入 disabled + proxy 视为未知 alias;enable 后恢复', async () => {
     // disable
     {
@@ -154,6 +172,55 @@ describe('img-proxy console api', () => {
       expect(readdirSync(cacheDir).length).toBe(0);
     }
   });
+
+  // 防 regression (review): handleGetRoutes 之前忽略 ctx.routesPath 走默认
+  // IMG_PROXY_ROUTES_PATH,导致 GET 与 POST 写不同文件。改 routesJson 到另一个
+  // tmp 路径,验证 GET 读的就是它。
+  it('GET /admin/api/routes 读 ctx.routesPath(不是 IMG_PROXY_ROUTES_PATH) — 防 regression', async () => {
+    const { req, url } = makeReq('/admin/api/routes');
+    const r = await handleConsoleRequest(req, url, ctxWith());
+    expect(r.status).toBe(200);
+    const routes = await r.json();
+    expect(Array.isArray(routes)).toBe(true);
+    expect(routes.length).toBe(1);
+    expect(routes[0].alias).toBe('glm-5.2');
+    // 注意:routesPath 是 tmp/test 路径,与 IMG_PROXY_ROUTES_PATH 完全不同。
+    // 如果 handler 走错路径 (default),会读到用户的真实 routes.json,这个 test 会 fail
+    // (断言 user routes.json 没有 glm-5.2)。
+  });
+
+  // 防 regression (review): handlePostConfig 之前对 null body 会让 'in' operator 抛 TypeError,
+  // outer catch 把 5xx E_CONSOLE_INTERNAL,应为 400 E_CONSOLE_BAD_REQUEST。
+  it('POST /admin/api/config body=null/array/number → 400 E_CONSOLE_BAD_REQUEST(不是 500) — 防 regression', async () => {
+    for (const bad of ['null', '123', '"foo"', '[1,2,3]']) {
+      const { req, url } = makeReq('/admin/api/config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: bad,
+      });
+      const r = await handleConsoleRequest(req, url, ctxWith());
+      expect(r.status).toBe(400);
+      const body = await r.json();
+      expect(body).toHaveProperty('code', 'E_CONSOLE_BAD_REQUEST');
+    }
+  });
+
+  // 防 regression (review): setRouteDisabled 之前抛 plain Error,handler 靠 msg.startsWith
+  // 字符串前缀判 404。改用 CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS') 后 handler 用
+  // err.code 而非字符串前缀。
+  it('POST /admin/api/routes/disable 未知 alias → 404 E_CONSOLE_UNKNOWN_ALIAS (CCLinkerError) — 防 regression', async () => {
+    const { req, url } = makeReq('/admin/api/routes/disable', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ alias: 'totally-unknown-alias-xyz' }),
+    });
+    const r = await handleConsoleRequest(req, url, ctxWith());
+    expect(r.status).toBe(404);
+    const body = await r.json();
+    expect(body).toHaveProperty('code', 'E_CONSOLE_UNKNOWN_ALIAS');
+    expect(body).toHaveProperty('error', expect.stringContaining('totally-unknown-alias-xyz'));
+  });
+
 
   it('POST /admin/api/routes/disable 未知 alias 返 404 E_CONSOLE_UNKNOWN_ALIAS', async () => {
     const { req, url } = makeReq('/admin/api/routes/disable', {
