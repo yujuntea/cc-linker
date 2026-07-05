@@ -231,6 +231,17 @@ export async function imgProxyStatus(): Promise<void> {
     }
   }
 
+
+  // Web Console 状态 — 让用户一眼看到能不能开浏览器
+  const consoleEnabled = config.get<boolean>('img_proxy.console_enabled', false);
+  console.log(chalk.cyan('\nWeb Console:'));
+  if (consoleEnabled) {
+    console.log(chalk.green(`   ✅ 启用 — http://${hostname}:${port}/`));
+    console.log(chalk.gray(`   cc-linker img-proxy console disable 可关闭`));
+  } else {
+    console.log(chalk.gray(`   ⚠️  禁用 — cc-linker img-proxy console enable 可打开`));
+  }
+
   if (platform() === 'darwin') {
     console.log(chalk.cyan('\n开机自启:'));
     console.log(existsSync(launchdPlistPath()) ? chalk.green('   ✅ launchd 已配置') : chalk.gray('   未配置 (cc-linker img-proxy daemon install)'));
@@ -335,13 +346,76 @@ export async function imgProxyWrapperStatus(): Promise<void> {
   }
 }
 
-// ---------- install / uninstall ----------
+// ---------- console (Web Console 监控后台) ----------
+// 启用/禁用 img-proxy Web Console (http://127.0.0.1:8765/)。
+// 写 ~/.cc-linker/config.toml 的 [img_proxy]console_enabled + reload config,
+// 但 **daemon 热开关需要重启进程** (ConfigManager 是 process-local 内存状态,
+// file 改了但 in-memory 状态需要重新构造) — 命令成功时提示重启。
+import { setConsoleEnabled } from '../../img-proxy/console/config-writer';
+
+export async function imgProxyConsoleEnable(): Promise<void> {
+  const configPath = expandPath(CONFIG_PATH);
+  try {
+    const { previous } = setConsoleEnabled(configPath, true);
+    console.log(chalk.green(`✅ Web Console 已启用 (config: ${configPath})`));
+    if (!previous) {
+      console.log(chalk.cyan(`   ${chalk.bold('提示')}: 需重启 daemon 才会生效:`));
+      console.log(chalk.cyan(`     cc-linker img-proxy stop && cc-linker img-proxy start`));
+    }
+    const port = config.get<number>('img_proxy.port', 8765);
+    const host = config.get<string>('img_proxy.hostname', '127.0.0.1');
+    console.log(chalk.cyan(`   之后访问 http://${host}:${port}/`));
+  } catch (err) {
+    console.log(chalk.red(`❌ 启用失败: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+export async function imgProxyConsoleDisable(): Promise<void> {
+  const configPath = expandPath(CONFIG_PATH);
+  try {
+    const { previous } = setConsoleEnabled(configPath, false);
+    if (!previous) {
+      console.log(chalk.gray(`⚠️  Web Console 已经禁用 (无需改动)`));
+      return;
+    }
+    console.log(chalk.green(`✅ Web Console 已禁用 (config: ${configPath})`));
+    console.log(chalk.cyan(`   提示: 需重启 daemon:`));
+    console.log(chalk.cyan(`     cc-linker img-proxy stop && cc-linker img-proxy start`));
+  } catch (err) {
+    console.log(chalk.red(`❌ 禁用失败: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+export async function imgProxyConsoleStatus(): Promise<void> {
+  const enabled = config.get<boolean>('img_proxy.console_enabled', false);
+  const port = config.get<number>('img_proxy.port', 8765);
+  const host = config.get<string>('img_proxy.hostname', '127.0.0.1');
+  console.log(chalk.blue('=== cc-linker img-proxy Web Console ==='));
+  if (enabled) {
+    console.log(chalk.green('✅ 启用'));
+    console.log(chalk.cyan(`   URL: http://${host}:${port}/`));
+    if (isRunning()) {
+      console.log(chalk.green(`   Daemon 已运行,立即可用`));
+    } else {
+      console.log(chalk.yellow(`   ⚠️  Daemon 未运行,需 cc-linker img-proxy start`));
+    }
+  } else {
+    console.log(chalk.gray('⚠️  禁用'));
+    console.log(chalk.cyan('   启用: cc-linker img-proxy console enable'));
+    console.log(chalk.cyan('   或在 install 完成后会自动询问'));
+  }
+  console.log(chalk.gray(`   Config: ${expandPath(CONFIG_PATH)}`));
+}
+
+
 export async function imgProxyInstall(opts: {
   providers?: string;
   all?: boolean;
   yes?: boolean;
   mode?: 'smart' | 'dumb';
-}): Promise<{ installedCount: number; failedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean }> {
+}): Promise<{ installedCount: number; failedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean; consoleInstalled: boolean; consoleSkipped: boolean }> {
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
   const smartModeConfig = config.get<boolean>('img_proxy.smart_mode', true);
@@ -427,7 +501,7 @@ export async function imgProxyInstall(opts: {
       message: '选择要启用图片代理的 provider (空格勾选,回车确认):',
       choices, pageSize: 20,
     }]);
-    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, failedCount: 0, wrapperInstalled: false, wrapperSkipped: false }; }
+    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, failedCount: 0, wrapperInstalled: false, wrapperSkipped: false, consoleInstalled: false, consoleSkipped: false }; }
     const pickedSet = new Set(picks as string[]);
     targets = filtered.filter(c => pickedSet.has(c.alias));
   }
@@ -475,8 +549,45 @@ export async function imgProxyInstall(opts: {
     }
   }
 
+  // Web Console 监控后台 — 让用户装完就能开浏览器看。
+  // 与 wrapper confirm 同款 UX:opt-in (default true),非交互式(--yes)
+  // 自动 yes。routes 没装成功时不问 (装过程本身失败的话 用户的关注点是 retry,
+  // 不是额外 feature)。
+  let consoleInstalled = false;
+  let consoleSkipped = false;
+  if ((installed + skipped) > 0 && !opts.yes) {
+    const { enable } = await inquirer.prompt([{
+      type: 'confirm', name: 'enable',
+      message: '是否启用 Web Console 监控后台 (http://127.0.0.1:8765/)?',
+      default: true,
+    }]);
+    if (enable) {
+      try {
+        setConsoleEnabled(expandPath(CONFIG_PATH), true);
+        consoleInstalled = true;
+      } catch (err) {
+        console.log(chalk.yellow(`⚠️  启用失败: ${(err as Error).message} — 可手动 cc-linker img-proxy console enable`));
+        consoleSkipped = true;
+      }
+    } else {
+      consoleSkipped = true;
+    }
+  } else if ((installed + skipped) > 0 && opts.yes) {
+    // --yes: 自动 yes,但仍写在控制台让用户知道
+    try {
+      setConsoleEnabled(expandPath(CONFIG_PATH), true);
+      consoleInstalled = true;
+    } catch {}
+  }
+
   console.log(chalk.green(`\n完成: ${installed} 新装, ${skipped} 已存在${failed > 0 ? `, ${failed} 失败` : ''}。启动: cc-linker img-proxy start --daemon`));
-  return { installedCount: installed + skipped, failedCount: failed, wrapperInstalled, wrapperSkipped };
+  if (consoleInstalled) {
+    console.log(chalk.cyan(`💡 Web Console 已启用 — 浏览器打开 http://127.0.0.1:${port}/`));
+    console.log(chalk.cyan(`   关闭: cc-linker img-proxy console disable`));
+  } else if (consoleSkipped) {
+    console.log(chalk.gray(`   启用 Web Console: cc-linker img-proxy console enable`));
+  }
+  return { installedCount: installed + skipped, failedCount: failed, wrapperInstalled, wrapperSkipped, consoleInstalled, consoleSkipped };
 }
 
 function buildChoiceLabel(c: Candidate): string {
@@ -526,6 +637,24 @@ export async function imgProxyUninstall(opts: { providers?: string; all?: boolea
         }]);
         if (wrap) {
           await imgProxyWrapperUninstall();
+        }
+      }
+    }
+
+    // console: --all 卸载 routes 同时也帮用户 disable Web Console (与 wrapper 同款 UX)。
+    // 单个 provider uninstall 不动 console — 那是局部操作,不影响 console 状态。
+    if (config.get<boolean>('img_proxy.console_enabled', false)) {
+      const { disable } = await inquirer.prompt([{
+        type: 'confirm', name: 'disable',
+        message: '也禁用 Web Console (下次启动后 http://127.0.0.1:8765/ 不再可用)?',
+        default: false,
+      }]);
+      if (disable) {
+        try {
+          setConsoleEnabled(expandPath(CONFIG_PATH), false);
+          console.log(chalk.green('✅ Web Console 已禁用'));
+        } catch (err) {
+          console.log(chalk.yellow(`⚠️  禁用失败: ${(err as Error).message}`));
         }
       }
     }

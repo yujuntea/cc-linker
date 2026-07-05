@@ -25,6 +25,7 @@ import { loadRoutes, listRoutes, setRouteDisabled } from '../routes';
 import { cleanupOldCache } from '../server';
 import { readRecentLogLines } from './log-parser';
 import { INDEX_HTML } from './html';
+import { setConsoleEnabled } from './config-writer';
 import type { HealthStats, RouteListEntry } from './types';
 
 // === health cache (Task 5):5s TTL module singleton,避免 /health 每次 statSync N 个文件 ===
@@ -135,41 +136,46 @@ async function handlePostConfig(req: Request, ctx: ConsoleContext): Promise<Resp
   }
   if (Object.keys(updates).length === 0) return jsonError(400, 'E_CONSOLE_BAD_REQUEST', 'no valid keys');
 
-  // 写回 ctx.configPath(atomic)。ctx.configPath 必须已 expandPath 成绝对路径
-  // (readFileSync 不识别 '~');cli 在 Task 9 接线时会用 expandPath(CONFIG_PATH)。
-  let current: any = {};
-  try {
-    current = parse(readFileSync(ctx.configPath, 'utf8'));
-  } catch (err) {
-    return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `读 config.toml 失败: ${err}`);
+  // console_enabled 用共用的 setConsoleEnabled helper — CLI img-proxy console enable
+  // 走的是同一个原子写路径,避免 CLI 和 handler 各自实现一遍 → drift。
+  if ('console_enabled' in updates && typeof updates.console_enabled === 'boolean') {
+    try {
+      setConsoleEnabled(ctx.configPath, updates.console_enabled);
+    } catch (err) {
+      return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', (err as Error).message);
+    }
   }
-  // bug fix (review): 之前无条件 spread (current.img_proxy ?? {}) — 当用户
-  // config.toml 里 img_proxy = ["a","b","c"](数组)或 "foo"(字符串)时,
-  // spread 把数组的 index 当 key 展开,stringify 写出 garbage TOML,
-  // renameSync 直接覆盖用户的 config.toml。Toml-as-user-input 安全:
-  // 只在 plain object 时 merge,其他当作缺失用 DEFAULTS 为底。
-  const existing = current.img_proxy;
-  const baseImgProxy =
-    existing && typeof existing === 'object' && !Array.isArray(existing)
-      ? existing
-      : { ...DEFAULTS.img_proxy };
-  current.img_proxy = { ...baseImgProxy, ...updates };
-
-  try {
-    const tmp = ctx.configPath + '.tmp';
-    writeFileSync(tmp, stringify(current), { mode: 0o600 });
-    renameSync(tmp, ctx.configPath);
-  } catch (err) {
-    return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `写 config.toml 失败: ${err}`);
+  // upstream_timeout_ms / stream_idle_timeout_ms 仍走原 inline 逻辑
+  // (这两个字段没有独立的 helper,直接在 handlePostConfig 里 atomic-write)
+  const otherUpdates: Record<string, unknown> = {};
+  for (const key of ['upstream_timeout_ms', 'stream_idle_timeout_ms'] as const) {
+    if (key in updates) otherUpdates[key] = updates[key];
   }
-
-  // 热 reload(config singleton 重新读 ctx.configPath 同源 — 生产环境 cli 传的就是
-  // CONFIG_PATH,所以 reload 读到的是同一个文件;test 里 ctx.configPath 是 tmp,
-  // reload 会读到 CONFIG_PATH — 这时只影响内存中的 img_proxy,不破坏本次写)。
-  try {
-    config.reload();
-  } catch (err) {
-    return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `reload 失败: ${err}`);
+  if (Object.keys(otherUpdates).length > 0) {
+    let current: any = {};
+    try {
+      current = parse(readFileSync(ctx.configPath, 'utf8')) ?? {};
+    } catch (err) {
+      return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `读 config.toml 失败: ${err}`);
+    }
+    const existing = current.img_proxy;
+    const baseImgProxy =
+      existing && typeof existing === 'object' && !Array.isArray(existing)
+        ? existing
+        : { ...DEFAULTS.img_proxy };
+    current.img_proxy = { ...baseImgProxy, ...otherUpdates };
+    try {
+      const tmp = ctx.configPath + '.tmp';
+      writeFileSync(tmp, stringify(current), { mode: 0o600 });
+      renameSync(tmp, ctx.configPath);
+    } catch (err) {
+      return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `写 config.toml 失败: ${err}`);
+    }
+    try {
+      config.reload();
+    } catch (err) {
+      return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `reload 失败: ${err}`);
+    }
   }
 
   audit('config_update', { applied: updates }, ctx.logPath);

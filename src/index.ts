@@ -27,6 +27,7 @@ import {
   imgProxyCurrentUrl,
   imgProxyResolve,
   imgProxyWrapperInstall, imgProxyWrapperUninstall, imgProxyWrapperStatus,
+  imgProxyConsoleEnable, imgProxyConsoleDisable, imgProxyConsoleStatus,
 } from './cli/commands/img-proxy';
 import { createRequire } from 'node:module';
 
@@ -225,6 +226,10 @@ wrapperCmd.command('status').description('查看 wrapper 状态').action(() => i
 const imgProxyDaemonCmd = imgProxyCmd.command('daemon').description('开机自启管理 (macOS launchd)');
 imgProxyDaemonCmd.command('install').description('配置开机自启').action(() => imgProxyDaemonInstall());
 imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());
+const imgProxyConsoleCmd = imgProxyCmd.command('console').description('管理 Web Console 监控后台 (http://127.0.0.1:8765/)');
+imgProxyConsoleCmd.command('enable').description('启用 Web Console,改 [img_proxy]console_enabled=true').action(() => imgProxyConsoleEnable());
+imgProxyConsoleCmd.command('disable').description('禁用 Web Console,改 [img_proxy]console_enabled=false').action(() => imgProxyConsoleDisable());
+imgProxyConsoleCmd.command('status').description('查看 Web Console 当前状态 + URL').action(() => imgProxyConsoleStatus());
 
 program
   .command('setup')
