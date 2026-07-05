@@ -904,102 +904,147 @@ git commit -m "feat(img-proxy-console): getCacheBytes with 5s TTL module-level c
 
 ```ts
 // tests/integration/img-proxy-console.test.ts
+//
+// 注意:每个 it 用独立的 tmpProxy + tmpDir(避免 routes/config 状态污染下一个 test,
+// 也避免 console_enabled=false test 反复启停)。所有临时目录都用 mkdtempSync。
+// configPath 必须传 workDir 下的临时 config.toml,绝对不能写到 ~/.cc-linker/config.toml
+// (readFileSync 不识 '~',且会污染用户配置)。
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { startProxyServer } from '../../src/img-proxy/server';
 import { saveRoutes } from '../../src/img-proxy/routes';
-import { config } from '../../src/utils/config';
 
-describe('img-proxy console integration', () => {
-  let cacheDir: string, routesPath: string, logPath: string, workDir: string;
-  let upstreamPort: number, upstreamServer: any;
-  let proxyServer: any;
-  let proxyBaseUrl: string;
-
-  beforeAll(async () => {
-    cacheDir = mkdtempSync(join(tmpdir(), 'console-int-cache-'));
-    workDir = mkdtempSync(join(tmpdir(), 'console-int-'));
-    routesPath = join(workDir, 'routes.json');
-    logPath = join(workDir, 'img-proxy.log');
-
-    upstreamServer = Bun.serve({
-      port: 0, hostname: '127.0.0.1',
-      async fetch(_req) {
-        return new Response('event: ok\ndata: {}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
-      },
-    });
-    upstreamPort = upstreamServer.port;
-
+/** 起一个独立的临时 proxy(每个 it 调一次),返回 baseUrl + cleanup */
+async function makeTmpProxy(opts: { consoleEnabled: boolean; withRoutes?: boolean } = { consoleEnabled: true, withRoutes: true }) {
+  const workDir = mkdtempSync(join(tmpdir(), 'console-int-'));
+  const cacheDir = join(workDir, 'cache');
+  const routesPath = join(workDir, 'routes.json');
+  const logPath = join(workDir, 'img-proxy.log');
+  const configPath = join(workDir, 'config.toml');
+  // 起一个最小 upstream mock
+  const upstreamServer = Bun.serve({
+    port: 0, hostname: '127.0.0.1',
+    async fetch(_req) {
+      return new Response('event: ok\ndata: {}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  if (opts.withRoutes) {
     await saveRoutes(routesPath, {
       version: 1, routes: {
-        'glm-5.2': { alias: 'glm-5.2', upstream: `http://127.0.0.1:${upstreamPort}`, provider_path: '/fake.json', original_base_url: `http://127.0.0.1:${upstreamPort}`, installed_at: '2026-07-05T00:00:00Z' },
+        'glm-5.2': {
+          alias: 'glm-5.2',
+          upstream: `http://127.0.0.1:${upstreamServer.port}`,
+          provider_path: '/fake.json',
+          original_base_url: `http://127.0.0.1:${upstreamServer.port}`,
+          installed_at: '2026-07-05T00:00:00Z',
+        },
       },
     });
+  }
+  const proxy = await startProxyServer({
+    port: 0, hostname: '127.0.0.1', cacheDir, routesPath,
+    promptTemplate: '[img: {path}]', consoleEnabled: opts.consoleEnabled, cacheMaxAgeHours: 24,
+    logPath, configPath,  // 关键:传 workDir 下临时 configPath,不污染用户配置
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${proxy.port}`,
+    cacheDir, routesPath, logPath, configPath, workDir,
+    cleanup: () => {
+      proxy.stop(true);
+      upstreamServer.stop(true);
+      rmSync(workDir, { recursive: true, force: true });
+    },
+  };
+}
 
-    proxyServer = await startProxyServer({
-      port: 0, hostname: '127.0.0.1', cacheDir, routesPath,
-      promptTemplate: '[img: {path}]', consoleEnabled: true, cacheMaxAgeHours: 24,
-      logPath,
-    });
-    proxyBaseUrl = `http://127.0.0.1:${proxyServer.port}`;
-  });
-  afterAll(() => {
-    proxyServer?.stop(true);
-    upstreamServer?.stop(true);
-    rmSync(cacheDir, { recursive: true, force: true });
-    rmSync(workDir, { recursive: true, force: true });
-  });
+describe('img-proxy console integration', () => {
+  // beforeAll/afterAll 现在不需要了 — 每个 test 自带 setup/teardown
 
   it('GET / 返 HTML 200', async () => {
-    const r = await fetch(`${proxyBaseUrl}/`);
-    expect(r.status).toBe(200);
-    expect(await r.text()).toContain('cc-linker img-proxy console');
+    const ctx = await makeTmpProxy();
+    try {
+      const r = await fetch(`${ctx.baseUrl}/`);
+      expect(r.status).toBe(200);
+      expect(await r.text()).toContain('cc-linker img-proxy console');
+    } finally { ctx.cleanup(); }
   });
 
   it('GET /admin/api/stats 返 stats JSON', async () => {
-    const r = await fetch(`${proxyBaseUrl}/admin/api/stats`);
-    expect(r.status).toBe(200);
-    const stats = await r.json();
-    expect(stats).toHaveProperty('totalRequests');
-    expect(stats).toHaveProperty('byStatus');
-    expect(stats).toHaveProperty('byAlias');
-    expect(stats).toHaveProperty('recent');
+    const ctx = await makeTmpProxy();
+    try {
+      const r = await fetch(`${ctx.baseUrl}/admin/api/stats`);
+      expect(r.status).toBe(200);
+      const stats = await r.json();
+      expect(stats).toHaveProperty('totalRequests');
+      expect(stats).toHaveProperty('byStatus');
+      expect(stats).toHaveProperty('byAlias');
+      expect(stats).toHaveProperty('recent');
+    } finally { ctx.cleanup(); }
   });
 
-  it('POST /admin/api/routes/disable 让 proxy 请求 502', async () => {
-    const r = await fetch(`${proxyBaseUrl}/admin/api/routes/disable`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ alias: 'glm-5.2' }),
-    });
-    expect(r.status).toBe(200);
-    const proxyResp = await fetch(`${proxyBaseUrl}/glm-5.2/v1/messages`, {
-      method: 'POST', body: '{}',
-    });
-    expect(proxyResp.status).toBe(502);
-    // 恢复
-    await fetch(`${proxyBaseUrl}/admin/api/routes/enable`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ alias: 'glm-5.2' }),
-    });
+  it('POST /admin/api/routes/disable 让 proxy 请求 502 + enable 恢复', async () => {
+    const ctx = await makeTmpProxy();
+    try {
+      const r = await fetch(`${ctx.baseUrl}/admin/api/routes/disable`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ alias: 'glm-5.2' }),
+      });
+      expect(r.status).toBe(200);
+      const proxyResp = await fetch(`${ctx.baseUrl}/glm-5.2/v1/messages`, {
+        method: 'POST', body: '{}',
+      });
+      expect(proxyResp.status).toBe(502);
+
+      // 恢复 enable,验证 enable 也 work
+      const en = await fetch(`${ctx.baseUrl}/admin/api/routes/enable`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ alias: 'glm-5.2' }),
+      });
+      expect(en.status).toBe(200);
+      const proxyResp2 = await fetch(`${ctx.baseUrl}/glm-5.2/v1/messages`, {
+        method: 'POST', body: '{}',
+      });
+      expect(proxyResp2.status).toBe(200);  // 恢复后 200
+    } finally { ctx.cleanup(); }
   });
 
   it('GET /admin/api/health 返 health info', async () => {
-    const r = await fetch(`${proxyBaseUrl}/admin/api/health`);
-    expect(r.status).toBe(200);
-    const h = await r.json();
-    expect(h).toHaveProperty('uptimeMs');
-    expect(h).toHaveProperty('pid');
-    expect(h).toHaveProperty('routeCount', 1);
+    const ctx = await makeTmpProxy();
+    try {
+      const r = await fetch(`${ctx.baseUrl}/admin/api/health`);
+      expect(r.status).toBe(200);
+      const h = await r.json();
+      expect(h).toHaveProperty('uptimeMs');
+      expect(h).toHaveProperty('pid');
+      expect(h).toHaveProperty('routeCount', 1);
+    } finally { ctx.cleanup(); }
   });
 
   it('POST /admin/api/cache/clear 返 ok + removed', async () => {
-    writeFileSync(join(cacheDir, 'test.png'), Buffer.alloc(10));
-    const r = await fetch(`${proxyBaseUrl}/admin/api/cache/clear`, { method: 'POST' });
-    expect(r.status).toBe(200);
-    const body = await r.json();
-    expect(body).toHaveProperty('ok', true);
+    const ctx = await makeTmpProxy();
+    try {
+      writeFileSync(join(ctx.cacheDir, 'test.png'), Buffer.alloc(10));
+      const r = await fetch(`${ctx.baseUrl}/admin/api/cache/clear`, { method: 'POST' });
+      expect(r.status).toBe(200);
+      const body = await r.json();
+      expect(body).toHaveProperty('ok', true);
+      expect(body).toHaveProperty('removed', 1);  // 1 个文件被清掉
+    } finally { ctx.cleanup(); }
+  });
+
+  it('POST /admin/api/routes/disable 未知 alias 返 404 E_CONSOLE_UNKNOWN_ALIAS', async () => {
+    const ctx = await makeTmpProxy();
+    try {
+      const r = await fetch(`${ctx.baseUrl}/admin/api/routes/disable`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ alias: 'nope-not-installed' }),
+      });
+      expect(r.status).toBe(404);
+      const body = await r.json();
+      expect(body).toHaveProperty('code', 'E_CONSOLE_UNKNOWN_ALIAS');
+    } finally { ctx.cleanup(); }
   });
 });
 ```
@@ -1238,12 +1283,12 @@ export async function handleConsoleRequest(req: Request, url: URL, ctx: ConsoleC
 - [ ] **Step 4: 跑测试确认 pass**
 
 Run: `bun test tests/integration/img-proxy-console.test.ts`
-Expected: PASS 5 tests
+Expected: PASS 6 tests
 
 - [ ] **Step 5: 跑全套确认不破**
 
 Run: `bun test`
-Expected: 现有 1206 + 新 5 = 1211 pass, 0 fail
+Expected: 现有 1206 + 新 6 = 1212 pass, 0 fail
 
 - [ ] **Step 6: Commit**
 
@@ -1654,7 +1699,9 @@ const stats = {
 // 总是接管 console 路由(即使 console_enabled=false),handler 内检查开关
 if (url.pathname === '/' || url.pathname.startsWith('/admin')) {
   return handleConsoleRequest(req, url, {
-    configPath: configPath ?? '~/.cc-linker/config.toml',  // 见 step 3d
+    // configPath 必须是已 expandPath 的绝对路径(readFileSync 不识 '~')。
+    // cli 接线时已 expand,test 里直接传绝对路径;兜底用 CONFIG_PATH(也是绝对路径)。
+    configPath: expandPath(configPath ?? CONFIG_PATH),
     routesPath,
     cacheDir,
     logPath,
@@ -1662,6 +1709,10 @@ if (url.pathname === '/' || url.pathname.startsWith('/admin')) {
   });
 }
 ```
+
+> **为什么 server.ts 内再 expand 一次**：cli 传的 `configPath` 已经展开,但 server.ts 拿到时不去校验;
+> 万一上游 caller 传了 '~...' 或相对路径,兜底一次保证 readFileSync 不会踩 ENOENT。
+> `CONFIG_PATH` 来自 `utils/paths.ts`,已是绝对路径。
 
 **d) 改 startProxyServer 加 configPath 参数**：
 
@@ -1675,6 +1726,7 @@ export interface ProxyServerOptions {
 ```
 
 `configPath` 传给 console handler 让它写回 config.toml。
+**顶部 import 加**：`import { CONFIG_PATH, expandPath } from '../utils/paths';`
 
 **e) 在 3 个分支写 stats**（对应 server.ts 实际行号）：
 
