@@ -1,432 +1,780 @@
 # `cc-linker img-proxy` 使用说明
 
-让**纯文本模型**(glm-5.2、qwen3、deepseek、kimi 等)在 Claude Code 里也能"接收"你粘贴的图片。
+让**纯文本模型**(glm-5.2、qwen3-max、deepseek、mimo-pro 等)在 Claude Code 里也能"接收"你粘贴的图片。
 
-> **重要心智模型**:`img-proxy` 不是让模型直接"看见"图片——它把图片**保存成本地文件**,然后给模型发一段**文本**(图片路径),并提示模型"如果你想识别这张图片,请调图片识别 MCP 工具"。所以你需要让模型**能访问图片识别 MCP**(比如 `mcp__MiniMax__understand_image`)。
+> **重要心智模型**:`img-proxy` 不让模型直接"看见"图片——它把图片**保存成本地文件**,然后给模型发一段**文本**(图片路径 + 调 MCP 的提示)。模型要"识别"图片,必须**主动调用图片识别 MCP**(比如 `mcp__MiniMax__understand_image`)。这是绕开纯文本模型 4xx 的核心设计。
 
 ---
 
 ## 目录
 
-- [TL;DR — 3 步上手](#tldr--3-步上手)
-- [冷启动 / CC Switch 用户](#冷启动--cc-switch-用户)
-- [它做了什么 / 没做什么](#它做了什么--没做什么)
-- [完整命令列表](#完整命令列表)
+- [它解决了什么问题](#它解决了什么问题)
+- [30 秒上手](#30-秒上手)
+- [系统架构](#系统架构)
+  - [请求生命周期](#请求生命周期)
+  - [数据流图](#数据流图)
+- [数据存储与路由映射](#数据存储与路由映射)
+  - [磁盘布局](#磁盘布局)
+  - [`routes.json` 路由表](#routesjson-路由表)
+  - [路由解析逻辑](#路由解析逻辑)
+- [智能安装(smart_mode)](#智能安装smart_mode)
+  - [4 路候选发现](#4-路候选发现)
+  - [模型分类规则](#模型分类规则)
+  - [模式行为矩阵](#模式行为矩阵)
+- [Shell wrapper 模式](#shell-wrapper-模式)
+- [用户场景指南](#用户场景指南)
+  - [场景 A:纯 CC Switch 用户](#场景-a纯-cc-switch-用户)
+  - [场景 B:自定义 alias 用户](#场景-b自定义-alias-用户)
+  - [场景 C:混合用户](#场景-c混合用户)
+  - [场景 D:cold-start 新用户](#场景-dcold-start-新用户)
+  - [场景 E:官方 API 直连](#场景-e官方-api-直连)
+- [`cc-linker setup` 一键向导](#cc-linker-setup-一键向导)
+- [命令参考](#命令参考)
 - [配置文件](#配置文件)
-- [Shell wrapper 模式 (CC Switch 用户专用)](#shell-wrapper-模式cc-switch-用户专用)
-- [常见问题](#常见问题)
 - [故障排除](#故障排除)
 - [卸载](#卸载)
-- [升级 / 迁移 (v2 智能安装)](#升级--迁移-v2-智能安装)
-- [智能模式 (smart_mode)](#智能模式-smart_mode)
-- [限制 / 已知问题](#限制--已知问题)
-- [容易踩的坑](#容易踩的坑)
+- [升级 / 迁移](#升级--迁移)
+- [已知限制 / 容易踩的坑](#已知限制--容易踩的坑)
 
 ---
 
-## TL;DR — 3 步上手
+## 它解决了什么问题
 
-> **v2 默认 smart 模式**:`install` 自动跳过 multimodal 模型(Claude / GPT-4 / Kimi 等),只装文本模型。不用担心破坏图片能力。
+Claude Code 客户端把截图粘贴进去时,会发送这样的 `messages` 请求:
+
+```json
+{ "messages": [{ "role": "user", "content": [
+  { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBOR..." } },
+  { "type": "text", "text": "看这个图" }
+]}]}
+```
+
+**支持图片的多模态模型**(Claude 3+、GPT-4、kimi、glm-4v、qwen-vl 等)能正常处理。
+
+**纯文本模型**(glm-5.2、qwen3-max、deepseek 等)直接 4xx:`Model only support text input`。
+这不是 Anthropic 协议问题——是上游模型自己拒收图片。
+
+**img-proxy 的办法**:
+1. 在客户端和上游之间劫持请求,识别 image block
+2. 把图片落盘到 `~/.cc-linker/img-proxy/cache/`
+3. 把 image block **替换**为一段文本(图片路径 + 提示模型调图片识别 MCP 工具)
+4. 上游收到纯文本请求,正常处理
+
+**前置依赖**:你的纯文本模型必须配**图片识别 MCP**(`mcp__MiniMax__understand_image` 或同类)。
+
+---
+
+## 30 秒上手
 
 ```bash
-# 1. 智能安装(自动发现 + 分类 + 选 text-only 模型,可能提示装 wrapper)
+# 1. 一键智能安装(自动分类 + 自动发现 CC Switch / alias)
 cc-linker img-proxy install --yes
 
-# 2. 后台启动代理(监听 127.0.0.1:8765)
+# 2. 后台启动代理
 cc-linker img-proxy start --daemon
 
-# 3. (可选)macOS 开机自启
+# 3. macOS 开机自启(可选)
 cc-linker img-proxy daemon install
+
+# 或者干脆一步到位:
+cc-linker setup              # 自动走完注册表 + 飞书 + img-proxy
 ```
 
-之后在 Claude Code 里粘贴图片,**就这样能用**了。模型会收到一段文本:
+跑完后:
 
-```
-[用户粘贴的图片已保存到本地: /Users/you/.cc-linker/img-proxy/cache/1783143359780-o07orl.png]
-当前模型为纯文本模型,无法直接查看图片内容。
-如需识别这张图片,请调用 mcp__MiniMax__understand_image 工具,image_source 参数传上述本地路径。
-```
-
-如果模型配了图片识别 MCP,就会调 MCP 工具去读图,然后正常回答你的问题。
-
-### 只想装某个 model?
-
-```bash
-# dumb 模式(不过滤 multimodal,装你想装的)
-cc-linker img-proxy install --providers glm-5.2,byte-agent-glm
-
-# 或显式 dumb 模式 + 全部
-cc-linker img-proxy install --all
-```
-
-### CC Switch 用户(直接跑 `claude` 不用 alias)?
-
-装个 shell wrapper 就好(`install` 会自动问):
-
-```bash
-cc-linker img-proxy wrapper install   # 装 cc-linker-proxy() 函数到 ~/.zshrc
-source ~/.zshrc                       # 重载 shell
-cc-linker-proxy "看这个图"             # 走 proxy,claude 直跑没影响
-```
-
-详见 [Shell wrapper 模式](#shell-wrapper-模式-cc-switch-用户专用)。
+- 纯文本模型(如 glm-5.2)粘贴图片,会收到这样的文本:
+  ```
+  [用户粘贴的图片已保存到本地: /Users/you/.cc-linker/img-proxy/cache/1783143359780-o07orl.png]
+  当前模型为纯文本模型,无法直接查看图片内容。
+  如需识别这张图片,请调用 mcp__MiniMax__understand_image 工具,image_source 参数传上述本地路径。
+  ```
+- 模型调用 MCP 工具后能正常回答你的问题
+- 多模态模型(Claude/Kimi 等)完全不受影响——它们不经 proxy,直连原 upstream
 
 ---
 
-## 冷启动 / CC Switch 用户
+## 系统架构
 
-`img-proxy install` 默认从 3 个来源合并发现 candidate:
-
-1. `~/.claude/providers/*.json`(你手写 / 之前 install 改写过的)
-2. `~/.cc-linker/auto-providers/*.json`(CC Switch 同步生成)
-3. `~/.zshrc` / `~/.bashrc` 里的 `alias cc-X='claude --settings ...'`(自动检测,pre-select 对应 provider)
-
-**如果你之前没用过 cc-linker(或没用过手工 `~/.claude/providers/*.json`)**,目录 1 是空的,install 会直接报错并给两种解决方案。
-
-**好消息:CC Switch 自动支持**。`discoverCandidates()` 在每次 install/status/uninstall 时调用,如果 `cc-switch.db` 的 mtime 比 `auto-providers/` 新,就重新同步一次。同时**清理 stale entries**(你在 CC Switch 里删的 provider 也会从 `auto-providers/` 清掉)。
-
-所以 CC Switch 用户**完全不用手动建 provider 文件**——直接 `cc-linker img-proxy install --yes`,你会看到所有 CC Switch 里的 provider 都列出来了,smart 模式预选 text-only(默认跳过 Kimi / Claude / GPT-4 等 multimodal),回车确认即可。
-
-### 数据来源优先级
+### 请求生命周期
 
 ```
-[alias] / cc-* alias in rc file
-   ↓ source 优先级
-~/.claude/providers/*.json   ← manual (你手写 / img-proxy install 改写后)
-   ↓ alias 冲突时覆盖
-~/.cc-linker/auto-providers/*.json  ← cc-switch 同步生成
+┌──────────────────┐                                    ┌──────────────────┐
+│  Claude Code CLI │                                    │  上游 LLM API    │
+│  (本机进程)       │                                    │  (Ark/GLM/Qwen…) │
+└──────────────────┘                                    └──────────────────┘
+         │ ① ANTHROPIC_BASE_URL=http://127.0.0.1:8765/<alias>           │
+         ▼                                                            ▲
+┌──────────────────────────── img-proxy(Bun.serve)────────────────────┴─────┐
+│                                                                           │
+│  ② 解析 url.pathname → 提取第一段作 alias                                │
+│  ③ 查 routes.json → 真实上游 URL(real upstream)                          │
+│  ④ 仅 POST /<alias>/v1/messages:                                          │
+│       buffer body → JSON.parse → stripImagesToPaths()                    │
+│         - base64 image → 落盘到 cache/                                   │
+│         - 替换成 text block(模板含 {path})                               │
+│  ⑤ fetch(realUpstream + rest + search, 透传 headers)                    │
+│  ⑥ 流式透传响应(SSE 等)                                                   │
+│  ⑦ 日志:appendLog(JSON{time, alias, method, path, stripped,             │
+│                         upstream_status, duration_ms})                    │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-`~/.cc-linker/auto-providers/` 跟 `ProviderManager`(Bot 那边)共享同一个目录,两边都会读。
+关键点:
 
-### CC Switch 数据库变了怎么办?
+- **POST `/v1/messages` 才会改 body**。GET/HEAD 直接透传;其他方法 streaming 透传(不消费)。
+- **改 body 不抛错**:JSON.parse 失败 → 用原始 bytes 透传。图片块异常 → 块原样保留。绝不阻塞。
+- **路由表是唯一 gate**:路径第一段若不在 `routes.json` → 直接 502 提示用户 install。
+- **流式响应**:不解析 SSE 内容,直接 pipe。
 
-每次 `install` / `status` / `uninstall` 都会触发 sync + stale cleanup。**不需要手动重启**。
+### 数据流图
 
-### 在 CC Switch 里加新 provider 后...
+```
+                  install / uninstall
+                  ──────────────────►
+   ~/.claude/providers/*.json            ~/.cc-linker/
+        │                                  │
+        │  (ProviderFileInfo:               │
+        │   alias=文件名stem,               │
+        │   baseUrl=ANTHROPIC_BASE_URL)     │
+        ▼                                  ▼
+  ┌──────────┐  install改写  ┌────────────────────┐
+  │ provider │ ──────────────►│ provider 文件       │
+  │ 文件     │                │  ANTHROPIC_BASE_URL │
+  │ (mm:600) │                │  = http://127.0.0.1:8765/<alias>
+  └──────────┘                └────────────────────┘
+                              ┌────────────────────┐
+                              │ provider.json.bak  │ 原始上游 URL
+                              └────────────────────┘
+                              ┌────────────────────┐
+                              │ ~/.cc-linker/      │
+                              │  img-proxy/        │
+                              │  routes.json       │ alias → upstream 真上游
+                              │  (m0:600)          │
+                              └────────────────────┘
+                                       │
+                                       │ 运行时(req 来时)
+                                       ▼
+                              ┌────────────────────┐
+                              │ img-proxy daemon   │
+                              │ 127.0.0.1:8765     │
+                              │  - parseAlias      │
+                              │  - stripImages      │
+                              │  - forward          │
+                              └────────────────────┘
+                                       │
+                                       │ 落盘
+                                       ▼
+                              ┌────────────────────┐
+                              │ ~/.cc-linker/      │
+                              │  img-proxy/        │
+                              │  cache/*.png       │ 文件 0600
+                              │  (7 天后清)        │
+                              └────────────────────┘
+                                       │
+                                       │ 替换成 text block:
+                                       ▼
+                              "[图片已保存: {path}]
+                               请调用 mcp__MiniMax__understand_image"
+```
 
-下次跑 `cc-linker img-proxy install --yes` 就能看到。**`img-proxy` 不会自动启用新 provider**——需要显式 install,避免"加了 CC Switch provider 自动启用代理"的意外。
+---
 
-### 你有 shell alias 怎么办?
+## 数据存储与路由映射
 
-smart install 会自动扫 `~/.zshrc` / `~/.bashrc` / `~/.zprofile` / `~/.bash_profile` 里 `alias cc-X='claude --settings ...'` 这样的行,**自动 pre-select 对应 provider 文件**。例如:
+### 磁盘布局
+
+| 路径 | 用途 | 权限 | 生命周期 |
+|------|------|------|----------|
+| `~/.cc-linker/img-proxy/routes.json` | 路由表(核心) | `0600` | 装/卸时增删,原子写 |
+| `~/.cc-linker/img-proxy/img-proxy.pid` | daemon PID | `0600` | 启动写,停清 |
+| `~/.cc-linker/img-proxy/img-proxy.log` | 请求日志(append) | 跟随日志 | append-only,人工 |
+| `~/.cc-linker/img-proxy/cache/` | 落盘图片 | 文件 `0600` | 启动 + 每小时清过期(>7 天) |
+| `~/.cc-linker/img-proxy/wrapper-backups/` | wrapper 卸前后 rc 文件备份 | `0644` | 装/卸 wrapper 时各一份 |
+| `~/.claude/providers/<alias>.json` | user-managed 原始 provider 配置 | user | install 改写 ANTHROPIC_BASE_URL |
+| `~/.claude/providers/<alias>.json.bak` | 改写前备份(含原始 BASE_URL) | user | uninstall 后删,uninstall 前保留 |
+| `~/.cc-linker/auto-providers/<alias>.json` | CC Switch 同步过来的 provider | `0600` | syncCcSwitchToAutoProviders |
+| `~/.zshrc` / `~/.bashrc` | shell wrapper 函数块 | `0644` | wrapper install 追加,uninstall 移除 |
+| `~/Library/LaunchAgents/com.cclinker.img-proxy.plist` | macOS launchd 配置 | `0644` | daemon install 写,uninstall 删 |
+
+### `routes.json` 路由表
+
+```typescript
+interface RouteEntry {
+  alias: string;              // 文件名 stem(glm-5.2、byte-agent-glm…)
+  upstream: string;           // 真实上游 base URL(如 https://open.bigmodel.cn/api/anthropic)
+  provider_path: string;      // provider 文件绝对路径(为卸载 / 状态展示)
+  original_base_url: string;  // 改写前的 BASE_URL(展示/审计;卸载还原时读 .bak)
+  installed_at: string;       // ISO 时间戳
+}
+
+interface RouteTable {
+  version: 1;
+  routes: Record<string, RouteEntry>;  // key = alias
+}
+```
+
+**关键设计**:`upstream` 字段存的是**真实上游 URL**,不是 proxy URL。这样:
+
+1. wrapper 知道"我要替哪个上游做剥离"
+2. uninstall 时能正确还原(从 .bak 读)
+3. routes.json 是"逻辑映射表",不依赖端口
+
+**写入语义**:用 `proper-lockfile` 互斥 + `tmp + rename` 原子写。并发 install 不会写坏。
+
+### 路由解析逻辑
+
+**正向(daemon 收到请求时)**:
+```
+GET/POST /<alias>/<rest>
+  ↓ parseAliasFromPath(pathname)
+  alias = 第一段非空段
+  ↓ getUpstreamByAlias(routes.json, alias)
+  upstream = routes[alias]?.upstream ?? null
+  ↓ 拼接
+  targetUrl = ${upstream}/<rest>${search}   ← upstream 末尾斜杠会被剥
+```
+
+**反向(wrapper 调 cc-linker 时)**:
+```
+cc-linker img-proxy resolve <realUpstream>
+  ↓ resolveProxyByUpstream(routes.json, port, hostname, realUpstream)
+  遍历 routes 找 upstream(经 normalizeUrlForCompare:小写 host + 剥末尾斜杠)匹配
+  ↓ 命中
+  proxyUrl = http://${hostname}:${port}/${alias}
+```
+
+`normalizeUrlForCompare` 是**反向解析的关键**——CC Switch 写 `https://x.com/api`,wrapper 读 settings.json 拿到 `https://x.com/api/`,差一个末尾斜杠也能匹配。
+
+---
+
+## 智能安装(smart_mode)
+
+v2 默认行为。`install` 不再是"装哪个"的手动挑选,而是:
+
+1. **自动发现候选**(4 路:manual / auto-synced cc-switch / alias 提示的文件存在性)
+2. **按模型名分类**(multimodal / text-only / unknown)
+3. **multimodal 自动跳过**(避免破坏图片能力)
+4. **text-only + unknown 默认预选**
+5. **检测到 CC Switch 时问要不要装 wrapper**
+
+### 4 路候选发现
+
+`discoverCandidates()` 合并 + 去重(manual 优先):
+
+| 来源 | 路径 | `source` 标签 |
+|------|------|---------------|
+| **manual** | `~/.claude/providers/*.json`(你手写或 install 改过的) | `[manual]` |
+| **auto** | `~/.cc-linker/auto-providers/*.json`(CC Switch 同步) | `[auto]` |
+| **alias hint** | 从 `~/.zshrc`/`~/.bashrc` 扫 `alias cc-X='claude --settings ...'` 推出来的 provider | `[alias]` |
+
+CC Switch 同步(`syncCcSwitchToAutoProviders`)只在每次 install 调用时执行,**带 mtime 检查**:
+
+- CC Switch DB 的 mtime > auto-providers 目录任一文件的 mtime → 重新同步
+- 否则跳过(幂等)
+- 同步时**清理 stale entries**(CC Switch 已删的 provider 也从 auto-providers 删)
+
+**手动改 token 后再 install**:`.bak` 不动,token 保留;`isProviderInstalled()` 检测到 BASE_URL 仍是当前 config 的 proxy URL → 真幂等,不重复写。
+
+### 模型分类规则
+
+`classifyModel()` 流程:
+
+1. 剥尾部 bracket(`glm-5.2[1m]` → `glm-5.2`)
+2. 跑 multimodal patterns(命中 → multimodal)
+3. 跑 text-only patterns(命中 → text-only)
+4. 都未命中 → unknown
+
+**内置 multimodal patterns**(跳过):
+
+| 厂商 | 匹配 |
+|------|------|
+| Anthropic | `claude-3*`、`claude-opus/sonnet/haiku` |
+| OpenAI | `gpt-4*` |
+| Google | `gemini-*-vision`、`gemini-1.5-pro` |
+| 阿里 Qwen | `qwen*-vl`、`qwen*-omni`、`qwen3.*-plus` |
+| 智谱 GLM | `glm-*-?v`(4v/4.5v/5v) |
+| Moonshot Kimi | `kimi*` |
+| MiniMax | `MiniMax-M3` |
+| 小米 MiMo | `mimo-v\d+`(不带 `-pro`) |
+| 字节 Doubao | `doubao*-vision`、`seed*-vision` |
+| Stepfun/Hunyuan/ERNIE | `step-1v`、`*-vision`、`*-vlm` |
+| 通用 | `-vision`、`-vl-`、`-vlm` |
+
+**内置 text-only patterns**(装):
+
+| 厂商 | 匹配 |
+|------|------|
+| 智谱 GLM | `glm-\d+(\.\d+)?`、`glm-4-air/turbo` |
+| DeepSeek | `deepseek*` |
+| 阿里 Qwen | `qwen-turbo/max/long/coder`、`qwen3.*-max`、`qwen3.*-coder` |
+| Moonshot legacy | `moonshot-v1-*` |
+| MiniMax | `MiniMax-M2`、`MiniMax-Text-*`、`abab*` |
+| 小米 MiMo | `mimo-*-pro` |
+| OpenAI 老版 | `gpt-3`、`gpt-3.5` |
+| 国内 | `baichuan*`、`yi-*` |
+
+**自定义 extras**(写在 `config.toml`,正则,大小写不敏感):
+
+```toml
+[img_proxy]
+# 追加 multimodal(也会被跳过)
+vision_model_patterns_extra = ["my-custom-vl-*"]
+
+# 追加 text-only(也会被 proxy)
+text_only_model_patterns_extra = ["my-custom-text-*"]
+```
+
+### 模式行为矩阵
+
+| 命令 | 模式 | 行为 |
+|------|------|------|
+| `install` | smart | 4 路发现 + 分类 + 预选 text-only + unknown + 交互 |
+| `install --yes` | smart | 同上但不交互(用默认预选) |
+| `install --providers X,Y` | **dumb** | 只装 X,Y,不过滤,显式指定优先 |
+| `install --all` | **dumb** | 全装,不过滤 |
+| `install --mode dumb` | dumb | 同 `--all`,但显式标 mode |
+| `install --mode smart` | smart | 显式 smart(默认就是) |
+
+`smart_mode = false` 可在 config 里关闭(回到 dumb 但用 `install` → 仍会走 4 路发现)。
+
+**Edge case**: `--providers kimi`(显式指定 multimodal) → 不会被 smart 过滤拦下,直接装。但会显示 `multimodal` 警告行(因为 smart 把 multimodal 都标 skip 了)。
+
+---
+
+## Shell wrapper 模式
+
+**适用人群**:用 CC Switch 直接 `claude`(没自定义 `cc-X` alias)。`~/.claude/settings.json` 是 CC Switch 写的——改 provider 文件无效,因为 Claude Code 直接读 settings.json。
+
+### 它怎么工作
 
 ```bash
-# ~/.zshrc:
-alias cc-glm='claude --settings ~/.claude/providers/glm-5.2.json'
+$ cc-linker-proxy "看这个图"
+  ↓
+shell 函数 cc-linker-proxy() (在 ~/.zshrc)
+  ① 如果 ANTHROPIC_BASE_URL 已设 → 直接 exec claude(递归防护)
+  ② 调 cc-linker img-proxy current-url    → 读 ~/.claude/settings.json
+  ③ 调 cc-linker img-proxy resolve <URL>  → 查 routes.json
+  ④ ANTHROPIC_BASE_URL=<proxy> claude "看这个图"
 ```
 
-跑 `install` 时 `glm-5.2` 默认勾选(且 classified 为 text-only)。无需手动 `--providers glm-5.2`。
+### 3 步启用
 
-**注意**:shell alias 用的是哪个 provider 文件,决定粘贴图片会不会被剥离——同名近似(比如 `cc-byte-glm` 指向 `byte-glm.json` 而你想装的是 `byte-agent-glm.json`)容易踩坑,详见 [Gotcha: cc-byte-glm ≠ cc-byte-agent-glm](#gotcha-cc-byte-glm--cc-byte-agent-glmname-collision-陷阱)。
+```bash
+# 1. 先装好(从 CC Switch 同步的所有 text-only provider 自动 route 进 routes.json)
+cc-linker img-proxy install --yes
 
-### 完全不用 CC Switch,也不想手写?
+# 2. 装 wrapper
+cc-linker img-proxy wrapper install
+# → 写入 ~/.zshrc(检测 ZSH_VERSION / $SHELL)或 ~/.bashrc
 
-最简单:**装 CC Switch** (https://github.com/farion1231/cc-switch),用它 GUI 管理所有 provider,img-proxy 自动读。如果不想装 CC Switch,手工创建 `~/.claude/providers/my-provider.json`:
+# 3. 重载 shell
+source ~/.zshrc
+
+# 验证
+cc-linker-proxy "echo test"   # 走 proxy
+claude "echo test"             # 直连(不受影响)
+```
+
+`install --yes` 检测到 CC Switch 且未装 wrapper 时**会自动问一次**(默认 y)。
+
+### 关键行为
+
+- **递归防护**:`ANTHROPIC_BASE_URL` 非空直接 exec,不走 resolve。
+- **幂等**:重复 `wrapper install` 不重复写。
+- **备份**:修改前 `~/.cc-linker/img-proxy/wrapper-backups/wrapper-backup-<ts>-<uuid>`。
+- **shell 检测**:`ZSH_VERSION` / `BASH_VERSION` / `$SHELL` 末段(zsh/bash)→ 写对应 rc。
+- **marker 区块**:`# >>> cc-linker img-proxy wrapper (do not edit this block) >>>` 到 `# <<<` 之间,可以手动编辑中间内容,但 marker 不能改(改了 uninstall 找不到)。
+
+### 子命令
+
+| 命令 | 作用 |
+|------|------|
+| `wrapper install` | 装 wrapper 到 shell rc |
+| `wrapper uninstall` | 移除 wrapper(原文件备份到 wrapper-backups/) |
+| `wrapper status` | 检测是否已装 + rc 文件路径 |
+| `current-url` | 读 settings.json 的 `ANTHROPIC_BASE_URL`(stdout 输出,空 = 没装) |
+| `resolve <upstream>` | 按真实 upstream 查 proxy URL(stdout 输出,空 = 没在 routes 里) |
+
+---
+
+## 用户场景指南
+
+### 场景 A:纯 CC Switch 用户
+
+**前置**:`~/.claude/providers/` 为空(或者根本没这目录),CC Switch 已装且有若干 provider。
+
+```bash
+$ cc-linker img-proxy install --yes
+
+🔍 发现 N 个 claude providers(来自 CC Switch):
+  ❯ ◯ [auto]  glm-5.2           ✅ text-only        glm-5.2[1m]
+    ◯ [auto]  kimi-for-coding   ⏭ multimodal-skip  kimi-for-coding[256k]
+    ◯ [auto]  qwen3.6-plus      ⏭ multimodal-skip  qwen3.6-plus[1m]
+    ◯ [auto]  minimax-m2.7      ✅ text-only        MiniMax-M3[1m]
+    ... (N more)
+
+ℹ  Smart 模式:跳过 M 个 multimodal provider
+
+✅ 已装 K 个(smart 模式)
+   glm-5.2    ✅ text-only
+   minimax-m2.7 ✅ text-only
+
+✅ 检测到 CC Switch,装 wrapper 到 ~/.zshrc? (Y/n)
+> y
+
+✅ wrapper 已装到 ~/.zshrc
+   运行 source ~/.zshrc 或重开 shell 激活 cc-linker-proxy
+
+完成: cc-linker img-proxy start --daemon
+```
+
+**日常**:
+
+```bash
+$ cc-switch use glm-5.2
+$ cc-linker-proxy "看这个图"
+# wrapper 自动找 glm-5.2 对应的 proxy URL,设置 ANTHROPIC_BASE_URL 后 exec claude
+
+$ cc-switch use kimi-for-coding
+$ cc-linker-proxy "看图"
+# 报错:"kimi-for-coding 没在 img-proxy 里,hint: cc-linker img-proxy install"
+# 这是预期行为 —— kimi 是 multimodal,image 走它没问题
+```
+
+**管理员不会 break**:`cc-linker-proxy` 只在 routes 里有 upstream 匹配时才替换 BASE_URL,否则 exit 1。手动 `claude "看图"` 完全不变。
+
+### 场景 B:自定义 alias 用户
+
+**前置**:`~/.claude/providers/byte-agent-glm.json` + `~/.zshrc`:
+
+```bash
+alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json'
+```
+
+```bash
+$ cc-linker img-proxy install --yes
+
+🔍 发现 1 个 provider(来自 manual + alias):
+  ❯ ◯ [alias]  byte-agent-glm   ✅ text-only        glm-5.2[1m]
+
+✅ 已装 1 个(smart 模式)
+# 注意:没问 wrapper(没 CC Switch)
+# 继续用 cc-byte-agent alias,无需 wrapper
+
+完成
+```
+
+**日常**(继续用 alias):
+
+```bash
+$ cc-byte-agent "看这个图"
+# alias 把 --settings 指向已改写 BASE_URL 的 byte-agent-glm.json
+# Claude Code 直连 http://127.0.0.1:8765/byte-agent-glm → proxy 剥图 → 转发
+```
+
+### 场景 C:混合用户
+
+**前置**:`~/.claude/providers/` 4 文件 + CC Switch 12 provider + 3 个 shell alias。
+
+```bash
+$ cc-linker img-proxy install --yes
+
+🔍 发现 16 个 candidate(去重后):
+  ❯ ◯ [manual]  byte-agent-glm  ✅ text-only        glm-5.2[1m]
+    ◯ [manual]  byte-glm        ✅ text-only        glm-5.2[1m]
+    ◯ [auto]    kimi-for-coding ⏭ multimodal-skip  kimi-for-coding[256k]
+    ◯ [auto]    qwen3.6-plus    ⏭ multimodal-skip  qwen3.6-plus[1m]
+    ... 
+
+# 同 alias 多源时:manual 赢(但只显示一个 entry)
+✅ 已装 6 个
+✅ wrapper 已装(CC Switch 检测到)
+```
+
+### 场景 D:cold-start 新用户
+
+**前置**:`~/.claude/providers/` 不存在 + CC Switch 未装。
+
+```bash
+$ cc-linker img-proxy install
+
+❌ 未找到任何可用的 provider 配置
+
+  已扫描的位置:
+    • ~/.claude/providers/ (manual - 不存在)
+    • ~/.cc-linker/auto-providers/ (auto - 不存在)
+    • ~/.cc-switch/cc-switch.db (未安装)
+
+  解决方案(任选其一):
+    1. 装 CC Switch (https://github.com/farion1231/cc-switch)
+       — GUI 管理 provider,装好后 Claude Code 自动可用,img-proxy 也会自动识别
+    2. 手动创建 provider 文件:
+       ~/.claude/providers/my-provider.json
+       (内容见下)
+
+错误 [E_IMG_PROXY_NO_PROVIDERS]
+```
+
+**手工 provider 文件模板**:
 
 ```json
 {
   "env": {
-    "ANTHROPIC_AUTH_TOKEN": "sk-...",
     "ANTHROPIC_BASE_URL": "https://your-provider.example/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "sk-...",
     "ANTHROPIC_MODEL": "your-model-name"
   }
 }
 ```
 
-格式参考已有 provider 文件(任何 Anthropic API 兼容的 endpoint 都可以)。`ANTHROPIC_BASE_URL` 是必需字段,其他 `ANTHROPIC_DEFAULT_*_MODEL` 可选。
+`ANTHROPIC_BASE_URL` 是必需字段,`ANTHROPIC_MODEL` 可选(只是展示用)。AUTH_TOKEN 看你上游要求。
+
+### 场景 E:官方 API 直连
+
+**前置**:`~/.claude/settings.json` 指 `https://api.anthropic.com`,无 CC Switch。
+
+同场景 D(没 manual 没 auto)报错。但如果你装了 CC Switch 选了任意 provider:
+
+```bash
+$ cc-linker-proxy "echo test"
+# settings.json 是 https://ark.cn-beijing.volces.com/api/plan(CC Switch 刚切了)
+# routes.json 里 ark 这个 alias 的 upstream 是 https://ark.cn-beijing.volces.com/api/plan
+# wrapper resolve 命中 → 走 proxy → OK
+```
+
+CC Switch 是 img-proxy 的**事实标准入口**。
 
 ---
 
-## 它做了什么 / 没做什么
+## `cc-linker setup` 一键向导
 
-| 行为 | |
-|------|---|
-| ✅ 把 `~/.claude/providers/*.json` 的 `ANTHROPIC_BASE_URL` 改成 `http://127.0.0.1:8765/<alias>` | |
-| ✅ Claude Code 发的请求里的 base64 image block 自动剥离,落盘到 `~/.cc-linker/img-proxy/cache/` | |
-| ✅ 替换成含本地路径的 text block,再转发给真实上游 | |
-| ✅ SSE 流式 / Authorization header / 其它 headers 透传 | |
-| ✅ `uninstall` 完全还原(保留你手动改过的 `BASE_URL`) | |
-| ❌ 让模型"看见"图片本身 | 模型需要**主动调图片识别 MCP** |
-| ❌ 压缩图片 / 改格式 / 上传云端 | 完全本地落盘 |
-| ❌ 处理 URL image(`{type:'image', source:{type:'url'}}`) | 只处理 base64 inline |
+`cc-linker setup` 会把注册表初始化 + Claude Code 权限 + 自动注册钩子 + 飞书 Bot + img-proxy 全部走一遍。**img-proxy 是默认最后一步**(`--skip-img-proxy` 可跳过)。
+
+### 默认步骤
+
+```
+1. 初始化会话注册表
+2. 选择 Claude Code 权限模式
+3. 安装 Claude Code 自动注册钩子
+4. 配置飞书 Bot(App ID + App Secret + 开机自启)— 除非 --skip-feishu
+5. 启用图片代理 (img-proxy)— 除非 --skip-img-proxy
+```
+
+### img-proxy 那一步具体干啥
+
+```bash
+$ cc-linker setup
+...
+── Step 5/5 ── 启用图片代理 (img-proxy)
+
+ℹ  img-proxy 让纯文本模型(glm-5.2/qwen/deepseek 等)也能在 Claude Code
+   里接收粘贴的图片...
+
+# (1) 探活(空 → 给出明确指引;有 → 列前 8 个)
+⚠️ 未扫描到任何 provider 配置
+   装 CC Switch 或手写 ~/.claude/providers/*.json 后再跑 setup
+# 或者:
+  检测到 N 个可用 provider(manual + cc-switch)
+    • glm-5.2      https://open.bigmodel.cn/api/anthropic
+    • kimi-for-coding https://api.moonshot.cn/anthropic
+    ...
+
+# (2) 询问是否启用
+? 是否启用图片代理(选要启用的 provider → 启动 daemon)? (Y/n)
+> y
+
+# (3) 调用 imgProxyInstall({})—— smart install 全自动:
+#     4 路发现 → 分类 → 预选 → interactive(setup 走的也是交互版,不是 --yes)
+? 选择要启用图片代理的 provider (空格勾选,回车确认):
+  ❯ ◯ [auto]  glm-5.2     ✅ text-only     glm-5.2[1m]
+    ◯ [auto]  kimi-for-coding ⏭ skip       kimi-for-coding[256k]
+    ...
+
+# (4) 装完:检测到 CC Switch 时问 wrapper
+? 检测到 CC Switch。是否装 wrapper(...)? (Y/n)
+> y
+
+# (5) 询问是否启动 daemon
+? 是否现在启动 img-proxy daemon? (Y/n)
+> y
+
+# (6) macOS 询问开机自启
+? 是否配置开机自启(launchd)? (Y/n)
+> y
+
+✅ img-proxy 已启动
+✅ img-proxy 开机自启已配置
+
+# Summary 里增加 wrapper 状态:
+  图片代理:           ✅ 已启用 (5 个 provider)
+  img-proxy 状态:     ✅ 运行中
+  开机自启:           ✅ launchd 已配置
+  img-proxy wrapper:  ✅ 已装 (用 cc-linker-proxy 替代 claude)
+```
+
+### 跳过指定步骤
+
+```bash
+cc-linker setup --skip-feishu --skip-img-proxy    # 只要本机
+cc-linker setup --skip-hook --skip-img-proxy     # 飞书 + 钩子
+```
+
+### setup 里 img-proxy 出错不会阻断
+
+```typescript
+try {
+  imgProxyResult = await runImgProxyWizard();
+} catch (err) {
+  console.log(chalk.yellow(`  ⚠️ img-proxy 配置失败: ${err}`));
+  console.log(chalk.gray('  提示: 可稍后手动执行 cc-linker img-proxy install/start'));
+}
+```
+
+失败给提示,继续跑完飞书 / Summary。
 
 ---
 
-## 完整命令列表
+## 命令参考
 
 ### 主命令
 
 | 命令 | 做什么 |
 |------|--------|
 | `cc-linker img-proxy install` | 交互式选 provider(smart 模式默认) |
-| `cc-linker img-proxy install --providers <aliases>` | dumb 模式 + 指定 provider(逗号分隔) |
-| `cc-linker img-proxy install --all` | dumb 模式 + 所有 |
-| `cc-linker img-proxy install --yes` | smart 模式 + 不交互(用默认预选) |
-| `cc-linker img-proxy install --mode <smart\|dumb>` | 显式指定模式 |
+| `cc-linker img-proxy install --yes` | smart + 不交互(用默认预选) |
+| `cc-linker img-proxy install --providers X,Y` | dumb + 指定 provider(逗号分隔) |
+| `cc-linker img-proxy install --all` | dumb + 所有(全装,不过滤) |
+| `cc-linker img-proxy install --mode smart` | 显式 smart |
+| `cc-linker img-proxy install --mode dumb` | 显式 dumb |
 | `cc-linker img-proxy uninstall` | 交互式卸 |
-| `cc-linker img-proxy uninstall --providers <aliases>` | 指定卸 |
-| `cc-linker img-proxy uninstall --all` | 卸所有 + 提示卸 wrapper(已装的话) |
-| `cc-linker img-proxy status` | 看 daemon / 已装 / 未装 / wrapper / launchd |
-| `cc-linker img-proxy start` / `start --daemon` | 前台 / 后台启动 |
+| `cc-linker img-proxy uninstall --providers X,Y` | 指定卸 |
+| `cc-linker img-proxy uninstall --all` | 卸所有(已装 wrapper 会问是否一并卸) |
+| `cc-linker img-proxy start` | 前台启动 |
+| `cc-linker img-proxy start --daemon` | 后台启动 |
 | `cc-linker img-proxy stop` | 停后台 daemon |
+| `cc-linker img-proxy status` | 看 daemon / 已装 / 未装 / wrapper / launchd |
 
-### Shell wrapper(CC Switch 用户)
+### 子命令
 
-| 命令 | 做什么 |
-|------|--------|
-| `cc-linker img-proxy wrapper install` | 装 `cc-linker-proxy()` 函数到 `~/.zshrc` / `~/.bashrc` |
-| `cc-linker img-proxy wrapper uninstall` | 从 rc 文件移除 wrapper |
-| `cc-linker img-proxy wrapper status` | 看 wrapper 是否已装 + rc 文件路径 |
-
-### 子命令(wrapper 调用用)
-
-| 命令 | 做什么 |
-|------|--------|
-| `cc-linker img-proxy current-url` | 读 `~/.claude/settings.json` 的 `env.ANTHROPIC_BASE_URL`(空 = 没装) |
-| `cc-linker img-proxy resolve <upstream>` | 按 upstream URL 查 proxy URL(空 = 没在 routes 里) |
-| `cc-linker img-proxy daemon install` / `uninstall` | macOS launchd 开机自启 |
-
-### 标志速查(`install`)
-
-| Flag | 含义 |
+| 命令 | 作用 |
 |------|------|
-| `-p, --providers <aliases>` | 逗号分隔,显式指定 + 强制 dumb 模式 |
-| `--all` | 全装 + 强制 dumb 模式 |
-| `--yes` | smart 模式不交互(默认预选) |
-| `--mode <smart\|dumb>` | 显式模式,Commander 会校验非法值 |
+| `cc-linker img-proxy wrapper install` | 装 shell wrapper 到 `~/.zshrc` / `~/.bashrc` |
+| `cc-linker img-proxy wrapper uninstall` | 移除 wrapper |
+| `cc-linker img-proxy wrapper status` | 看 wrapper 状态 + rc 文件路径 |
+| `cc-linker img-proxy current-url` | 读 `~/.claude/settings.json` 的 `env.ANTHROPIC_BASE_URL` |
+| `cc-linker img-proxy resolve <upstream>` | 按 upstream URL 查 proxy URL(空 = 没在 routes 里) |
+| `cc-linker img-proxy daemon install` | macOS launchd 开机自启 |
+| `cc-linker img-proxy daemon uninstall` | 卸载 launchd |
 
 ---
 
 ## 配置文件
 
-在 `~/.cc-linker/config.toml` 加 `[img_proxy]` section(全部可选,不写就用 defaults):
+`~/.cc-linker/config.toml` 的 `[img_proxy]` section(全部可选):
 
 ```toml
 [img_proxy]
-enabled = true                          # 总开关
-port = 8765                              # 监听端口
-hostname = "127.0.0.1"                  # 只绑 loopback,不暴露
-cache_max_age_hours = 168               # 缓存文件保留 7 天,启动 + 每小时清过期
-prompt_template = "..."                  # 给模型的文本,默认含 mcp__MiniMax__understand_image 提示
-smart_mode = true                        # v2: 自动跳过 multimodal 模型
-vision_model_patterns_extra = []        # 追加自定义 multimodal patterns
-text_only_model_patterns_extra = []     # 追加自定义 text-only patterns
-console_enabled = false                 # Phase 2 Web 控制台
+enabled = true                                  # 总开关(false 时 start 立刻退出)
+port = 8765                                     # 监听端口
+hostname = "127.0.0.1"                          # loopback,不暴露
+cache_max_age_hours = 168                       # 缓存保留 7 天,启动 + 每小时清过期
+prompt_template = "[用户粘贴的图片已保存到本地: {path}] ..."  # 给模型的文本
+console_enabled = false                          # Phase 2 Web 控制台(暂未启用)
+smart_mode = true                                # v2: 跳过 multimodal 模型
+vision_model_patterns_extra = []                 # 追加 multimodal patterns
+text_only_model_patterns_extra = []              # 追加 text-only patterns
 ```
 
-环境变量也能覆盖(注:`smart_mode` / `*_extra` 没有 env var,只在 config.toml):
+### 环境变量覆盖
 
-- `CC_LINKER_IMG_PROXY_ENABLED`
-- `CC_LINKER_IMG_PROXY_PORT`
-- `CC_LINKER_IMG_PROXY_HOSTNAME`
-- `CC_LINKER_IMG_PROXY_CACHE_HOURS`
-- `CC_LINKER_IMG_PROXY_PROMPT_TEMPLATE`
-
-### 自定义模型分类 patterns
-
-如果你的模型名不在内置列表里,可以追加 pattern(支持正则,大小写不敏感):
-
-```toml
-[img_proxy]
-smart_mode = true
-
-# 标记 multimodal(会被跳过)
-vision_model_patterns_extra = [
-  "my-custom-vl-*",
-]
-
-# 标记 text-only(会被 proxy)
-text_only_model_patterns_extra = [
-  "my-custom-text-*",
-]
-```
-
-详见 [智能模式 (smart_mode)](#智能模式-smart_mode)。
+| Env var | 覆盖 |
+|---------|------|
+| `CC_LINKER_IMG_PROXY_ENABLED` | `enabled` |
+| `CC_LINKER_IMG_PROXY_PORT` | `port` |
+| `CC_LINKER_IMG_PROXY_HOSTNAME` | `hostname` |
+| `CC_LINKER_IMG_PROXY_CACHE_HOURS` | `cache_max_age_hours` |
+| `CC_LINKER_IMG_PROXY_PROMPT_TEMPLATE` | `prompt_template` |
+| `CC_LINKER_IMG_PROXY_SMART_MODE` | `smart_mode` |
+| `CC_LINKER_IMG_PROXY_VISION_PATTERNS_EXTRA` | `vision_model_patterns_extra`(逗号分隔) |
+| `CC_LINKER_IMG_PROXY_TEXT_ONLY_PATTERNS_EXTRA` | `text_only_model_patterns_extra`(逗号分隔) |
 
 ### 自定义 prompt template
 
-**如果你用别的图片识别 MCP**(不是 `mcp__MiniMax__understand_image`),改 `prompt_template`:
+如果你用别的图片识别 MCP(非 `mcp__MiniMax__understand_image`),改 template:
 
 ```toml
 [img_proxy]
 prompt_template = "[用户粘贴的图片已保存到本地: {path}] 请用你的图片识别工具(image_source 传这个路径)来查看。"
 ```
 
-模板里必须含 `{path}` 占位符,代理会把图片路径填进去。如果模板不含 `{path}`,代理会**回退到默认文案**(避免空 text block 触发上游 4xx)。
-
----
-
-## Shell wrapper 模式(CC Switch 用户专用)
-
-> **适用人群**:你用 CC Switch 直接跑 `claude`(没有自定义 `cc-X` alias)。`~/.claude/settings.json` 是 CC Switch 写的,改 provider 文件没用。
-
-### 它怎么工作
-
-```
-用户跑:  cc-linker-proxy "看这个图"
-         ↓
-shell 函数 cc-linker-proxy() (在 ~/.zshrc)
-  1. 读 ~/.claude/settings.json 拿当前 upstream URL
-  2. 查 img-proxy routes 表,找到 proxy URL
-  3. ANTHROPIC_BASE_URL=<proxy> claude "看这个图"
-```
-
-### 3 步启用
-
-```bash
-# 1. 把要走 proxy 的 provider 都装上(从 CC Switch 同步出来)
-cc-linker img-proxy install --yes
-
-# 2. 装 wrapper 到 rc 文件
-cc-linker img-proxy wrapper install
-# 回答 y(默认)→ wrapper 装到 ~/.zshrc 或 ~/.bashrc
-
-# 3. 重载 shell
-source ~/.zshrc   # 或新开 terminal
-
-# 验证
-cc-linker-proxy "看这个图"   # 走 proxy
-claude "看这个图"             # 直连(行为不变,不受影响)
-```
-
-**`install --yes` 检测到 CC Switch 时会自动问你要不要装 wrapper**,直接回车确认即可,不用单独跑第 2 步。
-
-### Wrapper 关键行为
-
-- **递归防护**:`ANTHROPIC_BASE_URL` 已设时直接 exec claude,不调 resolve(避免无限循环和多余 sub-shell)
-- **幂等**:重复 `wrapper install` 不会重复写
-- **备份**:修改 rc 文件前先备份到 `~/.cc-linker/img-proxy/wrapper-backups/`
-- **支持 zsh + bash**(其他 shell 会提示不支持)
-- **检测当前 shell**:`ZSH_VERSION` → `.zshrc`,`BASH_VERSION` → `.bashrc`
-
-### 日常使用
-
-```bash
-# CC Switch 切到 glm-5.2
-cc-switch use glm-5.2
-
-# 跑 wrapper(走 proxy,图片被剥离)
-cc-linker-proxy "看这个图"
-
-# 直接跑 claude(直连,行为不变)
-claude "看这个图"
-
-# 切换 wrapper status
-cc-linker img-proxy wrapper status
-```
-
-### 卸载 wrapper
-
-```bash
-cc-linker img-proxy wrapper uninstall
-# 备份保留在 ~/.cc-linker/img-proxy/wrapper-backups/wrapper-backup-removed-<ts>-<uuid>
-
-# 或者连同所有 provider 一起清:
-cc-linker img-proxy uninstall --all
-# v2.7+: 会提示"也卸载 wrapper?"(默认 N,避免误删)
-```
-
----
-
-## 常见问题
-
-### Q: `glm-5.2` 用着用着突然不行了?
-
-大概率是 token 过期了。看 `~/.cc-linker/img-proxy/img-proxy.log` 末尾的上游状态码,4xx/401 就是上游鉴权失败。**重装会让 token 保留**(不覆盖 `.bak`),直接:
-
-```bash
-cc-linker img-proxy uninstall --providers glm-5.2 && cc-linker img-proxy install --providers glm-5.2
-```
-
-### Q: 我改了 config 里的 port,需要重装吗?
-
-不需要 `uninstall`。直接 `cc-linker img-proxy install --providers <alias>` 即可,代理会自动:
-
-- 更新 `BASE_URL` 到新端口
-- 保留 `.bak` 原上游(token 也不动)
-- `routes.json` 里的 upstream 仍是真上游,不会变成 self-loop(URL 规范化在 resolve 时自动剥 trailing slash + lowercase host)
-
-### Q: 我手动改了某个 provider 的 `BASE_URL`(迁移到别的服务器),卸的时候会丢吗?
-
-**不会**。`uninstall` 只在我们确实写进去过的代理 URL 才还原;你手动改的 `BASE_URL` 保留原样。routes 和 `.bak` 还是会清。
-
-### Q: 启动两次会冲突吗?
-
-第二次会优雅退出 `⚠️ 代理已在运行 (PID: ...)`。如果之前崩溃留下 stale PID 文件,会自动检测 + 清理(还加了 `isPidAlive()` check,防 EADDRINUSE 后假报成功)。
-
-### Q: smart 模式下 multimodal 模型去哪了?
-
-被自动跳过(显示 `⏭ multimodal-skip`)。它们不会进 routes.json,所以你直接用 Claude/Kimi 时仍走真上游,图片能力不受影响。想装某个 multimodal:用 `--providers <alias> --mode dumb`。
-
-### Q: 哪些 provider 可以用?
-
-**只要 `ANTHROPIC_BASE_URL` 不为空就行**(见 `cc-linker img-proxy status` 的 "未纳入代理的 provider" 列表)。这个列表里的都可用。
-
-### Q: 哪些 provider **不**能用?
-
-- 真实 upstream URL 不带 path 的(Claude Code 保留 path 段才能正确路由,我们实测 ARK `/api/plan` 工作)
-- HTTPS-only 上游不影响(proxy 用 http,只听 loopback)
-- 模型本身不识别 image 的——没图片识别 MCP 就只是把图片存了,模型看不到
-
-### Q: 我装了 CC Switch 后跑 smart install,看不到我新加的 provider?
-
-下次跑 `cc-linker img-proxy install` 时自动重新同步 + 清理 stale。**不需要手动触发**。
-
-### Q: 为什么 `cc-linker-proxy` 报"X 没在 img-proxy 里"?
-
-意味着当前 CC Switch 激活的 provider(`~/.claude/settings.json` 里的 `ANTHROPIC_BASE_URL`)没被你 install 到 img-proxy 里。**重新跑 `install`** 把它装上即可。
+模板**必须含 `{path}` 占位符**——代理会替换成实际的图片缓存路径。不含 `{path}` 时,代理**回退到默认文案**(避免空 text block 触发上游 4xx)。
 
 ---
 
 ## 故障排除
 
-**装完不工作** — 按顺序检查:
+### 装完不工作
 
-1. `cc-linker img-proxy status` 看 daemon 是否在跑、port 是否对
-2. `tail -20 ~/.cc-linker/img-proxy/img-proxy.log` 看请求日志(`stripped`、`upstream_status`、`duration_ms`)
-3. `curl http://127.0.0.1:8765/<alias>/v1/models` 看代理是否能 reach upstream(200 = OK)
-
-**"已在运行" 但端口没监听** — PID 文件 stale(进程死了 PID 文件还在):
+按顺序检查:
 
 ```bash
-# 看实际进程
-lsof -nP -iTCP:8765
-
-# 清 stale,重启(自动检测)
-cc-linker img-proxy stop
-cc-linker img-proxy start --daemon
+cc-linker img-proxy status              # daemon / port / routes / wrapper 状态
+tail -30 ~/.cc-linker/img-proxy/img-proxy.log
+curl http://127.0.0.1:8765/<alias>/v1/models  # 401 = OK(代理转发,鉴权失败符合预期)
 ```
 
-**Claude Code 提示图片发不出去 / 4xx** — 看 `img-proxy.log` 的 `upstream_status`:
+### 状态码速查
 
-| 状态码 | 含义 | 怎么办 |
-|--------|------|--------|
-| 401 / 403 | 上游鉴权失败 | 重装 + token 刷新 |
-| 404 | upstream URL 错(路径被裁剪) | 验证你的 `ANTHROPIC_BASE_URL` 完整保留 |
-| 502 + `unknown alias` | 路由表没这个 provider | `cc-linker img-proxy install --providers <alias>` |
+| upstream_status | 含义 | 怎么办 |
+|----|------|-------|
+| 401 / 403 | 上游鉴权失败 | token 过期。重装:`cc-linker img-proxy install --providers <alias>`(保留 `.bak`,token 不丢) |
+| 404 | upstream URL 错(路径被裁) | 检查 routes.json 里 alias 的 upstream 字段是否完整 |
+| 502 + "未知 provider alias" | 路由表没这个 provider | `cc-linker img-proxy install --providers <alias>` |
+| 502 + "上游不可达" | upstream 本身挂了 | 检查网络,curl 测一下 |
 
-**模型说"我看不到图片"** — 不是 proxy 的问题,是模型没调图片识别 MCP:
+### "已在运行" 但端口没监听
 
-- 确认你的 MCP 配置里启用了图片识别工具(`claude --mcp-config …` 或 `.mcp.json`)
-- 看模型 response 里有没有 "I'll call the image recognition tool" 类似措辞
-- 如果没有,把 `prompt_template` 改成更适合你模型的措辞
+```bash
+lsof -nP -iTCP:8765                 # 看实际监听者
+ps -p $(cat ~/.cc-linker/img-proxy/img-proxy.pid 2>/dev/null)  # 看 PID 是否活
+cc-linker img-proxy stop && cc-linker img-proxy start --daemon
+```
 
-**`cc-linker-proxy` 报 "找不到当前 provider URL"** — `~/.claude/settings.json` 没 `env.ANTHROPIC_BASE_URL` 字段:
+启动逻辑含 stale PID 检查 + `isPidAlive()`,正常不会出现这种情况。但 `kill -9` 后留下 stale 会被自动清理。
 
-- CC Switch 用户:在 CC Switch GUI 里选个 provider 激活
-- 其他用户:在 `settings.json` 加 `env.ANTHROPIC_BASE_URL`
+### 模型说"我看不到图片"
 
-**日志里看到大量 `cleanup removed N cached images`** — 正常,每小时定时清过期图片
+不是 proxy 的问题——是模型没调图片识别 MCP:
+
+- 确认你的 `.mcp.json` 或 `claude --mcp-config` 启用了图片识别
+- 看模型 response 有没有"I'll call the image recognition tool"措辞
+- 没的话:调整 `prompt_template` 让它更适合你的模型措辞
+
+### `cc-linker-proxy` 报 "找不到当前 provider URL"
+
+`~/.claude/settings.json` 没 `env.ANTHROPIC_BASE_URL` 字段:
+
+- CC Switch 用户:在 CC Switch GUI 里选个 provider 激活(会自动写 settings.json)
+- 其他用户:手动加 `"env": { "ANTHROPIC_BASE_URL": "..." }`
+
+### `cc-linker-proxy` 报 "X 没在 img-proxy 里"
+
+当前 CC Switch 激活的 provider 没被你 install 到 img-proxy 里:
+
+- `cc-linker img-proxy install --providers <alias>` 装上
+- 或 `install --yes` 让 smart mode 自动挑(但要 multimodal 才会被忽略)
+
+### 大量 `cleanup removed N cached images` 日志
+
+正常——每小时清过期图片的 INFO 日志。
 
 ---
 
 ## 卸载
 
-完整清理(回到原始状态):
-
 ```bash
-# 1. 卸每个 provider(已装 wrapper 的话会提示一并卸,默认 N)
+# 1. 卸所有已 install 的 provider (--all 时已装 wrapper 会问是否一并卸,默认 N)
 cc-linker img-proxy uninstall --all
 
 # 2. 卸 wrapper(如果上面没卸)
@@ -438,142 +786,119 @@ cc-linker img-proxy stop
 # 4. (如果装了 launchd)卸开机自启
 cc-linker img-proxy daemon uninstall
 
-# 5. 删缓存(可选)
+# 5. 清缓存(可选,7 天后会自己清)
 rm -rf ~/.cc-linker/img-proxy/cache
 ```
 
-`uninstall` 会把 provider 文件的 `BASE_URL` 还原(如果是我们装上去的),`routes.json` 清空,`.bak` 删除。**注意**:`uninstall` 会清掉 `.bak`,token 不会丢但需要手动管理(默认 `uninstall --all` 后下次 install 会重新生成 `.bak`)。
+`uninstall` 会:
+- 把 provider 文件的 `ANTHROPIC_BASE_URL` 还原(严格说:任何历史 port 的 proxy URL 都还原,从 `.bak` 读)
+- 清 `routes.json` 里的 entry
+- 删 `.bak`(防止过期备份累积)
+
+**手动改过 `BASE_URL` 不会被覆盖**(只对历史 proxy URL 做还原)。
 
 ---
 
-## 升级 / 迁移 (v2 智能安装)
+## 升级 / 迁移
 
-从 v1 dumb install 升级到 v2 smart install:
+### 从 v1(dumb install)升 v2(smart install)
 
-### 轻量迁移
+**轻量迁移**(已装 multimodal 不会被自动卸):
 
 ```bash
 cc-linker img-proxy install --yes
+# smart 模式会跳过 multimodal,可能装 wrapper,加新路由
+# 已装的不会被动
 ```
 
-smart 模式会跳过 multimodal、检测到 CC Switch 时会问要不要装 wrapper。**已装的 multimodal 不会被自动卸载**(smart 模式只加新路由,不删旧路由)。
-
-### 严格迁移(推荐)
+**严格迁移**(完全重置后重做):
 
 ```bash
-cc-linker img-proxy uninstall --all   # 还原所有 + 清 routes + 提示卸 wrapper
-cc-linker img-proxy install --yes     # smart 模式重新挑选
+cc-linker img-proxy uninstall --all      # 还原所有 + 清 routes + 问卸 wrapper
+cc-linker img-proxy install              # smart 模式重新挑选
 ```
 
-### 回滚
-
-如果新行为有问题:
+**回滚**(如果新行为不适合你):
 
 ```bash
 cc-linker img-proxy uninstall --all
-cc-linker img-proxy install --all      # dumb 模式(旧行为,装全部)
+cc-linker img-proxy install --all        # dumb 模式:所有都装(旧行为)
 ```
+
+### 改了 config 里的 port
+
+不需要 `uninstall`。直接 `install --providers <alias>` 即可:
+
+- BASE_URL 更新到新端口
+- `.bak` 原 upstream 保留
+- `routes.json` 的 upstream 仍是真上游(URL 规范化在 resolve 时生效)
+
+### 手动改了 `BASE_URL`(迁移到别的服务器)
+
+`uninstall` **不会丢**——你手动改的不包含 `/<alias>` 段(我们的 proxy URL pattern),`isAnyProxyUrl()` 检测 false,不还原。routes 和 `.bak` 仍按正常流程清。
 
 ---
 
-## 智能模式 (smart_mode)
+## 已知限制 / 容易踩的坑
 
-v2 默认 smart 模式:`install` 自动分类模型,跳过 multimodal(避免破坏图片能力)。
+### ⚠️ Gotcha: shell alias vs provider 文件名
 
-### 内置分类规则(23+ multimodal / 17 text-only)
-
-| 厂商 | Multimodal(跳过) | Text-only(装) |
-|------|---------|--------|
-| Anthropic | claude-3/opus/sonnet/haiku | (都 multimodal) |
-| OpenAI | gpt-4 | gpt-3, gpt-3.5 |
-| Google | gemini-1.5-pro, gemini-*-vision | |
-| 阿里 Qwen | qwen-vl/qwen-omni/qwen3.X-plus | qwen-turbo/max/long/coder/qwen3.X-max |
-| 智谱 GLM | glm-*-v(4v, 4.5v, 5v) | glm-4.5/4.6/5/5.1/5.2/4-air/4-turbo |
-| 月之暗 Kimi | 全部 multimodal | (都 multimodal) |
-| 小米 MiMo | mimo-v2.5(base) | mimo-v2.5-pro / mimo-*-pro |
-| MiniMax | MiniMax-M3 | MiniMax-M2 / MiniMax-Text- |
-| DeepSeek | (都 text-only) | 全部 |
-
-完整 patterns 见 `src/img-proxy/classify.ts`。
-
-### 配置自定义 patterns
-
-```toml
-[img_proxy]
-smart_mode = true
-
-# 额外标 multimodal(也会被跳过)
-vision_model_patterns_extra = [
-  "my-custom-vl-*",
-]
-
-# 额外标 text-only(也会被 proxy)
-text_only_model_patterns_extra = [
-  "my-custom-text-*",
-]
-```
-
-Pattern 是正则,大小写不敏感。后缀(如 `[1m]`, `[256k]`)会被自动剥离再匹配。
-
-### 关闭 smart(全装)
-
-```toml
-[img_proxy]
-smart_mode = false
-```
-
-或 CLI:`cc-linker img-proxy install --all`(dumb 模式,不过滤)。
-
-或单次用 `--mode dumb` 显式覆盖:
+如果你有多个文件名相近的 provider,**shell alias 用的是哪个文件决定图片会不会被剥离**:
 
 ```bash
-cc-linker img-proxy install --mode dumb
+# ~/.zshrc:
+alias cc-byte-glm='claude --settings ~/.claude/providers/byte-glm.json'      # ← 没装(只装了 byte-agent-glm)
+alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json'  # ← 装了
 ```
 
----
+跑 `cc-byte-glm "看图"` 还是直连原 upstream,proxy 完全没被 hit。看 `~/.cc-linker/img-proxy/img-proxy.log` 会发现**没有该 alias 的请求记录**。
 
-## 限制 / 已知问题
-
-### ⚠️ Gotcha: `cc-byte-glm` ≠ `cc-byte-agent-glm`(name collision 陷阱)
-
-如果你的 `~/.claude/providers/` 里有多个文件名相近的 provider,shell alias 用的是哪个文件决定了图片会不会被剥离。常见陷阱:
+**修复**:
 
 ```bash
-# ~/.zshrc 里:
-alias cc-byte-glm='claude --settings ~/.claude/providers/byte-glm.json'        # ← 没装!
-alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json' # ← 装了
-```
-
-你可能以为 `cc-byte-glm` 走的是 byte-agent 那个 provider,其实它们是**两个独立的 provider 文件**。即使你 install 了 `byte-agent-glm.json`,`cc-byte-glm` 仍然加载没装的 `byte-glm.json`,图片直接发到原 upstream。
-
-**症状**:粘贴图片 → `API Error: 400 Model only support text input`。看 `~/.cc-linker/img-proxy/img-proxy.log` 发现**没有任何该 alias 的请求记录**——proxy 完全没被 hit。
-
-**修复**(`cc-linker img-proxy` 工具已帮你装这个):
-
-```bash
-# 把所有相近名字的都装上,或直接装全部:
 cc-linker img-proxy install --providers byte-glm,byte-agent-glm
+# 或直接:
 cc-linker img-proxy install --all
 ```
 
-**预防**:安装前先看 `cc-linker img-proxy status` 的 "未纳入代理的 provider" 列表,确保你日常用的每个 shell alias 对应的 provider 文件都在装过的列表里。
+**预防**:安装前先 `cc-linker img-proxy status` 看"未纳入代理的 provider"列表。
 
 ### 其他限制
 
-1. **URL 形式的 image block 不处理**(`source.type === 'url'`)。Claude Code 通常把 URL 转 base64,如果是纯 URL,代理会原样转发,模型能不能 fetch 看上游能力。
-2. **清理 cache 是定时的**(启动 + 每小时),不会"立刻清"。如果磁盘敏感,手动 `rm` 即可。
-3. **`mcp__MiniMax__understand_image` 是硬编码到默认 prompt template**——如果你用别的 MCP,改 `prompt_template`。
-4. **fish / sh / ksh 等其他 shell 不支持 wrapper**。Fish 用 `alias cc-X cmd`(无等号),语法不同,未实现。
-5. **login shells**(ssh 登录、macOS 开机)不 source `.zshrc`,wrapper 不会被加载——只对交互式终端有效。
-6. **Phase 2 控制台**(Web 监控)还没做,要看实时计数只能 `grep stripped ~/.cc-linker/img-proxy/img-proxy.log`。
+1. **URL 形式 image block** (`source.type === 'url'`)不处理。Claude Code 通常把 URL 转 base64,但如果是纯 URL,代理原样转发,模型能不能 fetch 看上游。
+2. **清理是定时**的(启动 + 每小时),不会立刻清。磁盘敏感手动 `rm`。
+3. **`mcp__MiniMax__understand_image` 是默认模板硬编码的**——用别的 MCP 必须改 `prompt_template`。
+4. **fish / sh / ksh 不支持 wrapper**。Fish 用 `alias cc-X cmd`(无等号)语法不同,未实现。可手写函数。
+5. **login shells**(ssh 登录、macOS 开机)不 source `.zshrc`,wrapper 不会自动加载——只对交互式终端有效。
+6. **Phase 2 Web 控制台**(`/` + `/admin/api/*`)未实现,要看请求计数只能 `grep stripped ~/.cc-linker/img-proxy/img-proxy.log`。
+7. **不在 PATH 时** wrapper 调用会报 "command not found"——确保 `cc-linker` binary 已装到 `/usr/local/bin` 或类似位置。
+
+### 容易踩的坑
+
+1. **第一次安装前先 `status`** 看看哪些 provider 是"未纳入代理",这就是你能启用的范围。
+2. **`enabled = false` 跟 daemon `start --daemon` 混用**——enabled=false 时 daemon 启了会立刻退出。
+3. **改 `config.toml` 后 daemon 不自动 reload**——需要 `stop && start --daemon`。
+4. **cache 文件 mode 0o600**,有敏感截图别 chmod 放开。
+5. **`cc-linker-proxy` 必须从装了 wrapper 的 shell 跑**(`source ~/.zshrc` 后)。IDE 集成终端有时不 source,需要重启 IDE 或手动 source。
+6. **同一个 provider 别手动 `~/.claude/providers/` + CC Switch 同时管**——manual 优先,auto 的写入会被覆盖,容易分散。
 
 ---
 
-## 容易踩的坑
+## 相关源码
 
-1. **第一次安装前先 `cc-linker img-proxy status`** — 看看哪些 provider 是"未纳入代理",这就是你能启用的范围。
-2. **不要把 `img_proxy.enabled = false` 跟 daemon `start --daemon` 混用** — enabled 是总开关,daemon 启了但 enabled=false 会立刻退出。
-3. **改 `config.toml` 的 `[img_proxy]` section 后,daemon 不会自动 reload** — 需要 `cc-linker img-proxy stop && cc-linker img-proxy start --daemon`。
-4. **cache 文件 mode 0o600**(owner-only),有敏感截图的话别 chmod 放开。
-5. **`cc-linker-proxy` 必须从装了 wrapper 的 shell 跑**(`source ~/.zshrc` 后)。在 IDE 集成终端里需要重启 IDE 或手动 source。
-6. **别把同一个 provider 文件名既给手动 `~/.claude/providers/`,又给 CC Switch 同步的 `auto-providers/`** — manual 优先,auto 会被覆盖,但同时两份会让修改分散难追溯。
+| 文件 | 用途 |
+|------|------|
+| `src/img-proxy/server.ts` | Bun.serve 反向代理主体 |
+| `src/img-proxy/routes.ts` | 路由表读写 + 加锁 + 双向解析 |
+| `src/img-proxy/provider-scan.ts` | 扫描 + CC Switch 同步 |
+| `src/img-proxy/provider-config.ts` | install/uninstall 3 态机 |
+| `src/img-proxy/transform.ts` | 剥 image block + 落盘 |
+| `src/img-proxy/classify.ts` | 模型分类(builtin + extras) |
+| `src/img-proxy/aliases.ts` | shell alias 扫描 |
+| `src/img-proxy/discover.ts` | 4 路合并 + dedup + baseUrl 过滤 |
+| `src/img-proxy/wrapper.ts` | shell wrapper 函数生成 + marker 检测 |
+| `src/img-proxy/resolve.ts` | 读 settings.json(给 wrapper 调用) |
+| `src/cli/commands/img-proxy.ts` | 所有 `cc-linker img-proxy <cmd>` 实现 |
+| `src/cli/commands/setup.ts` | `cc-linker setup` 一键向导(集成 img-proxy) |
+| `src/utils/paths.ts` | 所有路径常量 |
+| `src/utils/config.ts` | `[img_proxy]` 默认值 + env 覆盖 |
