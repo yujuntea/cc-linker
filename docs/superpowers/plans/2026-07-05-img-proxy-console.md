@@ -412,6 +412,7 @@ git commit -m "feat(img-proxy-console): config.reload() hot-reloads img_proxy se
 
 **Files:**
 - Modify: `src/img-proxy/routes.ts:67-94` (`addRoute` 保留 disabled), `:83-94` (`removeRoute` 不变), `:97-99` (`getUpstreamByAlias` 读 disabled)
+- Modify: `src/img-proxy/types.ts` — `RouteEntry` 加 `disabled?: boolean`(spec §7.4 JSON shape 必填)
 - Create: `src/img-proxy/routes.ts:setRouteDisabled()` 新函数（line 95 后）
 - Test: `tests/unit/img-proxy/routes-disable.test.ts`
 
