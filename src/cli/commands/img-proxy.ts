@@ -131,6 +131,10 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
       promptTemplate: config.get<string>('img_proxy.prompt_template', DEFAULT_PROMPT_TEMPLATE),
       consoleEnabled: config.get<boolean>('img_proxy.console_enabled', false),
       cacheMaxAgeHours: config.get<number>('img_proxy.cache_max_age_hours', 168),
+      // v2 stream-level instrumentation:
+      logPath: IMG_PROXY_LOG_FILE,
+      upstreamTimeoutMs: config.get<number>('img_proxy.upstream_timeout_ms', 0),
+      streamIdleTimeoutMs: config.get<number>('img_proxy.stream_idle_timeout_ms', 0),
     });
   } catch (err) {
     console.error(chalk.red(`❌ 启动失败: ${err}`));

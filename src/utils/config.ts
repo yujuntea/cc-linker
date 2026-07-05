@@ -91,6 +91,10 @@ interface ConfigData {
     smart_mode: boolean;
     vision_model_patterns_extra: string[];
     text_only_model_patterns_extra: string[];
+    // v2 stream-level instrumentation: 上游大模型长响应(30~88s)+ 中途断连可观测
+    // 0 = 禁用(默认)。非 0 = 启用对应超时,保护 proxy 不被挂起/卡死的上游拖死
+    upstream_timeout_ms: number;     // upstream fetch 整体超时;触发后 502 给 client
+    stream_idle_timeout_ms: number;  // 距最后 chunk 超过 N ms 判 stalled,主动 cancel upstream
   };
   agent_view: AgentViewConfig;
 }
@@ -199,6 +203,9 @@ const DEFAULTS: ConfigData = {
     smart_mode: true,
     vision_model_patterns_extra: [],
     text_only_model_patterns_extra: [],
+    // v2 stream-level instrumentation: 默认全关,不改变现有用户行为
+    upstream_timeout_ms: 0,
+    stream_idle_timeout_ms: 0,
   },
   agent_view: {
     enabled: true,
@@ -323,6 +330,9 @@ export class ConfigManager {
       ['CC_LINKER_IMG_PROXY_CACHE_HOURS', 'img_proxy', 'cache_max_age_hours'],
       ['CC_LINKER_IMG_PROXY_PROMPT_TEMPLATE', 'img_proxy', 'prompt_template'],
       ['CC_LINKER_IMG_PROXY_SMART_MODE', 'img_proxy', 'smart_mode'],
+      // v2 stream-level instrumentation:
+      ['CC_LINKER_IMG_PROXY_UPSTREAM_TIMEOUT_MS', 'img_proxy', 'upstream_timeout_ms'],
+      ['CC_LINKER_IMG_PROXY_STREAM_IDLE_TIMEOUT_MS', 'img_proxy', 'stream_idle_timeout_ms'],
     ];
 
     // Parse array env vars for Claude tools
