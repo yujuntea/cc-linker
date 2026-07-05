@@ -870,8 +870,43 @@ cc-linker img-proxy install --all
 3. **`mcp__MiniMax__understand_image` 是默认模板硬编码的**——用别的 MCP 必须改 `prompt_template`。
 4. **fish / sh / ksh 不支持 wrapper**。Fish 用 `alias cc-X cmd`(无等号)语法不同,未实现。可手写函数。
 5. **login shells**(ssh 登录、macOS 开机)不 source `.zshrc`,wrapper 不会自动加载——只对交互式终端有效。
-6. **Phase 2 Web 控制台**(`/` + `/admin/api/*`)未实现,要看请求计数只能 `grep stripped ~/.cc-linker/img-proxy/img-proxy.log`。
-7. **不在 PATH 时** wrapper 调用会报 "command not found"——确保 `cc-linker` binary 已装到 `/usr/local/bin` 或类似位置。
+6. **不在 PATH 时** wrapper 调用会报 "command not found"——确保 `cc-linker` binary 已装到 `/usr/local/bin` 或类似位置。
+
+### Phase 2 Web Console（已实现）
+
+开启 `console_enabled = true` 后,访问 `http://127.0.0.1:8765/` 即可使用。
+
+#### 启用步骤
+
+```toml
+# ~/.cc-linker/config.toml
+[img_proxy]
+console_enabled = true
+```
+
+无需重启 daemon —— 下次请求自动生效。
+
+#### 5 个 Tab
+
+| Tab | 功能 |
+|---|---|
+| **Dashboard** | 实时 totalRequests / strippedImages / uptime / cache 文件数+大小；5min 状态分布；per-alias 聚合（requests / stripped / chunks / bytes / avgDuration / lastAt） |
+| **Log** | 最近 200 条请求表格，可按 alias / status / streamStatus / 时间过滤；可手动刷新或选 "Last 1h" |
+| **Config** | 修改 console_enabled / upstream_timeout_ms / stream_idle_timeout_ms，保存后热 reload |
+| **Routes** | 当前 routes 列表，每行 Enable/Disable 按钮 |
+| **Cache** | cache 概览 + "立即清理" 按钮 |
+
+#### 安全
+
+- 仅监听 127.0.0.1（需改 hostname 才能远程访问,本版本不支持）
+- 写操作前端 confirm() 二次确认
+- 所有写操作 audit log 到 `~/.cc-linker/img-proxy/img-proxy.log`，包含 `console_action` / `trigger: console` / 旧值新值
+
+#### 已知限制
+
+- 2s polling（不支持 SSE / WebSocket 推送）
+- Dark mode 暂未提供
+- Mobile responsive 暂未优化
 
 ### 容易踩的坑
 
