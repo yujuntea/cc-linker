@@ -7,6 +7,7 @@ import {
   isWrapperInstalled,
   installWrapper,
   uninstallWrapper,
+  detectShell,
   WRAPPER_START_MARKER,
   WRAPPER_END_MARKER,
 } from '../../../src/img-proxy/wrapper';
@@ -139,5 +140,63 @@ describe('uninstallWrapper', () => {
     expect(content).not.toContain(WRAPPER_START_MARKER);
     expect(content).not.toContain(WRAPPER_END_MARKER);
     expect(content).toContain('alias end="ls"');
+  });
+});
+
+describe('detectShell', () => {
+  test('ZSH_VERSION 优先(快速路径)', () => {
+    process.env.ZSH_VERSION = '5.9';
+    expect(detectShell()).toBe('zsh');
+    delete process.env.ZSH_VERSION;
+  });
+
+  test('BASH_VERSION 优先(快速路径)', () => {
+    process.env.BASH_VERSION = '5.2.0';
+    expect(detectShell()).toBe('bash');
+    delete process.env.BASH_VERSION;
+  });
+
+  test('两个都设了 → 优先 ZSH', () => {
+    process.env.ZSH_VERSION = '5.9';
+    process.env.BASH_VERSION = '5.2.0';
+    expect(detectShell()).toBe('zsh');
+    delete process.env.ZSH_VERSION;
+    delete process.env.BASH_VERSION;
+  });
+
+  test('Fallback 到 $SHELL 路径(/bin/zsh)', () => {
+    // 模拟 zsh 没导出 ZSH_VERSION 的情况(常见!)
+    delete process.env.ZSH_VERSION;
+    delete process.env.BASH_VERSION;
+    process.env.SHELL = '/bin/zsh';
+    expect(detectShell()).toBe('zsh');
+  });
+
+  test('Fallback 到 $SHELL 路径(/bin/bash)', () => {
+    delete process.env.ZSH_VERSION;
+    delete process.env.BASH_VERSION;
+    process.env.SHELL = '/bin/bash';
+    expect(detectShell()).toBe('bash');
+  });
+
+  test('Fallback 到 $SHELL 路径(/usr/local/bin/zsh)', () => {
+    delete process.env.ZSH_VERSION;
+    delete process.env.BASH_VERSION;
+    process.env.SHELL = '/usr/local/bin/zsh';
+    expect(detectShell()).toBe('zsh');
+  });
+
+  test('都不设 → 返回 null', () => {
+    delete process.env.ZSH_VERSION;
+    delete process.env.BASH_VERSION;
+    delete process.env.SHELL;
+    expect(detectShell()).toBeNull();
+  });
+
+  test('$SHELL=/bin/fish → 返回 null(fish 不支持)', () => {
+    delete process.env.ZSH_VERSION;
+    delete process.env.BASH_VERSION;
+    process.env.SHELL = '/bin/fish';
+    expect(detectShell()).toBeNull();
   });
 });

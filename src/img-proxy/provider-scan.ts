@@ -75,13 +75,21 @@ export function syncCcSwitchToAutoProviders(
   autoProvidersDir: string = AUTO_PROVIDERS_DIR,
 ): void {
   // mtime check:DB 没更新就跳过
+  // ⚠️ 用 auto-providers 下"最新文件"的 mtime 比较,不要用目录 mtime!
+  // 目录 mtime 会在文件被删除时跳到 NOW → 错误地认为刚同步过 → 跳过 sync
+  // 用户在 CC Switch 删 provider 后 → 我们的 I-4 cleanup 也删文件 → 目录 mtime 错位
+  // → 下次 install 看 auto-providers 是空的(没 sync)
   try {
     const dbStat = statSync(ccSwitchDbPath);
     if (existsSync(autoProvidersDir)) {
       try {
-        const dirStat = statSync(autoProvidersDir);
-        if (dirStat.mtimeMs >= dbStat.mtimeMs) return;
-      } catch { /* dirStat 失败 → 重写 */ }
+        let latestFileMtime = 0;
+        for (const file of readdirSync(autoProvidersDir)) {
+          const s = statSync(join(autoProvidersDir, file));
+          if (s.mtimeMs > latestFileMtime) latestFileMtime = s.mtimeMs;
+        }
+        if (latestFileMtime >= dbStat.mtimeMs) return;
+      } catch { /* stat 失败 → 重写 */ }
     }
   } catch { /* dbStat 失败 → 跳过整个同步 */ return; }
 

@@ -106,10 +106,18 @@ export function uninstallWrapper(
   return { removed: true, rcFile, backupPath };
 }
 
-/** 检测用户当前 shell(zsh/bash)。返回 null 表示不支持。 */
+/**
+ * 检测用户当前 shell(zsh/bash)。返回 null 表示不支持。
+ *
+ * 优先检查 shell 内部的版本 env var(zsh 是 ZSH_VERSION,bash 是 BASH_VERSION),
+ * 但这两个变量默认不导出到子进程,所以 fallback 到 $SHELL 路径(/bin/zsh, /bin/bash 等)。
+ */
 export function detectShell(): 'zsh' | 'bash' | null {
   if (process.env.ZSH_VERSION) return 'zsh';
   if (process.env.BASH_VERSION) return 'bash';
+  const sh = process.env.SHELL ?? '';
+  if (sh.endsWith('/zsh')) return 'zsh';
+  if (sh.endsWith('/bash')) return 'bash';
   return null;
 }
 
