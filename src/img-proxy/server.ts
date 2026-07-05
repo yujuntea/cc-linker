@@ -8,8 +8,10 @@
 //   - 未知 alias → 502;上游不可达 → 502
 //   - 响应 body 流式透传(SSE 等)
 //   - 启动时清一次过期缓存 + 每小时清理
-//   - 控制台路由(/)前置(Phase 1 consoleEnabled=false 不触发)
-//   - 返回 ProxyServer { port, hostname, stop, stats };stats 内存计数,Phase 2 控制台读
+//   - 控制台路由(/ 和 /admin/*)总是 mount;console_enabled gate 由 handler 内部读 config
+//     (spec §7.3 "方案 A",让 console_enabled 热开关不需要重启 daemon)
+//   - 返回 ProxyServer { port, hostname, stop, stats };stats 含 byStatus / byAlias / recent
+//     / startedAt,Phase 2 控制台读
 //
 // v2 stream-level instrumentation:
 //   - TransformStream 包 upstreamResp.body → 统计 chunk/byte
@@ -20,12 +22,18 @@
 //     / headers_to_first_chunk_ms
 //   - req.signal 转发给 upstream fetch(client 断开 → cancel upstream,不浪费 token)
 //   - upstreamResp.body === null 防护(204/205/304 响应)
+//
+// Task 8: 3-branch stats 写入 — catch / no_body / piping.finally 各 ++ 一次,
+//   totalRequests = 真实总请求数(成功 + 失败 + no_body)且各分支只写一次 stats。
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { getUpstreamByAlias } from './routes';
 import { stripImagesToPaths } from './transform';
-import { IMG_PROXY_LOG_FILE } from '../utils/paths';
+import { handleConsoleRequest } from './console/api';
+import { updateByAlias, pushRecent } from './console/stats-helpers';
+import type { AliasStats, RecentEntry } from './console/types';
+import { CONFIG_PATH, IMG_PROXY_LOG_FILE, expandPath } from '../utils/paths';
 
 export interface ProxyServerOptions {
   port: number;
@@ -43,13 +51,23 @@ export interface ProxyServerOptions {
   // v2: 距最后 chunk 超过 N ms 判 stalled 并主动 cancel upstream(0 = 不检测)
   // 区分"upstream 慢但还在跑" vs "upstream 完全卡死"
   streamIdleTimeoutMs?: number;
+  // Task 8: config.toml 绝对路径(已 expandPath)。console handler 用它写回 config。
+  // 默认 CONFIG_PATH(已绝对化);cli 接线时应显式 expand 一次传过来。
+  configPath?: string;
 }
 
 export interface ProxyServer {
   port: number;
   hostname: string;
   stop: (force?: boolean) => void;
-  stats: { totalRequests: number; strippedImages: number };  // 内存计数(Phase 2 控制台读)
+  stats: {
+    totalRequests: number;
+    strippedImages: number;
+    startedAt: number;
+    byStatus: Record<string, number>;
+    byAlias: Record<string, AliasStats>;
+    recent: RecentEntry[];
+  };
 }
 
 /** 从 pathname 提取第一段作 alias。空段返回 null。
@@ -93,7 +111,15 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
   const logPath = opts.logPath ?? IMG_PROXY_LOG_FILE;
   const upstreamTimeoutMs = opts.upstreamTimeoutMs ?? 0;
   const streamIdleTimeoutMs = opts.streamIdleTimeoutMs ?? 0;
-  const stats = { totalRequests: 0, strippedImages: 0 };
+  const configPath = opts.configPath;
+  const stats = {
+    totalRequests: 0,
+    strippedImages: 0,
+    startedAt: Date.now(),
+    byStatus: {} as Record<string, number>,
+    byAlias: {} as Record<string, AliasStats>,
+    recent: [] as RecentEntry[],
+  };
 
   // 一次性建 log 目录(原本每条 log 都 mkdirSync,浪费)
   try { mkdirSync(dirname(logPath), { recursive: true }); } catch {}
@@ -110,9 +136,19 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
     async fetch(req) {
       const url = new URL(req.url);
 
-      // 控制台路由前置(Phase 1 consoleEnabled=false 不触发;Phase 2 在此挂 / 和 /admin/api/*)
-      if (consoleEnabled && (url.pathname === '/' || url.pathname.startsWith('/admin'))) {
-        return new Response('console not implemented (Phase 2)', { status: 501 });
+      // Task 8: 总是接管 console 路由(即使 console_enabled=false),handler 内检查开关
+      // (spec §7.3 "方案 A")。这样 daemon 启动后改 console_enabled=true 下一请求立即生效,
+      // 不需要重启。
+      if (url.pathname === '/' || url.pathname.startsWith('/admin')) {
+        return handleConsoleRequest(req, url, {
+          // configPath 必须是已 expandPath 的绝对路径(readFileSync 不识 '~')。
+          // cli 接线时已 expand,test 里直接传绝对路径;兜底用 CONFIG_PATH(也是绝对路径)。
+          configPath: expandPath(configPath ?? CONFIG_PATH),
+          routesPath,
+          cacheDir,
+          logPath,
+          stats,
+        });
       }
 
       const alias = parseAliasFromPath(url.pathname);
@@ -201,14 +237,20 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         const finalStatus: 'client_aborted' | 'upstream_unreachable' =
           isAbort && req.signal.aborted ? 'client_aborted' : 'upstream_unreachable';
         upstreamErrorMsg = err instanceof Error ? err.message : String(err);
+        const errDuration = Date.now() - startedAt;
         appendLog(`INFO ${JSON.stringify({
           time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
           stripped, upstream_status: 0,
-          duration_ms: Date.now() - startedAt,
+          duration_ms: errDuration,
           chunks: 0, bytes: 0,
           stream_status: finalStatus,
           upstream_error_msg: upstreamErrorMsg,
         })}`, logPath);
+        // Task 8: 写 stats(fetch 抛错路径,totalRequests = 真实总请求数)
+        stats.totalRequests++;
+        stats.byStatus[finalStatus] = (stats.byStatus[finalStatus] ?? 0) + 1;
+        updateByAlias(stats, alias, { requests: 1, stripped, bytes: 0, chunks: 0, durationMs: errDuration });
+        pushRecent(stats, { ts: Date.now(), alias, status: 0, stream_status: finalStatus, chunks: 0, bytes: 0, duration_ms: errDuration, stripped });
         if (isAbort) {
           // Client 主动断开,response 无意义,499 = nginx convention "client closed request"
           return new Response(null, { status: 499 });
@@ -217,7 +259,9 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       }
 
       const headersToFirstChunk = Date.now() - startedAt;
-      stats.totalRequests++;
+      // 注:totalRequests 不在这里 ++;每个请求在 catch / no_body / piping.finally
+      // 三个分支之一 ++ 一次,确保 totalRequests = 真实总请求数(成功 + 失败 + no_body)
+      // 且各 branch 的 byAlias / byStatus / recent 也只写一次。
 
       // === 改动 #3: body null 防护(204/205/304 响应可能 body === null,直接传会崩) ===
       if (!upstreamResp.body) {
@@ -227,6 +271,11 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
           duration_ms: headersToFirstChunk, chunks: 0, bytes: 0,
           stream_status: 'no_body',
         })}`, logPath);
+        // Task 8: 写 stats(body === null 路径,headers 已收,body 为空)
+        stats.totalRequests++;
+        stats.byStatus.no_body = (stats.byStatus.no_body ?? 0) + 1;
+        updateByAlias(stats, alias, { requests: 1, stripped, bytes: 0, chunks: 0, durationMs: headersToFirstChunk });
+        pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: 'no_body', chunks: 0, bytes: 0, duration_ms: headersToFirstChunk, stripped });
         return new Response(null, {
           status: upstreamResp.status,
           headers: new Headers(upstreamResp.headers),
@@ -285,6 +334,11 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
           stream_status: streamStatus,
           upstream_error_msg: upstreamErrorMsg,
         })}`, logPath);
+        // Task 8: 写 stats(成功 stream 路径)
+        stats.totalRequests++;
+        stats.byStatus[streamStatus] = (stats.byStatus[streamStatus] ?? 0) + 1;
+        updateByAlias(stats, alias, { requests: 1, stripped, bytes, chunks, durationMs: duration });
+        pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus, chunks, bytes, duration_ms: duration, stripped });
       }).catch(() => { /* piping 已 reject 过,这里 swallow */ });
 
       // 透传 response(headers + status);body 用 TransformStream 的 readable,带埋点

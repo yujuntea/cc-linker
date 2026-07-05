@@ -21,6 +21,7 @@ import { tmpdir } from 'os';
 
 import { handleConsoleRequest } from '../../src/img-proxy/console/api';
 import { saveRoutes, getUpstreamByAlias } from '../../src/img-proxy/routes';
+import { startProxyServer } from '../../src/img-proxy/server';
 import { config } from '../../src/utils/config';
 
 describe('img-proxy console api', () => {
@@ -163,5 +164,28 @@ describe('img-proxy console api', () => {
     expect(r.status).toBe(404);
     const body = await r.json();
     expect(body).toHaveProperty('code', 'E_CONSOLE_UNKNOWN_ALIAS');
+  });
+
+  // Task 8: 真实起 proxy 验证 console_enabled=false 时 GET / 和 /admin/api/stats 返 404。
+  // (前 5 个测试走 handleConsoleRequest 直调,不走 server.ts 的 fetch 分发;
+  //  本测试验 server.ts 已经 always-mount handler,即使 consoleEnabled=false 也接管。)
+  it('console_enabled=false 时 GET / 和 /admin/api/stats 返 404 "Console disabled"', async () => {
+    // 临时关掉 console_enabled(外层 beforeAll 设的是 true);测试完恢复
+    config.setRuntimeOverride('img_proxy.console_enabled', false);
+    const tmpProxy = await startProxyServer({
+      port: 0, hostname: '127.0.0.1', cacheDir, routesPath,
+      promptTemplate: '[img: {path}]', consoleEnabled: false, cacheMaxAgeHours: 24,
+      logPath,
+    });
+    try {
+      const r = await fetch(`http://127.0.0.1:${tmpProxy.port}/`);
+      expect(r.status).toBe(404);
+      expect(await r.text()).toContain('Console disabled');
+      const r2 = await fetch(`http://127.0.0.1:${tmpProxy.port}/admin/api/stats`);
+      expect(r2.status).toBe(404);
+    } finally {
+      tmpProxy.stop(true);
+      config.setRuntimeOverride('img_proxy.console_enabled', true);  // restore
+    }
   });
 });
