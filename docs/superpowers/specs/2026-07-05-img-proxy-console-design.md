@@ -168,29 +168,68 @@ const stats = {
 
 ### 3.3 写入时机
 
-`piping.finally()`（server.ts 已有）每条请求结束时：
+**两个分支都要写 stats**（不只 piping.finally）：
 
 ```ts
+// ① fetch 抛错路径(server.ts:197 现有 catch)
+} catch (err) {
+  const isAbort = err instanceof Error && err.name === 'AbortError';
+  const finalStatus: 'client_aborted' | 'upstream_unreachable' =
+    isAbort && req.signal.aborted ? 'client_aborted' : 'upstream_unreachable';
+  // 既有 appendLog(...) 写 log
+  
+  // 新增:写 stats
+  stats.totalRequests++;
+  stats.byStatus[finalStatus] = (stats.byStatus[finalStatus] ?? 0) + 1;
+  updateByAlias(stats, alias, { requests: 1, stripped, bytes: 0, chunks: 0, durationMs: Date.now() - startedAt });
+  pushRecent(stats, { ts: Date.now(), alias, status: 0, stream_status: finalStatus, chunks: 0, bytes: 0, duration_ms: Date.now() - startedAt, stripped });
+  
+  // ... 既有 return Response
+}
+
+// ② body null 路径(server.ts:223)
+if (!upstreamResp.body) {
+  // 既有 appendLog
+  stats.totalRequests++;
+  stats.byStatus.no_body = (stats.byStatus.no_body ?? 0) + 1;
+  // ... 同上 stats 写入
+}
+
+// ③ piping.finally 路径(server.ts:276)
 piping.finally(() => {
+  if (idleTimer !== null) clearInterval(idleTimer);
+  const duration = Date.now() - startedAt;
   // 既有 appendLog(...)
-  
-  // 写入 stats 聚合
+  stats.totalRequests++;
   stats.byStatus[streamStatus] = (stats.byStatus[streamStatus] ?? 0) + 1;
-  
-  const a = stats.byAlias[alias] ??= { requests: 0, stripped: 0, bytes: 0, chunks: 0, avgDurationMs: 0, lastAt: 0 };
-  a.requests++;
-  a.stripped += stripped;
-  a.bytes += bytes;
-  a.chunks += chunks;
-  a.avgDurationMs = (a.avgDurationMs * (a.requests - 1) + duration) / a.requests;
-  a.lastAt = Date.now();
-  
-  stats.recent.unshift({ ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus, chunks, bytes, duration_ms: duration, stripped });
-  if (stats.recent.length > 200) stats.recent.length = 200;
+  updateByAlias(stats, alias, { requests: 1, stripped, bytes, chunks, durationMs: duration });
+  pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus, chunks, bytes, duration_ms: duration, stripped });
 });
 ```
 
+**为什么三个分支都写**：不同 stream_status 走不同分支；丢一个分支会让 stats.byStatus 漏数。
+
 **Ring buffer 上限 200**：够覆盖 2s polling × 几小时窗口；超过自动丢弃最旧。
+
+**辅助函数**（提到 server.ts 顶部或新 helper 文件）：
+
+```ts
+function updateByAlias(stats, alias, m: { requests: number; stripped: number; bytes: number; chunks: number; durationMs: number }) {
+  const a = stats.byAlias[alias] ??= { requests: 0, stripped: 0, bytes: 0, chunks: 0, avgDurationMs: 0, lastAt: 0 };
+  a.requests += m.requests;
+  a.stripped += m.stripped;
+  a.bytes += m.bytes;
+  a.chunks += m.chunks;
+  // 增量平均(避免存所有 duration 列表)
+  a.avgDurationMs = (a.avgDurationMs * (a.requests - m.requests) + m.durationMs * m.requests) / a.requests;
+  a.lastAt = Date.now();
+}
+
+function pushRecent(stats, entry) {
+  stats.recent.unshift(entry);
+  if (stats.recent.length > 200) stats.recent.length = 200;
+}
+```
 
 ### 3.4 为什么保留 log file + 加 stats
 
@@ -222,7 +261,9 @@ export interface ProxyServer {
 
 ```ts
 export interface LogEntry {
+  /** Date.parse(ISO timestamp from log line prefix) → ms timestamp */
   ts: number;
+  /** 原始行(含 [timestamp] INFO {json} 前缀) */
   raw: string;
   parsed: {
     alias: string;
@@ -245,26 +286,41 @@ export interface ReadRecentOpts {
   alias?: string;
   status?: number;        // upstream_status 过滤
   streamStatus?: string;
-  sinceMs?: number;
+  sinceMs?: number;       // Date.parse() 兼容格式; 0 = 不过滤
 }
 
 export async function readRecentLogLines(opts: ReadRecentOpts): Promise<LogEntry[]>;
 ```
 
+**注意**：前端 `?sinceMs=` 用 ms timestamp（Date.now()）—— 后端把 ISO 字符串 parse 后比较整数 ms。
+
 ### 4.2 增量 LogTail（避免 polling 时全文件重读）
 
+**必须是 module-level singleton**，否则每次请求 new LogTail → offset 永远是 0 → 每次重读全文件。
+
 ```ts
+// src/img-proxy/console/log-parser.ts
+let _tail: LogTail | null = null;
+function getTail(logPath: string): LogTail {
+  if (!_tail || _tail.logPath !== logPath) {
+    _tail = new LogTail(logPath);
+  }
+  return _tail;
+}
+
 export class LogTail {
-  constructor(logPath: string);
+  constructor(public readonly logPath: string) {}
   async readNew(): Promise<LogEntry[]>;  // 只读上次 offset 到现在的增量
   get offset(): number;
 }
 ```
 
 **实现思路**：
-- 用 `Bun.file(logPath).slice(offset).text()` 读增量字节
+- 用 `Bun.file(this.logPath).slice(this.offset).text()` 读增量字节
 - 维护 lastOffset（持久化到内存即可，daemon 重启重置 OK）
 - 按 `\n` split，最后一段可能不完整，留到下次
+
+**单元测试隔离**：测试里需要 `resetLogTail()` helper 调 `_tail = null`。
 
 ### 4.3 现有 log 行格式
 
@@ -305,9 +361,9 @@ INFO 行（stream instrumentation 输出的）：
 | Tab | 内容 | API | 刷新策略 |
 |---|---|---|---|
 | **Dashboard** | 总请求数 / strip 图 / 5min 状态分布 / per-alias 表 / uptime / cache size | `GET /admin/api/stats` + `/admin/api/health` | 2s polling |
-| **Log** | 最近 200 条请求表，可按 alias / status / streamStatus / 时间过滤 | `GET /admin/api/log?limit=200&alias=X&status=Y&sinceMs=Z` | 手动刷新 + 5s 自动 |
+| **Log** | 最近 200 条请求表，可按 alias / status / streamStatus / 时间过滤 | `GET /admin/api/log?limit=200&alias=X&status=Y&sinceMs=Z` | 手动"刷新"按钮 |
 | **Config** | 当前生效 img_proxy 配置（snapshot） + 表单改 console_enabled / upstream_timeout_ms / stream_idle_timeout_ms | `GET /admin/api/config` + `POST /admin/api/config` | 手动 |
-| **Routes** | 当前 routes 表，每行 Enable/Disable 按钮 | `GET /admin/api/routes` + `POST /admin/api/routes/{disable,enable}` | 5s polling |
+| **Routes** | 当前 routes 表，每行 Enable/Disable 按钮 | `GET /admin/api/routes` + `POST /admin/api/routes/{disable,enable}` | 2s polling（同 Dashboard，共享 setInterval） |
 | **Cache** | cache 大小 / 文件数 / 最后清理时间 + "立即清理"按钮 | `GET /admin/api/health` + `POST /admin/api/cache/clear` | 手动 |
 
 ### 5.3 Vanilla JS 结构（无 framework）
@@ -451,23 +507,28 @@ pollLoop();
 
 ```ts
 reload(): void {
-  // 重读 ~/.cc-linker/config.toml,用现有 parse() + merge() 流程
-  // (config.ts 已有 @iarna/toml 的 parse 和 merge 方法)
-  if (!existsSync(this.configPath)) return;
-  try {
-    const fileData = parse(readFileSync(this.configPath, 'utf8'));
-    // 只覆盖 img_proxy section,其他 section 不动
-    // (其他 section 可能是 CLI 启动时 set 的,不要 reset)
-    if (fileData?.img_proxy) {
-      this.data.img_proxy = { ...this.data.img_proxy, ...fileData.img_proxy };
+  // 关键:每次 reload 都用 DEFAULTS.img_proxy 作底,而不是 this.data.img_proxy
+  // 否则用户从 config.toml 删除某个字段后,旧值仍残留(this.data 已被前次 reload 改过)
+  // DEFAULTS 在 config.ts:191 是 const,保证每次 reload 都是"用默认值打底 + 文件覆盖"
+  if (!existsSync(this.configPath)) {
+    this.data.img_proxy = { ...DEFAULTS.img_proxy };
+  } else {
+    try {
+      const fileData = parse(readFileSync(this.configPath, 'utf8'));
+      this.data.img_proxy = {
+        ...DEFAULTS.img_proxy,
+        ...(fileData?.img_proxy ?? {}),
+      };
+    } catch (err) {
+      throw new Error(`config reload failed: ${err}`);
     }
-    // 重新应用 env 覆盖(用户可能改了 env var)
-    this.loadEnv();
-  } catch (err) {
-    throw new Error(`config reload failed: ${err}`);
   }
+  // 重新应用 env 覆盖(用户可能改了 env var)
+  this.loadEnv();
 }
 ```
+
+**import DEFAULTS**：`reload()` 需要 import DEFAULTS。`reload()` 是新加的 public 方法，可以调 const DEFAULTS（同模块）。
 
 ### 7.2 POST /admin/api/config 流程
 
@@ -489,13 +550,25 @@ reload(): void {
 ```ts
 function handleConsoleRequest(req, url) {
   if (!config.get('img_proxy.console_enabled')) {
-    return new Response('Console disabled.', { status: 404 });
+    return new Response('Console disabled. Set img_proxy.console_enabled=true in config.toml.', { status: 404 });
   }
   // ...
 }
 ```
 
 每请求读最新值 → console_enabled 改 true 后**下一请求立即生效**，不需要重启 daemon。
+
+**user-facing behavior 变化（accept 这是 desired）**：
+
+| 状态 | 旧行为（当前 server.ts:114） | 新行为（计划改动后） |
+|---|---|---|
+| console_enabled=false，访问 `/` | fall through 到 image proxy → alias='' → 502 'missing provider alias' | console handler 接 → 404 'Console disabled' |
+| console_enabled=false，访问 `/admin/api/stats` | 同上 → 502 | 404 'Console disabled' |
+| console_enabled=true | 501 'console not implemented (Phase 2)' | 真实 console 响应 |
+
+**改动**：把 server.ts:114 的 `if (consoleEnabled && ...)` 改成 `if (url.pathname === '/' || url.pathname.startsWith('/admin')) { return handleConsoleRequest(req, url); }`。`consoleEnabled` 局部 const 在新实现里**不再使用**（但保留兼容字段不破坏 ProxyServerOptions signature）。
+
+**cli 那边**：`cli/commands/img-proxy.ts:132` 仍传 `consoleEnabled` 给 `startProxyServer()`，但值仅作为 daemon 启动时**初始化 hint**（目前不影响新行为——新行为总是 mount handler）；保留是为了不破坏 ProxyServerOptions 签名。
 
 ### 7.4 Routes 临时 disable / enable
 
@@ -515,11 +588,66 @@ function handleConsoleRequest(req, url) {
 }
 ```
 
-- `getUpstreamByAlias()` 看到 `disabled: true` 返 null → proxy 走 502 unknown alias（已有路径）
-- `routes.ts` 加 `setRouteDisabled(alias: string, disabled: boolean): Promise<void>`：
-  - 用现有 proper-lockfile 锁 routes.json
-  - 改对应 entry 的 disabled 字段
-  - 写回文件
+**改动点**：
+
+1. **改 `getUpstreamByAlias`**（routes.ts:97）让它读 disabled 字段：
+
+   ```ts
+   export function getUpstreamByAlias(path: string, alias: string): string | null {
+     const entry = loadRoutes(path).routes[alias];
+     if (!entry || entry.disabled) return null;
+     return entry.upstream ?? null;
+   }
+   ```
+
+   - disabled route → 返 null → proxy 走 502 'unknown alias'（已有路径）
+   - 影响：现有测试 `tests/integration/img-proxy-server.test.ts` 不依赖 disabled（用 mock routes.json，没有 disabled 字段），不需要改测试
+   - 但需要加单测覆盖 disabled=true 返 null 的场景
+
+2. **`routes.ts` 加 `setRouteDisabled`**：
+
+   ```ts
+   export async function setRouteDisabled(
+     path: string, alias: string, disabled: boolean
+   ): Promise<void> {
+     await withRoutesLock(path, async () => {
+       const table = loadRoutes(path);
+       const entry = table.routes[alias];
+       if (!entry) throw new Error(`unknown alias: ${alias}`);
+       if (disabled) entry.disabled = true;
+       else delete entry.disabled;
+       const tmp = path + '.tmp';
+       writeFileSync(tmp, JSON.stringify(table, null, 2), { mode: 0o600 });
+       renameSync(tmp, path);
+     });
+   }
+   ```
+
+   - 用现有 `withRoutesLock`（proper-lockfile）
+   - disable=true → 设字段；disable=false → 删字段（schema 干净）
+   - unknown alias → throw（让 console api 返 404 E_CONSOLE_UNKNOWN_ALIAS）
+
+3. **`addRoute` 行为保持不变**（routes.ts:67）：
+   - 它 create/overwrite entry 时**不读** disabled 字段
+   - **已知 race**：user disable 某 alias 后跑 `img-proxy install --providers <alias>`，addRoute 会覆盖 entry，丢失 disable 状态
+   - **缓解**：addRoute 保留旧 entry 的 disabled 字段：
+
+     ```ts
+     export async function addRoute(path: string, alias: string, upstream: string, providerPath: string): Promise<void> {
+       await withRoutesLock(path, async () => {
+         const table = loadRoutes(path);
+         const existing = table.routes[alias];
+         table.routes[alias] = {
+           alias, upstream, provider_path: providerPath,
+           original_base_url: upstream,
+           installed_at: existing?.installed_at ?? new Date().toISOString(),
+           // 保留 disable 标记
+           ...(existing?.disabled ? { disabled: true } : {}),
+         };
+         // ... 既有 atomic write
+       });
+     }
+     ```
 
 **为什么用 disabled 字段而不是直接删**：保留历史 + 恢复时不用重装。
 
@@ -554,7 +682,29 @@ return { ok: true, removed };
 }
 ```
 
-**注意**：`cacheBytes` 计算可能慢（上千文件 → statSync N 次）。加简单缓存，5s 过期即可。
+**注意**：`cacheBytes` 计算可能慢（上千文件 → statSync N 次）。**5s 缓存放在 module-level singleton**（同 LogTail）：
+
+```ts
+// src/img-proxy/console/api.ts (module level)
+let _cacheBytesCache: { value: number; computedAt: 0 } = { value: 0, computedAt: 0 };
+const CACHE_TTL_MS = 5000;
+
+function getCacheBytes(cacheDir: string): number {
+  if (Date.now() - _cacheBytesCache.computedAt < CACHE_TTL_MS) {
+    return _cacheBytesCache.value;
+  }
+  let total = 0;
+  try {
+    for (const f of readdirSync(cacheDir)) {
+      try { total += statSync(join(cacheDir, f)).size; } catch {}
+    }
+  } catch {}
+  _cacheBytesCache = { value: total, computedAt: Date.now() };
+  return total;
+}
+```
+
+**单测隔离**：`resetHealthCache()` helper 清 `_cacheBytesCache = { value: 0, computedAt: 0 }`。
 
 ## 9. 测试策略
 
