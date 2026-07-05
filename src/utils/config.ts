@@ -114,7 +114,7 @@ export interface AgentViewConfig {
   rendezvous_timeout_ms: number;
 }
 
-const DEFAULTS: ConfigData = {
+export const DEFAULTS: ConfigData = {
   general: {
     registry_path: REGISTRY_PATH,
     log_level: 'info',
@@ -396,6 +396,28 @@ export class ConfigManager {
     const [section, k] = key.split('.');
     if (this.data[section as keyof ConfigData]) {
       (this.data[section as keyof ConfigData] as any)[k] = value;
+    }
+  }
+
+  /** 重读 ~/.cc-linker/config.toml,覆盖 img_proxy section。
+   *  用 DEFAULTS.img_proxy 作底,这样用户删字段后会 reset 到默认值(不会保留 stale 值)。
+   *  其他 section 不动(可能是 CLI 启动时 set 的)。 */
+  reload(): void {
+    if (!existsSync(this.configPath)) {
+      this.data.img_proxy = { ...DEFAULTS.img_proxy };
+      return;
+    }
+    try {
+      const fileData = parse(readFileSync(this.configPath, 'utf8')) as Record<string, any> | undefined;
+      const fileImgProxy = (fileData?.img_proxy ?? {}) as Partial<ConfigData['img_proxy']>;
+      this.data.img_proxy = {
+        ...DEFAULTS.img_proxy,
+        ...fileImgProxy,
+      };
+      // 重新应用 env 覆盖(用户可能改了 env var)
+      this.loadEnv();
+    } catch (err) {
+      throw new Error(`config reload failed: ${err}`);
     }
   }
 }
