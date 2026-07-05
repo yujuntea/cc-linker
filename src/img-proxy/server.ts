@@ -80,7 +80,7 @@ export function cleanupOldCache(cacheDir: string, maxAgeHours: number): number {
   for (const f of readdirSync(cacheDir)) {
     const p = join(cacheDir, f);
     try {
-      if (now - statSync(p).mtimeMs > maxAgeMs) { unlinkSync(p); cleaned++; }
+      if (now - statSync(p).mtimeMs >= maxAgeMs) { unlinkSync(p); cleaned++; }
     } catch {}
   }
   return cleaned;

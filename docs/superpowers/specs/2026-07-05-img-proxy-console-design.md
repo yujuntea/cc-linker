@@ -483,7 +483,7 @@ pollLoop();
 ```
 
 具体 error code 列表（写在 `src/img-proxy/console/api.ts` 顶部）：
-- `E_CONSOLE_DISABLED` (404, console_enabled=false)
+- `E_CONSOLE_DISABLED` (404, console_enabled=false) — **注意：返 plain text 而非 JSON**（见 §7.3 实现细节）
 - `E_CONSOLE_BAD_REQUEST` (400, body 缺字段 / 类型错)
 - `E_CONSOLE_UNKNOWN_ALIAS` (404, routes/{disable,enable} 给的 alias 不存在)
 - `E_CONSOLE_CONFIG_WRITE_FAILED` (500, atomic write 失败)
