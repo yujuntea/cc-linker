@@ -27,38 +27,44 @@
 
 ## File Structure
 
-### 新增（9 个）
+### 新增（10 个）
 
 ```
 src/img-proxy/console/
-  ├── html.ts              # INDEX_HTML 常量(~250 行:HTML + 内嵌 CSS + 内嵌 JS)
-  ├── api.ts               # handleConsoleRequest + 9 个 endpoint handler(~250 行)
-  ├── log-parser.ts        # LogEntry + readRecentLogLines + LogTail (~100 行)
-  ├── config-reload.ts     # writeConfigSection + readConfigSnapshot (~60 行)
-  └── types.ts             # 共享类型:HealthStats / RouteEntry / ConfigSnapshot (~40 行)
+  ├── types.ts             # 共享类型:LogEntry / ParsedLogEntry / AliasStats / RecentEntry / HealthStats / RouteListEntry / ReadRecentOpts (~80 行) — Task 1
+  ├── stats-helpers.ts     # updateByAlias + pushRecent (~40 行) — Task 1
+  ├── log-parser.ts        # LogEntry 解析 + readRecentLogLines + LogTail singleton (~100 行) — Task 4
+  ├── api.ts               # handleConsoleRequest + 9 endpoint + getCacheBytes (~280 行) — Task 5+6
+  └── html.ts              # INDEX_HTML 常量(~250 行:HTML + 内嵌 CSS + 内嵌 JS) — Task 7
 
 tests/unit/img-proxy/console/
-  ├── log-parser.test.ts
-  ├── config-reload.test.ts
-  ├── routes-disable.test.ts
-  └── html.test.ts
+  ├── stats-helpers.test.ts   # Task 1
+  ├── log-parser.test.ts      # Task 4
+  ├── health.test.ts          # Task 5
+  └── html.test.ts            # Task 7
 
-tests/integration/img-proxy-console.test.ts
+tests/unit/img-proxy/
+  └── routes-disable.test.ts  # Task 3
+
+tests/unit/utils/
+  └── config-reload.test.ts   # Task 2
+
+tests/integration/img-proxy-console.test.ts  # Task 6 + Task 8
 ```
 
 ### 改动（4 个）
 
 ```
-src/img-proxy/server.ts       # stats 字段扩展 + console 路由分发 + handleConsoleRequest
-src/utils/config.ts           # 加 reload() public 方法
-src/img-proxy/routes.ts       # 改 getUpstreamByAlias + 加 setRouteDisabled + 改 addRoute
-src/cli/commands/img-proxy.ts # 接线新参数(保留 consoleEnabled 作为 init hint)
+src/img-proxy/server.ts       # stats 字段扩展 + console 路由分发 + handleConsoleRequest — Task 8
+src/utils/config.ts           # 加 reload() public 方法 — Task 2
+src/img-proxy/routes.ts       # 改 getUpstreamByAlias + 加 setRouteDisabled + 改 addRoute — Task 3
+src/cli/commands/img-proxy.ts # 接线新参数 + 传 expandPath(CONFIG_PATH) — Task 9
 ```
 
 ### 改动 docs（1 个）
 
 ```
-docs/img-proxy.md             # 新章节 "Web Console"
+docs/img-proxy.md             # 替换 line 873 "Phase 2 未实现" 段为 Web Console 章节 — Task 10
 ```
 
 **总：~1300 行**（包含测试）
@@ -68,48 +74,51 @@ docs/img-proxy.md             # 新章节 "Web Console"
 ## Task 依赖图
 
 ```
-T1 (stats helpers) ─┐
-T2 (config reload) ──┤
-T3 (routes disable)─┤
-T4 (log-parser) ─────┤
-T5 (cacheBytes) ─────┤
-T7 (config-reload writer, depends T2) ──┤
-                                          ├─→ T6 (console api endpoints)
-T8 (html template) ───────────────────────┤
-                                          └─→ T9 (server.ts mount handler, depends T6 + T8)
-T10 (cli 接线, depends T9)
-T11 (docs 更新, depends T9 + T10)
+T1 (types + stats helpers, no deps)
+T2 (config reload, no deps)
+T3 (routes disable, no deps)
+T4 (log-parser, no deps) ──────────────────┐
+T5 (cacheBytes, no deps) ──────────────────┤
+T7 (html template, no deps) ───────────────┤
+                                          ├─→ T6 (console api endpoints, depends T1+T2+T3+T4+T5)
+T8 (server.ts mount handler, depends T6+T1)│
+T9 (cli 接线, depends T8)                  │
+T10 (docs 更新, depends T8+T9)             │
+T11 (最终验证, depends T1-T10)             │
 ```
+
+> **注**：原 plan 提到 T7 (config-reload writer)，合并到 T6 `handlePostConfig` 里。T7 现指 html template。
 
 ---
 
-## Task 1: Server stats helpers + 3 个分支 stats 写入
+## Task 1: console/types.ts + stats helpers
 
 **Files:**
-- Modify: `src/img-proxy/server.ts:48-53` (ProxyServer interface), `:96` (stats 字段), `:153/220/276-287` (stats 写入)
-- Create: helper 在 server.ts 顶部（`updateByAlias` / `pushRecent`）
-- Test: `tests/unit/img-proxy/server-stats.test.ts`
+- Create: `src/img-proxy/console/types.ts`（共享类型：LogEntry / ParsedLogEntry / AliasStats / RecentEntry / HealthStats / RouteListEntry / ReadRecentOpts）
+- Create: `src/img-proxy/console/stats-helpers.ts`（`updateByAlias` / `pushRecent` 函数,从 types.ts 导入类型）
+- Test: `tests/unit/img-proxy/console/stats-helpers.test.ts`
 
 **Interfaces:**
 - Produces:
-  - `ProxyServer.stats.byStatus: Record<string, number>`
-  - `ProxyServer.stats.byAlias: Record<string, AliasStats>`
-  - `ProxyServer.stats.recent: RecentEntry[]` (上限 200 环形)
-  - `ProxyServer.stats.startedAt: number`
+  - `console/types.ts` 导出所有共享类型（这是后续 task 4/6/8 都 import 的源）
+  - `console/stats-helpers.ts` 导出 `updateByAlias` / `pushRecent`
 - Consumes: 无（基础任务）
+
+> **为什么这个 task 是 Task 1**：所有 console 模块共用 types.ts;stats-helpers 的类型也在 types.ts;Task 4/6/8 都依赖它,放最前面避免循环依赖。
 
 ### Steps
 
 - [ ] **Step 1: 写 failing 测试**
 
 ```ts
-// tests/unit/img-proxy/server-stats.test.ts
+// tests/unit/img-proxy/console/stats-helpers.test.ts
 import { describe, it, expect } from 'bun:test';
-import { updateByAlias, pushRecent } from '../../../src/img-proxy/server-stats-helpers';
+import { updateByAlias, pushRecent } from '../../../../src/img-proxy/console/stats-helpers';
+import type { AliasStats, RecentEntry } from '../../../../src/img-proxy/console/types';
 
-describe('server stats helpers', () => {
+describe('stats helpers', () => {
   it('updateByAlias: 增量更新 byAlias 聚合', () => {
-    const stats = { byAlias: {} as any };
+    const stats = { byAlias: {} as Record<string, AliasStats> };
     updateByAlias(stats, 'glm-5.2', { requests: 1, stripped: 2, bytes: 100, chunks: 3, durationMs: 200 });
     updateByAlias(stats, 'glm-5.2', { requests: 1, stripped: 0, bytes: 200, chunks: 5, durationMs: 400 });
     expect(stats.byAlias['glm-5.2']).toEqual({
@@ -118,31 +127,33 @@ describe('server stats helpers', () => {
   });
 
   it('updateByAlias: 首次 alias 创建 entry', () => {
-    const stats = { byAlias: {} as any };
+    const stats = { byAlias: {} as Record<string, AliasStats> };
     updateByAlias(stats, 'byte-agent', { requests: 1, stripped: 0, bytes: 50, chunks: 1, durationMs: 100 });
     expect(stats.byAlias['byte-agent']).toBeDefined();
-    expect(stats.byAlias['byte-agent'].requests).toBe(1);
+    expect(stats.byAlias['byte-agent']!.requests).toBe(1);
   });
 
   it('pushRecent: unshift + 200 cap', () => {
-    const stats = { recent: [] as any[] };
+    const stats: { recent: RecentEntry[] } = { recent: [] };
     for (let i = 0; i < 250; i++) pushRecent(stats, { ts: i, alias: 'x', status: 200, stream_status: 'complete', chunks: 0, bytes: 0, duration_ms: 0, stripped: 0 });
     expect(stats.recent.length).toBe(200);
-    expect(stats.recent[0].ts).toBe(249); // 最新在头部
-    expect(stats.recent[199].ts).toBe(50); // 最旧在尾部
+    expect(stats.recent[0]!.ts).toBe(249); // 最新在头部
+    expect(stats.recent[199]!.ts).toBe(50); // 最旧在尾部
   });
 });
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `bun test tests/unit/img-proxy/server-stats.test.ts`
-Expected: FAIL "Cannot find module '../../../src/img-proxy/server-stats-helpers'"
+Run: `bun test tests/unit/img-proxy/console/stats-helpers.test.ts`
+Expected: FAIL "Cannot find module"
 
-- [ ] **Step 3: 实现 helpers**
+- [ ] **Step 3a: 实现 types.ts**
 
 ```ts
-// src/img-proxy/server-stats-helpers.ts
+// src/img-proxy/console/types.ts
+
+/** Per-alias 聚合(stats.byAlias[k] 的值类型) */
 export interface AliasStats {
   requests: number;
   stripped: number;
@@ -152,6 +163,7 @@ export interface AliasStats {
   lastAt: number;
 }
 
+/** 环形 buffer 元素(stats.recent[] 元素类型) */
 export interface RecentEntry {
   ts: number;
   alias: string;
@@ -162,6 +174,62 @@ export interface RecentEntry {
   duration_ms: number;
   stripped: number;
 }
+
+/** Log 文件解析后条目(Task 4 用) */
+export interface ParsedLogEntry {
+  alias: string;
+  method: string;
+  path: string;
+  stripped: number;
+  upstream_status: number;
+  duration_ms: number;
+  headers_to_first_chunk_ms?: number;
+  chunks?: number;
+  bytes?: number;
+  stream_status: string;
+  upstream_error_msg?: string | null;
+}
+
+export interface LogEntry {
+  /** Date.parse(ISO timestamp from log line prefix) → ms timestamp */
+  ts: number;
+  /** 原始行 */
+  raw: string;
+  parsed: ParsedLogEntry | null;
+}
+
+export interface ReadRecentOpts {
+  logPath: string;
+  limit?: number;
+  alias?: string;
+  status?: number;
+  streamStatus?: string;
+  sinceMs?: number;
+}
+
+/** GET /admin/api/health 响应(Task 6 用) */
+export interface HealthStats {
+  uptimeMs: number;
+  pid: number;
+  routeCount: number;
+  cacheFiles: number;
+  cacheBytes: number;
+}
+
+/** GET /admin/api/routes 响应(Task 6 用) */
+export interface RouteListEntry {
+  alias: string;
+  upstream: string;
+  installed_at: string;
+  disabled: boolean;
+}
+```
+
+- [ ] **Step 3b: 实现 stats-helpers.ts**
+
+```ts
+// src/img-proxy/console/stats-helpers.ts
+import type { AliasStats, RecentEntry } from './types';
 
 export function updateByAlias(
   stats: { byAlias: Record<string, AliasStats> },
@@ -190,14 +258,14 @@ export function pushRecent(
 
 - [ ] **Step 4: 跑测试确认 pass**
 
-Run: `bun test tests/unit/img-proxy/server-stats.test.ts`
+Run: `bun test tests/unit/img-proxy/console/stats-helpers.test.ts`
 Expected: PASS 3 tests
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/img-proxy/server-stats-helpers.ts tests/unit/img-proxy/server-stats.test.ts
-git commit -m "feat(img-proxy-console): add server stats helpers (byAlias + recent ring buffer)"
+git add src/img-proxy/console/types.ts src/img-proxy/console/stats-helpers.ts tests/unit/img-proxy/console/stats-helpers.test.ts
+git commit -m "feat(img-proxy-console): shared types + stats helpers (byAlias + recent ring buffer)"
 ```
 
 ---
@@ -449,7 +517,7 @@ export async function addRoute(path: string, alias: string, upstream: string, pr
 }
 ```
 
-**c) 加 `setRouteDisabled`（line 95 后）**：
+**c) 加 `setRouteDisabled`（插在 `removeRoute`（line 94 结束）后、`// 重命名` 注释（line 96）前）**：
 
 ```ts
 export async function setRouteDisabled(
@@ -488,17 +556,17 @@ git commit -m "feat(img-proxy-console): routes disable/enable with addRoute race
 
 **Files:**
 - Create: `src/img-proxy/console/log-parser.ts`
-- Create: `src/img-proxy/console/types.ts`（LogEntry 类型 + 共享 types）
 - Test: `tests/unit/img-proxy/console/log-parser.test.ts`
+
+**注意**：types.ts（LogEntry / ParsedLogEntry / ReadRecentOpts）已在 Task 1 创建并 commit，Task 4 只 import 用，不重复创建。
 
 **Interfaces:**
 - Produces:
-  - `LogEntry { ts: number, raw: string, parsed: ParsedLogEntry | null }`
-  - `ParsedLogEntry { alias, method, path, stripped, upstream_status, duration_ms, headers_to_first_chunk_ms?, chunks?, bytes?, stream_status, upstream_error_msg? }`
-  - `ReadRecentOpts { logPath, limit?, alias?, status?, streamStatus?, sinceMs? }`
-  - `readRecentLogLines(opts): Promise<LogEntry[]>`
-  - `LogTail { logPath, readNew(): Promise<LogEntry[]>, offset: number }` — module-level singleton via `getTail(logPath)` / `resetLogTail()`
-- Consumes: `node:fs` (readFileSync)
+  - `readRecentLogLines(opts: ReadRecentOpts): Promise<LogEntry[]>` — 全量倒序读 + filter + limit
+  - `class LogTail { logPath, readNew(): Promise<LogEntry[]>, offset: number }` — 增量读
+  - `getTail(logPath): LogTail` — module-level singleton
+  - `resetLogTail(): void` — 测试隔离
+- Consumes: `node:fs` (readFileSync, statSync, open from 'fs/promises'), `console/types.ts` (LogEntry / ParsedLogEntry / ReadRecentOpts)
 
 ### Steps
 
@@ -583,78 +651,9 @@ describe('log-parser', () => {
 Run: `bun test tests/unit/img-proxy/console/log-parser.test.ts`
 Expected: FAIL "Cannot find module"
 
-- [ ] **Step 3: 实现 types.ts**
+- [ ] **Step 3: 实现 log-parser.ts**
 
-```ts
-// src/img-proxy/console/types.ts
-export interface ParsedLogEntry {
-  alias: string;
-  method: string;
-  path: string;
-  stripped: number;
-  upstream_status: number;
-  duration_ms: number;
-  headers_to_first_chunk_ms?: number;
-  chunks?: number;
-  bytes?: number;
-  stream_status: string;
-  upstream_error_msg?: string | null;
-}
-
-export interface LogEntry {
-  /** Date.parse(ISO timestamp from log line prefix) → ms timestamp */
-  ts: number;
-  /** 原始行 */
-  raw: string;
-  parsed: ParsedLogEntry | null;
-}
-
-export interface ReadRecentOpts {
-  logPath: string;
-  limit?: number;
-  alias?: string;
-  status?: number;
-  streamStatus?: string;
-  sinceMs?: number;
-}
-
-export interface AliasStats {
-  requests: number;
-  stripped: number;
-  bytes: number;
-  chunks: number;
-  avgDurationMs: number;
-  lastAt: number;
-}
-
-export interface RecentEntry {
-  ts: number;
-  alias: string;
-  status: number;
-  stream_status: string;
-  chunks: number;
-  bytes: number;
-  duration_ms: number;
-  stripped: number;
-}
-
-export interface HealthStats {
-  uptimeMs: number;
-  pid: number;
-  routeCount: number;
-  cacheFiles: number;
-  cacheBytes: number;
-}
-
-export interface RouteListEntry {
-  alias: string;
-  upstream: string;
-  installed_at: string;
-  disabled: boolean;
-}
-```
-
-- [ ] **Step 4: 实现 log-parser.ts**
+（types.ts 已在 Task 1 创建并 commit,这里只 import 用）
 
 ```ts
 // src/img-proxy/console/log-parser.ts
@@ -764,9 +763,11 @@ Expected: PASS 6 tests
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/img-proxy/console/types.ts src/img-proxy/console/log-parser.ts tests/unit/img-proxy/console/log-parser.test.ts
+git add src/img-proxy/console/log-parser.ts tests/unit/img-proxy/console/log-parser.test.ts
 git commit -m "feat(img-proxy-console): log-parser with filter + LogTail singleton for incremental reads"
 ```
+
+> types.ts 不再 add —— 已在 Task 1 commit。
 
 ---
 
@@ -1014,14 +1015,15 @@ Expected: FAIL "console not implemented (Phase 2)" 返 501
 
 ```ts
 // src/img-proxy/console/api.ts
-import { existsSync, readdirSync, statSync, writeFileSync, renameSync, mkdirSync } from 'fs';
-import { dirname, join } from 'path';
+import { existsSync, readdirSync, statSync, writeFileSync, renameSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { parse, stringify } from '@iarna/toml';
 import { config } from '../../utils/config';
 import {
-  loadRoutes, listRoutes, getUpstreamByAlias, setRouteDisabled,
+  loadRoutes, listRoutes, setRouteDisabled,
 } from '../routes';
 import { cleanupOldCache } from '../server';
-import { readRecentLogLines, getTail, resetLogTail } from './log-parser';
+import { readRecentLogLines } from './log-parser';
 import type { HealthStats, RouteListEntry } from './types';
 
 // === health cache ===
@@ -1105,16 +1107,15 @@ async function handlePostConfig(req: Request, ctx: ConsoleContext): Promise<Resp
   if (Object.keys(updates).length === 0) return jsonError(400, 'E_CONSOLE_BAD_REQUEST', 'no valid keys');
 
   // 写回 config.toml(atomic)
-  // 用 @iarna/toml.stringify 保留格式(注释会丢,但其他 section 完整)
-  const { parse, stringify } = await import('@iarna/toml');
+  // 注意:ctx.configPath 必须是已 expandPath 的绝对路径(cli 接线时展开),
+  // 因为 readFileSync 不识别 '~'。
   let current: any = {};
   try {
-    current = parse(require('fs').readFileSync(ctx.configPath, 'utf8'));
+    current = parse(readFileSync(ctx.configPath, 'utf8'));
   } catch (err) {
     return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `读 config.toml 失败: ${err}`);
   }
-  const oldImgProxy = current.img_proxy ?? {};
-  current.img_proxy = { ...oldImgProxy, ...updates };
+  current.img_proxy = { ...(current.img_proxy ?? {}), ...updates };
 
   try {
     const tmp = ctx.configPath + '.tmp';
@@ -1200,6 +1201,7 @@ async function handleHealth(stats: any, ctx: ConsoleContext): Promise<Response> 
 // === 主入口 ===
 
 export interface ConsoleContext {
+  /** 已 expandPath 的绝对路径(如 ~/... → /Users/you/...) */
   configPath: string;
   routesPath: string;
   cacheDir: string;
@@ -1674,33 +1676,33 @@ export interface ProxyServerOptions {
 
 `configPath` 传给 console handler 让它写回 config.toml。
 
-**e) 在 3 个分支写 stats**（line 153 strippedImages 旁、line 220 totalRequests 旁、line 276 piping.finally 内）：
+**e) 在 3 个分支写 stats**（对应 server.ts 实际行号）：
 
-- line 153 旁（fetch catch 分支）：
+- **line 197 旁（fetch catch 分支）**：在 catch 块内既有的 `appendLog(...)` 之后加：
   ```ts
   stats.totalRequests++;
   stats.byStatus[finalStatus] = (stats.byStatus[finalStatus] ?? 0) + 1;
   updateByAlias(stats, alias, { requests: 1, stripped, bytes: 0, chunks: 0, durationMs: Date.now() - startedAt });
   pushRecent(stats, { ts: Date.now(), alias, status: 0, stream_status: finalStatus, chunks: 0, bytes: 0, duration_ms: Date.now() - startedAt, stripped });
   ```
-- line 220 旁（upstreamResp 拿到后）：
-  ```ts
-  stats.totalRequests++;
-  ```
-- line 223 no_body 分支：
+
+- **line 223 旁（upstreamResp.body null 分支）**：在既有的 `appendLog(...)` 之后加：
   ```ts
   stats.totalRequests++;
   stats.byStatus.no_body = (stats.byStatus.no_body ?? 0) + 1;
   updateByAlias(stats, alias, { requests: 1, stripped, bytes: 0, chunks: 0, durationMs: headersToFirstChunk });
   pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: 'no_body', chunks: 0, bytes: 0, duration_ms: headersToFirstChunk, stripped });
   ```
-- line 276 piping.finally 内：
+
+- **line 276 旁（piping.finally 块内）**：在既有的 `appendLog(...)` 之后加：
   ```ts
   stats.totalRequests++;
   stats.byStatus[streamStatus] = (stats.byStatus[streamStatus] ?? 0) + 1;
   updateByAlias(stats, alias, { requests: 1, stripped, bytes, chunks, durationMs: duration });
   pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus, chunks, bytes, duration_ms: duration, stripped });
   ```
+
+> **关键**：`stats.totalRequests++` 在现有 server.ts:220 已有，但只对成功 fetch 后计数。本 task 在 catch / no_body 两个分支也加 `stats.totalRequests++`，让 totalRequests = 真实总请求数（成功 + 失败 + no_body）。
 
 **f) 扩展 ProxyServer interface**（line 48-53）：
 
@@ -1755,6 +1757,9 @@ git commit -m "feat(img-proxy-console): server.ts mounts console handler + 3-bra
 修改 `src/cli/commands/img-proxy.ts` line 127-134：
 
 ```ts
+import { CONFIG_PATH, expandPath } from '../../utils/paths';
+// ... 既有 import ...
+
 let server;
 try {
   server = await startProxyServer({
@@ -1767,7 +1772,9 @@ try {
     logPath: IMG_PROXY_LOG_FILE,
     upstreamTimeoutMs: config.get<number>('img_proxy.upstream_timeout_ms', 0),
     streamIdleTimeoutMs: config.get<number>('img_proxy.stream_idle_timeout_ms', 0),
-    configPath: '~/.cc-linker/config.toml',  // 新增：让 console 能写回 config.toml
+    // 新增:把 CONFIG_PATH 展开成绝对路径,让 console 能 readFileSync 直接用
+    // (readFileSync 不识别 '~')
+    configPath: expandPath(CONFIG_PATH),
   });
 } catch (err) {
   // ... 既有错误处理
@@ -1776,7 +1783,13 @@ try {
 
 **为什么保留 consoleEnabled 参数**：保留 ProxyServerOptions 签名兼容性。server.ts 现在总是 mount console handler，consoleEnabled 参数实际不影响新行为（仅作为 init hint）。
 
-**configPath 怎么传**：用 `expandPath('~/.cc-linker/config.toml')` 从 `src/utils/paths` import（如果存在）；或直接传字符串让 `handlePostConfig` 自己 `expandPath`。
+**CONFIG_PATH 来源**：`src/utils/paths.ts:15` 已 export：
+
+```ts
+export const CONFIG_PATH = process.env.CC_LINKER_CONFIG_PATH ?? join(CC_LINKER_DIR, 'config.toml');
+```
+
+所以 `expandPath(CONFIG_PATH)` 已经把 env var 和 `~` 都处理掉,返回真实绝对路径。
 
 - [ ] **Step 2: 跑 typecheck**
 
@@ -1795,7 +1808,7 @@ git commit -m "feat(img-proxy-console): cli passes configPath to startProxyServe
 ## Task 10: docs/img-proxy.md 新章节 "Web Console"
 
 **Files:**
-- Modify: `docs/img-proxy.md` (新章节,在 Phase 2 之后)
+- Modify: `docs/img-proxy.md` line 873（替换 "Phase 2 未实现" 段为新章节）
 
 **Interfaces:**
 - Produces: 用户文档
@@ -1803,9 +1816,9 @@ git commit -m "feat(img-proxy-console): cli passes configPath to startProxyServe
 
 ### Steps
 
-- [ ] **Step 1: 写新章节**
+- [ ] **Step 1: 替换 line 873 的 "Phase 2 未实现" 段**
 
-在 `docs/img-proxy.md` 当前 line 873 (Phase 2 描述) 后,加：
+`docs/img-proxy.md` 当前 line 873 是 "Phase 2 Web 控制台...未实现"。**替换它**为：
 
 ```markdown
 ### Phase 2 Web Console（已实现）
@@ -1944,12 +1957,13 @@ git commit -m "chore(img-proxy-console): final smoke test verification"
 
 ### Type consistency
 
-- `ProxyServer.stats.byStatus / byAlias / recent` — Task 1 helpers + Task 8 server.ts 都用同一类型（from `./console/types`）
-- `LogEntry / ParsedLogEntry / ReadRecentOpts` — Task 4 定义, Task 6 使用
-- `ConsoleContext` — Task 6 定义, Task 8 调用
-- `config.reload()` — Task 2 定义, Task 6 调用
-- `setRouteDisabled(path, alias, disabled)` — Task 3 定义, Task 6 调用
-- `getCacheBytes / resetHealthCache` — Task 5 定义, Task 6 调用, Task 6 也调 `resetHealthCache` in `handlePostCacheClear`
+- `AliasStats / RecentEntry` — Task 1 types.ts 定义，Task 1 stats-helpers.ts + Task 8 server.ts 共享
+- `LogEntry / ParsedLogEntry / ReadRecentOpts` — Task 1 types.ts 定义，Task 4 log-parser.ts + Task 6 api.ts 共享
+- `HealthStats / RouteListEntry` — Task 1 types.ts 定义，Task 6 api.ts 使用
+- `ConsoleContext.configPath` — Task 6 定义（已 expandPath 绝对路径），Task 8 传入 + Task 9 cli 用 `expandPath(CONFIG_PATH)` 提供
+- `config.reload()` — Task 2 定义，Task 6 handlePostConfig 调用
+- `setRouteDisabled(path, alias, disabled)` — Task 3 定义，Task 6 handlePostDisable/handlePostEnable 调用
+- `getCacheBytes / resetHealthCache` — Task 5 定义，Task 6 handleHealth / handlePostCacheClear 使用
 
 ✅ 类型 / 函数名一致。
 
