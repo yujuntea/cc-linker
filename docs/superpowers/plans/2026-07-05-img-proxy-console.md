@@ -310,8 +310,11 @@ upstream_timeout_ms = 60000
 `);
     const { ConfigManager } = await import('../../../src/utils/config');
     const cfg = new ConfigManager(configPath);
-    expect(cfg.get('img_proxy.console_enabled')).toBe(false); // 启动时读到空 section = DEFAULTS
+    // Constructor reads + merges file,so console_enabled 已经是 true
+    expect(cfg.get('img_proxy.console_enabled')).toBe(true);
+    expect(cfg.get('img_proxy.upstream_timeout_ms')).toBe(60000);
     cfg.reload();
+    // reload 之后仍然 true(同文件内容)
     expect(cfg.get('img_proxy.console_enabled')).toBe(true);
     expect(cfg.get('img_proxy.upstream_timeout_ms')).toBe(60000);
   });
@@ -373,10 +376,13 @@ Expected: FAIL "cfg.reload is not a function"
       return;
     }
     try {
-      const fileData = parse(readFileSync(this.configPath, 'utf8'));
+      // parse() 返回 @iarna/toml 的 JsonMap interface,strict mode 下 spread 触发 TS2698。
+      // 显式 cast 到 Partial<ConfigData['img_proxy']> 修复,行为不变。
+      const fileData = parse(readFileSync(this.configPath, 'utf8')) as Record<string, any> | undefined;
+      const fileImgProxy = (fileData?.img_proxy ?? {}) as Partial<ConfigData['img_proxy']>;
       this.data.img_proxy = {
         ...DEFAULTS.img_proxy,
-        ...(fileData?.img_proxy ?? {}),
+        ...fileImgProxy,
       };
       // 重新应用 env 覆盖(用户可能改了 env var)
       this.loadEnv();

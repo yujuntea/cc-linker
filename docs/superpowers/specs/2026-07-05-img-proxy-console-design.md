@@ -512,19 +512,22 @@ reload(): void {
   // DEFAULTS 在 config.ts:191 是 const,保证每次 reload 都是"用默认值打底 + 文件覆盖"
   if (!existsSync(this.configPath)) {
     this.data.img_proxy = { ...DEFAULTS.img_proxy };
-  } else {
-    try {
-      const fileData = parse(readFileSync(this.configPath, 'utf8'));
-      this.data.img_proxy = {
-        ...DEFAULTS.img_proxy,
-        ...(fileData?.img_proxy ?? {}),
-      };
-    } catch (err) {
-      throw new Error(`config reload failed: ${err}`);
-    }
+    return;
   }
-  // 重新应用 env 覆盖(用户可能改了 env var)
-  this.loadEnv();
+  try {
+    // parse() 返回 @iarna/toml 的 JsonMap interface,strict mode 下 spread 触发 TS2698。
+    // 显式 cast 到 Partial<ConfigData['img_proxy']> 修复,行为不变。
+    const fileData = parse(readFileSync(this.configPath, 'utf8')) as Record<string, any> | undefined;
+    const fileImgProxy = (fileData?.img_proxy ?? {}) as Partial<ConfigData['img_proxy']>;
+    this.data.img_proxy = {
+      ...DEFAULTS.img_proxy,
+      ...fileImgProxy,
+    };
+    // 重新应用 env 覆盖(用户可能改了 env var)
+    this.loadEnv();
+  } catch (err) {
+    throw new Error(`config reload failed: ${err}`);
+  }
 }
 ```
 
