@@ -19,10 +19,12 @@ import { existsSync, readdirSync, statSync, writeFileSync, renameSync, readFileS
 import { join } from 'path';
 import { parse, stringify } from '@iarna/toml';
 
-import { config } from '../../utils/config';
+import { config, DEFAULTS } from '../../utils/config';
+import { CCLinkerError } from '../../utils/errors';
 import { loadRoutes, listRoutes, setRouteDisabled } from '../routes';
 import { cleanupOldCache } from '../server';
 import { readRecentLogLines } from './log-parser';
+import { INDEX_HTML } from './html';
 import type { HealthStats, RouteListEntry } from './types';
 
 // === health cache (Task 5):5s TTL module singleton,避免 /health 每次 statSync N 个文件 ===
@@ -50,6 +52,14 @@ export function resetHealthCache(): void {
 // === audit log helper ===
 // 写一条 INFO 行(JSON payload)到 ctx.logPath,供事后回溯 console 写操作。
 // writeFileSync fail 不抛(console 写操作不应该因 audit log 失败回滚业务写)。
+//
+// 设计说明 (review): 这里有意 **不走** src/utils/logger.ts:
+//   - logger.ts 格式 "[YYYY-MM-DD HH:mm:ss] [INFO] message" 与 img-proxy log 不同
+//   - log-parser.ts:4 的正则 "^\\[([^\\]]+)\\] (?:INFO|WARN|ERROR) (.+)$" 是
+//     为 img-proxy 的 ISO timestamp + JSON body 格式设计,与 logger 不兼容
+//   - 混合会让 Log tab 的 filter/alerts 漏判一半条目
+// 所以 audit + appendLog 是 **img-proxy log 专属 writer**,与 src/utils/logger.ts
+// 是两个并行体系。如未来要让 console 写入 logger,需要重写 log-parser regex。
 function audit(action: string, data: Record<string, unknown>, logPath: string): void {
   try {
     const payload = JSON.stringify({ time: new Date().toISOString(), console_action: action, ...data, trigger: 'console' });
@@ -109,6 +119,14 @@ async function handlePostConfig(req: Request, ctx: ConsoleContext): Promise<Resp
   try { body = await req.json(); } catch {
     return jsonError(400, 'E_CONSOLE_BAD_REQUEST', 'body 必须是 JSON');
   }
+  // bug fix (review): body=null/primitive 会让 'key in body' 抛 TypeError
+  // (ECMAScript `in` 要求右操作数是 Object)。不加 guard 外层 catch 把
+  // 5xx E_CONSOLE_INTERNAL,语义错(本应是 400 E_CONSOLE_BAD_REQUEST),
+  // 且 raw operator error message 透传到 client。sibling handlers
+  // (handlePostDisable/Enable) 都用 `typeof X !== 'string'`,本 handler 之前漏了同一层校验。
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return jsonError(400, 'E_CONSOLE_BAD_REQUEST', 'body 必须是 JSON object');
+  }
 
   const allowed = ['console_enabled', 'upstream_timeout_ms', 'stream_idle_timeout_ms'] as const;
   const updates: Record<string, unknown> = {};
@@ -125,7 +143,17 @@ async function handlePostConfig(req: Request, ctx: ConsoleContext): Promise<Resp
   } catch (err) {
     return jsonError(500, 'E_CONSOLE_CONFIG_WRITE_FAILED', `读 config.toml 失败: ${err}`);
   }
-  current.img_proxy = { ...(current.img_proxy ?? {}), ...updates };
+  // bug fix (review): 之前无条件 spread (current.img_proxy ?? {}) — 当用户
+  // config.toml 里 img_proxy = ["a","b","c"](数组)或 "foo"(字符串)时,
+  // spread 把数组的 index 当 key 展开,stringify 写出 garbage TOML,
+  // renameSync 直接覆盖用户的 config.toml。Toml-as-user-input 安全:
+  // 只在 plain object 时 merge,其他当作缺失用 DEFAULTS 为底。
+  const existing = current.img_proxy;
+  const baseImgProxy =
+    existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? existing
+      : { ...DEFAULTS.img_proxy };
+  current.img_proxy = { ...baseImgProxy, ...updates };
 
   try {
     const tmp = ctx.configPath + '.tmp';
@@ -148,8 +176,13 @@ async function handlePostConfig(req: Request, ctx: ConsoleContext): Promise<Resp
   return jsonOk({ ok: true, applied: updates });
 }
 
-async function handleGetRoutes(): Promise<Response> {
-  const routes = listRoutes().map((r): RouteListEntry => ({
+async function handleGetRoutes(ctx: ConsoleContext): Promise<Response> {
+  // bug fix (review): 之前 listRoutes() 默认参数走 IMG_PROXY_ROUTES_PATH,
+  // 而 handleHealth/handlePostDisable/handlePostEnable 都用 ctx.routesPath。
+  // 今天 ctx === IMG_PROXY_ROUTES_PATH 时被掩盖;一旦 ctx.routesPath ≠ 默认路径
+  // (test / 未来 --routes-path flag),GET 返生产 routes 但 POST 写测试文件,Routes tab
+  // 与实际 proxy 状态失同步。
+  const routes = listRoutes(ctx.routesPath).map((r): RouteListEntry => ({
     alias: r.alias,
     upstream: r.upstream,
     installed_at: r.installed_at,
@@ -169,9 +202,13 @@ async function handlePostDisable(req: Request, ctx: ConsoleContext): Promise<Res
   try {
     await setRouteDisabled(ctx.routesPath, alias, true);
   } catch (err) {
-    const msg = (err as Error).message;
-    if (msg.startsWith('unknown alias')) return jsonError(404, 'E_CONSOLE_UNKNOWN_ALIAS', msg);
-    return jsonError(500, 'E_CONSOLE_ROUTES_LOCK_FAILED', msg);
+    // bug fix (review): 用结构化 err.code 而非 msg.startsWith('unknown alias')
+    // — 字符串匹配脆弱,任何文案重构会静默 broken。setRouteDisabled 现在抛
+    // CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS', ...)。
+    if (err instanceof CCLinkerError && err.code === 'E_IMG_PROXY_UNKNOWN_ALIAS') {
+      return jsonError(404, 'E_CONSOLE_UNKNOWN_ALIAS', err.message);
+    }
+    return jsonError(500, 'E_CONSOLE_ROUTES_LOCK_FAILED', (err as Error).message);
   }
   audit('routes_disable', { alias }, ctx.logPath);
   return jsonOk({ ok: true });
@@ -188,9 +225,11 @@ async function handlePostEnable(req: Request, ctx: ConsoleContext): Promise<Resp
   try {
     await setRouteDisabled(ctx.routesPath, alias, false);
   } catch (err) {
-    const msg = (err as Error).message;
-    if (msg.startsWith('unknown alias')) return jsonError(404, 'E_CONSOLE_UNKNOWN_ALIAS', msg);
-    return jsonError(500, 'E_CONSOLE_ROUTES_LOCK_FAILED', msg);
+    // bug fix (review): 同 handlePostDisable — 用 err.code 而非字符串前缀。
+    if (err instanceof CCLinkerError && err.code === 'E_IMG_PROXY_UNKNOWN_ALIAS') {
+      return jsonError(404, 'E_CONSOLE_UNKNOWN_ALIAS', err.message);
+    }
+    return jsonError(500, 'E_CONSOLE_ROUTES_LOCK_FAILED', (err as Error).message);
   }
   audit('routes_enable', { alias }, ctx.logPath);
   return jsonOk({ ok: true });
@@ -243,12 +282,21 @@ export async function handleConsoleRequest(req: Request, url: URL, ctx: ConsoleC
   const path = url.pathname;
   const method = req.method;
 
+  // bug fix (review): GET / returns the SPA HTML;前 plan / Task 6/7 漏接,
+  // Task 8 接管 path 但 handler 没分支,导致 INDEX_HTML 不可达。
+  if (path === '/' && method === 'GET') {
+    return new Response(INDEX_HTML, {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }
+
   try {
     if (path === '/admin/api/stats' && method === 'GET') return await handleStats(ctx.stats);
     if (path === '/admin/api/log' && method === 'GET') return await handleLog(url, ctx.logPath);
     if (path === '/admin/api/config' && method === 'GET') return await handleGetConfig();
     if (path === '/admin/api/config' && method === 'POST') return await handlePostConfig(req, ctx);
-    if (path === '/admin/api/routes' && method === 'GET') return await handleGetRoutes();
+    if (path === '/admin/api/routes' && method === 'GET') return await handleGetRoutes(ctx);
     if (path === '/admin/api/routes/disable' && method === 'POST') return await handlePostDisable(req, ctx);
     if (path === '/admin/api/routes/enable' && method === 'POST') return await handlePostEnable(req, ctx);
     if (path === '/admin/api/cache/clear' && method === 'POST') return await handlePostCacheClear(ctx);

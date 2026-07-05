@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from '
 import { dirname, join } from 'path';
 import { IMG_PROXY_ROUTES_PATH } from '../utils/paths';
 import { lock as lockfileLock } from 'proper-lockfile';
+import { CCLinkerError } from '../utils/errors';
 import type { RouteTable, RouteEntry } from './types';
 
 export function loadRoutes(path: string = IMG_PROXY_ROUTES_PATH): RouteTable {
@@ -104,7 +105,13 @@ export async function setRouteDisabled(
   await withRoutesLock(path, async () => {
     const table = loadRoutes(path);
     const entry = table.routes[alias];
-    if (!entry) throw new Error(`unknown alias: ${alias}`);
+    // bug fix (review): 抛 CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS', ...) 而非
+    // 裸 Error。CLAUDE.md 要求所有用户面错误用 CCLinkerError —
+    // console handler 之前靠 msg.startsWith('unknown alias') 字符串前缀
+    // 判 404/500,任何文案重构都会静默 broken。现在靠 (err as CCLinkerError).code
+    // 结构化判,迁移到 errors.ts:39 的 suggestions 也直连得上。
+    // message 保持 "unknown alias: X" 文本,与历史 grep/log 兼容。
+    if (!entry) throw new CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS', `unknown alias: ${alias}`);
     if (disabled) entry.disabled = true;
     else delete entry.disabled;
     const tmp = path + '.tmp';

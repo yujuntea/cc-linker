@@ -139,7 +139,13 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       // Task 8: 总是接管 console 路由(即使 console_enabled=false),handler 内检查开关
       // (spec §7.3 "方案 A")。这样 daemon 启动后改 console_enabled=true 下一请求立即生效,
       // 不需要重启。
-      if (url.pathname === '/' || url.pathname.startsWith('/admin')) {
+      //
+      // bug fix (review): 不能用 startsWith('/admin') — 会贪心匹配
+      // /admin-foo/v1/messages 这种用户装的 alias 路径,把 proxy 请求吃掉。
+      // 只匹配精确的 /admin 或 /admin/... (下一段必有 '/' 或整段就 '/admin')。
+      const p = url.pathname;
+      const isConsolePath = p === '/' || p === '/admin' || p.startsWith('/admin/');
+      if (isConsolePath) {
         return handleConsoleRequest(req, url, {
           // configPath 必须是已 expandPath 的绝对路径(readFileSync 不识 '~')。
           // cli 接线时已 expand,test 里直接传绝对路径;兜底用 CONFIG_PATH(也是绝对路径)。
@@ -322,6 +328,11 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
 
       // === fire-and-forget log after stream settles ===
       // handler 已 return;piping 会继续在后台跑;event loop 保留 promise。
+      // 已知 limitation (review): 此路径是 async 的 — daemon 收到 SIGKILL
+      // 时 piping + finally 都不会执行,该请求的 stats + log entry 会丢失。
+      // daemon `cc-linker img-proxy stop` 走 SIGTERM(event loop 自然 drain),
+      // 不影响。SIGKILL 通过 pkill -9 / OOM 等极端路径触发,生产极少。
+      // 修复:同步 (catch / no_body) 路径不丢;只 piping.finally 路径受影响。
       piping.finally(() => {
         if (idleTimer !== null) clearInterval(idleTimer);
         const duration = Date.now() - startedAt;

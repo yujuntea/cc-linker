@@ -66,11 +66,21 @@ export class LogTail {
       const len = fileSize - this.offset;
       const buf = Buffer.alloc(len);
       await fh.read(buf, 0, len, this.offset);
-      this.offset = fileSize;
       const text = buf.toString('utf8');
       const lines = text.split('\n');
-      // 最后一段可能不完整(\n 没结尾),丢弃;下次会重读
-      if (lines.length > 0 && !text.endsWith('\n')) lines.pop();
+      const isComplete = text.endsWith('\n');
+      // bug fix (review): 原来先 `offset = fileSize` 再处理不完整 line,
+      // 导致 partial line 被 pop 丢弃后 offset 已经过掉了它 — 下次再
+      // 读也不会再看到 (comment 说 "下次会重读",但 offset 已逝)。
+      // 修正:不完整时只推到 "文件末尾 - 最后一段的长度",这样下次会从
+      // 该前缀位置继续读,把不完整 line 拼上后续字节。
+      if (!isComplete && lines.length > 0) {
+        const lastLine = lines[lines.length - 1]!;
+        this.offset = fileSize - Buffer.byteLength(lastLine, 'utf8');
+        lines.pop();
+      } else {
+        this.offset = fileSize;
+      }
       const entries: LogEntry[] = [];
       for (const line of lines) {
         if (!line) continue;

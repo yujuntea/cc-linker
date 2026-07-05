@@ -405,6 +405,7 @@ export class ConfigManager {
   reload(): void {
     if (!existsSync(this.configPath)) {
       this.data.img_proxy = { ...DEFAULTS.img_proxy };
+      this.reapplyRuntimeOverrides();
       return;
     }
     try {
@@ -416,8 +417,25 @@ export class ConfigManager {
       };
       // 重新应用 env 覆盖(用户可能改了 env var)
       this.loadEnv();
+      // bug fix (review): 之前 reload() 没动 runtimeOverrides — setRuntimeOverride 设过的
+      // key 会被文件读回来的值覆盖(因为 get() 优先看 this.data,而 reload 把 this.data
+      // 重置了),违反 setRuntimeOverride 的"高于文件"语义。现在显式重 apply,
+      // 保证测试/CLI 启动时设的 override 在 reload 后仍是最高优先级。
+      this.reapplyRuntimeOverrides();
     } catch (err) {
       throw new Error(`config reload failed: ${err}`);
+    }
+  }
+
+  /** 重新把所有 runtimeOverrides 应用回 this.data。helper 用于 reload() 收尾,
+   *  也供未来测试 reset scenario 使用。runtimeOverrides 的语义是
+   *  "高于文件 + 高于 env",所以 reload 后必须最后一步 apply。 */
+  private reapplyRuntimeOverrides(): void {
+    for (const [key, value] of this.runtimeOverrides) {
+      const [section, k] = key.split('.');
+      if (this.data[section as keyof ConfigData]) {
+        (this.data[section as keyof ConfigData] as any)[k] = value;
+      }
     }
   }
 }
