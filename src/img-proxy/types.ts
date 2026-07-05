@@ -4,6 +4,7 @@ export interface RouteEntry {
   provider_path: string;      // provider 文件绝对路径
   original_base_url: string;  // 改写前的 BASE_URL(仅展示/审计;还原读 .bak)
   installed_at: string;       // ISO 时间戳
+  disabled?: boolean;         // console 临时禁用 setRouteDisabled(true) 后存在;enable 时被删除
 }
 
 export interface RouteTable {

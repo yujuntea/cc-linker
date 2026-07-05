@@ -72,6 +72,8 @@ export async function addRoute(path: string, alias: string, upstream: string, pr
       alias, upstream, provider_path: providerPath,
       original_base_url: upstream,
       installed_at: existing?.installed_at ?? new Date().toISOString(),
+      // 保留 disable 标记(避免重跑 install 时丢状态)
+      ...(existing?.disabled ? { disabled: true } : {}),
     };
     mkdirSync(dirname(path), { recursive: true });
     const tmp = path + '.tmp';
@@ -93,9 +95,32 @@ export async function removeRoute(path: string, alias: string): Promise<void> {
   });
 }
 
+// 新加:setRouteDisabled — console Routes tab 用来临时禁用/恢复某个 alias 的路由
+// (不卸载,只是让 getUpstreamByAlias 返 null,proxy 走 passthrough)。throw 未知 alias
+// 是显式失败:防止 console 误把 disable 写到一个已被 uninstall 的 alias 上。
+export async function setRouteDisabled(
+  path: string, alias: string, disabled: boolean,
+): Promise<void> {
+  await withRoutesLock(path, async () => {
+    const table = loadRoutes(path);
+    const entry = table.routes[alias];
+    if (!entry) throw new Error(`unknown alias: ${alias}`);
+    if (disabled) entry.disabled = true;
+    else delete entry.disabled;
+    const tmp = path + '.tmp';
+    writeFileSync(tmp, JSON.stringify(table, null, 2), { mode: 0o600 });
+    renameSync(tmp, path);
+  });
+}
+
 // 重命名:resolveUpstream → getUpstreamByAlias(语义更清晰)
+// disable=true 时返 null,proxy 调用方就会把请求 passthrough 给原 upstream
+// (而不是把请求改写到 current alias 的 upstream 上,后者会被 disable 误
+// 路由到一个用户并不期望的目标)。
 export function getUpstreamByAlias(path: string, alias: string): string | null {
-  return loadRoutes(path).routes[alias]?.upstream ?? null;
+  const entry = loadRoutes(path).routes[alias];
+  if (!entry || entry.disabled) return null;
+  return entry.upstream ?? null;
 }
 
 // 新加:按 upstream 查 proxy URL(wrapper 调用)。比较前先规范化:
