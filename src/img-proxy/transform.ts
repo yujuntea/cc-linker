@@ -3,8 +3,11 @@ import { join } from 'path';
 import type { TransformResult } from './types';
 
 export const DEFAULT_PROMPT_TEMPLATE =
-  '[用户粘贴的图片已保存到本地: {path}] 当前模型为纯文本模型,无法直接查看图片内容。' +
-  '如需识别这张图片,请调用 mcp__MiniMax__understand_image 工具,image_source 参数传上述本地路径。';
+  '[用户粘贴的图片已保存到本地文件: {path}]\n' +
+  '当前模型为纯文本模型,请用以下方式之一查看该图片内容:\n' +
+  '1. 调用 Read 工具读取该本地路径(若 Read 支持图片)\n' +
+  '2. 调用你已注册的任何图片识别 MCP 工具(参数名视工具而定,常见如 image_source/image_url/image_path)\n' +
+  '3. 用 Bash 调用本地图片识别 CLI(如 mmx-cli 等,具体命令与参数名以工具文档为准)';
 
 export interface StripOptions {
   cacheDir: string;
