@@ -80,6 +80,59 @@ export function parseAliasFromPath(pathname: string): string | null {
   return seg && seg.length > 0 ? seg : null;
 }
 
+/** hop-by-hop 头(RFC 7230 §6.1)—— 代理不应转发,否则可能与 Bun 自己的传输层冲突。 */
+const HOP_BY_HOP_HEADERS = [
+  'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer',
+  'upgrade', 'proxy-authenticate', 'proxy-authorization',
+] as const;
+
+/**
+ * 反向代理**响应头**清理。
+ *
+ * 🔴 关键 bug 修复:Bun.fetch 会自动解压 gzip/deflate/br 响应体,但 **不会** 从
+ * `upstreamResp.headers` 里移除 `content-encoding`(以及非流式响应的 `content-length`
+ * —— 那是压缩后的大小)。原样转发这两个头给客户端 → 客户端(Claude Code)看到
+ * `content-encoding: gzip` 后对"已被 Bun 解压过的明文"再 gunzip → 流解析器崩 →
+ * 断开连接 → proxy 的 pipeTo 以 undefined reject(日志记 upstream_error)。
+ *
+ * 实测日志(1401 行):63 次 stream_status=upstream_error 全部 upstream_error_msg=undefined,
+ * 其中 56 次发生在 glm-5.2(open.bigmodel.cn 对大响应 gzip);每次都是 upstream_status=200、
+ * 传了 11KB–253KB 后中段失败。卸载代理直连正常 → 确认是代理转发"过期编码头"所致。
+ *
+ * 既然 body 已被 Bun 解压成明文,content-encoding / content-length 必须剥掉
+ * (content-length 是压缩后大小,已与解压后 body 不符;流式响应本就无 content-length,
+ * 删了让 Bun 自行 chunked 即可)。
+ */
+function sanitizeProxyResponseHeaders(src: Headers): Headers {
+  const h = new Headers(src);
+  h.delete('content-encoding');
+  h.delete('content-length');
+  for (const name of HOP_BY_HOP_HEADERS) h.delete(name);
+  return h;
+}
+
+/**
+ * 反向代理**请求头**清理。
+ *
+ * - host / content-length:fetch 会自己算,不能透传客户端的(已在用,此处收口)。
+ * - accept-encoding:收口到 Bun.fetch 能自动解压的 gzip/deflate/br。客户端
+ *   (Claude Code / reqwest)可能带 zstd 等编码,若上游真的回了 zstd 而 Bun 不解压,
+ *   响应侧剥 content-encoding 就会误伤(客户端拿到无法识别的原始 zstd 字节)。
+ *   统一限定到 Bun 已知能解压的集合 —— 既保留压缩省带宽,又保证响应侧剥头逻辑安全。
+ *   (客户端不发送 accept-encoding 时不强行加,保持其 identity 偏好。)
+ * - hop-by-hop 头:不转发(同 sanitizeProxyResponseHeaders)。
+ */
+function sanitizeProxyRequestHeaders(src: Headers): Headers {
+  const h = new Headers(src);
+  h.delete('host');
+  h.delete('content-length');
+  if (h.has('accept-encoding')) {
+    h.set('accept-encoding', 'gzip, deflate, br');
+  }
+  for (const name of HOP_BY_HOP_HEADERS) h.delete(name);
+  return h;
+}
+
 /** 写一条日志到 logPath。
  *  注意:不 mkdirSync 每条都调(高 QPS 时浪费 syscall),由 startProxyServer 一次性建好目录。
  */
@@ -202,10 +255,9 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         outBody = req.body;  // 其它方法 stream 透传(未消费)
       }
 
-      // 转发:透传 headers,删 host / content-length(让 fetch 重算)
-      const headers = new Headers(req.headers);
-      headers.delete('host');
-      headers.delete('content-length');
+      // 转发:清理后的请求头(详见 sanitizeProxyRequestHeaders)。
+      // 关键:accept-encoding 收口 + 删 host/content-length/hop-by-hop。
+      const headers = sanitizeProxyRequestHeaders(req.headers);
 
       // === 改动 #2: 转发 req.signal + 可选 upstream_timeout ===
       // req.signal 让 client 断开能 cancel upstream 工作(不浪费 token / 不挂死 socket)
@@ -284,7 +336,7 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: 'no_body', chunks: 0, bytes: 0, duration_ms: headersToFirstChunk, stripped });
         return new Response(null, {
           status: upstreamResp.status,
-          headers: new Headers(upstreamResp.headers),
+          headers: sanitizeProxyResponseHeaders(upstreamResp.headers),
         });
       }
 
@@ -305,7 +357,19 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       });
 
       // pipeTo().catch 检测 upstream mid-stream error(controller.error / socket reset)
+      // 分类要点:不能无条件写 upstream_error ——
+      //   1. 若 onClientAbort 已把 streamStatus 标成 client_aborted(req.signal abort
+      //      在 catch 前触发),不要覆盖。
+      //   2. pipeTo 在 readable 被取消(客户端断开)时 reject 的 reason 常是 undefined
+      //      (流取消不带 reason),靠 err instanceof Error 判会误判成 upstream_error。
+      //   所以先看 req.signal.aborted:是 → client_aborted;否 → 真上游错误。
+      //   (修复前:1401 行日志里 63 次 stream_status=upstream_error 全是
+      //    upstream_error_msg=undefined,实为客户端因 gzip 二次解压崩溃后断连,被误分类。)
       const piping = upstreamResp.body.pipeTo(writable).catch((err) => {
+        if (streamStatus === 'client_aborted' || req.signal.aborted) {
+          streamStatus = 'client_aborted';
+          return;
+        }
         streamStatus = 'upstream_error';
         upstreamErrorMsg = (err instanceof Error ? err.message : String(err));
       });
@@ -352,10 +416,12 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus, chunks, bytes, duration_ms: duration, stripped });
       }).catch(() => { /* piping 已 reject 过,这里 swallow */ });
 
-      // 透传 response(headers + status);body 用 TransformStream 的 readable,带埋点
+      // 透传 response(status + 清理后的 headers);body 用 TransformStream 的 readable,带埋点。
+      // 关键:响应头走 sanitizeProxyResponseHeaders —— 剥 content-encoding/content-length
+      // (Bun.fetch 自动解压后这俩头已过期,原样转发会让客户端二次解压崩溃)。
       return new Response(readable, {
         status: upstreamResp.status,
-        headers: new Headers(upstreamResp.headers),
+        headers: sanitizeProxyResponseHeaders(upstreamResp.headers),
       });
     },
   });

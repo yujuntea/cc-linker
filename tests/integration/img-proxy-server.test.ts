@@ -410,3 +410,182 @@ describe('img-proxy server v2 stream instrumentation', () => {
     expect(entry.stream_status).toBe('client_aborted');
   });
 });
+
+// === gzip 响应头剥离回归测试 ===
+// 根因:Bun.fetch 自动解压 gzip/deflate/br 响应体,但保留 content-encoding(及非流式
+// 的 content-length)。代理原样转发 → 客户端二次解压崩溃 → 断连 → pipeTo reject
+// (日志 upstream_error_msg=undefined)。实测 glm-5.2 大响应 56/63 次失败即此因。
+// 修法:sanitizeProxyResponseHeaders 剥 content-encoding/content-length + hop-by-hop;
+//       sanitizeProxyRequestHeaders 把 accept-encoding 收口到 gzip/deflate/br。
+describe('img-proxy server: gzip 响应头剥离 + accept-encoding 收口', () => {
+  let cacheDir: string, workDir: string, routesPath: string, logPath: string;
+  let upstreamServer: any, proxyServer: any, proxyPort: number;
+  let lastForwardedAcceptEncoding: string | null;
+
+  beforeAll(async () => {
+    cacheDir = mkdtempSync(join(tmpdir(), 'img-proxy-gz-cache-'));
+    workDir = mkdtempSync(join(tmpdir(), 'img-proxy-gz-'));
+    routesPath = join(workDir, 'routes.json');
+    logPath = join(workDir, 'img-proxy.log');
+
+    upstreamServer = Bun.serve({
+      port: 0, hostname: '127.0.0.1',
+      async fetch(req) {
+        // 记录代理转发过来的 accept-encoding(验证请求侧收口)
+        lastForwardedAcceptEncoding = req.headers.get('accept-encoding');
+        const ae = lastForwardedAcceptEncoding ?? '';
+        // 模拟真实 glm 上游:客户端声明能 gzip 就 gzip(大响应才会触发,这里用 SSE 文本)
+        const plain = new TextEncoder().encode(
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        );
+        if (ae.includes('gzip')) {
+          const gz = Bun.gzipSync(plain);
+          return new Response(gz, {
+            status: 200,
+            headers: {
+              'content-type': 'text/event-stream',
+              'content-encoding': 'gzip',
+              'content-length': String(gz.byteLength),  // 压缩后大小(与解压后 body 不符)
+            },
+          });
+        }
+        return new Response(plain, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      },
+    });
+
+    await saveRoutes(routesPath, {
+      version: 1,
+      routes: {
+        'glm-5.2': {
+          alias: 'glm-5.2', upstream: `http://127.0.0.1:${upstreamServer.port}`,
+          provider_path: '/fake/glm-5.2.json',
+          original_base_url: `http://127.0.0.1:${upstreamServer.port}`,
+          installed_at: '2026-07-04T00:00:00.000Z',
+        },
+      },
+    });
+
+    proxyServer = await startProxyServer({
+      port: 0, hostname: '127.0.0.1', cacheDir, routesPath,
+      promptTemplate: '[img: {path}]', consoleEnabled: false, cacheMaxAgeHours: 1,
+      logPath,
+    });
+    proxyPort = proxyServer.port;
+  });
+
+  afterAll(() => {
+    proxyServer?.stop(true);
+    upstreamServer?.stop(true);
+    rmSync(cacheDir, { recursive: true, force: true });
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  beforeEach(() => { lastForwardedAcceptEncoding = null; });
+
+  it('上游 gzip 响应:剥 content-encoding,body 为明文 SSE', async () => {
+    const resp = await fetch(`http://127.0.0.1:${proxyPort}/glm-5.2/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept-encoding': 'gzip, deflate, br' },
+      body: JSON.stringify({ model: 'glm-5.2[1m]', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(resp.status).toBe(200);
+    // 🔴 核心:content-encoding 必须被剥(Bun 已解压 body,留着会让客户端二次解压崩)
+    expect(resp.headers.get('content-encoding')).toBeNull();
+    // content-type 等正常头保留
+    expect(resp.headers.get('content-type')).toContain('text/event-stream');
+    // body 是明文 SSE,不是 gzip 字节(若客户端二次解压会拿到乱码 / 崩)
+    const text = await resp.text();
+    expect(text).toContain('message_start');
+    expect(text).toContain('message_stop');
+    // content-length 若存在,必须是解压后的真实大小(不能是压缩后的陈旧值)
+    const cl = resp.headers.get('content-length');
+    if (cl !== null) {
+      expect(Number(cl)).toBe(new TextEncoder().encode(text).length);
+    }
+  });
+
+  it('上游流式 gzip 响应(真实 glm 场景):剥 content-encoding,明文 SSE 逐块可达', async () => {
+    // 独立 routes + proxy,避免污染共享路由表(参照 mid-stream 测试的自包含模式)。
+    // upstream:把整段 SSE 一次性 gzip,再分块流式吐出(模拟真实 glm 上游的
+    // chunked + gzip。Bun.fetch 仍会自动解压并保留 content-encoding 头)。
+    const plain = new TextEncoder().encode(
+      'event: message_start\ndata: {"type":"message_start"}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    );
+    const gz = Bun.gzipSync(plain);
+    const tmpUp = Bun.serve({
+      port: 0, hostname: '127.0.0.1',
+      async fetch() {
+        return new Response(new ReadableStream({
+          async start(controller) {
+            const half = Math.floor(gz.byteLength / 2);
+            controller.enqueue(gz.slice(0, half));
+            await new Promise(r => setTimeout(r, 20));
+            controller.enqueue(gz.slice(half));
+            controller.close();
+          },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' },
+        });
+      },
+    });
+    const tmpDir2 = mkdtempSync(join(tmpdir(), 'img-proxy-gz-stream-'));
+    const tmpRoutes = join(tmpDir2, 'routes.json');
+    const tmpLog = join(tmpDir2, 'img-proxy.log');
+    await saveRoutes(tmpRoutes, {
+      version: 1,
+      routes: {
+        'glm-5.2': {
+          alias: 'glm-5.2', upstream: `http://127.0.0.1:${tmpUp.port}`,
+          provider_path: '/fake/glm-5.2.json',
+          original_base_url: `http://127.0.0.1:${tmpUp.port}`,
+          installed_at: '2026-07-04T00:00:00.000Z',
+        },
+      },
+    });
+    const tmpProxy = await startProxyServer({
+      port: 0, hostname: '127.0.0.1',
+      cacheDir: mkdtempSync(join(tmpdir(), 'img-proxy-gz-stream-cache-')),
+      routesPath: tmpRoutes,
+      promptTemplate: '[img: {path}]', consoleEnabled: false, cacheMaxAgeHours: 1,
+      logPath: tmpLog,
+    });
+
+    const resp = await fetch(`http://127.0.0.1:${tmpProxy.port}/glm-5.2/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept-encoding': 'gzip, deflate, br' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(resp.status).toBe(200);
+    // 🔴 流式场景同样:content-encoding 必须被剥
+    expect(resp.headers.get('content-encoding')).toBeNull();
+    // 逐块读取应拿到明文 SSE(非 gzip 字节)
+    const reader = resp.body!.getReader();
+    let decoded = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      decoded += new TextDecoder().decode(value);
+    }
+    expect(decoded).toContain('message_start');
+    expect(decoded).toContain('content_block_delta');
+    expect(decoded).toContain('message_stop');
+
+    tmpProxy.stop(true);
+    tmpUp.stop(true);
+    rmSync(tmpDir2, { recursive: true, force: true });
+  });
+
+  it('转发给上游的 accept-encoding 收口到 gzip/deflate/br(剥 zstd 等)', async () => {
+    await fetch(`http://127.0.0.1:${proxyPort}/glm-5.2/v1/messages`, {
+      method: 'POST',
+      // 客户端发 zstd(假设 Claude Code 某版本带),代理应剥掉只留 Bun 能解压的
+      headers: { 'content-type': 'application/json', 'accept-encoding': 'zstd, gzip, br' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(lastForwardedAcceptEncoding).toBe('gzip, deflate, br');
+  });
+});
