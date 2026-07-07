@@ -111,4 +111,10 @@ describe('DEFAULT_PROMPT_TEMPLATE (2026-07-07 tool-agnostic)', () => {
     expect(DEFAULT_PROMPT_TEMPLATE).toContain('MCP');
     expect(DEFAULT_PROMPT_TEMPLATE).toContain('mmx-cli');
   });
+
+  it('与 config.ts DEFAULTS.img_proxy.prompt_template 字面一致', async () => {
+    const { config } = await import('../../../src/utils/config');
+    const cfgDefault = config.get<string>('img_proxy.prompt_template', '');
+    expect(cfgDefault).toBe(DEFAULT_PROMPT_TEMPLATE);
+  });
 });
