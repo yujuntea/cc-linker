@@ -94,3 +94,21 @@ describe('stripImagesToPaths', () => {
     expect(readdirSync(cacheDir).length).toBe(2);
   });
 });
+
+describe('DEFAULT_PROMPT_TEMPLATE (2026-07-07 tool-agnostic)', () => {
+  // 安全闸:防止以后再有人把单一 MCP 名 hardcode 进 default
+  it('does NOT hardcode a specific image-recognition MCP tool', () => {
+    expect(DEFAULT_PROMPT_TEMPLATE).not.toContain('mcp__MiniMax__understand_image');
+    expect(DEFAULT_PROMPT_TEMPLATE).not.toMatch(/mcp__[A-Za-z0-9_]+__[A-Za-z_]+/);
+  });
+
+  it('仍含 {path} 占位符(不破坏 stripImagesToPaths fallback 逻辑)', () => {
+    expect(DEFAULT_PROMPT_TEMPLATE).toContain('{path}');
+  });
+
+  it('含三条工具路径关键词:Read / MCP / mmx-cli', () => {
+    expect(DEFAULT_PROMPT_TEMPLATE).toContain('Read 工具');
+    expect(DEFAULT_PROMPT_TEMPLATE).toContain('MCP');
+    expect(DEFAULT_PROMPT_TEMPLATE).toContain('mmx-cli');
+  });
+});
