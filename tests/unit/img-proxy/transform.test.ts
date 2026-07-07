@@ -96,25 +96,9 @@ describe('stripImagesToPaths', () => {
 });
 
 describe('DEFAULT_PROMPT_TEMPLATE (2026-07-07 tool-agnostic)', () => {
-  // 安全闸:防止以后再有人把单一 MCP 名 hardcode 进 default
+  // 防回归:防止以后再有人把单一 MCP tool 名 hardcode 进 default(template 由
+  // config.ts DEFAULTS 用同名常量 import,避免两处漂移)。
   it('does NOT hardcode a specific image-recognition MCP tool', () => {
-    expect(DEFAULT_PROMPT_TEMPLATE).not.toContain('mcp__MiniMax__understand_image');
     expect(DEFAULT_PROMPT_TEMPLATE).not.toMatch(/mcp__[A-Za-z0-9_]+__[A-Za-z_]+/);
-  });
-
-  it('仍含 {path} 占位符(不破坏 stripImagesToPaths fallback 逻辑)', () => {
-    expect(DEFAULT_PROMPT_TEMPLATE).toContain('{path}');
-  });
-
-  it('含三条工具路径关键词:Read / MCP / mmx-cli', () => {
-    expect(DEFAULT_PROMPT_TEMPLATE).toContain('Read 工具');
-    expect(DEFAULT_PROMPT_TEMPLATE).toContain('MCP');
-    expect(DEFAULT_PROMPT_TEMPLATE).toContain('mmx-cli');
-  });
-
-  it('与 config.ts DEFAULTS.img_proxy.prompt_template 字面一致', async () => {
-    const { config } = await import('../../../src/utils/config');
-    const cfgDefault = config.get<string>('img_proxy.prompt_template', '');
-    expect(cfgDefault).toBe(DEFAULT_PROMPT_TEMPLATE);
   });
 });

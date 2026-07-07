@@ -3,6 +3,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { parse } from '@iarna/toml';
 import { CONFIG_PATH, REGISTRY_PATH } from './paths';
+import { DEFAULT_PROMPT_TEMPLATE } from '../img-proxy/transform';
 
 interface ConfigData {
   general: {
@@ -197,12 +198,7 @@ export const DEFAULTS: ConfigData = {
     port: 8765,
     hostname: '127.0.0.1',
     cache_max_age_hours: 24 * 7,
-    prompt_template:
-      '[用户粘贴的图片已保存到本地文件: {path}]\n' +
-      '当前模型为纯文本模型,请用以下方式之一查看该图片内容:\n' +
-      '1. 调用 Read 工具读取该本地路径(若 Read 支持图片)\n' +
-      '2. 调用你已注册的任何图片识别 MCP 工具(参数名视工具而定,常见如 image_source/image_url/image_path)\n' +
-      '3. 用 Bash 调用本地图片识别 CLI(如 mmx-cli 等,具体命令与参数名以工具文档为准)',
+    prompt_template: DEFAULT_PROMPT_TEMPLATE,
     console_enabled: false, // Phase 2: Web 控制台
     // v2 smart install defaults:
     smart_mode: true,
