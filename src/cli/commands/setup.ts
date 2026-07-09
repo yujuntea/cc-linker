@@ -40,6 +40,7 @@ function isHookInstalled(): boolean {
 interface SetupOptions {
   skipFeishu?: boolean;
   skipHook?: boolean;
+  skipImgProxy?: boolean;
 }
 
 /** Result returned by the Feishu wizard for the summary display */
@@ -50,9 +51,19 @@ interface FeishuWizardResult {
   autoStart: boolean;
 }
 
+/** Result returned by the img-proxy wizard for the summary display */
+interface ImgProxyWizardResult {
+  configured: boolean;
+  installedCount: number;
+  started: boolean;
+  autoStart: boolean;
+  wrapperInstalled: boolean;
+  wrapperSkipped: boolean;
+}
+
 export async function setup(registry: RegistryManager, opts: SetupOptions = {}): Promise<void> {
   // Calculate total steps dynamically
-  const totalSteps = opts.skipFeishu ? 3 : 4;
+  const totalSteps = (opts.skipFeishu ? 3 : 4) + (opts.skipImgProxy ? 0 : 1);
 
   console.log(chalk.blue('═══════════════════════════════════════════'));
   console.log(chalk.blue('  cc-linker 一键配置向导'));
@@ -62,8 +73,13 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
   console.log(chalk.gray('  1. 初始化会话注册表'));
   console.log(chalk.gray('  2. 选择 Claude Code 权限模式'));
   console.log(chalk.gray('  3. 安装 Claude Code 自动注册钩子'));
+  let stepNum = 4;
   if (!opts.skipFeishu) {
-    console.log(chalk.gray('  4. 配置飞书 Bot（App ID + App Secret + 开机自启）'));
+    console.log(chalk.gray(`  ${stepNum}. 配置飞书 Bot（App ID + App Secret + 开机自启）`));
+    stepNum++;
+  }
+  if (!opts.skipImgProxy) {
+    console.log(chalk.gray(`  ${stepNum}. 启用图片代理 (img-proxy,自动识别纯文本模型 / 多模态 / CC Switch)`));
   }
   console.log('');
 
@@ -182,9 +198,140 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
     console.log('');
   }
 
+  // ===== Step (last): img-proxy setup =====
+  let imgProxyResult: ImgProxyWizardResult = {
+    configured: false,
+    installedCount: 0,
+    started: false,
+    autoStart: false,
+    wrapperInstalled: false,
+    wrapperSkipped: false,
+  };
+
+  if (!opts.skipImgProxy) {
+    console.log(chalk.cyan(`── Step ${totalSteps}/${totalSteps} ── 启用图片代理 (img-proxy)`));
+    console.log('');
+    console.log(chalk.gray('  ℹ  img-proxy 让纯文本模型(glm-5.2/qwen/deepseek 等)也能在 Claude Code'));
+    console.log(chalk.gray('     里接收粘贴的图片:把图片存成本地文件,模型收到路径文本 + 调 MCP 提示。'));
+    console.log(chalk.gray('     模型需要配图片识别能力(Read 工具 / 图片识别 MCP / mmx-cli 等本地 CLI)才能"看见"。'));
+    console.log('');
+
+    try {
+      imgProxyResult = await runImgProxyWizard();
+    } catch (err) {
+      // Best effort: img-proxy 失败不阻断 setup
+      console.log(chalk.yellow(`  ⚠️ img-proxy 配置失败: ${err}`));
+      console.log(chalk.gray('  提示: 可稍后手动执行 cc-linker img-proxy install/start'));
+    }
+    console.log('');
+  }
+
   // ===== Summary =====
-  printSummary(sessionCount, hookInstalled, feishuResult);
+  printSummary(sessionCount, hookInstalled, feishuResult, imgProxyResult);
   process.exit(0);
+}
+
+async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
+  const result: ImgProxyWizardResult = {
+    configured: false,
+    installedCount: 0,
+    started: false,
+    autoStart: false,
+    wrapperInstalled: false,
+    wrapperSkipped: false,
+  };
+  const { scanProviderFiles, hasCcSwitch } = await import('../../img-proxy/provider-scan');
+
+  const allProviders = scanProviderFiles().filter(p => p.baseUrl);
+
+  if (allProviders.length === 0) {
+    const ccSwitch = hasCcSwitch();
+    if (ccSwitch) {
+      console.log(chalk.yellow('  ⚠️ 检测到 CC Switch 但没找到 claude provider'));
+      console.log(chalk.gray('     检查 cc-switch.db 里是否有 app_type=claude 的记录'));
+    } else {
+      console.log(chalk.yellow('  ⚠️ 未扫描到任何 provider 配置'));
+      console.log(chalk.gray('     装 CC Switch 或手写 ~/.claude/providers/*.json 后再跑 setup'));
+    }
+    return result;
+  }
+
+  console.log(chalk.gray(`  检测到 ${allProviders.length} 个可用 provider(manual + cc-switch):`));
+  for (const p of allProviders.slice(0, 8)) {
+    console.log(chalk.gray(`    • ${p.alias}  ${p.baseUrl.slice(0, 60)}${p.baseUrl.length > 60 ? '...' : ''}`));
+  }
+  if (allProviders.length > 8) console.log(chalk.gray(`    ... 其余 ${allProviders.length - 8} 个`));
+  console.log('');
+
+  const { configure } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'configure',
+    message: '是否启用图片代理(选要启用的 provider → 启动 daemon)?',
+    default: true,
+  }]);
+
+  if (!configure) {
+    console.log(chalk.gray('  跳过 img-proxy 配置'));
+    return result;
+  }
+
+  // 调用 smart install：自动过滤多模态、按需提示 wrapper
+  const { imgProxyInstall, imgProxyStart } = await import('./img-proxy');
+  try {
+    const installResult = await imgProxyInstall({});
+    result.installedCount = installResult.installedCount;
+    // 只在至少装上 1 个 provider 时才算 configured,避免出现
+    // "✅ 已启用 (0 个 provider)" 这种自相矛盾的 summary。
+    result.configured = installResult.installedCount > 0;
+    result.wrapperInstalled = installResult.wrapperInstalled;
+    result.wrapperSkipped = installResult.wrapperSkipped;
+    if (installResult.installedCount === 0) {
+      console.log(chalk.yellow('  ⚠️ 0 个 provider 被安装(全部跳过 / 多模态 / 用户跳选)'));
+    }
+  } catch (err) {
+    console.log(chalk.red(`  ❌ 安装失败: ${err}`));
+    return result;
+  }
+
+  // 启动 daemon
+  const { startNow } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'startNow',
+    message: '是否现在启动 img-proxy daemon?',
+    default: true,
+  }]);
+
+  if (startNow) {
+    try {
+      await imgProxyStart({ daemon: true });
+      result.started = true;
+      console.log(chalk.green('  ✅ img-proxy 已启动'));
+    } catch (err) {
+      console.log(chalk.yellow(`  ⚠️ 自动启动失败: ${err}`));
+      console.log(chalk.gray('     可稍后手动执行 cc-linker img-proxy start --daemon'));
+    }
+  }
+
+  // macOS launchd
+  if (process.platform === 'darwin') {
+    const { autoStart } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'autoStart',
+      message: '是否配置开机自启(launchd)?',
+      default: true,
+    }]);
+    if (autoStart) {
+      const { imgProxyDaemonInstall } = await import('./img-proxy');
+      try {
+        await imgProxyDaemonInstall();
+        result.autoStart = true;
+      } catch (err) {
+        console.log(chalk.yellow(`  ⚠️ launchd 配置失败: ${err}`));
+      }
+    }
+  }
+
+  return result;
 }
 
 async function runFeishuWizard(existingAppId = '', existingAppSecret = ''): Promise<FeishuWizardResult> {
@@ -424,7 +571,7 @@ function printPermissionGuide(): void {
   console.log('');
 }
 
-function printSummary(sessionCount: number, hookInstalled: boolean, feishu: FeishuWizardResult): void {
+function printSummary(sessionCount: number, hookInstalled: boolean, feishu: FeishuWizardResult, imgProxy?: ImgProxyWizardResult): void {
   console.log(chalk.green('═══════════════════════════════════════════'));
   console.log(chalk.green('  ✅ 配置完成！'));
   console.log(chalk.green('═══════════════════════════════════════════'));
@@ -439,6 +586,21 @@ function printSummary(sessionCount: number, hookInstalled: boolean, feishu: Feis
   } else {
     console.log(chalk.gray('  飞书 Bot:     ⏸️  未配置（终端侧功能已就绪）'));
   }
+
+  if (imgProxy) {
+    if (imgProxy.configured) {
+      console.log(chalk.gray(`  图片代理:     ✅ 已启用 (${imgProxy.installedCount} 个 provider)`));
+      console.log(chalk.gray(`  img-proxy 状态: ${imgProxy.started ? '✅ 运行中' : '⏸️  未启动 (cc-linker img-proxy start --daemon)'}`));
+      if (imgProxy.autoStart) console.log(chalk.gray('  开机自启:     ✅ launchd 已配置'));
+      if (imgProxy.wrapperInstalled) {
+        console.log(chalk.gray('  img-proxy wrapper: ✅ 已装 (用 cc-linker-proxy 替代 claude)'));
+      } else if (imgProxy.wrapperSkipped) {
+        console.log(chalk.gray('  img-proxy wrapper: ⏭️  跳过(用户拒绝 — cc-linker-proxy 不可用)'));
+      }
+    } else {
+      console.log(chalk.gray('  图片代理:     ⏸️  未启用（可稍后 cc-linker img-proxy install）'));
+    }
+  }
   console.log('');
 
   console.log(chalk.cyan('  常用命令:'));
@@ -447,6 +609,10 @@ function printSummary(sessionCount: number, hookInstalled: boolean, feishu: Feis
   console.log(chalk.white('    cc-linker daemon status     — 查看 Bot 状态'));
   console.log(chalk.white('    cc-linker daemon uninstall  — 移除开机自启'));
   console.log(chalk.white('    cc-linker stop              — 停止 Bot 服务'));
+  if (imgProxy?.configured) {
+    console.log(chalk.white('    cc-linker img-proxy status  — 查看图片代理状态'));
+    console.log(chalk.white('    cc-linker img-proxy stop    — 停止图片代理 daemon'));
+  }
   console.log('');
 
   if (feishu.configured) {

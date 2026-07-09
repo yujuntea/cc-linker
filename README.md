@@ -29,6 +29,7 @@
 | 💬 **流式卡片交互** | 聊天应用中实时看到 Claude 的 thinking、tool_use 摘要（≤80 字符）和回复，5s tick 显示已用时，不再是"转圈等待" |
 | 🛡 **交互式权限确认** | SDK 模式下 Claude 需要执行工具时，飞书卡片弹出允许/拒绝按钮 |
 | 🖼 **图片消息支持** | 飞书发送的图片自动下载并传递给 Claude 分析 |
+| 🪄 **图片代理 (img-proxy)** | 纯文本模型 (glm-5.2、qwen3-max、deepseek、mimo-pro) 在 Claude Code 里也能接收粘贴图片 — 图片落盘 + 路径替换,模型自选 Read / MCP / 本地 CLI 识别 |
 | 📂 **目录浏览** | `/listDir` 命令交互式浏览和切换工作目录 |
 | 📋 **统一会话管理** | 自动扫描、增量同步，无需手动维护会话列表 |
 | 🎛 **多模型切换** | 在卡片中一键切换模型，无需改配置 |
@@ -169,6 +170,14 @@ cc-linker search <关键词>           # 搜索会话
 cc-linker export <UUID>             # 导出会话为 Markdown/JSON/Text
 cc-linker clean                     # 清理无效记录
 cc-linker status                    # 查看桥接状态
+
+# img-proxy 图片代理(纯文本模型接收图片)
+cc-linker img-proxy install         # 智能安装:自动发现 + 分类 text-only/multimodal
+cc-linker img-proxy install --yes   # 同上,非交互(用默认预选)
+cc-linker img-proxy start --daemon  # 后台启动代理
+cc-linker img-proxy stop            # 停后台代理
+cc-linker img-proxy status          # 查看 daemon / routes / wrapper / launchd 状态
+cc-linker img-proxy daemon install  # macOS 开机自启
 ```
 
 ### 聊天应用 Bot 命令（飞书）
@@ -207,6 +216,51 @@ cc-linker status                    # 查看桥接状态
 | `cc-linker daemon install` | 配置开机自动启动 |
 | `cc-linker daemon uninstall` | 移除开机自启 |
 | `cc-linker daemon status` | 查看后台服务状态 |
+
+## 🖼 纯文本模型也能接收图片 (img-proxy)
+
+> **痛点**:glm-5.2、qwen3-max、deepseek、mimo-pro 等纯文本模型编程能力强,是 Claude Code 日常主力;但目前都不支持多模态输入 —— 粘贴截图、错误信息、设计稿到 Claude Code 直接 `4xx (Model only support text input)`。
+
+**img-proxy 是个本地反向代理**(`127.0.0.1:8765`),装上后:
+
+1. 拦截 Claude Code 发出的请求,识别 `image` block
+2. 把图片落盘到 `~/.cc-linker/img-proxy/cache/`
+3. 替换成一段文本,告诉模型"图片已保存到这里,用 Read / 图片识别 MCP / 本地 CLI 看一下"
+
+模型按它已经会的能力挑选识别方式,你不用为不同的模型配不同的工具。**多模态模型 (Claude / Kimi / GPT-4v) 完全不受影响** —— 它们不经 proxy,直连原 upstream。
+
+### 30 秒上手
+
+如果你已经配置过 Claude Code(用 CC Switch 或自写 provider 文件):
+
+```bash
+# 智能安装:自动发现 + 分类(text-only 装 / multimodal 跳过),交互式确认要装哪些
+cc-linker img-proxy install
+# 不想交互确认?加 --yes 用默认预选(脚本/老用户场景)
+
+# 后台启动代理
+cc-linker img-proxy start --daemon
+
+# macOS 开机自启(可选)
+cc-linker img-proxy daemon install
+```
+
+> `cc-linker setup` 已经包含 img-proxy 这一步 — 全新用户不用单独跑。
+
+### 跑起来之后
+
+- **CC Switch 用户**:`img-proxy install` 检测到 CC Switch 会问要不要装 shell wrapper。装好后用 `cc-linker-proxy` 替代 `claude`,wrapper 自动从 `~/.claude/settings.json` 读当前 provider、查 routes.json,然后设 `ANTHROPIC_BASE_URL=http://127.0.0.1:8765/<alias>` 后 exec claude。
+- **自定义 alias 用户**:你已有的 `alias cc-X='claude --settings ...'` 不变 —— `img-proxy install` 改的是 `~/.claude/providers/*.json` 里的 `ANTHROPIC_BASE_URL`,alias 继续用,URL 已经指向 proxy。
+
+### 看看效果 / 排查
+
+- `cc-linker img-proxy status` 一眼看 daemon / 已装 routes / wrapper / launchd / Web Console 状态
+- 打开 `http://127.0.0.1:8765/` 看 Web Console(Dashboard / Log / Config / Routes / Cache)实时数据,需要 `cc-linker img-proxy console enable` 打开
+- 日志: `~/.cc-linker/img-proxy/img-proxy.log`
+
+详细配置、命令参考、踩坑列表见 [docs/img-proxy.md](docs/img-proxy.md)。
+
+---
 
 ## 🛰 Agent View 集成
 
@@ -650,6 +704,7 @@ git push --tags
 | [docs/验收测试报告.md](docs/验收测试报告.md) | 验收测试结果 |
 | [docs/Product.md](docs/Product.md) | 产品需求文档 |
 | [docs/model-switch-design.md](docs/model-switch-design.md) | 模型切换设计 |
+| [docs/img-proxy.md](docs/img-proxy.md) | 图片代理 (img-proxy) —— 让纯文本模型在 Claude Code 里也能接收粘贴图片 |
 
 ## License
 

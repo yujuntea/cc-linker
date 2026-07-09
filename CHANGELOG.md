@@ -4,6 +4,28 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **CLI Image Proxy (`cc-linker img-proxy`)** — 让纯文本模型(glm-5.2 等)也能在
+  Claude Code CLI 里接受粘贴的图片。在 `ANTHROPIC_BASE_URL` 链路上插一层本地反向
+  代理,拦截出站请求里的 inline `image` content block,落盘到
+  `~/.cc-linker/img-proxy/cache/`,替换成"图片本地路径 + 引导调 MCP 识别"的 text
+  block,再转发给真实上游。
+  - 路由键 = **provider 文件名 stem**(`byte-agent-glm.json` → `/byte-agent-glm`),
+    不用 `ProviderManager.generateShortAlias`(它会截断/冲突)。
+  - `src/img-proxy/server.ts` — `Bun.serve` 反向代理,SSE 流式透传,启动+定时清缓存,
+    内存计数(Phase 2 控制台读)。
+  - `src/img-proxy/transform.ts` — 剥离 base64 image block 落盘的纯函数;`{path}`
+    模板缺失时回退默认文案(避免空 text block)。
+  - `src/img-proxy/provider-config.ts` — install/uninstall 改写 BASE_URL,`.bak`
+    生命周期:install 写、uninstall 还原后删除(token 永远从当前文件读)。
+  - `cc-linker img-proxy install [--providers|--all] / uninstall / start [--daemon] /
+    stop / status / daemon install|uninstall`。daemon 三分支(child/parent/前台),
+    launchd 用 env 注入避免双重 fork。
+  - Phase 2(后续 plan)将叠加 Web 监控控制台。
+
 ## [0.7.5] - 2026-07-02
 
 ### Fixed

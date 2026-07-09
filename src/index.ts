@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import { RegistryManager } from './registry';
 import { syncBeforeCommand } from './scanner';
 import { handleError } from './utils/errors';
@@ -20,6 +20,15 @@ import { initFeishu } from './cli/commands/init-feishu';
 import { setup } from './cli/commands/setup';
 import { activityHook } from './cli/commands/activity-hook';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
+import {
+  imgProxyStart, imgProxyStop, imgProxyStatus,
+  imgProxyInstall, imgProxyUninstall,
+  imgProxyDaemonInstall, imgProxyDaemonUninstall,
+  imgProxyCurrentUrl,
+  imgProxyResolve,
+  imgProxyWrapperInstall, imgProxyWrapperUninstall, imgProxyWrapperStatus,
+  imgProxyConsoleEnable, imgProxyConsoleDisable, imgProxyConsoleStatus,
+} from './cli/commands/img-proxy';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -183,11 +192,51 @@ daemonCmd.command('install').description('配置开机自动启动').action(() =
 daemonCmd.command('uninstall').description('移除开机自动启动').action(() => uninstallDaemon());
 daemonCmd.command('status').description('查看后台服务状态').action(() => daemonServiceStatus());
 
+const imgProxyCmd = program.command('img-proxy').description('管理图片剥离代理 (让纯文本模型接受粘贴图片)');
+imgProxyCmd.command('install')
+  .description('把选定 provider 的 BASE_URL 改写为指向本地代理 (smart 默认,自动跳过多模态)')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部 provider(dumb 模式)')
+  .option('--yes', 'smart 默认预选,不交互')
+  // Fix I-8: choices 校验 --mode 只接受 smart/dumb — Commander 在 .option() 之后
+  // .choices() 在 JS 运行时有效(链上 this),但 TS 类型只在 Option 类上声明,
+  // 用 addOption + Option 实例显式表达意图,同时让 TS 类型也满意
+  .addOption(
+    new Option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)')
+      .choices(['smart', 'dumb'] as const),
+  )
+  .action((opts) => { imgProxyInstall(opts); });
+imgProxyCmd.command('uninstall')
+  .description('还原 provider 的 BASE_URL')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部已 install 的 provider')
+  .action((opts) => imgProxyUninstall(opts));
+imgProxyCmd.command('start')
+  .description('启动代理 (前台;加 --daemon 后台)')
+  .option('-d, --daemon', '后台运行')
+  .action((opts) => imgProxyStart(opts));
+imgProxyCmd.command('stop').description('停止代理').action(() => imgProxyStop());
+imgProxyCmd.command('status').description('查看代理状态').action(() => imgProxyStatus());
+imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL').action(() => imgProxyCurrentUrl());
+imgProxyCmd.command('resolve <upstream>').description('按真实 upstream URL 查 proxy URL').action((upstream) => imgProxyResolve({ upstream }));
+const wrapperCmd = imgProxyCmd.command('wrapper').description('管理 shell wrapper (cc-linker-proxy)');
+wrapperCmd.command('install').description('装 wrapper 到 ~/.zshrc').action(() => imgProxyWrapperInstall());
+wrapperCmd.command('uninstall').description('从 ~/.zshrc 移除 wrapper').action(() => imgProxyWrapperUninstall());
+wrapperCmd.command('status').description('查看 wrapper 状态').action(() => imgProxyWrapperStatus());
+const imgProxyDaemonCmd = imgProxyCmd.command('daemon').description('开机自启管理 (macOS launchd)');
+imgProxyDaemonCmd.command('install').description('配置开机自启').action(() => imgProxyDaemonInstall());
+imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());
+const imgProxyConsoleCmd = imgProxyCmd.command('console').description('管理 Web Console 监控后台 (http://127.0.0.1:8765/)');
+imgProxyConsoleCmd.command('enable').description('启用 Web Console,改 [img_proxy]console_enabled=true').action(() => imgProxyConsoleEnable());
+imgProxyConsoleCmd.command('disable').description('禁用 Web Console,改 [img_proxy]console_enabled=false').action(() => imgProxyConsoleDisable());
+imgProxyConsoleCmd.command('status').description('查看 Web Console 当前状态 + URL').action(() => imgProxyConsoleStatus());
+
 program
   .command('setup')
-  .description('一键配置向导（初始化 + 安装钩子 + 配置飞书 Bot）')
+  .description('一键配置向导（初始化 + 安装钩子 + 配置飞书 Bot + 启用图片代理）')
   .option('--skip-feishu', '跳过飞书 Bot 配置')
   .option('--skip-hook', '跳过 Claude Code 钩子安装')
+  .option('--skip-img-proxy', '跳过图片代理 (img-proxy) 配置')
   .action((opts) => withSync(async (registry) => {
     await setup(registry, opts);
   }, true));

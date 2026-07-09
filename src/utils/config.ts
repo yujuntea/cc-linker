@@ -3,6 +3,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { parse } from '@iarna/toml';
 import { CONFIG_PATH, REGISTRY_PATH } from './paths';
+import { DEFAULT_PROMPT_TEMPLATE } from '../img-proxy/transform';
 
 interface ConfigData {
   general: {
@@ -80,6 +81,22 @@ interface ConfigData {
     max_size_bytes: number;
     cleanup_max_age_hours: number;
   };
+  img_proxy: {
+    enabled: boolean;
+    port: number;
+    hostname: string;
+    cache_max_age_hours: number;
+    prompt_template: string;
+    console_enabled: boolean;
+    // v2 smart install:
+    smart_mode: boolean;
+    vision_model_patterns_extra: string[];
+    text_only_model_patterns_extra: string[];
+    // v2 stream-level instrumentation: 上游大模型长响应(30~88s)+ 中途断连可观测
+    // 0 = 禁用(默认)。非 0 = 启用对应超时,保护 proxy 不被挂起/卡死的上游拖死
+    upstream_timeout_ms: number;     // upstream fetch 整体超时;触发后 502 给 client
+    stream_idle_timeout_ms: number;  // 距最后 chunk 超过 N ms 判 stalled,主动 cancel upstream
+  };
   agent_view: AgentViewConfig;
 }
 
@@ -98,7 +115,7 @@ export interface AgentViewConfig {
   rendezvous_timeout_ms: number;
 }
 
-const DEFAULTS: ConfigData = {
+export const DEFAULTS: ConfigData = {
   general: {
     registry_path: REGISTRY_PATH,
     log_level: 'info',
@@ -176,6 +193,21 @@ const DEFAULTS: ConfigData = {
     max_size_bytes: 10 * 1024 * 1024,
     cleanup_max_age_hours: 24,
   },
+  img_proxy: {
+    enabled: true,
+    port: 8765,
+    hostname: '127.0.0.1',
+    cache_max_age_hours: 24 * 7,
+    prompt_template: DEFAULT_PROMPT_TEMPLATE,
+    console_enabled: false, // Phase 2: Web 控制台
+    // v2 smart install defaults:
+    smart_mode: true,
+    vision_model_patterns_extra: [],
+    text_only_model_patterns_extra: [],
+    // v2 stream-level instrumentation: 默认全关,不改变现有用户行为
+    upstream_timeout_ms: 0,
+    stream_idle_timeout_ms: 0,
+  },
   agent_view: {
     enabled: true,
     refresh_min_interval_ms: 2000,
@@ -206,6 +238,7 @@ function cloneDefaults(): ConfigData {
     claude: { ...DEFAULTS.claude },
     sdk: { ...DEFAULTS.sdk },
     images: { ...DEFAULTS.images },
+    img_proxy: { ...DEFAULTS.img_proxy },
     agent_view: { ...DEFAULTS.agent_view },
   };
 }
@@ -292,6 +325,15 @@ export class ConfigManager {
       ['CC_LINKER_AGENT_VIEW_BACKGROUND_ONLY', 'agent_view', 'background_only'],
       ['CC_LINKER_AGENT_VIEW_STOP_REQUIRES_CONFIRM', 'agent_view', 'stop_requires_confirm'],
       ['CC_LINKER_AGENT_VIEW_REPLY_THROTTLE_MS', 'agent_view', 'reply_throttle_ms'],
+      ['CC_LINKER_IMG_PROXY_ENABLED', 'img_proxy', 'enabled'],
+      ['CC_LINKER_IMG_PROXY_PORT', 'img_proxy', 'port'],
+      ['CC_LINKER_IMG_PROXY_HOSTNAME', 'img_proxy', 'hostname'],
+      ['CC_LINKER_IMG_PROXY_CACHE_HOURS', 'img_proxy', 'cache_max_age_hours'],
+      ['CC_LINKER_IMG_PROXY_PROMPT_TEMPLATE', 'img_proxy', 'prompt_template'],
+      ['CC_LINKER_IMG_PROXY_SMART_MODE', 'img_proxy', 'smart_mode'],
+      // v2 stream-level instrumentation:
+      ['CC_LINKER_IMG_PROXY_UPSTREAM_TIMEOUT_MS', 'img_proxy', 'upstream_timeout_ms'],
+      ['CC_LINKER_IMG_PROXY_STREAM_IDLE_TIMEOUT_MS', 'img_proxy', 'stream_idle_timeout_ms'],
     ];
 
     // Parse array env vars for Claude tools
@@ -302,6 +344,18 @@ export class ConfigManager {
     const disallowedToolsEnv = process.env.CC_LINKER_CLAUDE_DISALLOWED_TOOLS;
     if (disallowedToolsEnv !== undefined) {
       this.data.claude.disallowed_tools = disallowedToolsEnv.split(',').map(s => s.trim()).filter(Boolean);
+    }
+
+    // Parse array env vars for img-proxy model pattern allowlists (v2 smart install)
+    const visionPatternsEnv = process.env.CC_LINKER_IMG_PROXY_VISION_PATTERNS_EXTRA;
+    if (visionPatternsEnv !== undefined) {
+      this.data.img_proxy.vision_model_patterns_extra =
+        visionPatternsEnv.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    const textOnlyPatternsEnv = process.env.CC_LINKER_IMG_PROXY_TEXT_ONLY_PATTERNS_EXTRA;
+    if (textOnlyPatternsEnv !== undefined) {
+      this.data.img_proxy.text_only_model_patterns_extra =
+        textOnlyPatternsEnv.split(',').map(s => s.trim()).filter(Boolean);
     }
 
     for (const [envKey, section, key] of mappings) {
@@ -343,6 +397,46 @@ export class ConfigManager {
     const [section, k] = key.split('.');
     if (this.data[section as keyof ConfigData]) {
       (this.data[section as keyof ConfigData] as any)[k] = value;
+    }
+  }
+
+  /** 重读 ~/.cc-linker/config.toml,覆盖 img_proxy section。
+   *  用 DEFAULTS.img_proxy 作底,这样用户删字段后会 reset 到默认值(不会保留 stale 值)。
+   *  其他 section 不动(可能是 CLI 启动时 set 的)。 */
+  reload(): void {
+    if (!existsSync(this.configPath)) {
+      this.data.img_proxy = { ...DEFAULTS.img_proxy };
+      this.reapplyRuntimeOverrides();
+      return;
+    }
+    try {
+      const fileData = parse(readFileSync(this.configPath, 'utf8')) as Record<string, any> | undefined;
+      const fileImgProxy = (fileData?.img_proxy ?? {}) as Partial<ConfigData['img_proxy']>;
+      this.data.img_proxy = {
+        ...DEFAULTS.img_proxy,
+        ...fileImgProxy,
+      };
+      // 重新应用 env 覆盖(用户可能改了 env var)
+      this.loadEnv();
+      // bug fix (review): 之前 reload() 没动 runtimeOverrides — setRuntimeOverride 设过的
+      // key 会被文件读回来的值覆盖(因为 get() 优先看 this.data,而 reload 把 this.data
+      // 重置了),违反 setRuntimeOverride 的"高于文件"语义。现在显式重 apply,
+      // 保证测试/CLI 启动时设的 override 在 reload 后仍是最高优先级。
+      this.reapplyRuntimeOverrides();
+    } catch (err) {
+      throw new Error(`config reload failed: ${err}`);
+    }
+  }
+
+  /** 重新把所有 runtimeOverrides 应用回 this.data。helper 用于 reload() 收尾,
+   *  也供未来测试 reset scenario 使用。runtimeOverrides 的语义是
+   *  "高于文件 + 高于 env",所以 reload 后必须最后一步 apply。 */
+  private reapplyRuntimeOverrides(): void {
+    for (const [key, value] of this.runtimeOverrides) {
+      const [section, k] = key.split('.');
+      if (this.data[section as keyof ConfigData]) {
+        (this.data[section as keyof ConfigData] as any)[k] = value;
+      }
     }
   }
 }

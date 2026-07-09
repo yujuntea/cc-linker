@@ -137,6 +137,14 @@ The `withSync()` helper in `src/index.ts` wraps this. Some commands skip sync wi
 - Card builders (`card.ts`) emit Feishu interactive cards; `Refresh` actions are debounced by 2s and the original `messageId` is verified before patching to avoid stomping on an already-overwritten card.
 - All knobs (debounce, peek tail, reply timeout, min Claude version, etc.) live in `[agent_view]` in `config.toml` with env var overrides (see `src/utils/config.ts`).
 
+### CLI Image Proxy
+
+`cc-linker img-proxy` runs a local reverse proxy on `ANTHROPIC_BASE_URL` that strips inline `image` content blocks from Claude Code requests, saves them to `~/.cc-linker/img-proxy/cache/`, and replaces each with a text block containing the local path (so text-only models like glm-5.2 don't 4xx and can call an image-recognition MCP tool themselves).
+
+- **Routing key = provider filename stem** (`byte-agent-glm.json` → `/byte-agent-glm`), NOT `ProviderManager.generateShortAlias` (which truncates/conflicts). Scan via `src/img-proxy/provider-scan.ts`.
+- **Survivability**: launchd `KeepAlive` (Label `com.cclinker.img-proxy`) restarts on crash. Plist injects `CC_LINKER_IMG_PROXY_DAEMON=1` so launchd starts the child directly — no double-fork. `install` writes a `.bak`; `uninstall` restores BASE_URL (keeping current token) and deletes `.bak`.
+- Phase 1 (this) ships proxy + CLI. Phase 2 adds the web monitoring console (`/` + `/admin/api/*`, judgment already hoisted above alias parsing in `server.ts`).
+
 ## Key Patterns
 
 **Error handling**: Use `CCLinkerError(code, message)` from `src/utils/errors.ts`. Error codes have user-facing suggestions in `handleError()`.
@@ -162,6 +170,9 @@ The `withSync()` helper in `src/index.ts` wraps this. Some commands skip sync wi
 | `src/feishu/card-updater.ts` | Update interactive cards during streaming |
 | `src/queue/spool.ts` | Durable file-based message queue |
 | `src/registry/registry.ts` | Registry read/write with locking and backups |
+| `src/img-proxy/server.ts` | Image-block stripping reverse proxy (Bun.serve) — lets text-only models accept pasted images |
+| `src/cli/commands/img-proxy.ts` | `cc-linker img-proxy install/uninstall/start/stop/status/daemon` |
+| `docs/img-proxy.md` | User-facing usage doc for `img-proxy` (install / config / FAQ / troubleshooting) |
 | `src/feishu/mapping.ts` | User state with CAS updates |
 | `src/runtime/state-coordinator.ts` | Single-process lock |
 | `src/scanner/index.ts` | Pre-command sync orchestration |

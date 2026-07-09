@@ -29,6 +29,7 @@ Have you ever found yourself in these situations:
 | Streaming card interaction | See Claude's thinking, tool_use summary (≤80 chars), and replies in real-time in your chat app, with a 5s tick showing elapsed time — no more "spinning wait" |
 | SDK permission control | Optional SDK mode: approve/deny each tool use via interactive cards before Claude executes |
 | Image message support | Feishu images are downloaded automatically and passed to Claude for analysis |
+| **Image proxy (img-proxy)** | Text-only models (glm-5.2, qwen3-max, deepseek, mimo-pro) can accept pasted images in Claude Code — image saved to disk + path injected, model picks Read / MCP / local CLI to recognize |
 | Directory browsing | Use `/listDir` to browse directories and choose where the next new session should start |
 | Unified session management | Auto-scan, incremental sync, no manual session list maintenance needed |
 | Multi-model switching | One-click model switch in cards, no config changes required |
@@ -156,6 +157,14 @@ cc-linker search <keyword>          # Search sessions
 cc-linker export <UUID>             # Export session as Markdown/JSON/Text
 cc-linker clean                     # Clean up invalid records
 cc-linker status                    # Check bridge status
+
+# img-proxy image proxy (text-only models can accept images)
+cc-linker img-proxy install         # Smart install: auto-discover + classify text-only / multimodal
+cc-linker img-proxy install --yes   # Same, non-interactive (uses default pre-selection)
+cc-linker img-proxy start --daemon  # Start the proxy in the background
+cc-linker img-proxy stop            # Stop the background proxy
+cc-linker img-proxy status          # Show daemon / routes / wrapper / launchd state
+cc-linker img-proxy daemon install  # macOS auto-start on boot
 ```
 
 ### Chat App Bot Commands (Feishu)
@@ -194,6 +203,52 @@ Send these in a Feishu private chat with the Bot:
 | `cc-linker daemon install` | Configure auto-start on boot |
 | `cc-linker daemon uninstall` | Remove auto-start on boot |
 | `cc-linker daemon status` | Check background service status |
+
+## 🖼 Text-Only Models Can Accept Images (img-proxy)
+
+> **Pain point**: text-only models (glm-5.2, qwen3-max, deepseek, mimo-pro) are strong at programming and tend to be the daily workhorses in Claude Code. But none of them currently supports multimodal input — pasting a screenshot, error message, or design mockup in Claude Code hits `4xx (Model only support text input)` immediately.
+
+**img-proxy is a local reverse proxy** (`127.0.0.1:8765`) that:
+
+1. Intercepts Claude Code requests and detects `image` blocks
+2. Saves the image to `~/.cc-linker/img-proxy/cache/`
+3. Replaces it with a text block: "image saved to this path — use Read / image-recognition MCP / local CLI to view it"
+
+The model picks whichever recognition method it already knows how to call. No per-model tool configuration. **Multimodal models (Claude / Kimi / GPT-4v) are completely unaffected** — they bypass the proxy entirely.
+
+### 30-Second Quick Start
+
+If you've already configured Claude Code (via CC Switch or a manual provider file):
+
+```bash
+# Smart install: auto-discover + classify (install text-only / skip multimodal),
+# with interactive confirmation of which ones to install
+cc-linker img-proxy install
+# Don't want to confirm? Add --yes to accept defaults (good for scripts / returning users)
+
+# Start the proxy in the background
+cc-linker img-proxy start --daemon
+
+# Optional: auto-start on macOS boot
+cc-linker img-proxy daemon install
+```
+
+> `cc-linker setup` already includes the img-proxy step — fresh users don't need to run it separately.
+
+### After It's Running
+
+- **CC Switch users**: `img-proxy install` detects CC Switch and asks whether to install the shell wrapper. Once installed, use `cc-linker-proxy` instead of `claude` — the wrapper reads the current provider from `~/.claude/settings.json`, looks up the route, and sets `ANTHROPIC_BASE_URL=http://127.0.0.1:8765/<alias>` before exec'ing claude.
+- **Custom alias users**: your existing `alias cc-X='claude --settings ...'` keeps working. `img-proxy install` only rewrites the `ANTHROPIC_BASE_URL` inside `~/.claude/providers/*.json`; the alias stays the same and the URL now points at the proxy.
+
+### Inspect / Debug
+
+- `cc-linker img-proxy status` shows daemon / installed routes / wrapper / launchd / Web Console state at a glance
+- Open `http://127.0.0.1:8765/` for the Web Console (Dashboard / Log / Config / Routes / Cache); enable it with `cc-linker img-proxy console enable`
+- Logs: `~/.cc-linker/img-proxy/img-proxy.log`
+
+For full configuration, command reference, and gotchas, see [docs/img-proxy.md](docs/img-proxy.md).
+
+---
 
 ## Agent View Integration
 
@@ -587,6 +642,7 @@ git push --tags
 | [Acceptance Test Report](docs/验收测试报告.md) | Acceptance test results |
 | [Product Requirements](docs/Product.md) | Product requirements document |
 | [Model Switch Design](docs/model-switch-design.md) | Model switching design |
+| [Image Proxy (img-proxy)](docs/img-proxy.md) | Image proxy — lets text-only models accept pasted images in Claude Code |
 
 ## License
 
