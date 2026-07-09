@@ -41,6 +41,8 @@ async function saveImage(cacheDir: string, mediaType: string, dataB64: string): 
 /**
  * 剥离 messages 里 inline base64 image block → 落盘 → 替换成含本地路径的 text block。
  * url-source 与非 image block 原样保留。单 block 异常时原样保留(不抛错,绝不阻塞)。
+ * 递归进入 tool_result.content(Read tool 读 PNG 后 Claude Code 把图塞进 tool_result
+ * 嵌套 content,必须扫到,否则透传给纯文本模型 → 400)。
  *
  * 性能说明:
  * - mkdirSync 一次性提升到函数顶层(以前每张图都调一次,冗余)
@@ -60,12 +62,14 @@ export async function stripImagesToPaths(
   // 顶层一次性 mkdirSync,取代之前每张图都调用
   mkdirSync(opts.cacheDir, { recursive: true });
 
-  const out = await Promise.all(messages.map(async (msg: any) => {
-    if (!msg || typeof msg !== 'object') return msg;
-    const content = msg.content;
-    if (!Array.isArray(content)) return msg;  // string content 原样
-
-    const newContent = await Promise.all(content.map(async (block: any): Promise<any> => {
+  // 抽到命名函数:tool_result.content 嵌套 image 块要递归处理(2026-07-09 fix),
+  // 命名函数比在 .map 里再嵌一层 .map + 复制 strip 逻辑更清晰。
+  const processBlocks = async (blocks: any[]): Promise<any[]> => {
+    return Promise.all(blocks.map(async (block: any): Promise<any> => {
+      // 递归:tool_result 的 content 也是 content 数组,同样的 image block 可能藏在里面
+      if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+        return { ...block, content: await processBlocks(block.content) };
+      }
       if (block?.type !== 'image') return block;
       const src = block.source;
       if (!src || src.type !== 'base64' || typeof src.data !== 'string' || typeof src.media_type !== 'string') {
@@ -80,6 +84,14 @@ export async function stripImagesToPaths(
         return block;
       }
     }));
+  };
+
+  const out = await Promise.all(messages.map(async (msg: any) => {
+    if (!msg || typeof msg !== 'object') return msg;
+    const content = msg.content;
+    if (!Array.isArray(content)) return msg;  // string content 原样
+
+    const newContent = await processBlocks(content);
     return { ...msg, content: newContent };
   }));
 
