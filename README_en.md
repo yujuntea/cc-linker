@@ -206,7 +206,7 @@ Send these in a Feishu private chat with the Bot:
 
 ## 🖼 Text-Only Models Can Accept Images (img-proxy)
 
-> **Pain point**: text-only models (glm-5.2, qwen3-max, deepseek, mimo-pro) reject pasted images in Claude Code with `4xx (Model only support text input)`. Upgrading to multimodal (Claude / Kimi / GPT-4v) is more expensive. So how do you keep using cheap text-only models while still showing Claude your screenshots, error messages, or design mockups?
+> **Pain point**: text-only models (glm-5.2, qwen3-max, deepseek, mimo-pro) are strong at programming and tend to be the daily workhorses in Claude Code. But none of them currently supports multimodal input — pasting a screenshot, error message, or design mockup in Claude Code hits `4xx (Model only support text input)` immediately.
 
 **img-proxy is a local reverse proxy** (`127.0.0.1:8765`) that:
 
@@ -221,8 +221,10 @@ The model picks whichever recognition method it already knows how to call. No pe
 If you've already configured Claude Code (via CC Switch or a manual provider file):
 
 ```bash
-# One-click smart install: auto-discover providers + auto-classify (install text-only / skip multimodal)
-cc-linker img-proxy install --yes
+# Smart install: auto-discover + classify (install text-only / skip multimodal),
+# with interactive confirmation of which ones to install
+cc-linker img-proxy install
+# Don't want to confirm? Add --yes to accept defaults (good for scripts / returning users)
 
 # Start the proxy in the background
 cc-linker img-proxy start --daemon

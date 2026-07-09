@@ -219,7 +219,7 @@ cc-linker img-proxy daemon install  # macOS 开机自启
 
 ## 🖼 纯文本模型也能接收图片 (img-proxy)
 
-> **痛点**:glm-5.2、qwen3-max、deepseek、mimo-pro 等纯文本模型在 Claude Code 里粘贴图片直接 `4xx (Model only support text input)`。但升级到 Claude / Kimi / GPT-4v 等多模态模型又贵 —— 日常用便宜的纯文本模型时,怎么继续贴截图、错误信息、设计稿给 Claude 看?
+> **痛点**:glm-5.2、qwen3-max、deepseek、mimo-pro 等纯文本模型编程能力强,是 Claude Code 日常主力;但目前都不支持多模态输入 —— 粘贴截图、错误信息、设计稿到 Claude Code 直接 `4xx (Model only support text input)`。
 
 **img-proxy 是个本地反向代理**(`127.0.0.1:8765`),装上后:
 
@@ -234,8 +234,9 @@ cc-linker img-proxy daemon install  # macOS 开机自启
 如果你已经配置过 Claude Code(用 CC Switch 或自写 provider 文件):
 
 ```bash
-# 一键智能安装: 自动发现 provider + 自动分类(text-only 装 / multimodal 跳过)
-cc-linker img-proxy install --yes
+# 智能安装:自动发现 + 分类(text-only 装 / multimodal 跳过),交互式确认要装哪些
+cc-linker img-proxy install
+# 不想交互确认?加 --yes 用默认预选(脚本/老用户场景)
 
 # 后台启动代理
 cc-linker img-proxy start --daemon
