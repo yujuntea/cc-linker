@@ -576,11 +576,31 @@ export class AgentViewManager {
       logger.warn(`handleAttach: resolveLiveSession failed for ${sessionId}: ${err?.message ?? err}`);
     }
     // 0. 实时守卫(用翻译后的 sessionId — parent 不在但 fork 在也 OK)
+    // v2.2.15 fix(完整实现):先精确匹配;若 sessionId 仍是 8-hex 短 hash 且
+    // snapshot 中某 session 的 sessionId 是 36-char full UUID 且以它开头,把它
+    // 展开成 full(后续 CAS 写的就是 full,SDK 不拒)。原来只精确匹配,短 hash
+    // 进来 + snapshot 只有 full 时误报"会话已不存在"。
     const result = await AgentSnapshotFetcher.fetch();
-    if (
-      !result.ok ||
-      !result.sessions.find(s => s.sessionId === sessionId)
-    ) {
+    if (!result.ok) {
+      await this.deps.replyFn('⚠️ 会话已不存在', { openId });
+      return null;
+    }
+    let matchedSession = result.sessions.find(s => s.sessionId === sessionId);
+    if (!matchedSession && /^[0-9a-f]{8}$/.test(sessionId)) {
+      matchedSession = result.sessions.find(
+        s =>
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+            s.sessionId,
+          ) && s.sessionId.startsWith(sessionId),
+      );
+      if (matchedSession) {
+        logger.info(
+          `handleAttach: 短 hash ${sessionId} 命中 snapshot ${matchedSession.sessionId},展开成 full`,
+        );
+        sessionId = matchedSession.sessionId;
+      }
+    }
+    if (!matchedSession) {
       await this.deps.replyFn('⚠️ 会话已不存在', { openId });
       return null;
     }
