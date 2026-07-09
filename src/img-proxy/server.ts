@@ -186,7 +186,7 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
 
   const server = Bun.serve({
     port, hostname,
-    async fetch(req) {
+    async fetch(req, server) {
       const url = new URL(req.url);
 
       // Task 8: 总是接管 console 路由(即使 console_enabled=false),handler 内检查开关
@@ -232,6 +232,16 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       const startedAt = Date.now();
 
       const isMessagesPost = req.method === 'POST' && /\/v1\/messages(\/|$|\?)/.test(url.pathname);
+
+      // Fix(idleTimeout): Bun.serve 默认 idleTimeout=10s,在响应流式传输期间如果
+      // 超过 10s 没有数据发送,Bun 会直接关闭 client TCP 连接(connection reset)。
+      // LLM API 的 SSE 流式响应在 extended thinking / tool execution / 长 token 生成
+      // 期间很容易超过 10s 静默期 → client 看到 "Connection closed mid-response"。
+      // 对 POST /v1/messages 禁用 idleTimeout(Bun 官方推荐做法)。
+      // 其他请求(502 / console / HEAD 健康检查)保持默认 10s 保护。
+      if (isMessagesPost) {
+        server.timeout(req, 0);  // 0 = 禁用此请求的 idle timeout
+      }
 
       // 决定转发 body
       let outBody: BodyInit | null | undefined;
