@@ -4,27 +4,117 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] - 2026-07-09
 
 ### Added
 
-- **CLI Image Proxy (`cc-linker img-proxy`)** — 让纯文本模型(glm-5.2 等)也能在
-  Claude Code CLI 里接受粘贴的图片。在 `ANTHROPIC_BASE_URL` 链路上插一层本地反向
-  代理,拦截出站请求里的 inline `image` content block,落盘到
-  `~/.cc-linker/img-proxy/cache/`,替换成"图片本地路径 + 引导调 MCP 识别"的 text
-  block,再转发给真实上游。
+- **CLI Image Proxy (`cc-linker img-proxy`)** — 让纯文本模型(glm-5.2、
+  qwen3-max、deepseek、mimo-pro 等)在 Claude Code 里也能接收粘贴的图片。本地
+  反向代理 `127.0.0.1:8765`,拦截出站请求里的 inline `image` content block,
+  落盘到 `~/.cc-linker/img-proxy/cache/`,替换成"图片本地路径 + 引导调 Read /
+  图片识别 MCP / 本地 CLI"的 text block,再转发给真实上游。**多模态模型
+  (Claude/Kimi/GPT-4v 等)完全不受影响**(不经 proxy)。
   - 路由键 = **provider 文件名 stem**(`byte-agent-glm.json` → `/byte-agent-glm`),
     不用 `ProviderManager.generateShortAlias`(它会截断/冲突)。
-  - `src/img-proxy/server.ts` — `Bun.serve` 反向代理,SSE 流式透传,启动+定时清缓存,
-    内存计数(Phase 2 控制台读)。
-  - `src/img-proxy/transform.ts` — 剥离 base64 image block 落盘的纯函数;`{path}`
-    模板缺失时回退默认文案(避免空 text block)。
-  - `src/img-proxy/provider-config.ts` — install/uninstall 改写 BASE_URL,`.bak`
-    生命周期:install 写、uninstall 还原后删除(token 永远从当前文件读)。
-  - `cc-linker img-proxy install [--providers|--all] / uninstall / start [--daemon] /
-    stop / status / daemon install|uninstall`。daemon 三分支(child/parent/前台),
-    launchd 用 env 注入避免双重 fork。
-  - Phase 2(后续 plan)将叠加 Web 监控控制台。
+  - `src/img-proxy/server.ts` — `Bun.serve` 反向代理,SSE 流式透传。
+    POST `/v1/messages` 禁 `idleTimeout`(Bun 默认 10s 在长 thinking/tool
+    调用会断连),请求/响应头 `content-encoding`/`accept-encoding` 收口
+    (避免上游 gzip 响应被客户端二次解压崩),启动+每小时清过期缓存。
+  - `src/img-proxy/transform.ts` — `stripImagesToPaths` 递归处理
+    `tool_result.content` 嵌套 image block(Read 工具读 PNG 后 Claude Code
+    会嵌套塞进 tool_result),`{path}` 模板缺失时回退默认文案。
+  - `src/img-proxy/provider-config.ts` — `installProvider` 3 态机(真幂等
+    / 跨 port/hostname 重装 / 首次),`.bak` 生命周期(原始 upstream 永远
+    从 `.bak` 读)。`isAnyProxyUrl` 宽松匹配识别"我们装过的代理 URL"。
+  - `src/img-proxy/routes.ts` — `routes.json` 用 `proper-lockfile` + sentinel
+    互斥写,`disabled` 标志支持 console 软禁用。
+  - `cc-linker img-proxy install [--yes|--providers|--all] / uninstall / start
+    [--daemon] / stop / status / daemon install|uninstall`。Daemon 三分支
+    (parent/child/前台),launchd 用 `CC_LINKER_IMG_PROXY_DAEMON=1` env 注入
+    避免双重 fork,parent poll PID + `isPidAlive` 双重判定避免 EADDRINUSE
+    假阳性。
+
+- **Smart install with multimodal classification** — `img-proxy install`
+  默认 smart 模式: 4 路发现(manual / CC Switch auto / shell alias hint /
+  provider-scan)+ 内置分类(Claude/GPT/Gemini/Qwen/GLM/Kimi/MiniMax/MiMo
+  /Doubao/Stepfun 等),自动跳过 multimodal,只装 text-only + unknown。
+  可通过 `[img_proxy] smart_mode` 关闭,通过
+  `vision_model_patterns_extra` / `text_only_model_patterns_extra` 自定义
+  patterns。`--providers` 显式指定 multimodal 会抛 `E_IMG_PROXY_MULTIMODAL_PROVIDER`
+  而不是静默装。
+
+- **Shell wrapper (`cc-linker-proxy`)** — `img-proxy wrapper install` 写
+  shell 函数到 `~/.zshrc` / `~/.bashrc`。给 CC Switch 用户用(他们没自定义
+  `cc-X` alias,直接 `claude` 读 `~/.claude/settings.json`):wrapper 自动
+  从 settings.json 读当前 provider,查 routes.json,设
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8765/<alias>` 后 exec claude。递归
+  防护(已设 BASE_URL 直接 exec,不走 resolve)。`wrapper install` 期间
+  写备份到 `wrapper-backups/`。
+
+- **Web Console (Phase 2)** — `http://127.0.0.1:8765/`(`console_enabled = true`),
+  5 个 Tab:
+  - **Dashboard** — 实时 totalRequests / strippedImages / uptime / cache
+    文件数+大小,5min 状态分布,per-alias 聚合
+    (requests / stripped / chunks / bytes / avgDuration / lastAt)
+  - **Log** — 最近 200 条请求表格,按 alias / status / streamStatus /
+    时间过滤,可手动刷新
+  - **Config** — 改 `console_enabled` / `upstream_timeout_ms` /
+    `stream_idle_timeout_ms`(`console_enabled` 热开关,其它需重启)
+  - **Routes** — 每行 Enable / Disable 按钮(写 `disabled` 软禁用)
+  - **Cache** — 概览 + "立即清理" 按钮(调用 `cleanupOldCache(0)`)
+  - 所有写操作 audit log 到 `img-proxy.log`(`console_action` + `trigger: console`)
+  - CLI: `cc-linker img-proxy console enable|disable|status`
+
+- **New config keys** (`[img_proxy]` in `~/.cc-linker/config.toml`):
+  - `console_enabled` (default `false`) — Web Console 开关
+  - `upstream_timeout_ms` (default `0`) — upstream fetch 整体超时
+  - `stream_idle_timeout_ms` (default `0`) — 距最后 chunk 超过 N ms 判 stalled
+  - `smart_mode` (default `true`) — 跳过 multimodal
+  - `cache_max_age_hours` (default `168`) — 缓存保留 7 天
+  - 对应 env vars: `CC_LINKER_IMG_PROXY_UPSTREAM_TIMEOUT_MS` /
+    `CC_LINKER_IMG_PROXY_STREAM_IDLE_TIMEOUT_MS` / etc.
+
+- **README + 详细文档** — `README.md` 和 `README_en.md` 新增 img-proxy 核心
+  特性行、6 个 CLI 命令、新章节"纯文本模型也能接收图片 (img-proxy)"、详细
+  文档表链接。`docs/img-proxy.md` 全量覆盖:架构、4 路发现、模型分类、3 态
+  install、CC Switch / 自定义 alias / cold-start 场景、Web Console、11 个
+  踩坑点 + 修法。
+
+### Fixed
+
+- **handleAttach guard 只做精确匹配** (`src/agent-view/manager.ts:580-586`) —
+  v2.2.15 commit 注释声称"守卫同时认 short 和 full",但实现只精确匹配
+  `s.sessionId === sessionId`。当 card 传 short hash,snapshot 只有 full
+  UUID 时,守卫误报"会话已不存在",entry 写不下去。改为:先精确匹配,
+  失败但 sessionId 是 8-hex short → 找 snapshot 中 36-char full 且以它
+  开头,命中则把 sessionId 替换成 full(后续 CAS 写 full,SDK 不拒)。
+- **POST `/v1/messages` SSE 长静默期断连** — Bun.serve 默认
+  `idleTimeout=10s` 在 extended thinking / tool execution / 长 token
+  生成期间会关 client TCP → 客户端 `Connection closed mid-response`。
+  进入 fetch 前 `server.timeout(req, 0)` 禁该请求 idleTimeout。
+- **`content-encoding` 双解压导致客户端崩** — Bun.fetch 自动解压但保留
+  `content-encoding` + 过期 `content-length`,客户端对已被解压的明文
+  再 gunzip → 流解析崩 → pipeTo reject undefined。`sanitizeProxyResponseHeaders`
+  剥 content-encoding / content-length,`sanitizeProxyRequestHeaders` 把
+  `accept-encoding` 收口到 `gzip, deflate, br`。
+- **`tool_result.content` 嵌套 image 块不剥** — Claude Code 让 Read 工具
+  读 PNG 后塞进 `tool_result.content` 数组,老 strip 只扫顶层漏掉,纯文本
+  模型 4xx。`stripImagesToPaths` 抽 `processBlocks(blocks)` 命名函数递归。
+- **MiMo 正则老 lookahead bug** — 老 `/mimo-v\d+(?!-pro)/` backtrack 跳掉
+  pro 前缀,把 `mimo-v2.5-pro` 误判 multimodal。改为锚定
+  `/^mimo-v\d+(\.\d+)?$/` + 显式 `/^mimo-.*-pro/` 拦截 Pro 变体。
+- **launchd daemon install 留旧 PID 占 :8765** — 重装时 KeepAlive 在新
+  child 起来前把 port 给旧 child,新 child EADDRINUSE crash。daemon install
+  进入前先 `launchctl stop` + 轮询 SIGKILL 兜底 + `unload` + 清 PID 文件。
+- **parent spawn child 后 PID 文件"碰巧留下"假阳性** — 老 parent 盲目等
+  1200ms 后报"成功",child 可能 EADDRINUSE crash 后 PID 文件刚好留着。
+  改为 poll `PID_FILE === child.pid && isPidAlive(childPid)` 5s。
+- **CC Switch 同步 mtime 陷阱** — 老用 `auto-providers/` 目录 mtime,目录
+  mtime 在文件删除时跳到 NOW → 误判已同步。改为目录下**最新文件** mtime。
+- **`DEFAULT_PROMPT_TEMPLATE` 硬编码特定 MCP** — 改为工具无关,指引
+  Read / 任何图片 MCP / `mmx-cli`,用户可改 `prompt_template` 调。
+
+## [Unreleased]
 
 ## [0.7.5] - 2026-07-02
 
