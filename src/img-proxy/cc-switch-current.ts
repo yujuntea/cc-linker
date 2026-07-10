@@ -98,7 +98,7 @@ export function getCurrentCcSwitchProvider(
 export function getCcSwitchProviderConfigByName(
   name: string,
   ccSwitchDir: string = join(HOME, '.cc-switch'),
-): { settingsConfig: object } | null {
+): { settingsConfig: { env?: Record<string, string>; [k: string]: unknown } } | null {
   const dbPath = join(ccSwitchDir, 'cc-switch.db');
   if (!existsSync(dbPath)) return null;
   let db: Database | null = null;

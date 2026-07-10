@@ -343,6 +343,10 @@ export async function imgProxyCcSwitchSettings(): Promise<void> {
       console.error(`cc-linker-proxy: 当前 provider "${result.name}" 未同步`);
       console.error('  hint: cc-linker img-proxy install');
       process.exit(2);
+    default:
+      // 强制穷尽性: CcSwitchLookupResult 新增变体时 TS 会在这里报错。
+      const _exhaustive: never = result;
+      throw new Error(`unhandled cc-switch lookup status: ${JSON.stringify(_exhaustive)}`);
   }
 }
 
@@ -892,7 +896,7 @@ export async function imgProxyUpdate(opts: {
       try {
         await updateProvider({
           providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH,
-          port, hostname, latestCfg: latest.settingsConfig as any,
+          port, hostname, latestCfg: latest.settingsConfig,
         });
         console.log(chalk.green(`  ↻ ${t.alias}  已刷新`));
         updated++;
