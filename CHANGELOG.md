@@ -238,8 +238,10 @@ All notable changes to cc-linker are documented here. Format follows
   `cc-X` alias,直接 `claude` 读 `~/.claude/settings.json`):wrapper 自动
   从 settings.json 读当前 provider,查 routes.json,设
   `ANTHROPIC_BASE_URL=http://127.0.0.1:8765/<alias>` 后 exec claude。递归
-  防护(已设 BASE_URL 直接 exec,不走 resolve)。`wrapper install` 期间
-  写备份到 `wrapper-backups/`。
+  防护(幂等):已设为 proxy URL(resolve 返同 URL)直接 exec(E7 invariant);
+  已设为已装的 upstream URL 改写为 proxy URL + stderr warn;陌生 / stale
+  inherited URL fall back 到 settings.json + stderr warn;env 未设走
+  settings.json 路径。`wrapper install` 期间写备份到 `wrapper-backups/`。
 
 - **Web Console (Phase 2)** — `http://127.0.0.1:8765/`(`console_enabled = true`),
   5 个 Tab:

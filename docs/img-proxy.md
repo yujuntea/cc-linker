@@ -393,10 +393,10 @@ text_only_model_patterns_extra = ["my-custom-text-*"]
 $ cc-linker-proxy "看这个图"
   ↓
 shell 函数 cc-linker-proxy() (在 ~/.zshrc)
-  ① 如果 ANTHROPIC_BASE_URL 已设 → 直接 exec claude(递归防护)
-  ② 调 cc-linker img-proxy current-url    → 读 ~/.claude/settings.json
-  ③ 调 cc-linker img-proxy resolve <URL>  → 查 routes.json
-  ④ ANTHROPIC_BASE_URL=<proxy> claude "看这个图"
+  ① env 已设且 resolve 返同 URL → 直 exec claude(E7 invariant:proxy URL 保留)
+  ② env 已设且 resolve 返不同 URL → stderr warn "改写",exec claude (env=proxy)
+  ③ env 已设但 resolve 返空       → stderr warn "fall back",走 settings.json 路径
+  ④ env 未设                       → settings.json → resolve → exec claude (env=proxy)
 ```
 
 ### 3 步启用
@@ -421,7 +421,7 @@ claude "echo test"             # 直连(不受影响)
 
 ### 关键行为
 
-- **递归防护**:`ANTHROPIC_BASE_URL` 非空直接 exec,不走 resolve。
+- **递归防护(幂等)**:`ANTHROPIC_BASE_URL` 已设为 proxy URL(resolve 返同 URL)就直 exec,不走 resolve——保留用户显式选的 URL(E7 invariant)。设的是已装的 upstream URL 会改写为 proxy URL + stderr warn;陌生 / stale inherited URL 走 settings.json fall back + stderr warn。
 - **幂等**:重复 `wrapper install` 不重复写。
 - **备份**:修改前 `~/.cc-linker/img-proxy/wrapper-backups/wrapper-backup-<ts>-<uuid>`。
 - **shell 检测**:`ZSH_VERSION` / `BASH_VERSION` / `$SHELL` 末段(zsh/bash)→ 写对应 rc。
