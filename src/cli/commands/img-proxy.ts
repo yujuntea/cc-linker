@@ -149,9 +149,16 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
 
   const routes = loadRoutes(IMG_PROXY_ROUTES_PATH).routes;
   if (Object.keys(routes).length === 0) {
-    (isChild ? console.log : console.warn)(
-      isChild ? 'WARN 路由表为空,代理会转发失败。先 cc-linker img-proxy install' : chalk.yellow('⚠️  路由表为空,代理会转发失败。先 cc-linker img-proxy install'),
-    );
+    // 2026-07-10: child path 用 console.warn(被重写为 [WARN] 前缀)而非 console.log
+    // ([INFO] 前缀)。之前三元里 isChild 用 console.log 但文本里手写 "WARN ",结果
+    // log file 里同时出现 "[INFO] WARN ..." — log level 矛盾,grep/dashboard 按 level
+    // 过滤会漏这条。统一用 console.warn + 去掉手写 "WARN " 前缀(level 已在 [WARN]
+    // 里),前台保留 chalk.yellow 给终端用户视觉提示。
+    if (isChild) {
+      console.warn('路由表为空,代理会转发失败。先 cc-linker img-proxy install');
+    } else {
+      console.warn(chalk.yellow('⚠️  路由表为空,代理会转发失败。先 cc-linker img-proxy install'));
+    }
   }
 
   let server;
@@ -183,14 +190,16 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
   const cleanup = (sig: string) => {
     try { server.stop(true); } catch {}
     try { if (existsSync(IMG_PROXY_PID_FILE)) unlinkSync(IMG_PROXY_PID_FILE); } catch {}
+    // 2026-07-10: 关闭 logWriter(flush 已经在每个 write 里跑了,这里主要是 end() —
+    // 释放文件 handle,丢失的内 buffer 一般为空,但保留 end() 防御未来 logWriter
+    // 实现变 buffered 模式时不出问题。删掉 2026-07-10 之前的 5s setInterval:
+    // 那是 dead code,每个 console.* 都已 flush,interval 完全冗余。
+    try { if (logWriter) { logWriter.flush(); logWriter.end(); } } catch {}
     process.exit(0);  // OS signal 触发的清理路径,只在 daemon child 里跑,保留 exit
   };
   process.on('SIGTERM', () => cleanup('SIGTERM'));
   process.on('SIGINT', () => cleanup('SIGINT'));
   process.on('SIGHUP', () => {});
-
-  // child 定期 flush;前台靠 server 监听保活
-  if (isChild) setInterval(() => { try { logWriter.flush(); } catch {} }, 5000);
 }
 
 // ---------- stop ----------
@@ -280,11 +289,14 @@ export async function imgProxyStatus(): Promise<void> {
 }
 
 // ---------- current-url ----------
+// 2026-07-10: library 化。失败 throw 而不 process.exit(同 imgProxyStart / daemon install
+// 的契约)— CLI 入口 index.ts:235 在 try/catch 里 process.exit。如果这里直接
+// process.exit(1),未来若被 wizard / programmatic caller 调用,wizard 进程的
+// try/catch 接不住,会被杀(launchd child 自杀 bug 的同源模式)。
 export async function imgProxyCurrentUrl(): Promise<void> {
   const { url, parseError } = readCurrentUpstreamFromSettings();
   if (parseError) {
-    console.error(chalk.red(`❌ settings.json 解析失败: ${parseError.message}`));
-    process.exit(1);
+    throw new Error(`settings.json 解析失败: ${parseError.message}`);
   }
   if (url) console.log(url);
   // 空 stdout = "没找到" — wrapper 检测用
@@ -386,37 +398,32 @@ import { setConsoleEnabled } from '../../img-proxy/console/config-writer';
 
 export async function imgProxyConsoleEnable(): Promise<void> {
   const configPath = expandPath(CONFIG_PATH);
-  try {
-    const { previous } = setConsoleEnabled(configPath, true);
-    console.log(chalk.green(`✅ Web Console 已启用 (config: ${configPath})`));
-    if (!previous) {
-      console.log(chalk.cyan(`   ${chalk.bold('提示')}: 需重启 daemon 才会生效:`));
-      console.log(chalk.cyan(`     cc-linker img-proxy stop && cc-linker img-proxy start`));
-    }
-    const port = config.get<number>('img_proxy.port', 8765);
-    const host = config.get<string>('img_proxy.hostname', '127.0.0.1');
-    console.log(chalk.cyan(`   之后访问 http://${host}:${port}/`));
-  } catch (err) {
-    console.log(chalk.red(`❌ 启用失败: ${(err as Error).message}`));
-    process.exit(1);
+  // 2026-07-10: library 化。失败 throw 而不 process.exit(同 imgProxyStart /
+  // imgProxyCurrentUrl / daemon install)。CLI binding 在 index.ts:255 try/catch
+  // 里 process.exit。如果这里直接 process.exit,未来若被 wizard 调用,wizard
+  // 的 try/catch 接不住,wizard 进程被杀(同 launchd child 自杀 bug)。
+  const { previous } = setConsoleEnabled(configPath, true);
+  console.log(chalk.green(`✅ Web Console 已启用 (config: ${configPath})`));
+  if (!previous) {
+    console.log(chalk.cyan(`   ${chalk.bold('提示')}: 需重启 daemon 才会生效:`));
+    console.log(chalk.cyan(`     cc-linker img-proxy stop && cc-linker img-proxy start`));
   }
+  const port = config.get<number>('img_proxy.port', 8765);
+  const host = config.get<string>('img_proxy.hostname', '127.0.0.1');
+  console.log(chalk.cyan(`   之后访问 http://${host}:${port}/`));
 }
 
 export async function imgProxyConsoleDisable(): Promise<void> {
   const configPath = expandPath(CONFIG_PATH);
-  try {
-    const { previous } = setConsoleEnabled(configPath, false);
-    if (!previous) {
-      console.log(chalk.gray(`⚠️  Web Console 已经禁用 (无需改动)`));
-      return;
-    }
-    console.log(chalk.green(`✅ Web Console 已禁用 (config: ${configPath})`));
-    console.log(chalk.cyan(`   提示: 需重启 daemon:`));
-    console.log(chalk.cyan(`     cc-linker img-proxy stop && cc-linker img-proxy start`));
-  } catch (err) {
-    console.log(chalk.red(`❌ 禁用失败: ${(err as Error).message}`));
-    process.exit(1);
+  // 2026-07-10: library 化(同 imgProxyConsoleEnable)。
+  const { previous } = setConsoleEnabled(configPath, false);
+  if (!previous) {
+    console.log(chalk.gray(`⚠️  Web Console 已经禁用 (无需改动)`));
+    return;
   }
+  console.log(chalk.green(`✅ Web Console 已禁用 (config: ${configPath})`));
+  console.log(chalk.cyan(`   提示: 需重启 daemon:`));
+  console.log(chalk.cyan(`     cc-linker img-proxy stop && cc-linker img-proxy start`));
 }
 
 export async function imgProxyConsoleStatus(): Promise<void> {

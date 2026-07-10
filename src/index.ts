@@ -232,7 +232,16 @@ imgProxyCmd.command('start')
   });
 imgProxyCmd.command('stop').description('停止代理').action(() => imgProxyStop());
 imgProxyCmd.command('status').description('查看代理状态').action(() => imgProxyStatus());
-imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL').action(() => imgProxyCurrentUrl());
+imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL').action(() => {
+  // 2026-07-10: imgProxyCurrentUrl 改 library 化 throw 而不 process.exit(同
+  // imgProxyStart / daemon install)。CLI 入口负责 process.exit — 同 sibling。
+  try {
+    return imgProxyCurrentUrl();
+  } catch (err) {
+    console.error(chalk.red(`❌ ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
 imgProxyCmd.command('resolve <upstream>').description('按真实 upstream URL 查 proxy URL').action((upstream) => imgProxyResolve({ upstream }));
 const wrapperCmd = imgProxyCmd.command('wrapper').description('管理 shell wrapper (cc-linker-proxy)');
 wrapperCmd.command('install').description('装 wrapper 到 ~/.zshrc').action(() => imgProxyWrapperInstall());
@@ -252,8 +261,26 @@ imgProxyDaemonCmd.command('install').description('配置开机自启').action(as
 });
 imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());
 const imgProxyConsoleCmd = imgProxyCmd.command('console').description('管理 Web Console 监控后台 (http://127.0.0.1:8765/)');
-imgProxyConsoleCmd.command('enable').description('启用 Web Console,改 [img_proxy]console_enabled=true').action(() => imgProxyConsoleEnable());
-imgProxyConsoleCmd.command('disable').description('禁用 Web Console,改 [img_proxy]console_enabled=false').action(() => imgProxyConsoleDisable());
+// 2026-07-10: imgProxyConsoleEnable / imgProxyConsoleDisable 改 library 化 throw
+// 而不 process.exit(同 daemon install / imgProxyStart)。CLI 入口负责 process.exit —
+// 跟 sibling 函数对齐。如果这里直接调,wizard 未来若 wrap 它会被 process.exit 杀掉
+// (同 launchd child 自杀 bug 的源模式)。
+imgProxyConsoleCmd.command('enable').description('启用 Web Console,改 [img_proxy]console_enabled=true').action(() => {
+  try {
+    return imgProxyConsoleEnable();
+  } catch (err) {
+    console.error(chalk.red(`❌ 启用失败: ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
+imgProxyConsoleCmd.command('disable').description('禁用 Web Console,改 [img_proxy]console_enabled=false').action(() => {
+  try {
+    return imgProxyConsoleDisable();
+  } catch (err) {
+    console.error(chalk.red(`❌ 禁用失败: ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
 imgProxyConsoleCmd.command('status').description('查看 Web Console 当前状态 + URL').action(() => imgProxyConsoleStatus());
 
 program

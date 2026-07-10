@@ -323,7 +323,17 @@ export function cleanupOldCache(
   // Collect all cache files with their mtime + size
   const files: { path: string; mtimeMs: number; size: number }[] = [];
   let totalSize = 0;
-  for (const f of readdirSync(cacheDir)) {
+  // 2026-07-10: readdirSync 自己抛(ENOENT,if cacheDir 在 existsSync 检查后
+  // 被删除 — 用户手动 rm / 另一个 daemon 的 cleanup / install hook race)→
+  // 之前会 throw 到 caller,startup 路径会让 daemon 进程直接 crash。包 try/catch
+  // 返 0 视作 "没东西可清",与 existsSync=false 等价(都是 dir 不存在的语义)。
+  let entries: string[];
+  try {
+    entries = readdirSync(cacheDir);
+  } catch {
+    return 0;
+  }
+  for (const f of entries) {
     const p = join(cacheDir, f);
     try {
       const st = statSync(p);

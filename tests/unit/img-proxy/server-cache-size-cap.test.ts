@@ -100,4 +100,25 @@ describe('cleanupOldCache (P2-3 size cap)', () => {
     expect(cleaned).toBe(1);
     expect(readdirSync(tmpDir).sort()).toEqual(['subdir']);
   });
+
+  // 2026-07-10 回归:cache dir 在 existsSync 检查之后被删除 (用户手动 rm / install
+  // hook race / 另一个 daemon 的 cleanup 竞争) → readdirSync 抛 ENOENT。修前会让
+  // startup 路径 daemon 进程直接 crash。修后 readdirSync 包 try/catch,dir 消失返
+  // 0,与 existsSync=false 等价(都是"没东西可清"语义)。
+  it('returns 0 (does not throw) when cacheDir is removed mid-call', () => {
+    const cacheDir = join(tmpDir, 'racey');
+    require('fs').mkdirSync(cacheDir);
+    writeFileSync(join(cacheDir, 'a.png'), Buffer.alloc(100, 'x'));
+    // 直接删 cacheDir,模拟 race;cleanupOldCache 应 silent 返 0 不 throw
+    rmSync(cacheDir, { recursive: true, force: true });
+    let thrown: unknown = null;
+    let cleaned = -1;
+    try {
+      cleaned = cleanupOldCache(cacheDir, 24 * 7, 1024 * 1024);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeNull();
+    expect(cleaned).toBe(0);
+  });
 });

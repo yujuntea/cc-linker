@@ -289,31 +289,17 @@ async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
     // 这里不再重复问 — 用 result.startedNow 字段。早期 wizard 自己问 startNow 调
     // imgProxyStart,跟 imgProxyInstall 内部那个会双问,用户被问两次同样的问题。
     result.started = installResult.startedNow;
+    // 2026-07-10: 同上,launchd 也不重复问(P0-1 sibling)。imgProxyInstall 内部已调
+    // promptLaunchdAutoStart → imgProxyDaemonInstall,result.autoStart 已返回 —
+    // wizard 只透传 flag,不再触发二次 prompt / 二次 install(避免同一 plist 被
+    // stop → unload → reload → 重启 + 再次健康检查,浪费 ~5s)。
+    result.autoStart = installResult.autoStart;
     if (installResult.installedCount === 0) {
       console.log(chalk.yellow('  ⚠️ 0 个 provider 被安装(全部跳过 / 多模态 / 用户跳选)'));
     }
   } catch (err) {
     console.log(chalk.red(`  ❌ 安装失败: ${err}`));
     return result;
-  }
-
-  // macOS launchd
-  if (process.platform === 'darwin') {
-    const { autoStart } = await inquirer.prompt([{
-      type: 'confirm',
-      name: 'autoStart',
-      message: '是否配置开机自启(launchd)?',
-      default: true,
-    }]);
-    if (autoStart) {
-      const { imgProxyDaemonInstall } = await import('./img-proxy');
-      try {
-        await imgProxyDaemonInstall();
-        result.autoStart = true;
-      } catch (err) {
-        console.log(chalk.yellow(`  ⚠️ launchd 配置失败: ${err}`));
-      }
-    }
   }
 
   return result;
