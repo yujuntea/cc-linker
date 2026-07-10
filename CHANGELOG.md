@@ -194,6 +194,21 @@ All notable changes to cc-linker are documented here. Format follows
      自然终止。`cleanupOldCache` 的 7 天 mtime TTL 行为保留(Bun.write
      覆盖会刷新 mtime → 热图自然留住)。
 
+## [0.8.1] - 2026-07-11
+
+### Fixed
+- `cc-linker-proxy` 不再静默绕过 img-proxy:CC Switch 用户的 `~/.claude/settings.json` env 会覆盖 shell env,旧 wrapper 设 env 的机制失效。改为读 cc-switch 当前 provider + `claude --settings` 指向已替换 proxy URL 的 auto-providers 文件,可靠走代理。
+
+### Added
+- `cc-linker img-proxy update` 命令:CC Switch 改了 provider 配置(token/model/新增字段)后刷新 auto-providers 文件 + routes upstream。已装刷新、未装新装、manual 跳过、cc-switch 已删提示 uninstall。
+- `cc-linker img-proxy cc-switch-settings` 子命令:输出当前 cc-switch provider 的代理 settings 文件路径(给 wrapper 用)。
+
+### Changed
+- wrapper 函数重写:单一路径(cc-switch-settings + `claude --settings`),删除旧 4-branch(env 检测/resolve/fall-back)死代码。
+
+### Upgrade
+- 跑过 `cc-linker img-proxy install` 的用户:`cc-linker img-proxy wrapper uninstall && wrapper install && source ~/.zshrc`(或重开 shell)更新 wrapper 函数。
+
 ## [0.8.0] - 2026-07-09
 
 ### Added
