@@ -9,6 +9,7 @@ import {
   loadRoutes,
   removeRoute,
   normalizeUrlForCompare,
+  isProxyUrl,
 } from '../../../src/img-proxy/routes';
 
 let tmpDir: string;
@@ -154,6 +155,52 @@ describe('resolveProxyByUpstream 容忍 URL 小差异(Fix I-1)', () => {
   test('查询侧畸形 URL 返回 null 而不抛', async () => {
     await addRoute(routesPath, 'glm-5.2', 'https://x.com/api', '/tmp/x.json');
     expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'not a url')).toBeNull();
+  });
+});
+
+describe('isProxyUrl', () => {
+  test('http://127.0.0.1:8765/foo 视为 proxy URL', () => {
+    expect(isProxyUrl('http://127.0.0.1:8765/foo')).toBe(true);
+  });
+
+  test('http://localhost:8765/foo 视为 proxy URL', () => {
+    expect(isProxyUrl('http://localhost:8765/foo')).toBe(true);
+  });
+
+  test('http://[::1]:8765/foo 视为 proxy URL (IPv6 loopback)', () => {
+    expect(isProxyUrl('http://[::1]:8765/foo')).toBe(true);
+  });
+
+  test('https://127.0.0.1:8765/foo 视为 proxy URL (HTTPS)', () => {
+    expect(isProxyUrl('https://127.0.0.1:8765/foo')).toBe(true);
+  });
+
+  test('http://127.0.0.1:9999/foo 视为 proxy URL (任意 port)', () => {
+    expect(isProxyUrl('http://127.0.0.1:9999/foo')).toBe(true);
+  });
+
+  test('http://127.0.0.1:8765 (无 path) 视为 proxy URL', () => {
+    expect(isProxyUrl('http://127.0.0.1:8765')).toBe(true);
+  });
+
+  test('http://192.168.1.5:8765/foo 非 proxy URL (机器 IP)', () => {
+    expect(isProxyUrl('http://192.168.1.5:8765/foo')).toBe(false);
+  });
+
+  test('http://0.0.0.0:8765/foo 非 proxy URL (server bind addr)', () => {
+    expect(isProxyUrl('http://0.0.0.0:8765/foo')).toBe(false);
+  });
+
+  test('https://api.anthropic.com 非 proxy URL', () => {
+    expect(isProxyUrl('https://api.anthropic.com')).toBe(false);
+  });
+
+  test('空字符串非 proxy URL', () => {
+    expect(isProxyUrl('')).toBe(false);
+  });
+
+  test('malformed URL 非 proxy URL', () => {
+    expect(isProxyUrl('not a url')).toBe(false);
   });
 });
 

@@ -153,3 +153,15 @@ export function resolveProxyByUpstream(
 export function listRoutes(path: string = IMG_PROXY_ROUTES_PATH): RouteEntry[] {
   return Object.values(loadRoutes(path).routes);
 }
+
+/** Detect "is this URL a local proxy URL?"
+ *  Matches http(s)://<loopback>[:<any port>][/...] or just http(s)://<loopback>[:<port>]
+ *  loopback 候选: 127.0.0.1 / localhost / [::1]
+ *  port 不限定 (user 改过 config port 时 URL 仍能识别, 同一 shell 内的 wrapper heuristic 对齐)
+ *
+ *  Risk: 同一 loopback 上的别的本地服务也会被识别为 proxy URL.
+ *  Mitigation: user 想用别的本地服务应直接 `claude`,不走 cc-linker-proxy.
+ */
+export function isProxyUrl(url: string): boolean {
+  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/.test(url);
+}
