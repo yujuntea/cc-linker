@@ -6,7 +6,7 @@ import { spawnSync } from 'child_process';
 import inquirer from 'inquirer';
 import { config } from '../../utils/config';
 import { CCLinkerError } from '../../utils/errors';
-import { getExecutablePath } from '../../utils/executable';
+import { getExecutablePath, getLaunchdExecutablePath } from '../../utils/executable';
 import { readCurrentUpstreamFromSettings } from '../../img-proxy/resolve';
 import {
   IMG_PROXY_DIR, IMG_PROXY_CACHE_DIR, IMG_PROXY_ROUTES_PATH,
@@ -22,6 +22,7 @@ import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
 import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
 import { escapePlistString } from '../../utils/plist';
+import { retryHealthCheck, type HealthCheck } from '../../utils/daemon-health';
 import {
   detectShell, getRcFilePath, isWrapperInstalled,
   installWrapper, uninstallWrapper,
@@ -694,9 +695,13 @@ export async function imgProxyDaemonInstall(): Promise<void> {
 
   // Fix #3: PATH / homedir / exe 等插入 XML 之前转义,防 & 等特殊字符
   // 导致 plist 损坏 + launchctl load 静默失败
+  // Fix bug-2026-07-09: 用 getLaunchdExecutablePath 代替 getExecutablePath,确保
+  // ProgramArguments[0] 总是绝对路径。launchd 对 daemon/agent 的 executable
+  // 不走用户 shell 的 PATH,写裸 "cc-linker" 会 EX_CONFIG (78),KeepAlive
+  // 永远重启失败。
   const safePath = escapePlistString(process.env.PATH ?? '');
   const safeHome = escapePlistString(homedir());
-  const safeExe = escapePlistString(exe);
+  const safeExe = escapePlistString(getLaunchdExecutablePath());
   const safeLog = escapePlistString(IMG_PROXY_LOG_FILE);
 
   // ProgramArguments 不带 --daemon,改用 env 注入 CC_LINKER_IMG_PROXY_DAEMON=1
@@ -750,9 +755,73 @@ export async function imgProxyDaemonInstall(): Promise<void> {
     if (err) console.log(chalk.yellow(`⚠️ launchctl start 警告: ${err}`));
   }
 
+  // Fix bug-2026-07-09: 装完后做真实健康检查(plist-loaded + HTTP 探活),
+  // 不再"静默成功"。历史上 plist 写错时 launchd 一边报 EX_CONFIG 一边重启,
+  // 8765 永远不监听,但 setup 仍打印"已配置" → 用户看到"完成"实际服务挂掉。
+  // 冷启动需要几秒(launchd 拉起 + bun 编译 + 路由加载),所以每个 check
+  // 都在 retry window(默认 5 次,每次 1s,共 ~5s)内重试,而不是单次失败就报。
+  const port = config.get<number>('img_proxy.port', 8765);
+  const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
+  const retryOpts = { attempts: 5, intervalMs: 1000 };
+  const checks: HealthCheck[] = [
+    {
+      name: 'plist-loaded',
+      run: async () => {
+        const r = spawnSync('launchctl', ['print', 'gui/' + (process.getuid?.() ?? 0) + '/com.cclinker.img-proxy']);
+        const out = r.stdout.toString();
+        if (r.status !== 0) return { ok: false, message: `launchctl print exit ${r.status}` };
+        if (/last exit code\s*=\s*78/.test(out) || /state\s*=\s*spawn scheduled/.test(out)) {
+          return { ok: false, message: 'launchd 仍处于 spawn scheduled / last exit 78 (EX_CONFIG),plist 或 executable 不可执行' };
+        }
+        return { ok: true };
+      },
+    },
+    {
+      name: 'http-root',
+      run: async () => {
+        const ok = await probeHttpOnce(`http://${hostname}:${port}/`, 1500);
+        return ok ? { ok: true } : { ok: false, message: `${hostname}:${port} 在 health check 窗口内不可访问` };
+      },
+    },
+  ];
+  // 顺序跑 + retry window:plist-loaded 失败通常意味着 plist 写错,不重试也无用,
+  // 但 http-root 必须重试,因为 launchd 拉起 + 启动需要时间。
+  const plistResult = await retryHealthCheck(checks[0], retryOpts);
+  const httpResult = await retryHealthCheck(checks[1], retryOpts);
+  const result = {
+    ok: plistResult.ok && httpResult.ok,
+    failed: [
+      ...(plistResult.ok ? [] : [{ name: checks[0].name, message: plistResult.message ?? 'failed' }]),
+      ...(httpResult.ok ? [] : [{ name: checks[1].name, message: httpResult.message ?? 'failed' }]),
+    ],
+  };
+  if (!result.ok) {
+    console.log(chalk.red('❌ img-proxy 开机自启配置失败,健康检查未通过:'));
+    for (const f of result.failed) {
+      console.log(chalk.yellow(`   - ${f.name}: ${f.message}`));
+    }
+    console.log(chalk.gray(`   日志: ${IMG_PROXY_LOG_FILE}`));
+    console.log(chalk.gray('   常见原因: plist 的 ProgramArguments[0] 不是绝对路径 / 端口被占用 / 路由表为空'));
+    process.exit(1);
+  }
+
   console.log(chalk.green('✅ img-proxy 开机自启已配置 (KeepAlive,崩溃 10s 内自拉起)'));
   console.log(chalk.cyan(`   ${plistPath}`));
   console.log(chalk.gray('   卸载: cc-linker img-proxy daemon uninstall'));
+}
+
+/** 单次 HTTP probe:状态码 2xx/3xx 算 ok。 */
+async function probeHttpOnce(url: string, timeoutMs: number): Promise<boolean> {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    return res.status >= 200 && res.status < 400;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 export async function imgProxyDaemonUninstall(): Promise<void> {

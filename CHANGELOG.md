@@ -6,6 +6,18 @@ All notable changes to cc-linker are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **img-proxy daemon install 后健康检查** — `cc-linker img-proxy daemon
+  install` 之前在 `launchctl load/start` 之后只 print 成功,没有真正验证
+  launchd 是否进入 running + 8765 端口是否可访问。`src/utils/daemon-health.ts`
+  新模块把检查抽象成可注入的 `HealthCheck` 列表(`retryHealthCheck` +
+  `runPostInstallHealthChecks`),生产代码传 launchctl / curl 实测,测试
+  可传 stub 避免副作用。失败时显式 exit 1 + 打印失败项,不再"静默成功"。
+  配套:`executable.ts` 新增 `getLaunchdExecutablePath()`,launchd 对
+  daemon 不走用户 shell 的 PATH,之前写裸 `cc-linker` → `EX_CONFIG (78)`,
+  KeepAlive 永远重启失败;plist 改写绝对路径修掉。
+
 ### Fixed
 
 - **img-proxy cache 重复落盘 + 诱导 Read 循环** — `stripImagesToPaths` 的
