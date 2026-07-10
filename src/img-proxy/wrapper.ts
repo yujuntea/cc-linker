@@ -17,30 +17,53 @@ function escapeRegex(s: string): string {
 
 /**
  * 生成 wrapper 函数代码块(含 markers),可直接追加到 shell rc 文件。
- * 含递归防护:`ANTHROPIC_BASE_URL` 已设则直接 exec claude(避免 alias 链 + 多余 sub-shell)。
+ *
+ * 设计:递归防护 + fall back。
+ *   - env 已设为 proxy URL (resolve 返同 URL) → 直 exec claude (E7 invariant:URL 不变)
+ *   - env 设为 upstream URL 且已装        → 改写为 proxy URL,warn 一次
+ *   - env 是陌生 / stale inherited URL    → fall back 到 settings.json (current-url)
+ *   - env 未设                            → 直接走 settings.json 路径
  */
 export function generateWrapperBlock(): string {
   return `${WRAPPER_START_MARKER}
 cc-linker-proxy() {
-  # === 递归防护(验收 §14.7 E7) ===
-  if [ -n "\${ANTHROPIC_BASE_URL:-}" ]; then
-    command claude "\$@"
-    return \$?
+  local env_url resolved real_url proxy_url
+
+  env_url="\${ANTHROPIC_BASE_URL:-}"
+
+  # Path 1: env set
+  if [ -n "\$env_url" ]; then
+    resolved="\$(command cc-linker img-proxy resolve "\$env_url")"
+    if [ -n "\$resolved" ] && [ "\$resolved" = "\$env_url" ]; then
+      # 已是 proxy URL -> user 显式选过, 直接 exec (E7 invariant: URL 不变)
+      command claude "\$@"
+      return \$?
+    fi
+    if [ -n "\$resolved" ]; then
+      # env 是 upstream URL 但已装 -> 改写为 proxy URL + warn
+      echo "cc-linker-proxy: ANTHROPIC_BASE_URL=\$env_url -> proxy=\$resolved (改写)" >&2
+      ANTHROPIC_BASE_URL="\$resolved" command claude "\$@"
+      return \$?
+    fi
+    # env 解析失败 (陌生 URL / stale inherited) -> fall back to settings.json
+    echo "cc-linker-proxy: env ANTHROPIC_BASE_URL=\$env_url 解析失败, fall back 到 settings.json" >&2
   fi
 
-  local real_url="\$(command cc-linker img-proxy current-url)"
+  # Path 2: env unset OR fall back -> read settings.json
+  real_url="\$(command cc-linker img-proxy current-url)"
   if [ -z "\$real_url" ]; then
     echo "cc-linker-proxy: 找不到当前 provider URL" >&2
     echo "  检查 ~/.claude/settings.json 是否含 env.ANTHROPIC_BASE_URL" >&2
     return 1
   fi
-  local proxy_url
+
   proxy_url="\$(command cc-linker img-proxy resolve "\$real_url")"
   if [ -z "\$proxy_url" ]; then
     echo "cc-linker-proxy: \$real_url 没在 img-proxy 里" >&2
     echo "  hint: cc-linker img-proxy install" >&2
     return 1
   fi
+
   ANTHROPIC_BASE_URL="\$proxy_url" command claude "\$@"
 }
 ${WRAPPER_END_MARKER}

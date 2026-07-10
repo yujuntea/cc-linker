@@ -53,9 +53,10 @@ function runWrapper(env: Record<string, string>, settingsUrl: string): { stdout:
       ...env,
       FAKE_SETTINGS_URL: settingsUrl,
       FAKE_CLAUDE_LOG: fakeClaudeLog,
-      // Hermetic: 显式清空递归防护依赖的变量,避免宿主 shell 已设 ANTHROPIC_BASE_URL
-      // 导致 wrapper 直 exec claude(跳过 stub 路径)。空串在 [ -n ] 测试里视同未设。
-      ANTHROPIC_BASE_URL: '',
+      // Hermetic: 只要宿主/测试没显式设 ANTHROPIC_BASE_URL,就清空。
+      // 旧 wrapper 短路过 settings.json 时要空串(让 env_url 测试走 fall back 路径),
+      // 新 wrapper 需要传测试用例的 stale URL(本次修复场景)。
+      ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL ?? '',
       PATH: `${tmpDir}:${process.env.PATH}`,
     },
     encoding: 'utf-8',
@@ -92,13 +93,30 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe('cc-linker-proxy integration (scaffolding)', () => {
-  test('harness: stubs reachable, wrapper exits cleanly on empty settings', () => {
-    // Empty settings URL → wrapper fails fast ("找不到当前 provider URL")
-    // exit 1 + stderr contains the message + claude NOT called (log empty)
-    const { exitCode, stderr, claudeLog } = runWrapper({}, '');
-    expect(exitCode).toBe(1);
-    expect(stderr).toContain('找不到当前 provider URL');
-    expect(claudeLog).toBe('');
+describe('cc-linker-proxy integration: BUG FIX (env=stale non-proxy URL)', () => {
+  test('env=https://api.minimaxi.com/anthropic + settings.json=ark → fall back + warn + claude sees proxy URL', () => {
+    // env=stale inherited non-proxy URL (bug scenario)
+    //   |  settings.json configured to ark (a provider img-proxy knows about)
+    //   v
+    // wrapper should fall back to settings.json (current-url), resolve it
+    // through stub cc-linker, and exec claude with the proxy URL — even
+    // though env resolved to empty (unrecognised upstream).
+    const { stderr, exitCode, claudeLog } = runWrapper(
+      { ANTHROPIC_BASE_URL: 'https://api.minimaxi.com/anthropic' },
+      'https://ark.cn-beijing.volces.com/api/plan',
+    );
+
+    // Exit success (claude called)
+    expect(exitCode).toBe(0);
+
+    // Stderr warn mentions fall back
+    expect(stderr).toContain('fall back');
+
+    // claude received the proxy URL (NOT the stale minimaxi URL)
+    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/byte-agent-glm');
+    expect(claudeLog).not.toContain('minimaxi');
+
+    // claude called with --version (passed through)
+    expect(claudeLog).toContain('ARGS:--version');
   });
 });

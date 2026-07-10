@@ -38,10 +38,22 @@ describe('generateWrapperBlock', () => {
     expect(block).toContain('cc-linker-proxy()');
   });
 
-  test('包含递归防护(ANTHROPIC_BASE_URL 已设 → 直 exec)', () => {
+  test('包含递归防护 (resolve 返同 URL → 直 exec, E7 invariant)', () => {
     const block = generateWrapperBlock();
     expect(block).toMatch(/ANTHROPIC_BASE_URL/);
     expect(block).toContain('command claude');
+    // 新版 idempotent guard: 比较 resolve 结果与输入
+    expect(block).toMatch(/\$resolved.*=.*\$env_url/);
+  });
+
+  test('包含 stderr warn (env override → "改写")', () => {
+    const block = generateWrapperBlock();
+    expect(block).toContain('改写');
+  });
+
+  test('包含 fall back 消息 (env unresolvable)', () => {
+    const block = generateWrapperBlock();
+    expect(block).toContain('fall back');
   });
 
   test('包含调 cc-linker img-proxy current-url 和 resolve', () => {
