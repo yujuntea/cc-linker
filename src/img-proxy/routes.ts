@@ -140,6 +140,12 @@ export function resolveProxyByUpstream(
   hostname: string,
   upstream: string
 ): string | null {
+  // Idempotent: 已是 proxy URL (本地 loopback) → 原样返, 保留 user 显式 alias 选择
+  // (防止 user 选过的 alias 被 routes 查表重写到 "默认" alias — E7 invariant)
+  if (isProxyUrl(upstream)) {
+    return upstream;
+  }
+  // 否则按 upstream URL 查 routes (现有逻辑)
   const table = loadRoutes(path);
   const query = normalizeUrlForCompare(upstream);
   for (const [alias, entry] of Object.entries(table.routes)) {

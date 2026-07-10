@@ -61,6 +61,36 @@ describe('resolveProxyByUpstream(新函数)', () => {
   test('空 routes 返回 null', () => {
     expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'https://any.com')).toBeNull();
   });
+
+  test('input 已是 proxy URL (127.0.0.1) → 原样返 (idempotent)', () => {
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'http://127.0.0.1:8765/glm-5.2')).toBe('http://127.0.0.1:8765/glm-5.2');
+  });
+
+  test('input 已是 proxy URL (localhost) → 原样返', () => {
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'http://localhost:8765/kimi')).toBe('http://localhost:8765/kimi');
+  });
+
+  test('input 已是 proxy URL ([::1] IPv6) → 原样返', () => {
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'http://[::1]:8765/foo')).toBe('http://[::1]:8765/foo');
+  });
+
+  test('input 是 proxy URL 但 port 与 config 不同 → 仍原样返 (loose match)', () => {
+    // config port=8765, 但 input port=9999 — user 改过 port, 尊重其选择
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'http://127.0.0.1:9999/foo')).toBe('http://127.0.0.1:9999/foo');
+  });
+
+  test('input 是 proxy URL 且 alias 同 upstream 有多个 routes → 保留 user 选择, 不重写到默认 alias', async () => {
+    // 同一 upstream 有两条 routes (glm-5.2 + glm-5.2-back), user 显式选 glm-5.2
+    // idempotent 应当保留 glm-5.2, 不重写为 glm-5.2-back
+    await addRoute(routesPath, 'glm-5.2', 'https://api.x.com', '/tmp/x.json');
+    await addRoute(routesPath, 'glm-5.2-back', 'https://api.x.com', '/tmp/x.json');
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'http://127.0.0.1:8765/glm-5.2')).toBe('http://127.0.0.1:8765/glm-5.2');
+  });
+
+  test('input 是 machine IP 而非 loopback → 不视作 proxy URL, 走 routes 查表', async () => {
+    await addRoute(routesPath, 'foo', 'http://192.168.1.5:8765/foo', '/tmp/foo.json');
+    expect(resolveProxyByUpstream(routesPath, 8765, '127.0.0.1', 'http://192.168.1.5:8765/foo')).toBe('http://127.0.0.1:8765/foo');
+  });
 });
 
 describe('基础行为(loadRoutes / saveRoutes / addRoute / removeRoute)', () => {
