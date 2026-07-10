@@ -120,3 +120,91 @@ describe('cc-linker-proxy integration: BUG FIX (env=stale non-proxy URL)', () =>
     expect(claudeLog).toContain('ARGS:--version');
   });
 });
+
+describe('cc-linker-proxy integration: scenarios', () => {
+  test('E7: env=proxy URL (127.0.0.1) -> preserved, no warn', () => {
+    // env already points at the proxy -> user explicitly chose it.
+    // Wrapper must NOT rewrite or fall back (E7 invariant: URL unchanged).
+    const { stderr, exitCode, claudeLog } = runWrapper(
+      { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/glm-5.2' },
+      '', // settings.json irrelevant when env set + matches proxy
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain('改写');
+    expect(stderr).not.toContain('fall back');
+    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/glm-5.2');
+  });
+
+  test('E7 localhost: env=proxy URL (localhost) -> preserved, no warn', () => {
+    // Same as above but with hostname=localhost (also matches proxy pattern).
+    const { stderr, exitCode, claudeLog } = runWrapper(
+      { ANTHROPIC_BASE_URL: 'http://localhost:8765/qwen-deepseek' },
+      '',
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain('改写');
+    expect(stderr).not.toContain('fall back');
+    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://localhost:8765/qwen-deepseek');
+  });
+
+  test('E7 non-default port: env=proxy URL (port 9999) -> preserved, no warn', () => {
+    // Non-default proxy port (still loopback) -> should also be preserved.
+    // E7 invariant is about the URL pattern, not a specific port number.
+    const { stderr, exitCode, claudeLog } = runWrapper(
+      { ANTHROPIC_BASE_URL: 'http://127.0.0.1:9999/glm-5.2' },
+      '',
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain('改写');
+    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:9999/glm-5.2');
+  });
+
+  test('scenario 1: env unset + settings.json upstream -> proxy URL, no warn', () => {
+    // Common case: env unset, settings.json has a known upstream URL.
+    // Wrapper should silently resolve to proxy URL.
+    const { stderr, exitCode, claudeLog } = runWrapper(
+      {}, // env unset
+      'https://ark.cn-beijing.volces.com/api/plan',
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe(''); // no warn
+    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/byte-agent-glm');
+  });
+
+  test('scenario 5: env=installed upstream URL -> rewritten to proxy URL, warn 改写', () => {
+    // env has an upstream URL whose provider IS installed -> resolve returns
+    // proxy URL. Wrapper should rewrite ANTHROPIC_BASE_URL to proxy URL and
+    // warn once so user knows their env was overridden.
+    const { stderr, exitCode, claudeLog } = runWrapper(
+      { ANTHROPIC_BASE_URL: 'https://ark.cn-beijing.volces.com/api/plan' },
+      '',
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain('改写');
+    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/byte-agent-glm');
+    // Upstream URL must not leak into claude's env.
+    expect(claudeLog).not.toContain('ark.cn-beijing');
+  });
+
+  test('scenario 4: env=unknown URL + settings.json empty -> wrapper error, claude not called', () => {
+    // env points at a stale inherited URL not in img-proxy, AND settings.json
+    // has no URL. Wrapper should:
+    //   1. Try to resolve env URL -> empty (stub returns nothing for minimaxi)
+    //   2. Fall back to settings.json -> empty (FAKE_SETTINGS_URL='')
+    //   3. Emit both warnings and exit non-zero WITHOUT calling claude
+    const { stderr, exitCode, claudeLog } = runWrapper(
+      { ANTHROPIC_BASE_URL: 'https://api.minimaxi.com/anthropic' },
+      '', // settings.json empty
+    );
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('fall back'); // env unresolvable -> fall back attempted
+    expect(stderr).toContain('找不到当前 provider URL'); // settings also empty
+    expect(claudeLog).toBe(''); // claude must NOT be called
+  });
+});
