@@ -8,6 +8,25 @@ All notable changes to cc-linker are documented here. Format follows
 
 ### Added
 
+- **img-proxy 模型调用 token 统计** — 之前 Dashboard 只有 transport-level
+  `bytes` (响应体明文字节数),看不到具体花了多少 model tokens。新加从
+  upstream 响应 SSE/JSON 解析 `usage` 字段的逻辑(`applyUsageLine` 在
+  `server.ts`),自动识别:
+  - **Anthropic 格式**:`message_start` 拿 `input_tokens` +
+    `cache_read_input_tokens` + `cache_creation_input_tokens`,
+    `message_delta` 拿最终 `output_tokens`
+  - **OpenAI-compat 格式**(glm / qwen / deepseek / OpenAI 自身):
+    `usage.prompt_tokens` + `usage.completion_tokens`
+  - 同时支持流式(SSE 多 event)与非流式(单 JSON body)— 整 body
+    无换行时由 `piping.finally` flush 残留的 sseBuf
+  累加语义 max-of:同一请求内重复声明同一字段取最大值,防 message_start
+  里的 `output_tokens=1` 被 message_delta 后的旧值回退。
+
+  累计到 per-alias 聚合(`AliasStats`) + per-request 环形 buffer
+  (`RecentEntry`) + log JSON 行(Log tab 可用)。Dashboard Per Alias 表
+  新增 4 列:In Tokens / Out Tokens / Cache Read / Cache Create;
+  Log 表 4 列同位置。
+
 - **img-proxy daemon install 后健康检查** — `cc-linker img-proxy daemon
   install` 之前在 `launchctl load/start` 之后只 print 成功,没有真正验证
   launchd 是否进入 running + 8765 端口是否可访问。`src/utils/daemon-health.ts`

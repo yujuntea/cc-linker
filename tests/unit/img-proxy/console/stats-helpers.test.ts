@@ -5,16 +5,26 @@ import type { AliasStats, RecentEntry } from '../../../../src/img-proxy/console/
 describe('stats helpers', () => {
   it('updateByAlias: 增量更新 byAlias 聚合', () => {
     const stats = { byAlias: {} as Record<string, AliasStats> };
-    updateByAlias(stats, 'glm-5.2', { requests: 1, stripped: 2, bytes: 100, chunks: 3, durationMs: 200 });
-    updateByAlias(stats, 'glm-5.2', { requests: 1, stripped: 0, bytes: 200, chunks: 5, durationMs: 400 });
+    updateByAlias(stats, 'glm-5.2', {
+      requests: 1, stripped: 2, bytes: 100, chunks: 3, durationMs: 200,
+      inputTokens: 50, outputTokens: 20, cacheReadTokens: 30, cacheCreationTokens: 5,
+    });
+    updateByAlias(stats, 'glm-5.2', {
+      requests: 1, stripped: 0, bytes: 200, chunks: 5, durationMs: 400,
+      inputTokens: 70, outputTokens: 30, cacheReadTokens: 40, cacheCreationTokens: 10,
+    });
     expect(stats.byAlias['glm-5.2']).toEqual({
       requests: 2, stripped: 2, bytes: 300, chunks: 8, avgDurationMs: 300, lastAt: expect.any(Number),
+      inputTokens: 120, outputTokens: 50, cacheReadTokens: 70, cacheCreationTokens: 15,
     });
   });
 
   it('updateByAlias: 首次 alias 创建 entry', () => {
     const stats = { byAlias: {} as Record<string, AliasStats> };
-    updateByAlias(stats, 'byte-agent', { requests: 1, stripped: 0, bytes: 50, chunks: 1, durationMs: 100 });
+    updateByAlias(stats, 'byte-agent', {
+      requests: 1, stripped: 0, bytes: 50, chunks: 1, durationMs: 100,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
+    });
     expect(stats.byAlias['byte-agent']).toBeDefined();
     expect(stats.byAlias['byte-agent']!.requests).toBe(1);
   });

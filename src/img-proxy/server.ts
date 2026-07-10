@@ -86,6 +86,78 @@ const HOP_BY_HOP_HEADERS = [
   'upgrade', 'proxy-authenticate', 'proxy-authorization',
 ] as const;
 
+/** 一次请求内累积的 model-side token 计数(由 TransformStream 跨 chunk 累加) */
+export interface UsageAccum {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}
+
+/**
+ * 从一条 SSE / 非流式响应行提取 usage token 计数,累加到 acc。
+ * 兼容三种格式:
+ *   1) Anthropic message_start: {message: {usage: {input_tokens, output_tokens,
+ *                                  cache_read_input_tokens, cache_creation_input_tokens}}}
+ *   2) Anthropic message_delta:  {usage: {output_tokens}}
+ *   3) OpenAI-compat:            {usage: {prompt_tokens, completion_tokens}}
+ *
+ * 累加语义是 max-of:同一请求里 message_start 报 input_tokens=1234 +
+ * output_tokens=1 之后,message_delta 会再报 output_tokens=567。
+ * max 保护:不会因为中间 SSE event 里的旧值回退,也防上游重复声明同一数值时
+ * 数值变小(早期 Anthropic SDK 偶发)。malformed 行一律 silently skip。
+ *
+ * 接受的形式:
+ *   - "data: {...}"     (流式 SSE data 行)
+ *   - "{...}"           (非流式单 JSON body — 整段无换行,被丢给 sseBuf 末段)
+ *   - "[DONE]"          (OpenAI 流终止信号,无 payload,直接返回)
+ * 其它行("event: xxx"、SSE 注释 ": xxx"、空行)直接 return。
+ */
+export function applyUsageLine(line: string, acc: UsageAccum): void {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  let jsonStr: string;
+  if (trimmed.startsWith('data:')) {
+    jsonStr = trimmed.slice(5).trim();
+    if (jsonStr === '[DONE]') return;
+  } else if (trimmed.startsWith('{')) {
+    jsonStr = trimmed;
+  } else {
+    return;  // event: 行 / SSE 注释 / 其它格式
+  }
+
+  let obj: unknown;
+  try { obj = JSON.parse(jsonStr); } catch { return; }
+  if (!obj || typeof obj !== 'object') return;
+
+  const o = obj as Record<string, unknown>;
+  // Anthropic 两种 + OpenAI-compat 一种:都尝试。message.usage 是 message_start 形态,
+  // bare usage 是 message_delta 形态;两条都 try,后者通常覆盖前者的 output_tokens。
+  const u = (o.usage ?? (o.message as Record<string, unknown> | undefined)?.usage) as
+    Record<string, unknown> | undefined;
+  if (!u || typeof u !== 'object') return;
+
+  if (typeof u.input_tokens === 'number') {
+    acc.inputTokens = Math.max(acc.inputTokens, u.input_tokens);
+  }
+  if (typeof u.output_tokens === 'number') {
+    acc.outputTokens = Math.max(acc.outputTokens, u.output_tokens);
+  }
+  if (typeof u.cache_read_input_tokens === 'number') {
+    acc.cacheReadTokens = Math.max(acc.cacheReadTokens, u.cache_read_input_tokens);
+  }
+  if (typeof u.cache_creation_input_tokens === 'number') {
+    acc.cacheCreationTokens = Math.max(acc.cacheCreationTokens, u.cache_creation_input_tokens);
+  }
+  if (typeof u.prompt_tokens === 'number') {
+    acc.inputTokens = Math.max(acc.inputTokens, u.prompt_tokens);
+  }
+  if (typeof u.completion_tokens === 'number') {
+    acc.outputTokens = Math.max(acc.outputTokens, u.completion_tokens);
+  }
+}
+
 /**
  * 反向代理**响应头**清理。
  *
@@ -317,7 +389,11 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         // Task 8: 写 stats(fetch 抛错路径,totalRequests = 真实总请求数)
         stats.totalRequests++;
         stats.byStatus[finalStatus] = (stats.byStatus[finalStatus] ?? 0) + 1;
-        updateByAlias(stats, alias, { requests: 1, stripped, bytes: 0, chunks: 0, durationMs: errDuration });
+        // 没拿到响应 → usage 全 0
+        updateByAlias(stats, alias, {
+          requests: 1, stripped, bytes: 0, chunks: 0, durationMs: errDuration,
+          inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
+        });
         pushRecent(stats, { ts: Date.now(), alias, status: 0, stream_status: finalStatus, chunks: 0, bytes: 0, duration_ms: errDuration, stripped });
         if (isAbort) {
           // Client 主动断开,response 无意义,499 = nginx convention "client closed request"
@@ -342,7 +418,11 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         // Task 8: 写 stats(body === null 路径,headers 已收,body 为空)
         stats.totalRequests++;
         stats.byStatus.no_body = (stats.byStatus.no_body ?? 0) + 1;
-        updateByAlias(stats, alias, { requests: 1, stripped, bytes: 0, chunks: 0, durationMs: headersToFirstChunk });
+        // body 为空(204/205/304 等)→ 无 usage 可解析,全 0
+        updateByAlias(stats, alias, {
+          requests: 1, stripped, bytes: 0, chunks: 0, durationMs: headersToFirstChunk,
+          inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
+        });
         pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: 'no_body', chunks: 0, bytes: 0, duration_ms: headersToFirstChunk, stripped });
         return new Response(null, {
           status: upstreamResp.status,
@@ -350,18 +430,35 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         });
       }
 
-      // === 改动 #1: TransformStream 包 upstream body,统计 chunk/byte ===
+      // === 改动 #1: TransformStream 包 upstream body,统计 chunk/byte + usage ===
       let chunks = 0;
       let bytes = 0;
       let lastChunkAt = Date.now();
       // streamStatus / upstreamErrorMsg 在 fetch 之前的 abort listener 已声明并赋值
       // (client_aborted 可能已被标记;其他状态由下面的 pipeTo().catch 赋值)
 
+      // 2026-07-10: 跨 chunk 累积 SSE 事件,从 upstream 响应里提取 usage token 统计。
+      // 同时支持流式(SSE 多 event)与非流式(单 JSON body)— 整 body 一行被 pop 到
+      // sseBuf 末段,piping.finally 里 flush;见 applyUsageLine 注释。
+      let sseBuf = '';
+      const usage: UsageAccum = {
+        inputTokens: 0, outputTokens: 0,
+        cacheReadTokens: 0, cacheCreationTokens: 0,
+      };
+      const utf8 = new TextDecoder();
+
       const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
           chunks++;
           bytes += chunk.byteLength;
           lastChunkAt = Date.now();
+          // stream: true 让 decoder 跨 chunk 处理多字节 UTF-8
+          sseBuf += utf8.decode(chunk, { stream: true });
+          const lines = sseBuf.split('\n');
+          sseBuf = lines.pop() ?? '';  // 末段可能不完整,留给下个 chunk
+          for (const line of lines) {
+            applyUsageLine(line, usage);
+          }
           controller.enqueue(chunk);  // pass-through,无缓冲
         },
       });
@@ -409,6 +506,10 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       // 修复:同步 (catch / no_body) 路径不丢;只 piping.finally 路径受影响。
       piping.finally(() => {
         if (idleTimer !== null) clearInterval(idleTimer);
+        // stream 已 settle;处理 sseBuf 残留的最后一段。
+        // 非流式响应尤其重要:整 body 一个 JSON 没换行,被 pop 留到了 sseBuf。
+        if (sseBuf.trim()) applyUsageLine(sseBuf, usage);
+        sseBuf = '';
         const duration = Date.now() - startedAt;
         appendLog(`INFO ${JSON.stringify({
           time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
@@ -418,12 +519,27 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
           chunks, bytes,
           stream_status: streamStatus,
           upstream_error_msg: upstreamErrorMsg,
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          cache_read_input_tokens: usage.cacheReadTokens,
+          cache_creation_input_tokens: usage.cacheCreationTokens,
         })}`, logPath);
         // Task 8: 写 stats(成功 stream 路径)
         stats.totalRequests++;
         stats.byStatus[streamStatus] = (stats.byStatus[streamStatus] ?? 0) + 1;
-        updateByAlias(stats, alias, { requests: 1, stripped, bytes, chunks, durationMs: duration });
-        pushRecent(stats, { ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus, chunks, bytes, duration_ms: duration, stripped });
+        updateByAlias(stats, alias, {
+          requests: 1, stripped, bytes, chunks, durationMs: duration,
+          inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+          cacheReadTokens: usage.cacheReadTokens, cacheCreationTokens: usage.cacheCreationTokens,
+        });
+        pushRecent(stats, {
+          ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus,
+          chunks, bytes, duration_ms: duration, stripped,
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          cache_read_input_tokens: usage.cacheReadTokens,
+          cache_creation_input_tokens: usage.cacheCreationTokens,
+        });
       }).catch(() => { /* piping 已 reject 过,这里 swallow */ });
 
       // 透传 response(status + 清理后的 headers);body 用 TransformStream 的 readable,带埋点。

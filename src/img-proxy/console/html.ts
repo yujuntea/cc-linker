@@ -34,6 +34,7 @@ main { padding: 16px; max-width: 1400px; margin: 0 auto; }
 table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden; }
 th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #f3f4f6; }
 th { background: #f9fafb; font-weight: 600; font-size: 11px; text-transform: uppercase; color: #6b7280; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr:last-child td { border-bottom: none; }
 tr.disabled { color: #9ca3af; }
 .form-row { margin-bottom: 12px; }
@@ -104,6 +105,15 @@ function formatDuration(ms) {
   return (ms / 60000).toFixed(2) + 'm';
 }
 
+function formatTokens(n) {
+  // 大数缩写,1.2K / 3.4M。null/undefined 返 '-' (Log 表里"该请求未报 usage"很常见)
+  if (n == null) return '-';
+  if (n < 1000) return String(n);
+  if (n < 1e6) return (n / 1e3).toFixed(n < 1e4 ? 1 : 0) + 'K';
+  if (n < 1e9) return (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + 'M';
+  return (n / 1e9).toFixed(1) + 'B';
+}
+
 function renderDashboard() {
   const v = state.data;
   if (!v.stats) return '<p>加载中...</p>';
@@ -124,10 +134,10 @@ function renderDashboard() {
     html += \`<tr><td class="status-\${esc(k)}">\${esc(k)}</td><td>\${n}</td><td>\${pct}%</td></tr>\`;
   }
   html += '</table>';
-  html += '<h3 style="margin-top:24px">Per Alias</h3><table><tr><th>Alias</th><th>Requests</th><th>Stripped</th><th>Chunks</th><th>Bytes</th><th>Avg Duration</th><th>Last</th></tr>';
+  html += '<h3 style="margin-top:24px">Per Alias</h3><table><tr><th>Alias</th><th>Requests</th><th>In Tokens</th><th>Out Tokens</th><th>Cache Read</th><th>Cache Create</th><th>Stripped</th><th>Chunks</th><th>Bytes</th><th>Avg Duration</th><th>Last</th></tr>';
   const ba = s.byAlias || {};
   for (const [alias, a] of Object.entries(ba)) {
-    html += \`<tr><td>\${esc(alias)}</td><td>\${a.requests}</td><td>\${a.stripped}</td><td>\${a.chunks}</td><td>\${a.bytes}</td><td>\${formatDuration(a.avgDurationMs)}</td><td>\${new Date(a.lastAt).toLocaleTimeString()}</td></tr>\`;
+    html += \`<tr><td>\${esc(alias)}</td><td>\${a.requests}</td><td title="input_tokens" class="num">\${formatTokens(a.inputTokens || 0)}</td><td title="output_tokens" class="num">\${formatTokens(a.outputTokens || 0)}</td><td title="cache_read_input_tokens" class="num">\${formatTokens(a.cacheReadTokens || 0)}</td><td title="cache_creation_input_tokens" class="num">\${formatTokens(a.cacheCreationTokens || 0)}</td><td>\${a.stripped}</td><td>\${a.chunks}</td><td>\${a.bytes}</td><td>\${formatDuration(a.avgDurationMs)}</td><td>\${new Date(a.lastAt).toLocaleTimeString()}</td></tr>\`;
   }
   html += '</table>';
   return html;
@@ -146,10 +156,10 @@ function renderLog() {
   html += '<button class="action" onclick="state.filters.sinceMs=Date.now()-3600000;pollLoop()">Last 1h</button>';
   html += '<button class="action" onclick="pollLoop()">Refresh</button>';
   html += '</div>';
-  html += '<table><tr><th>Time</th><th>Alias</th><th>Method</th><th>Status</th><th>Stream Status</th><th>Chunks</th><th>Bytes</th><th>Duration</th><th>Stripped</th></tr>';
+  html += '<table><tr><th>Time</th><th>Alias</th><th>Method</th><th>Status</th><th>Stream Status</th><th>In</th><th>Out</th><th>Cache R</th><th>Cache C</th><th>Chunks</th><th>Bytes</th><th>Duration</th><th>Stripped</th></tr>';
   for (const e of v.log) {
     const p = e.parsed || {};
-    html += \`<tr><td>\${new Date(e.ts).toLocaleTimeString()}</td><td>\${esc(p.alias || '-')}</td><td>\${esc(p.method || '-')}</td><td>\${p.upstream_status || '-'}</td><td class="status-\${esc(p.stream_status || '-')}">\${esc(p.stream_status || '-')}</td><td>\${p.chunks ?? '-'}</td><td>\${p.bytes ?? '-'}</td><td>\${formatDuration(p.duration_ms)}</td><td>\${p.stripped ?? '-'}</td></tr>\`;
+    html += \`<tr><td>\${new Date(e.ts).toLocaleTimeString()}</td><td>\${esc(p.alias || '-')}</td><td>\${esc(p.method || '-')}</td><td>\${p.upstream_status || '-'}</td><td class="status-\${esc(p.stream_status || '-')}">\${esc(p.stream_status || '-')}</td><td class="num">\${formatTokens(p.input_tokens)}</td><td class="num">\${formatTokens(p.output_tokens)}</td><td class="num">\${formatTokens(p.cache_read_input_tokens)}</td><td class="num">\${formatTokens(p.cache_creation_input_tokens)}</td><td>\${p.chunks ?? '-'}</td><td>\${p.bytes ?? '-'}</td><td>\${formatDuration(p.duration_ms)}</td><td>\${p.stripped ?? '-'}</td></tr>\`;
   }
   html += '</table>';
   return html;
