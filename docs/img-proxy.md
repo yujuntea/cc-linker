@@ -421,7 +421,7 @@ claude "echo test"             # 直连(不受影响)
 
 ### 关键行为
 
-- **递归防护(幂等)**:`ANTHROPIC_BASE_URL` 已设为 proxy URL(resolve 返同 URL)就直 exec,不走 resolve——保留用户显式选的 URL(E7 invariant)。设的是已装的 upstream URL 会改写为 proxy URL + stderr warn;陌生 / stale inherited URL 走 settings.json fall back + stderr warn。
+- **递归防护(幂等)**:`ANTHROPIC_BASE_URL` 已设为 proxy URL 时,resolve 返同 URL → 直 exec,保留用户显式选的 URL(E7 invariant)。已装的 upstream URL → 改写为 proxy URL + stderr warn;陌生 / stale inherited URL → settings.json fall back + stderr warn。
 - **幂等**:重复 `wrapper install` 不重复写。
 - **备份**:修改前 `~/.cc-linker/img-proxy/wrapper-backups/wrapper-backup-<ts>-<uuid>`。
 - **shell 检测**:`ZSH_VERSION` / `BASH_VERSION` / `$SHELL` 末段(zsh/bash)→ 写对应 rc。
