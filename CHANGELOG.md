@@ -69,6 +69,30 @@ All notable changes to cc-linker are documented here. Format follows
   (`tests/unit/cli/img-proxy-start-library.test.ts`) 跑真实
   binary 2 秒验子进程不被自杀。
 
+- **setup wizard 双问 startNow(P0-1)** — 上一轮 P1-1 在 imgProxyInstall 内部
+  加了 promptStartDaemon,但 wizard (`setup.ts`) 自己也问 startNow 调
+  imgProxyStart,runImgProxyWizard 调 imgProxyInstall 之后又问一次。
+  用户跑 setup 时被问两次同样的"是否现在启动 daemon?"。修法:删
+  wizard 自己的 startNow 步骤,改用 installResult.startedNow 字段(从
+  imgProxyInstall 的 promptStartDaemon 拿)。一行 import 也清掉
+  (imgProxyStart 没人调了)。
+
+- **sseBuf 截断时无 log(observability regression,P1-1)** — 上一轮 P2-1
+  抽 processChunkForUsage 时丢了截断时的 appendLog WARN,畸形 SSE
+  event 来时 admin 看不到任何日志。修法:加 onTruncate 回调参数,
+  TransformStream caller 传 appendLog 回调(打 WARN log)。test 加
+  truncateCalls 计数验证回调被调一次。
+
+- **Web Console enable 后无"需 daemon restart"提示(P1-2)** — console
+  enable 改 config.toml 但 daemon 启动时才读。promptStartDaemon Yes
+  时会自然 restart(console 生效);No 时用户得自己 restart — 加
+  一行黄色提示免得用户看 8765/ 发现 console 还是 disabled 困惑。
+  放在 promptStartDaemon 之后(那时 startedNow 已知)。
+
+- **escapePlistString 测试覆盖不全(P1-3)** — 之前只测 `& " <`,
+  漏了 `> '` 和 unicode 路径。加 2 个 case:XML 关闭 + 单引号,
+  Chinese / emoji home 路径,确保 escapePlistString 不过度转义
+  unicode 也不会漏 XML 关键字符。
 - **img-proxy daemon install 失败时 process.exit 杀 wizard(同类 bug)** —
   `imgProxyDaemonInstall` 在 setup wizard 里被 try/catch 包
   (`setup.ts:327`) 期望它 throw,但函数用了 3 处 `process.exit(1)`

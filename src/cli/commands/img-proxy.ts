@@ -634,6 +634,13 @@ export async function imgProxyInstall(opts: {
   // 也让上面刚 enable 的 Web Console 自然生效(daemon 启动时读 config)— P1-2
   // 顺带解决。失败 log + 不 throw(providers 已装好,daemon 起不来不回滚)。
   const startedNow = await promptStartDaemon({ yes: !!opts.yes });
+  // 2026-07-10 P1-2: console enabled 改 config.toml 但 daemon 启动时才读。
+  // promptStartDaemon Yes 时已自然 restart(console 生效),No 时用户得自己 restart。
+  // 在两 prompt 之间补一行提示,免得用户看 8765/ 发现 console 还是 disabled 困惑。
+  if (consoleInstalled && !startedNow) {
+    console.log(chalk.yellow('   ⚠️ Web Console 需 daemon 启动后生效: cc-linker img-proxy start --daemon'));
+  }
+
   const autoStart = await promptLaunchdAutoStart({ yes: !!opts.yes });
 
   return {

@@ -97,6 +97,7 @@ const MAX_SSE_BUF_BYTES = 4 * 1024 * 1024;
  * - 末行不完整(没换行结尾)留到下个 chunk (lines.pop())
  * - sseBuf 超 MAX_SSE_BUF_BYTES 截断 + 标记 truncated,后续 chunk 不再 tracking
  *   (防单 chunk 大行 OOM)
+ * - 截断时调 onTruncate 回调(让调用方打 WARN log,observability 保留)
  */
 export function processChunkForUsage(
   chunk: Uint8Array,
@@ -106,11 +107,13 @@ export function processChunkForUsage(
     utf8: TextDecoder;
     usage: UsageAccum;
   },
+  onTruncate?: () => void,  // 2026-07-10 P1-1: 截断时回调(让调用方打 log)
 ): void {
   state.sseBuf += state.utf8.decode(chunk, { stream: true });
   if (!state.truncated && state.sseBuf.length > MAX_SSE_BUF_BYTES) {
     state.truncated = true;
     state.sseBuf = '';
+    onTruncate?.();
   }
   if (!state.truncated) {
     const lines = state.sseBuf.split('\n');
@@ -588,7 +591,11 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
           chunks++;
           bytes += chunk.byteLength;
           lastChunkAt = Date.now();
-          processChunkForUsage(chunk, sseState);
+          processChunkForUsage(chunk, sseState, () => {
+            // 2026-07-10 P1-1: 截断时打 WARN log(observability)— 上游畸形 SSE
+            // event 大行无换行导致 OOM 是关键 debugging 信号,admin 必须看到
+            appendLog(`WARN sseBuf 超 ${MAX_SSE_BUF_BYTES} bytes 截断 (单 chunk 大行 / 畸形 SSE 事件);usage tracking 关闭,响应继续 pass-through`, logPath);
+          });
           controller.enqueue(chunk);  // pass-through,无缓冲
         },
       });

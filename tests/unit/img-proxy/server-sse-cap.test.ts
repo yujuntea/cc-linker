@@ -54,10 +54,13 @@ describe('processChunkForUsage', () => {
     expect(state.usage.inputTokens).toBe(1);
     // 现在喂一个 5MB 的 chunk (> 4MB cap)
     const bigChunk = new Uint8Array(5 * 1024 * 1024);
-    processChunkForUsage(bigChunk, state);
+    let truncateCalls = 0;
+    processChunkForUsage(bigChunk, state, () => { truncateCalls++; });
     // 截断后 sseBuf 被清空,truncated 标记
     expect(state.truncated).toBe(true);
     expect(state.sseBuf).toBe('');
+    // 2026-07-10 P1-1: onTruncate 回调被调一次(observability 钩子)
+    expect(truncateCalls).toBe(1);
     // 后续 chunk 不再 tracking usage
     processChunkForUsage(
       new TextEncoder().encode('data: {"usage":{"prompt_tokens":99999}}\n'),

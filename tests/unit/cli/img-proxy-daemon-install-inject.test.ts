@@ -77,6 +77,36 @@ describe('buildLaunchdPlistContent (pure function)', () => {
     expect(xml).not.toContain('with"quote');
     expect(xml).not.toContain('<file>');
   });
+
+  it('escapes > and \' (more XML chars to prevent plist corruption)', () => {
+    // 2026-07-10 P1-3: 扩展 escape 测试覆盖。> 闭合 plist 标签,' 在 plist 字符串里
+    // 不强制 escape 但我们要确保不会因为顺序问题破坏 plist 解析。
+    const xml = buildLaunchdPlistContent({
+      executable: '/bin/cc-linker>evil',         // > 闭合 plist 标签
+      home: "/Users/with'apostrophe",          // ' XML attribute 里关键
+      logFile: '/tmp/log>path',                 // 路径里的 >
+      envPath: '/usr/bin:cc-linker\'s',
+    });
+    expect(xml).not.toContain('cc-linker>evil');
+    expect(xml).not.toContain("/Users/with'apostrophe");
+    expect(xml).not.toContain('log>path');
+  });
+
+  it('preserves Unicode paths (Chinese / emoji) without breaking plist', () => {
+    // 2026-07-10 P1-3: 验证 unicode 路径(home 含中文、logFile 含 emoji)正常
+    // 写到 plist 不破坏 XML(escapePlistString 应该保留 unicode 不过度转义)。
+    const xml = buildLaunchdPlistContent({
+      executable: '/usr/local/bin/cc-linker',
+      home: '/Users/张三',
+      logFile: '/Users/张三/Logs/cc🚀.log',
+      envPath: '/usr/bin',
+    });
+    expect(xml).toContain('/Users/张三');
+    expect(xml).toContain('cc🚀.log');
+    // 结构完好(没破坏 plist 标签)
+    expect(xml).toContain('<plist version="1.0">');
+    expect(xml).toContain('</plist>');
+  });
 });
 
 describe('runLaunchdInstallWithDeps (deps-injected, no side effects)', () => {

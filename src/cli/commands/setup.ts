@@ -276,7 +276,7 @@ async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
   }
 
   // 调用 smart install：自动过滤多模态、按需提示 wrapper
-  const { imgProxyInstall, imgProxyStart } = await import('./img-proxy');
+  const { imgProxyInstall } = await import('./img-proxy');
   try {
     const installResult = await imgProxyInstall({});
     result.installedCount = installResult.installedCount;
@@ -285,34 +285,16 @@ async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
     result.configured = installResult.installedCount > 0;
     result.wrapperInstalled = installResult.wrapperInstalled;
     result.wrapperSkipped = installResult.wrapperSkipped;
+    // 2026-07-10: imgProxyInstall 内部已含 promptStartDaemon(同款 inquirer 引导),
+    // 这里不再重复问 — 用 result.startedNow 字段。早期 wizard 自己问 startNow 调
+    // imgProxyStart,跟 imgProxyInstall 内部那个会双问,用户被问两次同样的问题。
+    result.started = installResult.startedNow;
     if (installResult.installedCount === 0) {
       console.log(chalk.yellow('  ⚠️ 0 个 provider 被安装(全部跳过 / 多模态 / 用户跳选)'));
     }
   } catch (err) {
     console.log(chalk.red(`  ❌ 安装失败: ${err}`));
     return result;
-  }
-
-  // 启动 daemon
-  const { startNow } = await inquirer.prompt([{
-    type: 'confirm',
-    name: 'startNow',
-    message: '是否现在启动 img-proxy daemon?',
-    default: true,
-  }]);
-
-  if (startNow) {
-    try {
-      // 2026-07-10: imgProxyStart 改 library 化,throw 而不是 process.exit —
-      // 之前 process.exit(0) 会把 wizard 进程也杀了,launchd 步骤永远到不了。
-      // 现在 throw 由这里 catch,wizard 继续往下走 macOS launchd 配置。
-      await imgProxyStart({ daemon: true });
-      result.started = true;
-      // (imgProxyStart 内部已打 "✅ img-proxy 已在后台启动 (PID: ...)",这里不再重复)
-    } catch (err) {
-      console.log(chalk.yellow(`  ⚠️ 自动启动失败: ${(err as Error).message}`));
-      console.log(chalk.gray('     可稍后手动执行 cc-linker img-proxy start --daemon'));
-    }
   }
 
   // macOS launchd
