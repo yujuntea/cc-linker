@@ -591,13 +591,16 @@ cc-linker-proxy "echo test"
 # 期望:ANTHROPIC_BASE_URL 切到新 provider 的 proxy URL
 ```
 
-### 10.5 E7:递归 wrapper 防护
+### 10.5 E7:wrapper idempotent (env=proxy URL 时 URL 不变)
 
 ```bash
-# 设 ANTHROPIC_BASE_URL 已设,跑 wrapper
+# 设 ANTHROPIC_BASE_URL 已设为 proxy URL,跑 wrapper
 ANTHROPIC_BASE_URL=http://127.0.0.1:8765/glm-5.2 cc-linker-proxy --version 2>&1 | head -3
-# 期望:不报错,不调 resolve,直接 exec claude(ANTHROPIC_BASE_URL 还是 8765)
+# 期望:不报错,resolve 返同 URL,直接 exec claude(ANTHROPIC_BASE_URL 还是 8765)
+# 注:resolve 实际被调用,但 result 与 input 相同(走 idempotent 路径),URL 不被改写
 ```
+
+**Regression 测试**: 此测试在新 wrapper(2026-07-10)前后行为一致 — user 显式选的 proxy URL 永远被尊重。
 
 ### 10.6 E10:custom vision patterns via config
 

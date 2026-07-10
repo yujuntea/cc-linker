@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { installProvider, uninstallProvider, isProviderInstalled } from '../../../src/img-proxy/provider-config';
+import { installProvider, uninstallProvider, isProviderInstalled, updateProvider } from '../../../src/img-proxy/provider-config';
 import { loadRoutes } from '../../../src/img-proxy/routes';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -145,5 +145,125 @@ describe('provider-config', () => {
     expect(after.env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic');  // 从 .bak 还原
     expect(loadRoutes(routesPath).routes['glm-5.2']).toBeUndefined();
     expect(existsSync(p + '.bak')).toBe(false);
+  });
+});
+
+describe('updateProvider', () => {
+  let tmpDir: string;
+  let providerPath: string;
+  let routesPath: string;
+  let bakPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'update-provider-'));
+    providerPath = join(tmpDir, 'Byte-glm-agent.json');
+    routesPath = join(tmpDir, 'routes.json');
+    bakPath = providerPath + '.bak';
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('刷新 token, BASE_URL 保持 proxy URL', async () => {
+    // 已装状态: BASE_URL=proxy, .bak 存在
+    writeFileSync(providerPath, JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/Byte-glm-agent', ANTHROPIC_AUTH_TOKEN: 'old-token' },
+      name: 'Byte-glm-agent', alias: 'Byte-glm-agent',
+    }));
+    writeFileSync(bakPath, readFileSync(providerPath));
+
+    const latestCfg = {
+      env: { ANTHROPIC_BASE_URL: 'https://ark.cn-beijing.volces.com/api/plan', ANTHROPIC_AUTH_TOKEN: 'new-token' },
+    };
+
+    await updateProvider({
+      providerPath, alias: 'Byte-glm-agent', routesPath,
+      port: 8765, hostname: '127.0.0.1', latestCfg,
+    });
+
+    const updated = JSON.parse(readFileSync(providerPath, 'utf8'));
+    expect(updated.env.ANTHROPIC_AUTH_TOKEN).toBe('new-token');
+    // BASE_URL 保持 proxy URL (不回退上游)
+    expect(updated.env.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:8765/Byte-glm-agent');
+  });
+
+  it('cc-switch 改了上游 URL -> routes.json upstream 更新', async () => {
+    writeFileSync(providerPath, JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/Byte-glm-agent' },
+      name: 'Byte-glm-agent', alias: 'Byte-glm-agent',
+    }));
+    // routes.json 已有该 alias (installed_at 保留)
+    writeFileSync(routesPath, JSON.stringify({
+      version: 1,
+      routes: { 'Byte-glm-agent': { alias: 'Byte-glm-agent', upstream: 'https://old-ark.com', provider_path: providerPath, original_base_url: 'https://old-ark.com', installed_at: '2026-01-01T00:00:00.000Z' } },
+    }));
+
+    const latestCfg = { env: { ANTHROPIC_BASE_URL: 'https://new-ark.com' } };
+
+    await updateProvider({
+      providerPath, alias: 'Byte-glm-agent', routesPath,
+      port: 8765, hostname: '127.0.0.1', latestCfg,
+    });
+
+    const routes = loadRoutes(routesPath);
+    expect(routes.routes['Byte-glm-agent']?.upstream).toBe('https://new-ark.com');
+    // installed_at 保留 (addRoute 覆盖同 alias 时保留)
+    expect(routes.routes['Byte-glm-agent']?.installed_at).toBe('2026-01-01T00:00:00.000Z');
+  });
+
+  it('cc-switch 新增 env 字段 -> auto-providers 文件包含新字段', async () => {
+    writeFileSync(providerPath, JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/X' },
+      name: 'X', alias: 'X',
+    }));
+
+    const latestCfg = { env: { ANTHROPIC_BASE_URL: 'https://x.com', ANTHROPIC_MODEL: 'glm-5.2', API_TIMEOUT_MS: '3000000' } };
+
+    await updateProvider({
+      providerPath, alias: 'X', routesPath,
+      port: 8765, hostname: '127.0.0.1', latestCfg,
+    });
+
+    const updated = JSON.parse(readFileSync(providerPath, 'utf8'));
+    expect(updated.env.ANTHROPIC_MODEL).toBe('glm-5.2');
+    expect(updated.env.API_TIMEOUT_MS).toBe('3000000');
+    expect(updated.env.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:8765/X');
+  });
+
+  it('cc-switch 删除 env 字段 -> auto-providers 文件移除该字段', async () => {
+    writeFileSync(providerPath, JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/X', STALE_FIELD: 'x' },
+      name: 'X', alias: 'X',
+    }));
+
+    const latestCfg = { env: { ANTHROPIC_BASE_URL: 'https://x.com' } };  // 无 STALE_FIELD
+
+    await updateProvider({
+      providerPath, alias: 'X', routesPath,
+      port: 8765, hostname: '127.0.0.1', latestCfg,
+    });
+
+    const updated = JSON.parse(readFileSync(providerPath, 'utf8'));
+    expect(updated.env.STALE_FIELD).toBeUndefined();
+  });
+
+  it('.bak 不动 (保留首次 install 备份)', async () => {
+    writeFileSync(providerPath, JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/X' },
+      name: 'X', alias: 'X',
+    }));
+    const originalBak = JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://original-upstream.com' } });
+    writeFileSync(bakPath, originalBak);
+
+    const latestCfg = { env: { ANTHROPIC_BASE_URL: 'https://new-upstream.com' } };
+
+    await updateProvider({
+      providerPath, alias: 'X', routesPath,
+      port: 8765, hostname: '127.0.0.1', latestCfg,
+    });
+
+    // .bak 内容不变
+    expect(readFileSync(bakPath, 'utf8')).toBe(originalBak);
   });
 });

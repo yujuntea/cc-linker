@@ -17,31 +17,26 @@ function escapeRegex(s: string): string {
 
 /**
  * 生成 wrapper 函数代码块(含 markers),可直接追加到 shell rc 文件。
- * 含递归防护:`ANTHROPIC_BASE_URL` 已设则直接 exec claude(避免 alias 链 + 多余 sub-shell)。
+ *
+ * 单一路径: 调 cc-linker img-proxy cc-switch-settings 拿当前 cc-switch provider
+ * 对应的 auto-providers 文件路径 (BASE_URL 已替换成 proxy URL), 用 claude --settings 指定。
+ * 失败(stdout 空) -> 透传子命令 stderr 提示 + return 1。
+ *
+ * 不读 ANTHROPIC_BASE_URL (旧 4-branch 设 env 机制被 settings.json env 覆盖, 是死代码)。
+ * 不调 current-url/resolve (旧路径)。
  */
 export function generateWrapperBlock(): string {
   return `${WRAPPER_START_MARKER}
 cc-linker-proxy() {
-  # === 递归防护(验收 §14.7 E7) ===
-  if [ -n "\${ANTHROPIC_BASE_URL:-}" ]; then
-    command claude "\$@"
+  local settings_file
+  settings_file="\$(command cc-linker img-proxy cc-switch-settings 2>/dev/null)"
+  if [ -n "\$settings_file" ] && [ -f "\$settings_file" ]; then
+    command claude --settings "\$settings_file" "\$@"
     return \$?
   fi
-
-  local real_url="\$(command cc-linker img-proxy current-url)"
-  if [ -z "\$real_url" ]; then
-    echo "cc-linker-proxy: 找不到当前 provider URL" >&2
-    echo "  检查 ~/.claude/settings.json 是否含 env.ANTHROPIC_BASE_URL" >&2
-    return 1
-  fi
-  local proxy_url
-  proxy_url="\$(command cc-linker img-proxy resolve "\$real_url")"
-  if [ -z "\$proxy_url" ]; then
-    echo "cc-linker-proxy: \$real_url 没在 img-proxy 里" >&2
-    echo "  hint: cc-linker img-proxy install" >&2
-    return 1
-  fi
-  ANTHROPIC_BASE_URL="\$proxy_url" command claude "\$@"
+  # stdout 空 -> 失败。重跑不吞 stderr, 让分类提示显示给用户
+  command cc-linker img-proxy cc-switch-settings >/dev/null
+  return 1
 }
 ${WRAPPER_END_MARKER}
 `;

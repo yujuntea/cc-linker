@@ -145,3 +145,33 @@ function readUpstreamFromBak(providerPath: string): string | null {
     return null;
   }
 }
+
+export interface UpdateOpts {
+  providerPath: string;
+  alias: string;
+  routesPath: string;
+  port: number;
+  hostname: string;
+  latestCfg: { env?: Record<string, string>; [k: string]: unknown };
+}
+
+/** 刷新已装 provider 的配置 (cc-switch 改了 token/model/新增字段后)。
+ *  - env 整体替换为 cc-switch 最新值, 但 BASE_URL 保持 proxy URL (不回退上游)
+ *  - routes.json 的 upstream 更新为 cc-switch 最新 BASE_URL (真实上游)
+ *  - 不动 .bak (保留首次 install 的原始备份)
+ *
+ *  env 整体替换语义: 新增字段自动包含, 删除字段自动移除, 不用逐字段 diff。 */
+export async function updateProvider(opts: UpdateOpts): Promise<void> {
+  const { providerPath, alias, routesPath, port, hostname, latestCfg } = opts;
+  const proxyUrl = `http://${hostname}:${port}/${alias}`;
+  const newEnv = { ...(latestCfg.env ?? {}), ANTHROPIC_BASE_URL: proxyUrl };
+  const newCfg = { ...latestCfg, env: newEnv, name: alias, alias };
+  const tmp = providerPath + '.tmp';
+  writeFileSync(tmp, JSON.stringify(newCfg, null, 2), { mode: 0o600 });
+  renameSync(tmp, providerPath);
+
+  const newUpstream = latestCfg.env?.ANTHROPIC_BASE_URL;
+  if (typeof newUpstream === 'string' && newUpstream) {
+    await addRoute(routesPath, alias, newUpstream, providerPath);  // addRoute 覆盖同 alias, 保留 installed_at
+  }
+}

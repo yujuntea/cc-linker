@@ -14,10 +14,11 @@ import {
   AUTO_PROVIDERS_DIR,
   CONFIG_PATH, expandPath,
 } from '../../utils/paths';
-import { installProvider, uninstallProvider, isProviderInstalled } from '../../img-proxy/provider-config';
-import { loadRoutes, removeRoute, resolveProxyByUpstream } from '../../img-proxy/routes';
+import { installProvider, uninstallProvider, isProviderInstalled, updateProvider } from '../../img-proxy/provider-config';
+import { loadRoutes, removeRoute, resolveProxyByUpstream, isProxyUrl } from '../../img-proxy/routes';
 import { scanProviderFiles, hasCcSwitch } from '../../img-proxy/provider-scan';
 import { discoverCandidates, type Candidate } from '../../img-proxy/discover';
+import { getCurrentCcSwitchProvider, getCcSwitchProviderConfigByName } from '../../img-proxy/cc-switch-current';
 import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
 import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
@@ -310,6 +311,43 @@ export async function imgProxyResolve(opts: { upstream: string }): Promise<void>
   const proxyUrl = resolveProxyByUpstream(IMG_PROXY_ROUTES_PATH, port, hostname, opts.upstream);
   if (proxyUrl) console.log(proxyUrl);
   // 空 stdout = "没找到" — wrapper 检测用
+}
+
+// ---------- cc-switch-settings ----------
+// 给 cc-linker-proxy wrapper 调用: 输出当前 cc-switch provider 对应的 auto-providers 文件路径。
+// 成功 stdout=path exit 0; 失败 stdout 空 + stderr 提示 + exit 2。
+//
+// process.exit 例外说明: 这是纯 CLI 子命令 (wrapper 通过 subprocess 调), 无 library caller 场景,
+// 与 imgProxyCurrentUrl/imgProxyResolve (已 library 化) 不同。YAGNI - 不为想象的 programmatic caller 过度设计。
+export async function imgProxyCcSwitchSettings(): Promise<void> {
+  const result = getCurrentCcSwitchProvider();
+  switch (result.status) {
+    case 'ok': {
+      if (!isProxyUrl(result.provider.baseUrl)) {
+        console.error(`cc-linker-proxy: 当前 provider "${result.provider.name}" 未装代理`);
+        console.error(`  hint: cc-linker img-proxy install --providers ${result.provider.name}`);
+        process.exit(2);
+      }
+      console.log(result.provider.settingsFile);
+      return;
+    }
+    case 'no-ccswitch':
+      console.error('cc-linker-proxy: 未检测到 CC Switch');
+      console.error('  hint: 装 CC Switch 并选一个 provider, 或用 claude --settings <provider文件>');
+      process.exit(2);
+    case 'no-current':
+      console.error('cc-linker-proxy: CC Switch 未选中 claude provider');
+      console.error('  hint: 在 CC Switch 里选一个 provider');
+      process.exit(2);
+    case 'no-file':
+      console.error(`cc-linker-proxy: 当前 provider "${result.name}" 未同步`);
+      console.error('  hint: cc-linker img-proxy install');
+      process.exit(2);
+    default:
+      // 强制穷尽性: CcSwitchLookupResult 新增变体时 TS 会在这里报错。
+      const _exhaustive: never = result;
+      throw new Error(`unhandled cc-switch lookup status: ${JSON.stringify(_exhaustive)}`);
+  }
 }
 
 // ---------- wrapper-install ----------
@@ -759,6 +797,141 @@ function buildChoiceLabel(c: Candidate): string {
   const sourceTag = `[${c.source}]`;
   const kindTag = c.kind === 'multimodal' ? '⏭ skip' : `✅ ${c.kind}`;
   return `${sourceTag} ${c.alias} ${kindTag} ${c.model || '(no model)'}`;
+}
+
+// ---------- update ----------
+// 刷新已装 provider 的 cc-switch 最新配置 (token/model/新增字段)。
+// 选择流程跟 install 一致; 区别: 已装的调 updateProvider 刷新, 未装的走 installProvider。
+// manual provider 已装 -> 跳过 (直接改文件); 未装 -> install。
+//
+// P1 fix (2026-07-11): sync 的 cleanup pass 会预删 cc-switch 已删 provider 的 .json,
+// 所以循环里的 getCcSwitchProviderConfigByName -> null 分支在真实路径不可达。
+// 末尾加 orphan-route 扫描: routes.json 里 provider_path 已不存在 -> 提示 uninstall。
+export async function imgProxyUpdate(opts: {
+  providers?: string;
+  all?: boolean;
+  yes?: boolean;
+  mode?: 'smart' | 'dumb';
+}): Promise<{ updatedCount: number; installedCount: number; failedCount: number }> {
+  const port = config.get<number>('img_proxy.port', 8765);
+  const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
+  const smartModeConfig = config.get<boolean>('img_proxy.smart_mode', true);
+  const extraPatterns = {
+    visionPatterns: config.get<string[]>('img_proxy.vision_model_patterns_extra', []),
+    textOnlyPatterns: config.get<string[]>('img_proxy.text_only_model_patterns_extra', []),
+  };
+
+  const isExplicit = !!opts.providers || !!opts.all;
+  const mode = opts.mode ?? (isExplicit ? 'dumb' : 'smart');
+  const useClassification = mode === 'smart' && smartModeConfig;
+
+  const candidates = discoverCandidates({
+    manualDir: CLAUDE_PROVIDERS_DIR,
+    autoDir: AUTO_PROVIDERS_DIR,
+    extraPatterns,
+  });
+
+  if (candidates.length === 0) {
+    console.log(chalk.red('❌ 未找到任何可用的 provider 配置'));
+    throw new CCLinkerError('E_IMG_PROXY_NO_PROVIDERS', '未找到任何可用的 provider 配置');
+  }
+
+  const filtered = useClassification
+    ? candidates.filter(c => c.kind !== 'multimodal')
+    : candidates;
+
+  if (useClassification) {
+    const skippedMultimodal = candidates.length - filtered.length;
+    if (skippedMultimodal > 0) {
+      console.log(chalk.gray(`  ℹ  Smart 模式:跳过 ${skippedMultimodal} 个 multimodal provider\n`));
+    }
+  }
+
+  const choices = filtered.map(c => ({
+    name: buildChoiceLabel(c),
+    value: c.alias,
+    short: c.alias,
+    checked: c.kind !== 'multimodal',
+  }));
+
+  let targets: Candidate[];
+  if (opts.providers) {
+    const wanted = new Set(opts.providers.split(',').map(s => s.trim()).filter(Boolean));
+    targets = candidates.filter(c => wanted.has(c.alias));
+    if (targets.length === 0) {
+      throw new CCLinkerError('E_IMG_PROXY_UNKNOWN_ALIAS', `未找到 provider 文件 ${opts.providers}`);
+    }
+  } else if (opts.all || opts.yes) {
+    targets = filtered;
+  } else {
+    const { picks } = await inquirer.prompt([{
+      type: 'checkbox', name: 'picks',
+      message: '选择要刷新/安装的 provider (空格勾选,回车确认):',
+      choices, pageSize: 20,
+    }]);
+    if (picks.length === 0) {
+      console.log(chalk.gray('未选择'));
+      return { updatedCount: 0, installedCount: 0, failedCount: 0 };
+    }
+    const pickedSet = new Set(picks as string[]);
+    targets = filtered.filter(c => pickedSet.has(c.alias));
+  }
+
+  console.log(chalk.blue(`\n刷新/安装 ${targets.length} 个 provider...\n`));
+  let updated = 0, installed = 0, failed = 0;
+  for (const t of targets) {
+    const isInstalled = isProviderInstalled(t.path, port, hostname);
+    if (isInstalled && t.source === 'manual') {
+      // manual provider 已装 -> 直接改文件, 不走 cc-switch 刷新
+      console.log(chalk.gray(`  ⊘ ${t.alias}  manual provider, 直接改文件即可`));
+      continue;
+    }
+    if (isInstalled) {
+      // auto provider 已装 -> 从 cc-switch 拉最新配置 -> updateProvider 刷新
+      const latest = getCcSwitchProviderConfigByName(t.alias);
+      if (!latest) {
+        console.log(chalk.yellow(`  ⚠ ${t.alias}  已从 cc-switch 删除, 建议 cc-linker img-proxy uninstall --providers ${t.alias}`));
+        continue;
+      }
+      try {
+        await updateProvider({
+          providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH,
+          port, hostname, latestCfg: latest.settingsConfig,
+        });
+        console.log(chalk.green(`  ↻ ${t.alias}  已刷新`));
+        updated++;
+      } catch (err) {
+        console.log(chalk.red(`  ❌ ${t.alias}  ${err}`));
+        failed++;
+      }
+    } else {
+      // 未装 -> installProvider (跟 install 一样)
+      try {
+        await installProvider({ providerPath: t.path, alias: t.alias, routesPath: IMG_PROXY_ROUTES_PATH, port, hostname });
+        console.log(chalk.green(`  ✅ ${t.alias}  新装`));
+        installed++;
+      } catch (err) {
+        console.log(chalk.red(`  ❌ ${t.alias}  ${err}`));
+        failed++;
+      }
+    }
+  }
+
+  // P1 fix: orphan-route 扫描
+  // sync 的 cleanup pass 可能已删 cc-switch 移除的 provider 的 .json,
+  // 但 routes.json + .bak 残留 (sync 只动 auto-providers/ 不动 routes)。
+  // 扫 routes 找 provider_path 已不存在的 -> 建议 uninstall 清路由。
+  const routes = loadRoutes(IMG_PROXY_ROUTES_PATH).routes;
+  let orphanCount = 0;
+  for (const [alias, entry] of Object.entries(routes)) {
+    if (!existsSync(entry.provider_path)) {
+      console.log(chalk.yellow(`  ⚠ ${alias}  provider 文件已删 (cc-switch 移除?), 建议 cc-linker img-proxy uninstall --providers ${alias}`));
+      orphanCount++;
+    }
+  }
+
+  console.log(chalk.green(`\n完成: ${updated} 刷新, ${installed} 新装${failed > 0 ? `, ${failed} 失败` : ''}${orphanCount > 0 ? `, ${orphanCount} 孤立 route` : ''}。`));
+  return { updatedCount: updated, installedCount: installed, failedCount: failed };
 }
 
 export async function imgProxyUninstall(opts: { providers?: string; all?: boolean }): Promise<void> {

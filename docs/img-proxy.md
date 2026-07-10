@@ -393,10 +393,11 @@ text_only_model_patterns_extra = ["my-custom-text-*"]
 $ cc-linker-proxy "看这个图"
   ↓
 shell 函数 cc-linker-proxy() (在 ~/.zshrc)
-  ① 如果 ANTHROPIC_BASE_URL 已设 → 直接 exec claude(递归防护)
-  ② 调 cc-linker img-proxy current-url    → 读 ~/.claude/settings.json
-  ③ 调 cc-linker img-proxy resolve <URL>  → 查 routes.json
-  ④ ANTHROPIC_BASE_URL=<proxy> claude "看这个图"
+  ① 调 cc-linker img-proxy cc-switch-settings  -> 读 cc-switch 当前 provider
+     -> 找 ~/.cc-linker/auto-providers/<name>.json (BASE_URL 已替换成 proxy)
+  ② claude --settings <该文件> "看这个图"  (claude 的 --settings 覆盖 settings.json env)
+  ↓
+img-proxy (127.0.0.1:8765) 剥 image block -> 上游纯文本模型
 ```
 
 ### 3 步启用
@@ -421,7 +422,8 @@ claude "echo test"             # 直连(不受影响)
 
 ### 关键行为
 
-- **递归防护**:`ANTHROPIC_BASE_URL` 非空直接 exec,不走 resolve。
+- **cc-switch 驱动**:读 cc-switch 当前 provider,用 `claude --settings` 指向已替换 proxy URL 的 auto-providers 文件。CC Switch 切换 provider 后 `cc-linker-proxy` 自动跟随(实时读,不缓存)。
+- **失败明确报错**:无 CC Switch / 未选 provider / 未装代理时,stderr 提示 + exit 1,绝不静默直连上游。
 - **幂等**:重复 `wrapper install` 不重复写。
 - **备份**:修改前 `~/.cc-linker/img-proxy/wrapper-backups/wrapper-backup-<ts>-<uuid>`。
 - **shell 检测**:`ZSH_VERSION` / `BASH_VERSION` / `$SHELL` 末段(zsh/bash)→ 写对应 rc。
@@ -436,6 +438,23 @@ claude "echo test"             # 直连(不受影响)
 | `wrapper status` | 检测是否已装 + rc 文件路径 |
 | `current-url` | 读 settings.json 的 `ANTHROPIC_BASE_URL`(stdout 输出,空 = 没装) |
 | `resolve <upstream>` | 按真实 upstream 查 proxy URL(stdout 输出,空 = 没在 routes 里) |
+| `cc-switch-settings` | 输出当前 cc-switch provider 的代理 settings 文件路径(给 wrapper 用) |
+
+### 刷新配置 (cc-switch 改了 token/model 后)
+
+CC Switch 里改了 provider 的 token / model / 新增 env 字段后,auto-providers 文件不会自动刷新。
+跑 update 刷新:
+
+```bash
+cc-linker img-proxy update            # 交互选择
+cc-linker img-proxy update --all      # 全部
+cc-linker img-proxy update -p glm-5.2 # 指定
+```
+
+- 已装的 provider:刷新 env(token/model/新增字段)+ 更新 routes upstream,BASE_URL 保持 proxy URL
+- 未装的 provider:新装(跟 install 一样)
+- manual provider 已装:跳过(直接改文件即可)
+- cc-switch 已删的 provider:路由残留时提示 `uninstall --providers <alias>`
 
 ---
 
@@ -703,8 +722,10 @@ try {
 | `cc-linker img-proxy wrapper install` | 装 shell wrapper 到 `~/.zshrc` / `~/.bashrc` |
 | `cc-linker img-proxy wrapper uninstall` | 移除 wrapper |
 | `cc-linker img-proxy wrapper status` | 看 wrapper 状态 + rc 文件路径 |
+| `cc-linker img-proxy update` | 刷新已装 provider 的 cc-switch 最新配置(token/model/新增字段); 未装的会新装 |
 | `cc-linker img-proxy current-url` | 读 `~/.claude/settings.json` 的 `env.ANTHROPIC_BASE_URL` |
 | `cc-linker img-proxy resolve <upstream>` | 按 upstream URL 查 proxy URL(空 = 没在 routes 里) |
+| `cc-linker img-proxy cc-switch-settings` | 输出当前 cc-switch provider 的代理 settings 文件路径(给 wrapper 用) |
 | `cc-linker img-proxy console enable` | 改 `console_enabled = true`(需 `stop && start` 生效) |
 | `cc-linker img-proxy console disable` | 改 `console_enabled = false`(需 `stop && start` 生效) |
 | `cc-linker img-proxy console status` | 看 console 是否启用 + 访问 URL + daemon 状态 |

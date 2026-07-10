@@ -194,6 +194,21 @@ All notable changes to cc-linker are documented here. Format follows
      自然终止。`cleanupOldCache` 的 7 天 mtime TTL 行为保留(Bun.write
      覆盖会刷新 mtime → 热图自然留住)。
 
+## [0.8.1] - 2026-07-11
+
+### Fixed
+- `cc-linker-proxy` 不再静默绕过 img-proxy:CC Switch 用户的 `~/.claude/settings.json` env 会覆盖 shell env,旧 wrapper 设 env 的机制失效。改为读 cc-switch 当前 provider + `claude --settings` 指向已替换 proxy URL 的 auto-providers 文件,可靠走代理。
+
+### Added
+- `cc-linker img-proxy update` 命令:CC Switch 改了 provider 配置(token/model/新增字段)后刷新 auto-providers 文件 + routes upstream。已装刷新、未装新装、manual 跳过、cc-switch 已删提示 uninstall。
+- `cc-linker img-proxy cc-switch-settings` 子命令:输出当前 cc-switch provider 的代理 settings 文件路径(给 wrapper 用)。
+
+### Changed
+- wrapper 函数重写:单一路径(cc-switch-settings + `claude --settings`),删除旧 4-branch(env 检测/resolve/fall-back)死代码。
+
+### Upgrade
+- 跑过 `cc-linker img-proxy install` 的用户:`cc-linker img-proxy wrapper uninstall && wrapper install && source ~/.zshrc`(或重开 shell)更新 wrapper 函数。
+
 ## [0.8.0] - 2026-07-09
 
 ### Added
@@ -238,8 +253,10 @@ All notable changes to cc-linker are documented here. Format follows
   `cc-X` alias,直接 `claude` 读 `~/.claude/settings.json`):wrapper 自动
   从 settings.json 读当前 provider,查 routes.json,设
   `ANTHROPIC_BASE_URL=http://127.0.0.1:8765/<alias>` 后 exec claude。递归
-  防护(已设 BASE_URL 直接 exec,不走 resolve)。`wrapper install` 期间
-  写备份到 `wrapper-backups/`。
+  防护(幂等):已设为 proxy URL(resolve 返同 URL)直接 exec(E7 invariant);
+  已设为已装的 upstream URL 改写为 proxy URL + stderr warn;陌生 / stale
+  inherited URL fall back 到 settings.json + stderr warn;env 未设走
+  settings.json 路径。`wrapper install` 期间写备份到 `wrapper-backups/`。
 
 - **Web Console (Phase 2)** — `http://127.0.0.1:8765/`(`console_enabled = true`),
   5 个 Tab:

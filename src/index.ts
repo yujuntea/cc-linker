@@ -23,10 +23,11 @@ import { activityHook } from './cli/commands/activity-hook';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
 import {
   imgProxyStart, imgProxyStop, imgProxyStatus, shouldExitAfterImgProxyStart,
-  imgProxyInstall, imgProxyUninstall,
+  imgProxyInstall, imgProxyUninstall, imgProxyUpdate,
   imgProxyDaemonInstall, imgProxyDaemonUninstall,
   imgProxyCurrentUrl,
   imgProxyResolve,
+  imgProxyCcSwitchSettings,
   imgProxyWrapperInstall, imgProxyWrapperUninstall, imgProxyWrapperStatus,
   imgProxyConsoleEnable, imgProxyConsoleDisable, imgProxyConsoleStatus,
 } from './cli/commands/img-proxy';
@@ -212,6 +213,15 @@ imgProxyCmd.command('uninstall')
   .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
   .option('--all', '全部已 install 的 provider')
   .action((opts) => imgProxyUninstall(opts));
+imgProxyCmd.command('update')
+  .description('刷新已装 provider 的 cc-switch 最新配置 (token/model/新增字段); 未装的会新装')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部 provider')
+  .option('--yes', 'smart 默认预选,不交互')
+  .addOption(
+    new Option('--mode <mode>', 'smart 或 dumb').choices(['smart', 'dumb'] as const),
+  )
+  .action((opts) => { imgProxyUpdate(opts); });
 imgProxyCmd.command('start')
   .description('启动代理 (前台;加 --daemon 后台)')
   .option('-d, --daemon', '后台运行')
@@ -243,6 +253,7 @@ imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 
   }
 });
 imgProxyCmd.command('resolve <upstream>').description('按真实 upstream URL 查 proxy URL').action((upstream) => imgProxyResolve({ upstream }));
+imgProxyCmd.command('cc-switch-settings').description('输出当前 cc-switch provider 的代理 settings 文件路径 (给 cc-linker-proxy wrapper 用)').action(() => imgProxyCcSwitchSettings());
 const wrapperCmd = imgProxyCmd.command('wrapper').description('管理 shell wrapper (cc-linker-proxy)');
 wrapperCmd.command('install').description('装 wrapper 到 ~/.zshrc').action(() => imgProxyWrapperInstall());
 wrapperCmd.command('uninstall').description('从 ~/.zshrc 移除 wrapper').action(() => imgProxyWrapperUninstall());
