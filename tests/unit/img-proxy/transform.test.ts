@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { stripImagesToPaths, DEFAULT_PROMPT_TEMPLATE } from '../../../src/img-proxy/transform';
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -91,7 +91,10 @@ describe('stripImagesToPaths', () => {
     ];
     const result = await stripImagesToPaths(messages, { cacheDir, promptTemplate: '{path}' });
     expect(result.strippedCount).toBe(2);
-    expect(readdirSync(cacheDir).length).toBe(2);
+    // 同 base64 走 content-hash dedup:两次都写同一文件(2026-07-10 fix)
+    expect(readdirSync(cacheDir).length).toBe(1);
+    // 两次返回的 path 必须一致,模型才能识别"同一张图"避免反复 Read
+    expect(result.savedImages[0]).toBe(result.savedImages[1]);
   });
 
   // Bug fix (2026-07-09): 之前 transform 只扫 message.content 顶层 image 块,
@@ -169,5 +172,73 @@ describe('DEFAULT_PROMPT_TEMPLATE (2026-07-07 tool-agnostic)', () => {
   // config.ts DEFAULTS 用同名常量 import,避免两处漂移)。
   it('does NOT hardcode a specific image-recognition MCP tool', () => {
     expect(DEFAULT_PROMPT_TEMPLATE).not.toMatch(/mcp__[A-Za-z0-9_]+__[A-Za-z_]+/);
+  });
+});
+
+// === content-hash dedup (2026-07-10 fix) ===
+// 修掉"Read tool result 反馈循环"导致的 cache 爆炸(实测 11 张唯一图涨到 1483 份)。
+// 设计:filename = sha256(dataB64).slice(0,32) + ext。同一 base64 永远落同一文件。
+describe('saveImage content-hash dedup', () => {
+  let cacheDir: string;
+  beforeEach(() => { cacheDir = mkdtempSync(join(tmpdir(), 'img-proxy-dedup-')); });
+  afterEach(() => { rmSync(cacheDir, { recursive: true, force: true }); });
+
+  it('filename is <32-hex>.<ext>, not Date.now()-random', async () => {
+    const messages = [{
+      role: 'user',
+      content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_DOT_PNG_B64 } }],
+    }];
+    const result = await stripImagesToPaths(messages, { cacheDir, promptTemplate: '{path}' });
+    const path = result.savedImages[0]!;
+    const base = path.slice(cacheDir.length + 1);  // 去掉 cacheDir + /
+    expect(base).toMatch(/^[a-f0-9]{32}\.png$/);   // 32 hex + .png
+  });
+
+  it('same base64 across two separate requests → 1 file on disk, 2 strippedCount', async () => {
+    // 模拟"Read tool 反馈循环":第一轮用户贴图,第二轮 tool_result 又带回同一张图
+    const m1 = [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_DOT_PNG_B64 } }] }];
+    const m2 = [{
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: 'toolu_1',
+        content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_DOT_PNG_B64 } }],
+      }],
+    }];
+    const r1 = await stripImagesToPaths(m1, { cacheDir, promptTemplate: '{path}' });
+    const r2 = await stripImagesToPaths(m2, { cacheDir, promptTemplate: '{path}' });
+    expect(r1.strippedCount).toBe(1);
+    expect(r2.strippedCount).toBe(1);
+    // 关键:disk 上仍是 1 份,模型在两轮里看到的是同一 path
+    expect(readdirSync(cacheDir)).toHaveLength(1);
+    expect(r1.savedImages[0]).toBe(r2.savedImages[0]);
+  });
+
+  it('different base64 → different files (no false dedup)', async () => {
+    // 真实测试中需要 2 段不同 base64。RED_DOT_PNG_B64 是 1x1 红色 PNG,反向 aRGB
+    // 加 1 字节让它不同。
+    const variant = RED_DOT_PNG_B64.slice(0, -4) + 'AAAA';
+    const messages = [
+      { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_DOT_PNG_B64 } }] },
+      { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: variant } }] },
+    ];
+    const result = await stripImagesToPaths(messages, { cacheDir, promptTemplate: '{path}' });
+    expect(result.strippedCount).toBe(2);
+    expect(readdirSync(cacheDir)).toHaveLength(2);  // 不同的图不应被合并
+    expect(result.savedImages[0]).not.toBe(result.savedImages[1]);
+  });
+
+  it('does not rewrite file when same data appears again (mtime unchanged)', async () => {
+    const messages = [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_DOT_PNG_B64 } }] }];
+    const r1 = await stripImagesToPaths(messages, { cacheDir, promptTemplate: '{path}' });
+    const path = r1.savedImages[0]!;
+    const mtimeBefore = statSync(path).mtimeMs;
+    // 跨请求间隔需要 > mtime 精度。1ms sleep 在大多数 fs 上足够让 mtime 变化,
+    // 但要观察的是"第二次没有触发 write"——Bun.write 会刷新 mtime,如果 mtime 不变
+    // 就证明没写。给 50ms 缓冲确保就算 mtime 变了也只可能是 1 次新写。
+    await new Promise((r) => setTimeout(r, 50));
+    await stripImagesToPaths(messages, { cacheDir, promptTemplate: '{path}' });
+    const mtimeAfter = statSync(path).mtimeMs;
+    expect(mtimeAfter).toBe(mtimeBefore);  // existsSync 命中,没 write
   });
 });

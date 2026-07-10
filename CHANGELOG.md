@@ -4,6 +4,23 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **img-proxy cache 重复落盘 + 诱导 Read 循环** — `stripImagesToPaths` 的
+  `saveImage` 改为对 base64 算 sha256 取前 32 hex 作文件名,`existsSync` 命中
+  即跳过写。修掉两个相关问题:
+  1. 磁盘:Read 工具读图后 Claude Code 把图塞回 `tool_result.content`,
+     proxy 递归 strip 每次都生成新文件名(`Date.now()-<random>`),同一张图
+     在多次 Read 反馈循环里被反复落盘。**实测 11 张唯一图涨到 1483 份
+     (183 MB),sha256 去重后只需 11 份 (<1 MB),浪费率 99.5%**。
+  2. Token:每次新文件名被模型视为"未访问过的文件",模型会反复调 Read
+     看同一张图,每轮多花的 tool call + tool_result 文案 token 是真钱。
+     改用 content-hash 文件名后,模型两轮看到的是同一 path,Read 循环
+     自然终止。`cleanupOldCache` 的 7 天 mtime TTL 行为保留(Bun.write
+     覆盖会刷新 mtime → 热图自然留住)。
+
 ## [0.8.0] - 2026-07-09
 
 ### Added

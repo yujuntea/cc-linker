@@ -1,4 +1,5 @@
-import { mkdirSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
+import { createHash } from 'crypto';
 import { join } from 'path';
 import type { TransformResult } from './types';
 
@@ -21,20 +22,26 @@ const EXT_BY_MEDIA: Record<string, string> = {
   'image/gif': 'gif',
 };
 
-function randomSuffix(len = 6): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let out = '';
-  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
-  return out;
+/** Hash data → 32-hex 文件名 stem。同 base64 永远映射到同一路径,实现 content-hash dedup。 */
+function hashDataB64(dataB64: string): string {
+  return createHash('sha256').update(dataB64).digest('hex').slice(0, 32);
 }
 
 async function saveImage(cacheDir: string, mediaType: string, dataB64: string): Promise<string> {
   const ext = EXT_BY_MEDIA[mediaType] ?? 'png';
-  const name = `${Date.now()}-${randomSuffix()}.${ext}`;
+  // content-hash 文件名:同一张图(同 base64)永远写到同一路径
+  //  - 第二次起 existsSync 短路,跳过 write IO
+  //  - 同一张图被 Read tool 反馈回 tool_result.content 时,模型拿到的 path 与原图一致,
+  //    不会产生"phantom 新文件"诱导模型再 Read 一次(那种正反馈循环在 11 张图里
+  //    烧出过 1483 个文件,11 张去重到 1 张,浪费率 99.5%)
+  //  - 已被 dedup 的图再次被请求,新覆盖会让 mtime 刷新,7 天 TTL 自然留住热图
+  const name = `${hashDataB64(dataB64)}.${ext}`;
   const path = join(cacheDir, name);
-  // Bun.write 比 writeFileSync 快 1.5-2x(用优化 syscall,跳过 libuv shim)
-  // 异步 + 并发让多图消息的总 wall-time 从 N×per_image 降到 max(per_image)
-  await Bun.write(path, Buffer.from(dataB64, 'base64'), { mode: 0o600 });
+  if (!existsSync(path)) {
+    // Bun.write 比 writeFileSync 快 1.5-2x(用优化 syscall,跳过 libuv shim)
+    // 异步 + 并发让多图消息的总 wall-time 从 N×per_image 降到 max(per_image)
+    await Bun.write(path, Buffer.from(dataB64, 'base64'), { mode: 0o600 });
+  }
   return path;
 }
 
@@ -43,6 +50,13 @@ async function saveImage(cacheDir: string, mediaType: string, dataB64: string): 
  * url-source 与非 image block 原样保留。单 block 异常时原样保留(不抛错,绝不阻塞)。
  * 递归进入 tool_result.content(Read tool 读 PNG 后 Claude Code 把图塞进 tool_result
  * 嵌套 content,必须扫到,否则透传给纯文本模型 → 400)。
+ *
+ * 去重设计(2026-07-10 fix):
+ * 文件名 = sha256(data).slice(0,32) + ext。同 base64 永远落同一文件,existsSync 命中
+ * 即跳过 write。修掉两个问题:
+ *  1. 磁盘:同张图被 Read 工具回环写 N 次,cache 涨到几百倍(实测 11 张图 → 1483 份)
+ *  2. token:每次新文件名被模型视为"未访问过的文件",会诱使模型反复 Read 同一图,
+ *     多花的 tool call + tool_result 文案 token 是真钱
  *
  * 性能说明:
  * - mkdirSync 一次性提升到函数顶层(以前每张图都调一次,冗余)
