@@ -15,9 +15,10 @@ import {
   CONFIG_PATH, expandPath,
 } from '../../utils/paths';
 import { installProvider, uninstallProvider, isProviderInstalled } from '../../img-proxy/provider-config';
-import { loadRoutes, removeRoute, resolveProxyByUpstream } from '../../img-proxy/routes';
+import { loadRoutes, removeRoute, resolveProxyByUpstream, isProxyUrl } from '../../img-proxy/routes';
 import { scanProviderFiles, hasCcSwitch } from '../../img-proxy/provider-scan';
 import { discoverCandidates, type Candidate } from '../../img-proxy/discover';
+import { getCurrentCcSwitchProvider } from '../../img-proxy/cc-switch-current';
 import { startProxyServer } from '../../img-proxy/server';
 import { DEFAULT_PROMPT_TEMPLATE } from '../../img-proxy/transform';
 import { writePidAtomic, readPid, isPidAlive, clearPid } from '../../utils/pid';
@@ -310,6 +311,39 @@ export async function imgProxyResolve(opts: { upstream: string }): Promise<void>
   const proxyUrl = resolveProxyByUpstream(IMG_PROXY_ROUTES_PATH, port, hostname, opts.upstream);
   if (proxyUrl) console.log(proxyUrl);
   // 空 stdout = "没找到" — wrapper 检测用
+}
+
+// ---------- cc-switch-settings ----------
+// 给 cc-linker-proxy wrapper 调用: 输出当前 cc-switch provider 对应的 auto-providers 文件路径。
+// 成功 stdout=path exit 0; 失败 stdout 空 + stderr 提示 + exit 2。
+//
+// process.exit 例外说明: 这是纯 CLI 子命令 (wrapper 通过 subprocess 调), 无 library caller 场景,
+// 与 imgProxyCurrentUrl/imgProxyResolve (已 library 化) 不同。YAGNI - 不为想象的 programmatic caller 过度设计。
+export async function imgProxyCcSwitchSettings(): Promise<void> {
+  const result = getCurrentCcSwitchProvider();
+  switch (result.status) {
+    case 'ok': {
+      if (!isProxyUrl(result.provider.baseUrl)) {
+        console.error(`cc-linker-proxy: 当前 provider "${result.provider.name}" 未装代理`);
+        console.error(`  hint: cc-linker img-proxy install --providers ${result.provider.name}`);
+        process.exit(2);
+      }
+      console.log(result.provider.settingsFile);
+      return;
+    }
+    case 'no-ccswitch':
+      console.error('cc-linker-proxy: 未检测到 CC Switch');
+      console.error('  hint: 装 CC Switch 并选一个 provider, 或用 claude --settings <provider文件>');
+      process.exit(2);
+    case 'no-current':
+      console.error('cc-linker-proxy: CC Switch 未选中 claude provider');
+      console.error('  hint: 在 CC Switch 里选一个 provider');
+      process.exit(2);
+    case 'no-file':
+      console.error(`cc-linker-proxy: 当前 provider "${result.name}" 未同步`);
+      console.error('  hint: cc-linker img-proxy install');
+      process.exit(2);
+  }
 }
 
 // ---------- wrapper-install ----------

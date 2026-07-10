@@ -27,6 +27,7 @@ import {
   imgProxyDaemonInstall, imgProxyDaemonUninstall,
   imgProxyCurrentUrl,
   imgProxyResolve,
+  imgProxyCcSwitchSettings,
   imgProxyWrapperInstall, imgProxyWrapperUninstall, imgProxyWrapperStatus,
   imgProxyConsoleEnable, imgProxyConsoleDisable, imgProxyConsoleStatus,
 } from './cli/commands/img-proxy';
@@ -243,6 +244,7 @@ imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 
   }
 });
 imgProxyCmd.command('resolve <upstream>').description('按真实 upstream URL 查 proxy URL').action((upstream) => imgProxyResolve({ upstream }));
+imgProxyCmd.command('cc-switch-settings').description('输出当前 cc-switch provider 的代理 settings 文件路径 (给 cc-linker-proxy wrapper 用)').action(() => imgProxyCcSwitchSettings());
 const wrapperCmd = imgProxyCmd.command('wrapper').description('管理 shell wrapper (cc-linker-proxy)');
 wrapperCmd.command('install').description('装 wrapper 到 ~/.zshrc').action(() => imgProxyWrapperInstall());
 wrapperCmd.command('uninstall').description('从 ~/.zshrc 移除 wrapper').action(() => imgProxyWrapperUninstall());
