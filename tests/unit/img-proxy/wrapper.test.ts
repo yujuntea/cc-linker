@@ -38,28 +38,32 @@ describe('generateWrapperBlock', () => {
     expect(block).toContain('cc-linker-proxy()');
   });
 
-  test('包含递归防护 (resolve 返同 URL → 直 exec, E7 invariant)', () => {
+  test('调 cc-linker img-proxy cc-switch-settings 子命令', () => {
     const block = generateWrapperBlock();
-    expect(block).toMatch(/ANTHROPIC_BASE_URL/);
+    expect(block).toContain('cc-linker img-proxy cc-switch-settings');
+  });
+
+  test('用 claude --settings 指定 provider 文件', () => {
+    const block = generateWrapperBlock();
+    expect(block).toContain('--settings');
     expect(block).toContain('command claude');
-    // 新版 idempotent guard: 比较 resolve 结果与输入
-    expect(block).toMatch(/\$resolved.*=.*\$env_url/);
   });
 
-  test('包含 stderr warn (env override → "改写")', () => {
+  test('失败时重跑子命令透传 stderr + return 1', () => {
     const block = generateWrapperBlock();
-    expect(block).toContain('改写');
+    expect(block).toContain('>/dev/null');
+    expect(block).toContain('return 1');
   });
 
-  test('包含 fall back 消息 (env unresolvable)', () => {
+  test('不再读 ANTHROPIC_BASE_URL (删旧 4-branch 死代码)', () => {
     const block = generateWrapperBlock();
-    expect(block).toContain('fall back');
+    expect(block).not.toContain('ANTHROPIC_BASE_URL');
   });
 
-  test('包含调 cc-linker img-proxy current-url 和 resolve', () => {
+  test('不再调 current-url / resolve (旧路径)', () => {
     const block = generateWrapperBlock();
-    expect(block).toContain('cc-linker img-proxy current-url');
-    expect(block).toContain('cc-linker img-proxy resolve');
+    expect(block).not.toContain('current-url');
+    expect(block).not.toContain('img-proxy resolve');
   });
 });
 
