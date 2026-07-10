@@ -9,59 +9,40 @@ let tmpDir: string;
 let rcFile: string;
 let fakeClaudeLog: string;
 
-// Stub `cc-linker`: handles `img-proxy current-url` + `img-proxy resolve <url>`
-// Settings URL is passed via FAKE_SETTINGS_URL env var (pre-computed by test) —
-// avoids JSON parsing in shell (no node/jq dependency).
-// Stub `claude`: captures ANTHROPIC_BASE_URL + args.
+// Stub `cc-linker`: 只处理 `img-proxy cc-switch-settings` 子命令
+// FAKE_SETTINGS_FILE env var 非空 -> stdout 输出该路径 (成功)
+// FAKE_SETTINGS_FILE 空 -> stdout 空 + stderr 提示 (失败)
 const STUB_CCLINKER = `#!/bin/bash
-case "$1 $2" in
-  "img-proxy current-url")
-    echo "$FAKE_SETTINGS_URL"
-    ;;
-  "img-proxy resolve")
-    url="$3"
-    case "$url" in
-      # idempotent: already proxy URL -> return unchanged
-      http://127.0.0.1:*|http://localhost:*)
-        echo "$url"
-        ;;
-      # mock: this upstream is installed as byte-agent-glm
-      https://ark.cn-beijing.volces.com/api/plan)
-        echo "http://127.0.0.1:8765/byte-agent-glm"
-        ;;
-      # mock: not installed -> return empty (triggers fall back)
-      https://api.minimaxi.com/anthropic)
-        ;;
-      *) ;;
-    esac
-    ;;
-esac
+if [ "$1 $2" = "img-proxy cc-switch-settings" ]; then
+  if [ -n "$FAKE_SETTINGS_FILE" ]; then
+    echo "$FAKE_SETTINGS_FILE"
+  else
+    echo "cc-linker-proxy: 未检测到 CC Switch" >&2
+    echo "  hint: 装 CC Switch" >&2
+    exit 2
+  fi
+fi
 `;
 
+// Stub `claude`: 捕获 --settings 参数 + 原始 args
 const STUB_CLAUDE = `#!/bin/bash
 {
-  echo "ENV:ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
   echo "ARGS:$@"
   echo "---"
 } >> "$FAKE_CLAUDE_LOG"
 `;
 
-function runWrapper(env: Record<string, string>, settingsUrl: string): { stdout: string; stderr: string; exitCode: number; claudeLog: string } {
-  const result = spawnSync('bash', ['-c', `source ${rcFile} && cc-linker-proxy --version`], {
+function runWrapper(env: Record<string, string>, fakeSettingsFile: string, wrapperArgs: string = '--version'): { stdout: string; stderr: string; exitCode: number; claudeLog: string } {
+  const result = spawnSync('bash', ['-c', `source ${rcFile} && cc-linker-proxy ${wrapperArgs}`], {
     env: {
       ...process.env,
       ...env,
-      FAKE_SETTINGS_URL: settingsUrl,
+      FAKE_SETTINGS_FILE: fakeSettingsFile,
       FAKE_CLAUDE_LOG: fakeClaudeLog,
-      // Hermetic: 只要宿主/测试没显式设 ANTHROPIC_BASE_URL,就清空。
-      // 旧 wrapper 短路过 settings.json 时要空串(让 env_url 测试走 fall back 路径),
-      // 新 wrapper 需要传测试用例的 stale URL(本次修复场景)。
-      ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL ?? '',
       PATH: `${tmpDir}:${process.env.PATH}`,
     },
     encoding: 'utf-8',
   });
-  // claude 没被调时 fakeClaudeLog 不存在,readFileSync 会 ENOENT — 当空串处理
   let claudeLog = '';
   try {
     claudeLog = readFileSync(fakeClaudeLog, 'utf-8').trim();
@@ -93,118 +74,37 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe('cc-linker-proxy integration: BUG FIX (env=stale non-proxy URL)', () => {
-  test('env=https://api.minimaxi.com/anthropic + settings.json=ark → fall back + warn + claude sees proxy URL', () => {
-    // env=stale inherited non-proxy URL (bug scenario)
-    //   |  settings.json configured to ark (a provider img-proxy knows about)
-    //   v
-    // wrapper should fall back to settings.json (current-url), resolve it
-    // through stub cc-linker, and exec claude with the proxy URL — even
-    // though env resolved to empty (unrecognised upstream).
-    const { stderr, exitCode, claudeLog } = runWrapper(
-      { ANTHROPIC_BASE_URL: 'https://api.minimaxi.com/anthropic' },
-      'https://ark.cn-beijing.volces.com/api/plan',
-    );
-
-    // Exit success (claude called)
+describe('cc-linker-proxy integration (cc-switch-settings 路径)', () => {
+  test('成功: cc-switch-settings 返 path -> claude 收到 --settings <path> + args', () => {
+    const fakeFile = join(tmpDir, 'provider.json');
+    writeFileSync(fakeFile, '{}');
+    const { exitCode, claudeLog } = runWrapper({}, fakeFile);
     expect(exitCode).toBe(0);
-
-    // Stderr warn mentions fall back
-    expect(stderr).toContain('fall back');
-
-    // claude received the proxy URL (NOT the stale minimaxi URL)
-    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/byte-agent-glm');
-    expect(claudeLog).not.toContain('minimaxi');
-
-    // claude called with --version (passed through)
-    expect(claudeLog).toContain('ARGS:--version');
-  });
-});
-
-describe('cc-linker-proxy integration: scenarios', () => {
-  test('E7: env=proxy URL (127.0.0.1) -> preserved, no warn', () => {
-    // env already points at the proxy -> user explicitly chose it.
-    // Wrapper must NOT rewrite or fall back (E7 invariant: URL unchanged).
-    const { stderr, exitCode, claudeLog } = runWrapper(
-      { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8765/glm-5.2' },
-      '', // settings.json irrelevant when env set + matches proxy
-    );
-
-    expect(exitCode).toBe(0);
-    expect(stderr).not.toContain('改写');
-    expect(stderr).not.toContain('fall back');
-    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/glm-5.2');
+    expect(claudeLog).toContain(`--settings ${fakeFile}`);
+    expect(claudeLog).toContain('--version');
   });
 
-  test('E7 localhost: env=proxy URL (localhost) -> preserved, no warn', () => {
-    // Same as above but with hostname=localhost (also matches proxy pattern).
-    const { stderr, exitCode, claudeLog } = runWrapper(
-      { ANTHROPIC_BASE_URL: 'http://localhost:8765/qwen-deepseek' },
-      '',
-    );
-
-    expect(exitCode).toBe(0);
-    expect(stderr).not.toContain('改写');
-    expect(stderr).not.toContain('fall back');
-    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://localhost:8765/qwen-deepseek');
-  });
-
-  test('E7 non-default port: env=proxy URL (port 9999) -> preserved, no warn', () => {
-    // Non-default proxy port (still loopback) -> should also be preserved.
-    // E7 invariant is about the URL pattern, not a specific port number.
-    const { stderr, exitCode, claudeLog } = runWrapper(
-      { ANTHROPIC_BASE_URL: 'http://127.0.0.1:9999/glm-5.2' },
-      '',
-    );
-
-    expect(exitCode).toBe(0);
-    expect(stderr).not.toContain('改写');
-    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:9999/glm-5.2');
-  });
-
-  test('scenario 1: env unset + settings.json upstream -> proxy URL, no warn', () => {
-    // Common case: env unset, settings.json has a known upstream URL.
-    // Wrapper should silently resolve to proxy URL.
-    const { stderr, exitCode, claudeLog } = runWrapper(
-      {}, // env unset
-      'https://ark.cn-beijing.volces.com/api/plan',
-    );
-
-    expect(exitCode).toBe(0);
-    expect(stderr).toBe(''); // no warn
-    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/byte-agent-glm');
-  });
-
-  test('scenario 5: env=installed upstream URL -> rewritten to proxy URL, warn 改写', () => {
-    // env has an upstream URL whose provider IS installed -> resolve returns
-    // proxy URL. Wrapper should rewrite ANTHROPIC_BASE_URL to proxy URL and
-    // warn once so user knows their env was overridden.
-    const { stderr, exitCode, claudeLog } = runWrapper(
-      { ANTHROPIC_BASE_URL: 'https://ark.cn-beijing.volces.com/api/plan' },
-      '',
-    );
-
-    expect(exitCode).toBe(0);
-    expect(stderr).toContain('改写');
-    expect(claudeLog).toContain('ENV:ANTHROPIC_BASE_URL=http://127.0.0.1:8765/byte-agent-glm');
-    // Upstream URL must not leak into claude's env.
-    expect(claudeLog).not.toContain('ark.cn-beijing');
-  });
-
-  test('scenario 4: env=unknown URL + settings.json empty -> wrapper error, claude not called', () => {
-    // env points at a stale inherited URL not in img-proxy, AND settings.json
-    // has no URL. Wrapper should:
-    //   1. Try to resolve env URL -> empty (stub returns nothing for minimaxi)
-    //   2. Fall back to settings.json -> empty (FAKE_SETTINGS_URL='')
-    //   3. Emit both warnings and exit non-zero WITHOUT calling claude
-    const { stderr, exitCode, claudeLog } = runWrapper(
-      { ANTHROPIC_BASE_URL: 'https://api.minimaxi.com/anthropic' },
-      '', // settings.json empty
-    );
-
+  test('失败: cc-switch-settings 返空 -> claude 不被调用, stderr 透传提示, exit 1', () => {
+    const { exitCode, stderr, claudeLog } = runWrapper({}, '');
     expect(exitCode).toBe(1);
-    expect(stderr).toContain('fall back'); // env unresolvable -> fall back attempted
-    expect(stderr).toContain('找不到当前 provider URL'); // settings also empty
-    expect(claudeLog).toBe(''); // claude must NOT be called
+    expect(claudeLog).toBe('');
+    expect(stderr).toContain('未检测到 CC Switch');
+  });
+
+  test('claude args 透传 (-p "reply OK")', () => {
+    const fakeFile = join(tmpDir, 'provider.json');
+    writeFileSync(fakeFile, '{}');
+    const { claudeLog } = runWrapper({}, fakeFile, '-p "reply OK"');
+    expect(claudeLog).toContain('--settings');
+    expect(claudeLog).toContain('-p');
+    expect(claudeLog).toContain('reply OK');
+  });
+
+  test('回归: wrapper 不读 ANTHROPIC_BASE_URL (设了也忽略, 走 cc-switch-settings)', () => {
+    const fakeFile = join(tmpDir, 'provider.json');
+    writeFileSync(fakeFile, '{}');
+    const { exitCode, claudeLog } = runWrapper({ ANTHROPIC_BASE_URL: 'https://stale.com' }, fakeFile);
+    expect(exitCode).toBe(0);
+    expect(claudeLog).toContain(`--settings ${fakeFile}`);
   });
 });
