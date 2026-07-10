@@ -446,7 +446,7 @@ export async function imgProxyInstall(opts: {
   all?: boolean;
   yes?: boolean;
   mode?: 'smart' | 'dumb';
-}): Promise<{ installedCount: number; failedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean; consoleInstalled: boolean; consoleSkipped: boolean }> {
+}): Promise<{ installedCount: number; failedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean; consoleInstalled: boolean; consoleSkipped: boolean; autoStart: boolean }> {
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
   const smartModeConfig = config.get<boolean>('img_proxy.smart_mode', true);
@@ -532,7 +532,7 @@ export async function imgProxyInstall(opts: {
       message: '选择要启用图片代理的 provider (空格勾选,回车确认):',
       choices, pageSize: 20,
     }]);
-    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, failedCount: 0, wrapperInstalled: false, wrapperSkipped: false, consoleInstalled: false, consoleSkipped: false }; }
+    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, failedCount: 0, wrapperInstalled: false, wrapperSkipped: false, consoleInstalled: false, consoleSkipped: false, autoStart: false }; }
     const pickedSet = new Set(picks as string[]);
     targets = filtered.filter(c => pickedSet.has(c.alias));
   }
@@ -616,9 +616,64 @@ export async function imgProxyInstall(opts: {
     console.log(chalk.cyan(`💡 Web Console 已启用 — 浏览器打开 http://127.0.0.1:${port}/`));
     console.log(chalk.cyan(`   关闭: cc-linker img-proxy console disable`));
   } else if (consoleSkipped) {
-    console.log(chalk.gray(`   启用 Web Console: cc-linker img-proxy console enable`));
+    console.log(chalk.gray('   启用 Web Console: cc-linker img-proxy console enable`'));
   }
-  return { installedCount: installed + skipped, failedCount: failed, wrapperInstalled, wrapperSkipped, consoleInstalled, consoleSkipped };
+
+  // 2026-07-10: install 完后引导配置 launchd 开机自启(和 setup wizard 一致)。
+  // 之前 install 命令只装 providers,不问 launchd,导致用户跑 `cc-linker img-proxy install`
+  // 后 daemon 不会开机自启(只有 launchd-managed 那个才自启)。
+  // 实现抽到 promptLaunchdAutoStart,单测覆盖各种平台/TTY 组合。
+  const autoStart = await promptLaunchdAutoStart({ yes: !!opts.yes });
+
+  return { installedCount: installed + skipped, failedCount: failed, wrapperInstalled, wrapperSkipped, consoleInstalled, consoleSkipped, autoStart };
+}
+
+/**
+ * install / setup 流程完后引导用户配置 launchd 开机自启(2026-07-10 加)。
+ *
+ * 行为契约:
+ * - 非 darwin 平台 → 永远返 false(linux/windows 无 launchd)
+ * - 非交互模式(无 TTY,如 CI / 脚本)→ 永远返 false,不阻塞
+ * - 用户答 Yes → 调 imgProxyDaemonInstall;成功返 true,**失败不 throw**(只 log,
+ *   让 caller 把 install 主流程的成果保留)
+ * - 用户答 No / inquirer 抛 → 返 false
+ * - --yes flag → 默认 Yes(脚本友好);无 flag → 默认 No(交互,conservative)
+ *
+ * 抽出独立函数是为了单测能直接调,不用跑整个 install 流(写 plist、跑 launchctl
+ * 都有副作用)。
+ */
+export async function promptLaunchdAutoStart(opts: { yes?: boolean }): Promise<boolean> {
+  if (process.platform !== 'darwin') {
+    console.log(chalk.gray('   开机自启: 非 darwin 跳过'));
+    return false;
+  }
+  if (!process.stdin.isTTY) {
+    console.log(chalk.gray('   开机自启: 非交互模式,跳过 — 手动 `cc-linker img-proxy daemon install`'));
+    return false;
+  }
+  try {
+    const { autoStart: want } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'autoStart',
+      message: '是否配置开机自启(launchd)?',
+      default: !!opts.yes,
+    }]);
+    if (!want) return false;
+    try {
+      await imgProxyDaemonInstall();
+      return true;
+    } catch (err) {
+      // 不 throw:install 主流程已成功(providers + wrapper + console),
+      // launchd 只是可选附加项。失败 log 出来让用户知道怎么手动跑
+      console.log(chalk.yellow(`⚠️  launchd 配置失败: ${(err as Error).message}`));
+      console.log(chalk.gray('   可稍后手动执行 cc-linker img-proxy daemon install`'));
+      return false;
+    }
+  } catch (err) {
+    // inquirer 自身失败(用户 Ctrl+C 等)— 也不 throw,只 log
+    console.log(chalk.gray(`   跳过 launchd 询问: ${(err as Error).message}`));
+    return false;
+  }
 }
 
 function buildChoiceLabel(c: Candidate): string {

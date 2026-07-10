@@ -96,6 +96,19 @@ All notable changes to cc-linker are documented here. Format follows
   修法:dedup 命中时 `utimesSync` 刷 mtime(无 IO,只 touch),
   让 cleanupOldCache 知道这是热图。
 
+### Added
+
+- **img-proxy install 完后引导配置 launchd 开机自启** —
+  之前 `cc-linker img-proxy install` 装完 providers 就结束,不问
+  launchd。用户跑这个命令后 daemon 不会开机自启(只有 setup wizard
+  才引导)。修法:install 完后(macOS only、TTY 必备)问一句"是否
+  配置开机自启",Yes 调 `imgProxyDaemonInstall`。
+  - 失败 log + 不 throw(providers 已装好,launchd 失败不回滚)
+  - 非 darwin 平台跳过,无 TTY 自动跳过(脚本友好)
+  - `--yes` flag 默认 Yes(脚本场景),无 flag 默认 No(交互,保守)
+  - 抽出 `promptLaunchdAutoStart()` 独立函数方便单测
+  - return type 加 `autoStart: boolean` 字段
+
 - **img-proxy cache 重复落盘 + 诱导 Read 循环** — `stripImagesToPaths` 的
   `saveImage` 改为对 base64 算 sha256 取前 32 hex 作文件名,`existsSync` 命中
   即跳过写。修掉两个相关问题:
