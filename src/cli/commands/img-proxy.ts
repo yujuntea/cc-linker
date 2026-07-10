@@ -699,7 +699,14 @@ function launchdPlistPath(): string {
 }
 
 export async function imgProxyDaemonInstall(): Promise<void> {
-  if (platform() !== 'darwin') { console.log(chalk.red('目前仅支持 macOS launchd 自启')); process.exit(1); }
+  // Library 契约(2026-07-10 修):失败 throw,成功 return。**不调 process.exit**。
+  // 之前 3 处 process.exit(1) 是同类 bug(wizard 在 setup.ts:327 try/catch 包了
+  // 但 process.exit 接不住,直接把 setup wizard 进程杀了;同样会触发 launchd
+  // throttle 死锁)。CLI binding (src/index.ts:242) 与 wizard 自己负责 exit /
+  // 决定 throw 后怎么处理。
+  if (platform() !== 'darwin') {
+    throw new Error('目前仅支持 macOS launchd 自启');
+  }
   const exe = getExecutablePath();
   const plistPath = launchdPlistPath();
 
@@ -771,7 +778,7 @@ export async function imgProxyDaemonInstall(): Promise<void> {
     console.log(chalk.red(`❌ launchctl load 失败 (exit ${loadResult.status})`));
     console.log(chalk.yellow(`   ${loadErr}`));
     console.log(chalk.gray(`   检查 plist: ${plistPath}`));
-    process.exit(1);
+    throw new Error(`launchctl load 失败 (exit ${loadResult.status}): ${loadErr}`);
   }
   if (loadErr.includes('already loaded')) {
     // load 会失败因为 plist 已经在;但我们 unload 过上面的代码块 —— 这种情况
@@ -832,7 +839,8 @@ export async function imgProxyDaemonInstall(): Promise<void> {
     }
     console.log(chalk.gray(`   日志: ${IMG_PROXY_LOG_FILE}`));
     console.log(chalk.gray('   常见原因: plist 的 ProgramArguments[0] 不是绝对路径 / 端口被占用 / 路由表为空'));
-    process.exit(1);
+    const failedNames = result.failed.map(f => `${f.name}: ${f.message}`).join('; ');
+    throw new Error(`img-proxy 开机自启健康检查未通过 (${failedNames})`);
   }
 
   console.log(chalk.green('✅ img-proxy 开机自启已配置 (KeepAlive,崩溃 10s 内自拉起)'));

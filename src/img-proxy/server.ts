@@ -504,42 +504,61 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       // daemon `cc-linker img-proxy stop` 走 SIGTERM(event loop 自然 drain),
       // 不影响。SIGKILL 通过 pkill -9 / OOM 等极端路径触发,生产极少。
       // 修复:同步 (catch / no_body) 路径不丢;只 piping.finally 路径受影响。
+      //
+      // 2026-07-10: 整个 finally 回调包 try/catch。
+      // 之前 applyUsageLine / appendLog / updateByAlias / pushRecent 任何一处 throw
+      // 都会让 finally 的 promise reject,Bun 默认 unhandled rejection 让 process
+      // 退出 → launchd KeepAlive 看到非零 exit 触发重启 + throttle。和 imgProxyStart
+      // 之前的 launchd child 自杀是同一条路径。包 try/catch + log + swallow,保证
+      // finally 永远 resolve,daemon 不会因为埋点路径上的 bug 自杀。
       piping.finally(() => {
-        if (idleTimer !== null) clearInterval(idleTimer);
-        // stream 已 settle;处理 sseBuf 残留的最后一段。
-        // 非流式响应尤其重要:整 body 一个 JSON 没换行,被 pop 留到了 sseBuf。
-        if (sseBuf.trim()) applyUsageLine(sseBuf, usage);
-        sseBuf = '';
-        const duration = Date.now() - startedAt;
-        appendLog(`INFO ${JSON.stringify({
-          time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
-          stripped, upstream_status: upstreamResp.status,
-          duration_ms: duration,
-          headers_to_first_chunk_ms: headersToFirstChunk,
-          chunks, bytes,
-          stream_status: streamStatus,
-          upstream_error_msg: upstreamErrorMsg,
-          input_tokens: usage.inputTokens,
-          output_tokens: usage.outputTokens,
-          cache_read_input_tokens: usage.cacheReadTokens,
-          cache_creation_input_tokens: usage.cacheCreationTokens,
-        })}`, logPath);
-        // Task 8: 写 stats(成功 stream 路径)
-        stats.totalRequests++;
-        stats.byStatus[streamStatus] = (stats.byStatus[streamStatus] ?? 0) + 1;
-        updateByAlias(stats, alias, {
-          requests: 1, stripped, bytes, chunks, durationMs: duration,
-          inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
-          cacheReadTokens: usage.cacheReadTokens, cacheCreationTokens: usage.cacheCreationTokens,
-        });
-        pushRecent(stats, {
-          ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus,
-          chunks, bytes, duration_ms: duration, stripped,
-          input_tokens: usage.inputTokens,
-          output_tokens: usage.outputTokens,
-          cache_read_input_tokens: usage.cacheReadTokens,
-          cache_creation_input_tokens: usage.cacheCreationTokens,
-        });
+        try {
+          if (idleTimer !== null) clearInterval(idleTimer);
+          // stream 已 settle;处理 sseBuf 残留的最后一段。
+          // 非流式响应尤其重要:整 body 一个 JSON 没换行,被 pop 留到了 sseBuf。
+          if (sseBuf.trim()) applyUsageLine(sseBuf, usage);
+          sseBuf = '';
+          const duration = Date.now() - startedAt;
+          appendLog(`INFO ${JSON.stringify({
+            time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
+            stripped, upstream_status: upstreamResp.status,
+            duration_ms: duration,
+            headers_to_first_chunk_ms: headersToFirstChunk,
+            chunks, bytes,
+            stream_status: streamStatus,
+            upstream_error_msg: upstreamErrorMsg,
+            input_tokens: usage.inputTokens,
+            output_tokens: usage.outputTokens,
+            cache_read_input_tokens: usage.cacheReadTokens,
+            cache_creation_input_tokens: usage.cacheCreationTokens,
+          })}`, logPath);
+          // Task 8: 写 stats(成功 stream 路径)
+          stats.totalRequests++;
+          stats.byStatus[streamStatus] = (stats.byStatus[streamStatus] ?? 0) + 1;
+          updateByAlias(stats, alias, {
+            requests: 1, stripped, bytes, chunks, durationMs: duration,
+            inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+            cacheReadTokens: usage.cacheReadTokens, cacheCreationTokens: usage.cacheCreationTokens,
+          });
+          pushRecent(stats, {
+            ts: Date.now(), alias, status: upstreamResp.status, stream_status: streamStatus,
+            chunks, bytes, duration_ms: duration, stripped,
+            input_tokens: usage.inputTokens,
+            output_tokens: usage.outputTokens,
+            cache_read_input_tokens: usage.cacheReadTokens,
+            cache_creation_input_tokens: usage.cacheCreationTokens,
+          });
+        } catch (err) {
+          // 任何埋点失败都 swallow + log,绝不让 process 因埋点 bug 自杀。
+          // 这是 launchd daemon — unhandled rejection 触发 process exit + KeepAlive
+          // 重启 + 多次失败后 throttle,会让 daemon 永远起不来。和 launchd child
+          // 自杀是同源问题。
+          try {
+            appendLog(`ERROR piping.finally instrumentation failed: ${(err as Error).message}`, logPath);
+          } catch {
+            // log 也失败(磁盘满 / log 文件被锁)? 最后兜底,什么都做不了,至少别 propagate
+          }
+        }
       }).catch(() => { /* piping 已 reject 过,这里 swallow */ });
 
       // 透传 response(status + 清理后的 headers);body 用 TransformStream 的 readable,带埋点。

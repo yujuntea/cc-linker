@@ -113,8 +113,15 @@ describe('e2e: cc-linker img-proxy start as launchd child (CC_LINKER_IMG_PROXY_D
   //
   // 注意:naturalExit 只在子进程"自己死"时记录;测试自己 kill 子进程时不应该被记为
   // naturalExit(否则"还活着 → 测试 kill → exit → 误以为自杀" 的反向 false positive)。
+  //
+  // 关键 setup:确保 8765 端口空闲。如果之前有 launchd-managed daemon 跑着(P0
+  // test 留下的),这测试会因 EADDRINUSE 撞端口失败。先 stop 任何现有 daemon。
   it('child 进程跑 2 秒后应该仍存活(server 监听保活 event loop)', async () => {
-    const { spawn } = await import('child_process');
+    const { spawn, spawnSync } = await import('child_process');
+    // Stop 任何已经在跑的 img-proxy(包括 launchd 托管的) — 不然 EADDRINUSE 撞端口
+    // 会让 child 退出(0),无法验证 server 保活逻辑
+    spawnSync('cc-linker', ['img-proxy', 'stop'], { stdio: 'ignore' });
+    await new Promise((r) => setTimeout(r, 500));  // 等端口释放
     const child = spawn('bun', ['run', 'src/index.ts', 'img-proxy', 'start'], {
       env: { ...process.env, CC_LINKER_IMG_PROXY_DAEMON: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],

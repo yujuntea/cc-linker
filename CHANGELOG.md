@@ -69,6 +69,33 @@ All notable changes to cc-linker are documented here. Format follows
   (`tests/unit/cli/img-proxy-start-library.test.ts`) 跑真实
   binary 2 秒验子进程不被自杀。
 
+- **img-proxy daemon install 失败时 process.exit 杀 wizard(同类 bug)** —
+  `imgProxyDaemonInstall` 在 setup wizard 里被 try/catch 包
+  (`setup.ts:327`) 期望它 throw,但函数用了 3 处 `process.exit(1)`
+  (非 darwin / launchctl load 失败 / 健康检查失败)。`process.exit`
+  不可 catch,直接杀 wizard 进程 — 同 imgProxyStart 上一条 fix 的
+  同一类反模式。修法:3 处全改 `throw new Error(...)`,
+  `index.ts:242` 的 CLI binding 加 try/catch 维持 CLI 行为。
+  新增 spy-on-process.exit 测试验证(`img-proxy-daemon-install-library.test.ts`)。
+
+- **piping.finally 回调无 try/catch,unhandled rejection 自杀** —
+  `src/img-proxy/server.ts` 的 `piping.finally(() => { ... })` 回调里
+  `applyUsageLine / appendLog / updateByAlias / pushRecent` 任一处
+  throw 都会变成 unhandled promise rejection → Bun 默认让 process
+  exit with non-zero → launchd KeepAlive 把 child 当成失败 →
+  反复重启 + 5+ 次后 throttle。和上一条 launchd child 自杀是同源
+  问题(都是 process 自杀 → launchd 反复重启 → throttle)。
+  修法:整个 finally 回调包 try/catch,任何错误 log + swallow,
+  保证 finally 永远 resolve,daemon 不会因埋点 bug 自杀。
+
+- **cache dedup 命中后 mtime 不刷,热图被 7 天 TTL 误清** —
+  `transform.ts` 的 dedup 命中分支 `if (!existsSync)` skip write,
+  文件 mtime 永远停在第一次写入。`cleanupOldCache` 用 mtime 判 7
+  天 TTL → 用户每天粘同一张图,第 8 天被误清 → 模型下次看到
+  同一图要重新 download + prompt cache 失效,既烧 token 又慢。
+  修法:dedup 命中时 `utimesSync` 刷 mtime(无 IO,只 touch),
+  让 cleanupOldCache 知道这是热图。
+
 - **img-proxy cache 重复落盘 + 诱导 Read 循环** — `stripImagesToPaths` 的
   `saveImage` 改为对 base64 算 sha256 取前 32 hex 作文件名,`existsSync` 命中
   即跳过写。修掉两个相关问题:

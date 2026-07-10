@@ -239,7 +239,17 @@ wrapperCmd.command('install').description('装 wrapper 到 ~/.zshrc').action(() 
 wrapperCmd.command('uninstall').description('从 ~/.zshrc 移除 wrapper').action(() => imgProxyWrapperUninstall());
 wrapperCmd.command('status').description('查看 wrapper 状态').action(() => imgProxyWrapperStatus());
 const imgProxyDaemonCmd = imgProxyCmd.command('daemon').description('开机自启管理 (macOS launchd)');
-imgProxyDaemonCmd.command('install').description('配置开机自启').action(() => imgProxyDaemonInstall());
+imgProxyDaemonCmd.command('install').description('配置开机自启').action(async () => {
+  // 2026-07-10: imgProxyDaemonInstall 改 library 化 throw 而不 process.exit。
+  // 之前失败时 process.exit(1) 会顺带把 setup wizard 进程杀了(同 imgProxyStart
+  // 的 bug),现在 throw 让 wizard 的 try/catch 能接住。
+  try {
+    await imgProxyDaemonInstall();
+  } catch (err) {
+    console.error(chalk.red(`❌ ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
 imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());
 const imgProxyConsoleCmd = imgProxyCmd.command('console').description('管理 Web Console 监控后台 (http://127.0.0.1:8765/)');
 imgProxyConsoleCmd.command('enable').description('启用 Web Console,改 [img_proxy]console_enabled=true').action(() => imgProxyConsoleEnable());

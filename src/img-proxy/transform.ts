@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, utimesSync } from 'fs';
 import { createHash } from 'crypto';
 import { join } from 'path';
 import type { TransformResult } from './types';
@@ -34,10 +34,15 @@ async function saveImage(cacheDir: string, mediaType: string, dataB64: string): 
   //  - 同一张图被 Read tool 反馈回 tool_result.content 时,模型拿到的 path 与原图一致,
   //    不会产生"phantom 新文件"诱导模型再 Read 一次(那种正反馈循环在 11 张图里
   //    烧出过 1483 个文件,11 张去重到 1 张,浪费率 99.5%)
-  //  - 已被 dedup 的图再次被请求,新覆盖会让 mtime 刷新,7 天 TTL 自然留住热图
+  //  - 已被 dedup 的图再次被请求,刷 mtime 让 7 天 TTL 留住热图(否则 mtime
+  //    永远停在第一次写入,7 天后被 cleanupOldCache 误清,模型下次看到
+  //    同一图要重新触发 download + prompt cache 失效)
   const name = `${hashDataB64(dataB64)}.${ext}`;
   const path = join(cacheDir, name);
-  if (!existsSync(path)) {
+  if (existsSync(path)) {
+    // 命中:不重写(IO),只 touch mtime 让 cleanupOldCache 知道这是热图
+    utimesSync(path, new Date(), new Date());
+  } else {
     // Bun.write 比 writeFileSync 快 1.5-2x(用优化 syscall,跳过 libuv shim)
     // 异步 + 并发让多图消息的总 wall-time 从 N×per_image 降到 max(per_image)
     await Bun.write(path, Buffer.from(dataB64, 'base64'), { mode: 0o600 });

@@ -228,17 +228,26 @@ describe('saveImage content-hash dedup', () => {
     expect(result.savedImages[0]).not.toBe(result.savedImages[1]);
   });
 
-  it('does not rewrite file when same data appears again (mtime unchanged)', async () => {
+  it('dedup hit touches mtime to keep cache TTL hot (2026-07-10 fix)', async () => {
+    // 2026-07-10 改:dedup 命中时不再 skip — 改成 utimesSync 刷 mtime。
+    // 原因:cleanupOldCache 用 mtime 判 7 天 TTL。如果 dedup 命中不刷 mtime,
+    // 热图 mtime 永远停在第一次写入,第 8 天被误清 → 模型下次看到同一图
+    // 触发重新 download + prompt cache 失效,既烧 token 又慢。
+    //
+    // 验证方向:文件大小没变(content 没重写),但 mtime 变了(utimesSync 触了)。
     const messages = [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_DOT_PNG_B64 } }] }];
     const r1 = await stripImagesToPaths(messages, { cacheDir, promptTemplate: '{path}' });
     const path = r1.savedImages[0]!;
+    const sizeBefore = statSync(path).size;
     const mtimeBefore = statSync(path).mtimeMs;
-    // 跨请求间隔需要 > mtime 精度。1ms sleep 在大多数 fs 上足够让 mtime 变化,
-    // 但要观察的是"第二次没有触发 write"——Bun.write 会刷新 mtime,如果 mtime 不变
-    // 就证明没写。给 50ms 缓冲确保就算 mtime 变了也只可能是 1 次新写。
+    // sleep > mtime 精度(通常 1ms),让 mtime 变化可观察
     await new Promise((r) => setTimeout(r, 50));
     await stripImagesToPaths(messages, { cacheDir, promptTemplate: '{path}' });
+    const sizeAfter = statSync(path).size;
     const mtimeAfter = statSync(path).mtimeMs;
-    expect(mtimeAfter).toBe(mtimeBefore);  // existsSync 命中,没 write
+    // 1. content 没重写(同 base64 → 同 hash → 同文件)
+    expect(sizeAfter).toBe(sizeBefore);
+    // 2. mtime 刷了(utimesSync 让 cleanupOldCache 知道这是热图)
+    expect(mtimeAfter).toBeGreaterThan(mtimeBefore);
   });
 });
