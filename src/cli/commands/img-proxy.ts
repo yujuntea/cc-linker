@@ -37,6 +37,23 @@ function isRunning(): boolean {
 
 // ---------- start ----------
 /**
+ * CLI 启动后是否该让当前进程退出。
+ *
+ * 关键语义(2026-07-10 fix):
+ * - parent 分支(spawn child 后返回)→ true(parent 进程该退出,child 自己接管)
+ * - child / foreground 分支(直接跑 server)→ **false** ← 这里错了就会自杀!
+ *
+ * 历史上 CLI binding 写 `await imgProxyStart(opts); process.exit(0);` 是基于"parent
+ * 总会 exit"的假设;但 launchd 启的 child 是 `cc-linker img-proxy start`(无 --daemon
+ * flag、带 CC_LINKER_IMG_PROXY_DAEMON=1)走 child 分支,函数返回后 CLI binding 无脑
+ * process.exit(0) 把 server 跟着杀了 → launchd KeepAlive 不断重启,throttle 触发,
+ * daemon 永远起不来。
+ */
+export function shouldExitAfterImgProxyStart(opts: { daemon?: boolean }): boolean {
+  return opts.daemon === true;
+}
+
+/**
  * 启动 img-proxy 守护进程 / 前台 server。
  *
  * Library 契约(2026-07-10 改):
@@ -47,6 +64,8 @@ function isRunning(): boolean {
  *   把 setup wizard 进程也杀了,导致 launchd 配置步骤永远到不了)。
  * - signal handler (SIGTERM/SIGINT) 内部的 process.exit(0) **保留**:那是 OS 信号
  *   触发的清理路径,只发生在真正作为 daemon 跑的 child 进程里,不是 library 行为。
+ * - 退出决策走 `shouldExitAfterImgProxyStart(opts)`(见上)。parent 分支返回 → true;
+ *   child / foreground 分支返回 → false(server 会保活 process,不要杀)。
  */
 export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
   if (!config.get<boolean>('img_proxy.enabled', true)) {

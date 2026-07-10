@@ -22,7 +22,7 @@ import { setup } from './cli/commands/setup';
 import { activityHook } from './cli/commands/activity-hook';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
 import {
-  imgProxyStart, imgProxyStop, imgProxyStatus,
+  imgProxyStart, imgProxyStop, imgProxyStatus, shouldExitAfterImgProxyStart,
   imgProxyInstall, imgProxyUninstall,
   imgProxyDaemonInstall, imgProxyDaemonUninstall,
   imgProxyCurrentUrl,
@@ -217,11 +217,14 @@ imgProxyCmd.command('start')
   .option('-d, --daemon', '后台运行')
   .action(async (opts) => {
     // 2026-07-10: imgProxyStart 改 library 化不调 process.exit;CLI 入口自己处理。
-    // 之前 library 在 spawn child 成功后 process.exit(0) 会顺带把 setup wizard
-    // 进程杀了,导致后续 launchd 配置步骤走不到。
+    // 关键:必须用 shouldExitAfterImgProxyStart 决定是否 exit —— parent 分支
+    // (--daemon) 返回后 parent 该退出,child/foreground 分支返回后 server 会保活,
+    // 不能 process.exit 否则自杀。bug 历史:launchd 启的 child 走 child 分支,
+    // 旧版 CLI binding 无脑 process.exit(0),server 起完立刻被杀,launchd 反复
+    // 重启触发 throttle,daemon 永远起不来。
     try {
       await imgProxyStart(opts);
-      process.exit(0);
+      if (shouldExitAfterImgProxyStart(opts)) process.exit(0);
     } catch (err) {
       console.error(chalk.red(`❌ ${(err as Error).message}`));
       process.exit(1);

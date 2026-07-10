@@ -52,6 +52,23 @@ All notable changes to cc-linker are documented here. Format follows
   (SIGTERM/SIGINT) 的 process.exit(0) 保留 — 那是 OS 信号
   触发的清理路径,只在真正作为 daemon 跑的 child 里跑。
 
+- **img-proxy launchd child 启完秒死 + launchd throttle 死锁** —
+  上条 fix 引入的二级 bug:CLI binding 写成 `await imgProxyStart(opts);
+  process.exit(0)`,**没区分** parent 分支(应 exit)和 child /
+  foreground 分支(应让 server 保活)。launchd 启的 child 走
+  `cc-linker img-proxy start`(无 --daemon flag,带
+  CC_LINKER_IMG_PROXY_DAEMON=1)→ child 分支,server 监听
+  8765 写 "img-proxy listening" 后 CLI binding 无脑 process.exit(0)
+  把进程杀了。launchd KeepAlive 立刻重启 → 同样的 5 秒内死循环
+  → 5+ 次失败后 launchd 内部 throttle(`state = spawn scheduled` +
+  `active count = 0`),daemon 永远起不来。修法:加 helper
+  `shouldExitAfterImgProxyStart(opts)` 显式表达"该不该 exit",
+  CLI binding 改成 `if (shouldExitAfterImgProxyStart(opts)) process.exit(0)`。
+  parent 分支(daemon=true)exit;child / foreground 分支(daemon 缺省
+  或 false)让 server 保活,不再自杀。新 e2e 测试
+  (`tests/unit/cli/img-proxy-start-library.test.ts`) 跑真实
+  binary 2 秒验子进程不被自杀。
+
 - **img-proxy cache 重复落盘 + 诱导 Read 循环** — `stripImagesToPaths` 的
   `saveImage` 改为对 base64 算 sha256 取前 32 hex 作文件名,`existsSync` 命中
   即跳过写。修掉两个相关问题:

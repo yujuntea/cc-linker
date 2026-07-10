@@ -12,6 +12,30 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 
+describe('shouldExitAfterImgProxyStart (CLI binding 退出决策)', () => {
+  // 2026-07-10 fix:这个 helper 是 CLI binding 决定是否 process.exit 的单一真理源。
+  // 历史上 CLI binding 写死 process.exit(0) 调 launchd child 自杀 —
+  // launchd 启 `cc-linker img-proxy start` 走 child 分支(无 --daemon),
+  // 返回后无脑 process.exit 把刚起的 server 杀了,KeepAlive 循环 + throttle,
+  // daemon 永远起不来。
+  let shouldExitAfterImgProxyStart: typeof import('../../../src/cli/commands/img-proxy').shouldExitAfterImgProxyStart;
+
+  beforeEach(async () => {
+    const mod = await import('../../../src/cli/commands/img-proxy');
+    shouldExitAfterImgProxyStart = mod.shouldExitAfterImgProxyStart;
+  });
+
+  it('--daemon 走 parent 分支:应该 exit', () => {
+    expect(shouldExitAfterImgProxyStart({ daemon: true })).toBe(true);
+  });
+
+  it('无 flag 走 child/foreground 分支:不该 exit(否则 launchd child 自杀)', () => {
+    expect(shouldExitAfterImgProxyStart({})).toBe(false);
+    expect(shouldExitAfterImgProxyStart({ daemon: false })).toBe(false);
+    expect(shouldExitAfterImgProxyStart({ daemon: undefined })).toBe(false);
+  });
+});
+
 describe('imgProxyStart library contract (no process.exit)', () => {
   let tmpHome: string;
   let ccLinkerDir: string;
@@ -79,5 +103,37 @@ describe('imgProxyStart library contract (no process.exit)', () => {
       // 启动失败(端口占用等)也算 OK — 关键是 process.exit 没被调
     }
     expect(exitSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('e2e: cc-linker img-proxy start as launchd child (CC_LINKER_IMG_PROXY_DAEMON=1)', () => {
+  // 2026-07-10 终极回归:跑真实 binary 模拟 launchd 行为,看 daemon 是否立即自杀。
+  // 用 spawn 直接调 bun,env 注入 CC_LINKER_IMG_PROXY_DAEMON=1,
+  // 2 秒后看子进程是否还活着 — 应该活着(若 process.exit(0) 把 server 杀了,它 2s 内就死)。
+  //
+  // 注意:naturalExit 只在子进程"自己死"时记录;测试自己 kill 子进程时不应该被记为
+  // naturalExit(否则"还活着 → 测试 kill → exit → 误以为自杀" 的反向 false positive)。
+  it('child 进程跑 2 秒后应该仍存活(server 监听保活 event loop)', async () => {
+    const { spawn } = await import('child_process');
+    const child = spawn('bun', ['run', 'src/index.ts', 'img-proxy', 'start'], {
+      env: { ...process.env, CC_LINKER_IMG_PROXY_DAEMON: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let naturalExit: { code: number | null } | null = null;
+    let killedByUs = false;
+    child.on('exit', (code) => {
+      if (!killedByUs) naturalExit = { code };
+    });
+    // 等 2 秒
+    await new Promise((r) => setTimeout(r, 2000));
+    if (naturalExit) {
+      child.kill('SIGKILL');
+      throw new Error(`child 2s 内自然自杀 (exit code ${naturalExit.code}) — CLI binding 的 process.exit(0) 杀掉了 child`);
+    }
+    // 2s 时还活着 → 修复生效。我们自己 kill 清理
+    killedByUs = true;
+    child.kill('SIGTERM');
+    await new Promise((r) => setTimeout(r, 500));  // 给 signal handler 清理时间
+    // 不再 assert:naturalExit 已确认是 null(没自然退),通过测试
   });
 });
