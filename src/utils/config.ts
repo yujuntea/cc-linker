@@ -86,6 +86,7 @@ interface ConfigData {
     port: number;
     hostname: string;
     cache_max_age_hours: number;
+    cache_max_bytes: number;  // 2026-07-10 P2-3:cache 目录总大小上限(bytes),超了从最旧删
     prompt_template: string;
     console_enabled: boolean;
     // v2 smart install:
@@ -198,6 +199,7 @@ export const DEFAULTS: ConfigData = {
     port: 8765,
     hostname: '127.0.0.1',
     cache_max_age_hours: 24 * 7,
+    cache_max_bytes: 1024 * 1024 * 1024,  // 1GB (2026-07-10 P2-3)
     prompt_template: DEFAULT_PROMPT_TEMPLATE,
     console_enabled: false, // Phase 2: Web 控制台
     // v2 smart install defaults:
@@ -329,6 +331,7 @@ export class ConfigManager {
       ['CC_LINKER_IMG_PROXY_PORT', 'img_proxy', 'port'],
       ['CC_LINKER_IMG_PROXY_HOSTNAME', 'img_proxy', 'hostname'],
       ['CC_LINKER_IMG_PROXY_CACHE_HOURS', 'img_proxy', 'cache_max_age_hours'],
+      ['CC_LINKER_IMG_PROXY_CACHE_BYTES', 'img_proxy', 'cache_max_bytes'],
       ['CC_LINKER_IMG_PROXY_PROMPT_TEMPLATE', 'img_proxy', 'prompt_template'],
       ['CC_LINKER_IMG_PROXY_SMART_MODE', 'img_proxy', 'smart_mode'],
       // v2 stream-level instrumentation:

@@ -446,7 +446,7 @@ export async function imgProxyInstall(opts: {
   all?: boolean;
   yes?: boolean;
   mode?: 'smart' | 'dumb';
-}): Promise<{ installedCount: number; failedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean; consoleInstalled: boolean; consoleSkipped: boolean; autoStart: boolean }> {
+}): Promise<{ installedCount: number; failedCount: number; wrapperInstalled: boolean; wrapperSkipped: boolean; consoleInstalled: boolean; consoleSkipped: boolean; startedNow: boolean; autoStart: boolean }> {
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
   const smartModeConfig = config.get<boolean>('img_proxy.smart_mode', true);
@@ -532,7 +532,7 @@ export async function imgProxyInstall(opts: {
       message: '选择要启用图片代理的 provider (空格勾选,回车确认):',
       choices, pageSize: 20,
     }]);
-    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, failedCount: 0, wrapperInstalled: false, wrapperSkipped: false, consoleInstalled: false, consoleSkipped: false, autoStart: false }; }
+    if (picks.length === 0) { console.log(chalk.gray('未选择')); return { installedCount: 0, failedCount: 0, wrapperInstalled: false, wrapperSkipped: false, consoleInstalled: false, consoleSkipped: false, startedNow: false, autoStart: false }; }
     const pickedSet = new Set(picks as string[]);
     targets = filtered.filter(c => pickedSet.has(c.alias));
   }
@@ -562,7 +562,14 @@ export async function imgProxyInstall(opts: {
     const shell = detectShell();
     if (shell) {
       const rcFile = getRcFilePath(shell);
-      if (!isWrapperInstalled(rcFile)) {
+      if (isWrapperInstalled(rcFile)) {
+        wrapperInstalled = true;
+      } else if (opts.yes) {
+        // 2026-07-10 (P1-3): --yes 模式跳过 inquirer 阻塞,自动 yes
+        // 装 wrapper(脚本/CI 友好);仿 console enable 那块的 !opts.yes 跳过模式。
+        await imgProxyWrapperInstall();
+        wrapperInstalled = true;
+      } else {
         const { wrap } = await inquirer.prompt([{
           type: 'confirm', name: 'wrap',
           message: '检测到 CC Switch。是否装 wrapper(让 cc-linker-proxy 命令替代 claude)?',
@@ -574,8 +581,6 @@ export async function imgProxyInstall(opts: {
         } else {
           wrapperSkipped = true;
         }
-      } else {
-        wrapperInstalled = true;
       }
     }
   }
@@ -623,9 +628,22 @@ export async function imgProxyInstall(opts: {
   // 之前 install 命令只装 providers,不问 launchd,导致用户跑 `cc-linker img-proxy install`
   // 后 daemon 不会开机自启(只有 launchd-managed 那个才自启)。
   // 实现抽到 promptLaunchdAutoStart,单测覆盖各种平台/TTY 组合。
+  //
+  // 2026-07-10: 在 launchd 引导之前先问 startNow(P1-1)— 之前只装不跑,用户装完
+  // 没法用,得手跑 start。Yes 时调 imgProxyStart({daemon:true}) 触发 restart,
+  // 也让上面刚 enable 的 Web Console 自然生效(daemon 启动时读 config)— P1-2
+  // 顺带解决。失败 log + 不 throw(providers 已装好,daemon 起不来不回滚)。
+  const startedNow = await promptStartDaemon({ yes: !!opts.yes });
   const autoStart = await promptLaunchdAutoStart({ yes: !!opts.yes });
 
-  return { installedCount: installed + skipped, failedCount: failed, wrapperInstalled, wrapperSkipped, consoleInstalled, consoleSkipped, autoStart };
+  return {
+    installedCount: installed + skipped,
+    failedCount: failed,
+    wrapperInstalled, wrapperSkipped,
+    consoleInstalled, consoleSkipped,
+    startedNow,
+    autoStart,
+  };
 }
 
 /**
@@ -642,6 +660,51 @@ export async function imgProxyInstall(opts: {
  * 抽出独立函数是为了单测能直接调,不用跑整个 install 流(写 plist、跑 launchctl
  * 都有副作用)。
  */
+
+/**
+ * install / setup 流程完后引导用户立即启动 daemon(2026-07-10 加,P1-1 修复)。
+ *
+ * 行为契约(对齐 promptLaunchdAutoStart):
+ * - 非交互模式(无 TTY)→ 返 false,不阻塞
+ * - 用户答 Yes → 调 `imgProxyStart({ daemon: true })` (parent 分支,后台 spawn);
+ *   成功返 true;**失败不 throw**(只 log,装好的 providers 还在)
+ * - 用户答 No / inquirer 抛 → 返 false
+ * - --yes flag → 默认 Yes(脚本友好);无 flag → 默认 No
+ *
+ * 为什么要单独抽:install 主流程已成功(provider 装、wrapper 装、console enable),
+ * 这步是可选附加项,失败 log 不回滚。同时让 `console enable` 在 startNow Yes 时
+ * 自然生效(daemon 启动时读 config)— 这是 P1-2 的解药。
+ */
+export async function promptStartDaemon(opts: { yes?: boolean }): Promise<boolean> {
+  if (!process.stdin.isTTY) {
+    console.log(chalk.gray('   启动 daemon: 非交互模式,跳过'));
+    return false;
+  }
+  try {
+    const { startNow } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'startNow',
+      message: '是否现在启动 img-proxy daemon?',
+      default: !!opts.yes,
+    }]);
+    if (!startNow) return false;
+    try {
+      await imgProxyStart({ daemon: true });
+      return true;
+    } catch (err) {
+      // 不 throw:install 主流程已成功(providers + wrapper + console),daemon 启动
+      // 只是可选附加项。失败 log 出来让用户知道怎么手动跑
+      console.log(chalk.yellow(`⚠️  daemon 启动失败: ${(err as Error).message}`));
+      console.log(chalk.gray('   可稍后手动执行 cc-linker img-proxy start --daemon'));
+      return false;
+    }
+  } catch (err) {
+    // inquirer 自身失败(用户 Ctrl+C 等)— 也不 throw,只 log
+    console.log(chalk.gray(`   跳过启动询问: ${(err as Error).message}`));
+    return false;
+  }
+}
+
 export async function promptLaunchdAutoStart(opts: { yes?: boolean }): Promise<boolean> {
   if (process.platform !== 'darwin') {
     console.log(chalk.gray('   开机自启: 非 darwin 跳过'));
@@ -753,105 +816,157 @@ function launchdPlistPath(): string {
   return join(homedir(), 'Library', 'LaunchAgents', 'com.cclinker.img-proxy.plist');
 }
 
-export async function imgProxyDaemonInstall(): Promise<void> {
-  // Library 契约(2026-07-10 修):失败 throw,成功 return。**不调 process.exit**。
-  // 之前 3 处 process.exit(1) 是同类 bug(wizard 在 setup.ts:327 try/catch 包了
-  // 但 process.exit 接不住,直接把 setup wizard 进程杀了;同样会触发 launchd
-  // throttle 死锁)。CLI binding (src/index.ts:242) 与 wizard 自己负责 exit /
-  // 决定 throw 后怎么处理。
-  if (platform() !== 'darwin') {
+/**
+ * 生成 launchd plist XML 内容(2026-07-10 抽,deps 注入的前置)。
+ * 纯函数:输入字符串,输出字符串。不读文件系统,不起子进程。
+ * Test 单覆盖 — 改 escape 行为不会破坏 plist 格式。
+ */
+export function buildLaunchdPlistContent(opts: {
+  executable: string;
+  home: string;
+  logFile: string;
+  envPath: string;
+}): string {
+  const safePath = escapePlistString(opts.envPath);
+  const safeHome = escapePlistString(opts.home);
+  const safeExe = escapePlistString(opts.executable);
+  const safeLog = escapePlistString(opts.logFile);
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '<key>Label</key><string>com.cclinker.img-proxy</string>',
+    '<key>ProgramArguments</key>',
+    '<array>',
+    `<string>${safeExe}</string>`,
+    '<string>img-proxy</string>',
+    '<string>start</string>',
+    '</array>',
+    `<key>WorkingDirectory</key><string>${safeHome}</string>`,
+    '<key>RunAtLoad</key><true/>',
+    '<key>KeepAlive</key><true/>',
+    '<key>ThrottleInterval</key><integer>10</integer>',
+    `<key>StandardOutPath</key><string>${safeLog}</string>`,
+    `<key>StandardErrorPath</key><string>${safeLog}</string>`,
+    '<key>EnvironmentVariables</key>',
+    '<dict>',
+    '<key>CC_LINKER_IMG_PROXY_DAEMON</key><string>1</string>',
+    `<key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${safePath}</string>`,
+    '</dict>',
+    '</dict>',
+    '</plist>',
+  ].join('\n');
+}
+
+/**
+ * imgProxyDaemonInstall 的所有 side-effect 依赖(2026-07-10 抽,P1-4 修复)。
+ * 默认实现 (`defaultLaunchdInstallDeps`) 跑真实 launchctl / 写 plist / kill process;
+ * test 注入 fake 实现不污染环境(不写 plist / 不 kill 真进程 / 不跑 launchctl)。
+ */
+export interface LaunchdInstallDeps {
+  platform: NodeJS.Platform;
+  plistPath: string;
+  writePlist: (content: string) => void;
+  mkdirPlistDir: () => void;
+  existsPlist: () => boolean;
+  runLaunchctl: (args: string[]) => { status: number | null; stdout: string; stderr: string };
+  readPid: () => number | null;
+  clearPid: () => void;
+  isProcessAlive: (pid: number) => boolean;
+  killProcess: (pid: number, signal: NodeJS.Signals) => boolean;
+  sleep: (ms: number) => Promise<void>;
+  getUid: () => number;
+  label: string;
+  /** HTTP 探活:2xx/3xx 返 true。test 注入 fake 避免 5s+ retry。 */
+  probeHttp: (url: string, timeoutMs: number) => Promise<boolean>;
+}
+
+function defaultLaunchdInstallDeps(): LaunchdInstallDeps {
+  const plistPath = launchdPlistPath();
+  return {
+    platform: process.platform,
+    plistPath,
+    writePlist: (content) => {
+      mkdirSync(dirname(plistPath), { recursive: true });
+      writeFileSync(plistPath, content, { mode: 0o644 });
+    },
+    mkdirPlistDir: () => mkdirSync(dirname(plistPath), { recursive: true }),
+    existsPlist: () => existsSync(plistPath),
+    runLaunchctl: (args) => {
+      const r = spawnSync('launchctl', args);
+      return { status: r.status, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+    },
+    readPid: () => readPid(IMG_PROXY_PID_FILE),
+    clearPid: () => clearPid(IMG_PROXY_PID_FILE),
+    isProcessAlive: (pid) => isPidAlive(pid),
+    killProcess: (pid, signal) => {
+      try { process.kill(pid, signal); return true; } catch { return false; }
+    },
+    sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+    getUid: () => process.getuid?.() ?? 0,
+    label: 'com.cclinker.img-proxy',
+    probeHttp: async (url, timeoutMs) => probeHttpOnce(url, timeoutMs),
+  };
+}
+
+export async function runLaunchdInstallWithDeps(deps: LaunchdInstallDeps): Promise<void> {
+  // Library 契约(2026-07-10):失败 throw,成功 return。**不调 process.exit**。
+  if (deps.platform !== 'darwin') {
     throw new Error('目前仅支持 macOS launchd 自启');
   }
-  const exe = getExecutablePath();
-  const plistPath = launchdPlistPath();
 
-  // Fix #5: 重装前先停现有 daemon,避免 launchd KeepAlive 重启新 child 时
-  // 旧进程还在 :8765 上导致 EADDRINUSE,服务静默失败
-  if (existsSync(plistPath)) {
-    spawnSync('launchctl', ['stop', 'com.cclinker.img-proxy']);
-    const existingPid = readPid(IMG_PROXY_PID_FILE);
-    if (existingPid !== null && isPidAlive(existingPid)) {
+  // Fix #5: 重装前先停现有 daemon
+  if (deps.existsPlist()) {
+    deps.runLaunchctl(['stop', deps.label]);
+    const existingPid = deps.readPid();
+    if (existingPid !== null && deps.isProcessAlive(existingPid)) {
       console.log(chalk.gray(`  停止旧 daemon (PID: ${existingPid})...`));
       try {
-        process.kill(existingPid, 'SIGTERM');
+        deps.killProcess(existingPid, 'SIGTERM');
         for (let i = 0; i < 20; i++) {
-          try { process.kill(existingPid, 0); await new Promise(r => setTimeout(r, 300)); }
-          catch { break; }
+          if (!deps.isProcessAlive(existingPid)) break;
+          await deps.sleep(300);
         }
-        try { process.kill(existingPid, 0); process.kill(existingPid, 'SIGKILL'); } catch {}
+        if (deps.isProcessAlive(existingPid)) {
+          deps.killProcess(existingPid, 'SIGKILL');
+        }
       } catch {}
     }
-    spawnSync('launchctl', ['unload', plistPath]);
-    clearPid(IMG_PROXY_PID_FILE);
+    deps.runLaunchctl(['unload', deps.plistPath]);
+    deps.clearPid();
   }
 
-  // Fix #3: PATH / homedir / exe 等插入 XML 之前转义,防 & 等特殊字符
-  // 导致 plist 损坏 + launchctl load 静默失败
-  // Fix bug-2026-07-09: 用 getLaunchdExecutablePath 代替 getExecutablePath,确保
-  // ProgramArguments[0] 总是绝对路径。launchd 对 daemon/agent 的 executable
-  // 不走用户 shell 的 PATH,写裸 "cc-linker" 会 EX_CONFIG (78),KeepAlive
-  // 永远重启失败。
-  const safePath = escapePlistString(process.env.PATH ?? '');
-  const safeHome = escapePlistString(homedir());
-  const safeExe = escapePlistString(getLaunchdExecutablePath());
-  const safeLog = escapePlistString(IMG_PROXY_LOG_FILE);
+  // 写 plist
+  const plist = buildLaunchdPlistContent({
+    executable: getLaunchdExecutablePath(),
+    home: homedir(),
+    logFile: IMG_PROXY_LOG_FILE,
+    envPath: process.env.PATH ?? '',
+  });
+  deps.mkdirPlistDir();
+  deps.writePlist(plist);
 
-  // ProgramArguments 不带 --daemon,改用 env 注入 CC_LINKER_IMG_PROXY_DAEMON=1
-  // → launchd 直接起 child,不双重 fork,KeepAlive 崩溃重拉的也是 child
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.cclinker.img-proxy</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${safeExe}</string>
-    <string>img-proxy</string>
-    <string>start</string>
-  </array>
-  <key>WorkingDirectory</key><string>${safeHome}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>${safeLog}</string>
-  <key>StandardErrorPath</key><string>${safeLog}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>CC_LINKER_IMG_PROXY_DAEMON</key><string>1</string>
-    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${safePath}</string>
-  </dict>
-</dict>
-</plist>`;
-  mkdirSync(dirname(plistPath), { recursive: true });
-  writeFileSync(plistPath, plist, { mode: 0o644 });
-
-  // Fix #3: 检查 launchctl load 返回码,失败时不静默 ✅
-  // 'already loaded' 是合法的(用户手启动过),其他 stderr 都报出来
-  const loadResult = spawnSync('launchctl', ['load', plistPath]);
-  const loadErr = loadResult.stderr.toString().trim();
+  // launchctl load
+  const loadResult = deps.runLaunchctl(['load', deps.plistPath]);
+  const loadErr = loadResult.stderr.trim();
   if (loadResult.status !== 0 && !loadErr.includes('already loaded')) {
     console.log(chalk.red(`❌ launchctl load 失败 (exit ${loadResult.status})`));
     console.log(chalk.yellow(`   ${loadErr}`));
-    console.log(chalk.gray(`   检查 plist: ${plistPath}`));
+    console.log(chalk.gray(`   检查 plist: ${deps.plistPath}`));
     throw new Error(`launchctl load 失败 (exit ${loadResult.status}): ${loadErr}`);
   }
   if (loadErr.includes('already loaded')) {
-    // load 会失败因为 plist 已经在;但我们 unload 过上面的代码块 —— 这种情况
-    // 只在 plist 文件被外部修改时出现,提醒一下
     console.log(chalk.gray('  (plist 已加载,启动当前 daemon 即可)'));
   }
 
-  const startResult = spawnSync('launchctl', ['start', 'com.cclinker.img-proxy']);
+  const startResult = deps.runLaunchctl(['start', deps.label]);
   if (startResult.status !== 0) {
-    const err = startResult.stderr.toString().trim();
+    const err = startResult.stderr.trim();
     if (err) console.log(chalk.yellow(`⚠️ launchctl start 警告: ${err}`));
   }
 
-  // Fix bug-2026-07-09: 装完后做真实健康检查(plist-loaded + HTTP 探活),
-  // 不再"静默成功"。历史上 plist 写错时 launchd 一边报 EX_CONFIG 一边重启,
-  // 8765 永远不监听,但 setup 仍打印"已配置" → 用户看到"完成"实际服务挂掉。
-  // 冷启动需要几秒(launchd 拉起 + bun 编译 + 路由加载),所以每个 check
-  // 都在 retry window(默认 5 次,每次 1s,共 ~5s)内重试,而不是单次失败就报。
+  // 健康检查
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
   const retryOpts = { attempts: 5, intervalMs: 1000 };
@@ -859,8 +974,8 @@ export async function imgProxyDaemonInstall(): Promise<void> {
     {
       name: 'plist-loaded',
       run: async () => {
-        const r = spawnSync('launchctl', ['print', 'gui/' + (process.getuid?.() ?? 0) + '/com.cclinker.img-proxy']);
-        const out = r.stdout.toString();
+        const r = deps.runLaunchctl(['print', `gui/${deps.getUid()}/${deps.label}`]);
+        const out = r.stdout;
         if (r.status !== 0) return { ok: false, message: `launchctl print exit ${r.status}` };
         if (/last exit code\s*=\s*78/.test(out) || /state\s*=\s*spawn scheduled/.test(out)) {
           return { ok: false, message: 'launchd 仍处于 spawn scheduled / last exit 78 (EX_CONFIG),plist 或 executable 不可执行' };
@@ -871,13 +986,11 @@ export async function imgProxyDaemonInstall(): Promise<void> {
     {
       name: 'http-root',
       run: async () => {
-        const ok = await probeHttpOnce(`http://${hostname}:${port}/`, 1500);
+        const ok = await deps.probeHttp(`http://${hostname}:${port}/`, 1500);
         return ok ? { ok: true } : { ok: false, message: `${hostname}:${port} 在 health check 窗口内不可访问` };
       },
     },
   ];
-  // 顺序跑 + retry window:plist-loaded 失败通常意味着 plist 写错,不重试也无用,
-  // 但 http-root 必须重试,因为 launchd 拉起 + 启动需要时间。
   const plistResult = await retryHealthCheck(checks[0], retryOpts);
   const httpResult = await retryHealthCheck(checks[1], retryOpts);
   const result = {
@@ -899,8 +1012,20 @@ export async function imgProxyDaemonInstall(): Promise<void> {
   }
 
   console.log(chalk.green('✅ img-proxy 开机自启已配置 (KeepAlive,崩溃 10s 内自拉起)'));
-  console.log(chalk.cyan(`   ${plistPath}`));
+  console.log(chalk.cyan(`   ${deps.plistPath}`));
   console.log(chalk.gray('   卸载: cc-linker img-proxy daemon uninstall'));
+}
+
+/**
+ * imgProxyDaemonInstall — 默认 deps 调 runLaunchdInstallWithDeps 的薄壳。
+ * Library 契约(2026-07-10):失败 throw,成功 return。**不调 process.exit**。
+ * 之前 3 处 process.exit(1) 是同类 bug(wizard 在 setup.ts:327 try/catch 包了
+ * 但 process.exit 接不住,直接把 setup wizard 进程杀了;同样会触发 launchd
+ * throttle 死锁)。CLI binding (`src/index.ts:242`) 与 wizard 自己负责 exit /
+ * 决定 throw 后怎么处理。
+ */
+export async function imgProxyDaemonInstall(): Promise<void> {
+  return runLaunchdInstallWithDeps(defaultLaunchdInstallDeps());
 }
 
 /** 单次 HTTP probe:状态码 2xx/3xx 算 ok。 */

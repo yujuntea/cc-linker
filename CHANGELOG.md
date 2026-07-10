@@ -78,6 +78,54 @@ All notable changes to cc-linker are documented here. Format follows
   `index.ts:242` 的 CLI binding 加 try/catch 维持 CLI 行为。
   新增 spy-on-process.exit 测试验证(`img-proxy-daemon-install-library.test.ts`)。
 
+- **imgProxyInstall 装完不立即启动 daemon(只引导 launchd)** —
+  之前 install 完只写 plist + 引导 launchd,daemon 没在用户眼皮底下起,
+  装完立刻用不了。修法:加 `promptStartDaemon({ yes })` 抽函数(对齐
+  `promptLaunchdAutoStart` 模式),在 console enable 之后、launchd 引导之前
+  问 startNow。Yes 调 `imgProxyStart({daemon:true})` 触发 restart,
+  让 console enable 自然生效(daemon 启动时读 config — P1-2 顺带解决)。
+  失败 log + 不 throw(providers 已装好,daemon 起不来不回滚)。
+  return type 加 `startedNow: boolean`。
+
+- **wrapper install 在 --yes 模式下阻塞 CI/脚本** —
+  之前 wrapper confirm 块无 `!opts.yes` 跳过,`cc-linker img-proxy install --all --yes`
+  在 CI 会被 inquirer 阻塞。修法:仿 console enable 那块的 `!opts.yes` 跳过模式,
+  `--yes` 时自动 yes 装 wrapper(不调 inquirer)。
+
+- **imgProxyDaemonInstall 抽 deps 注入层,test 100% 纯净** —
+  之前的 daemon-install test 必须跑真实 `imgProxyDaemonInstall` →
+  写 `~/Library/LaunchAgents/com.cclinker.img-proxy.plist` + 跑
+  `launchctl load`,污染 CI runner 的 launchd 状态。修法:
+  - 抽 `buildLaunchdPlistContent(opts)` 纯函数(不读文件不起子进程)
+  - 抽 `LaunchdInstallDeps` interface + `runLaunchdInstallWithDeps(deps)`
+    主体(所有 side effect 通过 deps 注入:writePlist / runLaunchctl /
+    killProcess / probeHttp / etc.)
+  - `imgProxyDaemonInstall()` 变成 default deps 调 `runLaunchdInstallWithDeps`
+    的薄壳(行为 100% 兼容)
+  - 新 test `img-proxy-daemon-install-inject.test.ts` 12 个 case 全用 fake deps,
+    不污染环境
+
+- **sseBuf 内存无上限,DoS 风险(P2-1)** —
+  之前 sseBuf 跨 chunk 累积无 size cap,上游畸形 SSE event 一个 data 行
+  100MB 没换行会 OOM。修法:抽 `processChunkForUsage(chunk, state)` 出来
+  + 加 `MAX_SSE_BUF_BYTES = 4MB`,超了截断 + 标记 truncated,后续 chunk
+  不再 tracking usage(本请求 usage 全 0),但 controller.enqueue 仍
+  pass-through,响应不受影响。
+
+- **log 文件无 size cap(P2-2)** —
+  appendLog 之前只 append,log 文件无限增长(daemon log 1.5MB、
+  img-proxy log 780MB 已是现状)。修法:加 size-based rotation,
+  `LOG_MAX_BYTES = 50MB` 自动 rotate,保留 3 个 backups ≈ 200MB 上限。
+  状态缓存在 module-level `Map<logPath, size>` — Bun JS 单线程 +
+  `appendFileSync` 同步,无 race。
+
+- **cache 目录无总大小 cap(P2-3)** —
+  cleanupOldCache 之前只按 mtime 7 天清,用户每天粘 1000 张图
+  (×1MB) 7 天就涨到 7GB,7 天后才清。修法:加 `cacheMaxBytes` 参数
+  (默认 1GB,从 config `img_proxy.cache_max_bytes` 读,env 覆盖
+  `CC_LINKER_IMG_PROXY_CACHE_BYTES`)。超了按 mtime 升序从最旧删,直到
+  totalSize ≤ cap。
+
 - **piping.finally 回调无 try/catch,unhandled rejection 自杀** —
   `src/img-proxy/server.ts` 的 `piping.finally(() => { ... })` 回调里
   `applyUsageLine / appendLog / updateByAlias / pushRecent` 任一处

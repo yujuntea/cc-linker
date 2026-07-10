@@ -26,7 +26,7 @@
 // Task 8: 3-branch stats 写入 — catch / no_body / piping.finally 各 ++ 一次,
 //   totalRequests = 真实总请求数(成功 + 失败 + no_body)且各分支只写一次 stats。
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { getUpstreamByAlias } from './routes';
 import { stripImagesToPaths } from './transform';
@@ -34,6 +34,7 @@ import { handleConsoleRequest } from './console/api';
 import { updateByAlias, pushRecent } from './console/stats-helpers';
 import type { AliasStats, RecentEntry } from './console/types';
 import { CONFIG_PATH, IMG_PROXY_LOG_FILE, expandPath } from '../utils/paths';
+import { config } from '../utils/config';
 
 export interface ProxyServerOptions {
   port: number;
@@ -43,6 +44,7 @@ export interface ProxyServerOptions {
   promptTemplate: string;
   consoleEnabled: boolean;
   cacheMaxAgeHours: number;
+  cacheMaxBytes?: number;  // 2026-07-10 P2-3:cache 总大小上限,默认从 config 读
   // v2: 测试可注入 logPath(默认 IMG_PROXY_LOG_FILE)
   logPath?: string;
   // v2: upstream fetch 整体超时(ms);0 = 不超时(默认)。
@@ -78,6 +80,45 @@ export interface ProxyServer {
 export function parseAliasFromPath(pathname: string): string | null {
   const seg = pathname.replace(/^\/+/, '').split('/')[0];
   return seg && seg.length > 0 ? seg : null;
+}
+
+/** 2026-07-10 P2-1: sseBuf 累积上限。超过就截断 + 关 usage tracking(防上游
+ * 畸形 SSE event 巨大无换行导致 OOM)。4MB 远超正常 SSE event 体积(几 KB ~ 几 MB);
+ * 截断后 controller.enqueue 仍 pass-through,响应不受影响。 */
+const MAX_SSE_BUF_BYTES = 4 * 1024 * 1024;
+
+/**
+ * 处理单个 chunk 累积到 sseBuf + 提取 usage(2026-07-10 抽,P2-1)。
+ * 抽出来是为了单测(在 TransformStream closure 里 hard to test)。
+ *
+ * 行为:
+ * - 跨 chunk 累积 sseBuf (TextDecoder stream:true 处理多字节 UTF-8)
+ * - 每行调 applyUsageLine 提取 usage
+ * - 末行不完整(没换行结尾)留到下个 chunk (lines.pop())
+ * - sseBuf 超 MAX_SSE_BUF_BYTES 截断 + 标记 truncated,后续 chunk 不再 tracking
+ *   (防单 chunk 大行 OOM)
+ */
+export function processChunkForUsage(
+  chunk: Uint8Array,
+  state: {
+    sseBuf: string;
+    truncated: boolean;
+    utf8: TextDecoder;
+    usage: UsageAccum;
+  },
+): void {
+  state.sseBuf += state.utf8.decode(chunk, { stream: true });
+  if (!state.truncated && state.sseBuf.length > MAX_SSE_BUF_BYTES) {
+    state.truncated = true;
+    state.sseBuf = '';
+  }
+  if (!state.truncated) {
+    const lines = state.sseBuf.split('\n');
+    state.sseBuf = lines.pop() ?? '';
+    for (const line of lines) {
+      applyUsageLine(line, state.usage);
+    }
+  }
 }
 
 /** hop-by-hop 头(RFC 7230 §6.1)—— 代理不应转发,否则可能与 Bun 自己的传输层冲突。 */
@@ -207,25 +248,108 @@ function sanitizeProxyRequestHeaders(src: Headers): Headers {
 
 /** 写一条日志到 logPath。
  *  注意:不 mkdirSync 每条都调(高 QPS 时浪费 syscall),由 startProxyServer 一次性建好目录。
+ *
+ * 2026-07-10 P2-2: 加 size-based rotation。
+ * 之前 appendLog 只 append,log 文件无限增长(daemon log 1.5MB、img-proxy log
+ * 780MB 已经是现状)。现在超 50MB 自动 rotate:logPath.3 (最旧) 删,logPath.2→.3,
+ * logPath.1→.2,logPath→.1,新建 logPath 继续写。共保留 3 个 backups ≈ 200MB 上限。
+ * 状态 (size) 缓存在 module-level Map — Bun JS 单线程,appendFileSync 同步,
+ * 不会有 race。
  */
+const LOG_MAX_BYTES = 50 * 1024 * 1024;
+const LOG_BACKUPS = 3;
+const logState = new Map<string, { size: number }>();
+
 function appendLog(line: string, logPath: string): void {
   try {
-    appendFileSync(logPath, `[${new Date().toISOString()}] ${line}\n`);
+    const formatted = `[${new Date().toISOString()}] ${line}\n`;
+    appendFileSync(logPath, formatted);
+    // Track size for rotation(per logPath)
+    let state = logState.get(logPath);
+    if (!state) {
+      state = { size: existsSync(logPath) ? statSync(logPath).size : 0 };
+      logState.set(logPath, state);
+    }
+    state.size += Buffer.byteLength(formatted);
+    if (state.size >= LOG_MAX_BYTES) {
+      rotateLogFile(logPath, state);
+    }
   } catch {}
 }
 
-/** 清理 cacheDir 里超过 maxAgeHours 的文件。返回清理数。 */
-export function cleanupOldCache(cacheDir: string, maxAgeHours: number): number {
+/** 内部:rotate logPath → logPath.1,shift older backups,drop oldest. */
+function rotateLogFile(logPath: string, state: { size: number }): void {
+  try {
+    const oldest = `${logPath}.${LOG_BACKUPS}`;
+    if (existsSync(oldest)) unlinkSync(oldest);
+    for (let i = LOG_BACKUPS - 1; i >= 1; i--) {
+      const from = `${logPath}.${i}`;
+      const to = `${logPath}.${i + 1}`;
+      if (existsSync(from)) renameSync(from, to);
+    }
+    renameSync(logPath, `${logPath}.1`);
+    state.size = 0;
+  } catch {}
+}
+
+/** Test-only: 重置 module-level log state(防止 test 互相污染) */
+export function _resetLogStateForTest(): void {
+  logState.clear();
+}
+
+/** 清理 cacheDir 里超过 maxAgeHours 的文件 + 超 cacheMaxBytes 时按 mtime 从旧清起。
+ * 返回清理数(两个条件合并)。
+ *
+ * 2026-07-10 P2-3: 加 size-based cap。cache 文件在 7 天 TTL 期间可能涨到几 GB
+ * (用户每天粘 1000 张图 × 1MB)。现在 cacheMaxBytes (默认 1GB) 兜底 — 总大小
+ * 超了从 mtime 最旧的文件开始清,直到回到 cap 以下。
+ *
+ * 实现:listdir + stat 一次拿所有文件的 mtime + size,排序后从最旧删起。
+ * 文件数量大(O(10k))时这个循环还是 O(n) 单次,够用。
+ */
+export function cleanupOldCache(
+  cacheDir: string,
+  maxAgeHours: number,
+  cacheMaxBytes: number = 1024 * 1024 * 1024,  // 默认 1GB
+): number {
   if (!existsSync(cacheDir)) return 0;
   const maxAgeMs = maxAgeHours * 3_600_000;
   const now = Date.now();
   let cleaned = 0;
+
+  // Collect all cache files with their mtime + size
+  const files: { path: string; mtimeMs: number; size: number }[] = [];
+  let totalSize = 0;
   for (const f of readdirSync(cacheDir)) {
     const p = join(cacheDir, f);
     try {
-      if (now - statSync(p).mtimeMs >= maxAgeMs) { unlinkSync(p); cleaned++; }
+      const st = statSync(p);
+      if (!st.isFile()) continue;
+      // 1) mtime-based cleanup (P2-3 之前的逻辑,7 天 TTL)
+      if (now - st.mtimeMs >= maxAgeMs) {
+        unlinkSync(p);
+        cleaned++;
+        continue;  // 删了不计入 totalSize
+      }
+      files.push({ path: p, mtimeMs: st.mtimeMs, size: st.size });
+      totalSize += st.size;
     } catch {}
   }
+
+  // 2) size-based cleanup (P2-3 新加):从最旧开始删,直到 totalSize <= cacheMaxBytes
+  if (totalSize > cacheMaxBytes) {
+    // 按 mtime 升序(最旧在前)
+    files.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const f of files) {
+      if (totalSize <= cacheMaxBytes) break;
+      try {
+        unlinkSync(f.path);
+        totalSize -= f.size;
+        cleaned++;
+      } catch {}
+    }
+  }
+
   return cleaned;
 }
 
@@ -233,6 +357,8 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
   const {
     port, hostname, cacheDir, routesPath, promptTemplate, consoleEnabled, cacheMaxAgeHours,
   } = opts;
+  const cacheMaxBytes = opts.cacheMaxBytes
+    ?? config.get<number>('img_proxy.cache_max_bytes', 1024 * 1024 * 1024);
   const logPath = opts.logPath ?? IMG_PROXY_LOG_FILE;
   const upstreamTimeoutMs = opts.upstreamTimeoutMs ?? 0;
   const streamIdleTimeoutMs = opts.streamIdleTimeoutMs ?? 0;
@@ -250,9 +376,9 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
   try { mkdirSync(dirname(logPath), { recursive: true }); } catch {}
 
   // 启动清一次过期缓存 + 每小时清
-  cleanupOldCache(cacheDir, cacheMaxAgeHours);
+  cleanupOldCache(cacheDir, cacheMaxAgeHours, cacheMaxBytes);
   const cleanupTimer = setInterval(() => {
-    const n = cleanupOldCache(cacheDir, cacheMaxAgeHours);
+    const n = cleanupOldCache(cacheDir, cacheMaxAgeHours, cacheMaxBytes);
     if (n > 0) appendLog(`INFO cleanup removed ${n} cached images`, logPath);
   }, 3_600_000);
 
@@ -440,25 +566,29 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       // 2026-07-10: 跨 chunk 累积 SSE 事件,从 upstream 响应里提取 usage token 统计。
       // 同时支持流式(SSE 多 event)与非流式(单 JSON body)— 整 body 一行被 pop 到
       // sseBuf 末段,piping.finally 里 flush;见 applyUsageLine 注释。
-      let sseBuf = '';
+      //
+      // 2026-07-10 P2-1: sseBuf 加 maxSize 保护(MAX_SSE_BUF_BYTES = 4MB)。
+      // 上游畸形 SSE 事件一个 data 行 100MB 没换行,sseBuf 累积会 OOM。
+      // 4MB 远超正常 SSE 事件(单 event 几 KB 几 MB);超了截断 + log warning,
+      // 之后不再 tracking usage(本请求 usage 全 0),但 controller.enqueue 继续
+      // 抽到 processChunkForUsage 单测 — 在 TransformStream closure 内 hard to test。
       const usage: UsageAccum = {
         inputTokens: 0, outputTokens: 0,
         cacheReadTokens: 0, cacheCreationTokens: 0,
       };
-      const utf8 = new TextDecoder();
+      const sseState = {
+        sseBuf: '',
+        truncated: false,
+        utf8: new TextDecoder(),
+        usage,
+      };
 
       const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
           chunks++;
           bytes += chunk.byteLength;
           lastChunkAt = Date.now();
-          // stream: true 让 decoder 跨 chunk 处理多字节 UTF-8
-          sseBuf += utf8.decode(chunk, { stream: true });
-          const lines = sseBuf.split('\n');
-          sseBuf = lines.pop() ?? '';  // 末段可能不完整,留给下个 chunk
-          for (const line of lines) {
-            applyUsageLine(line, usage);
-          }
+          processChunkForUsage(chunk, sseState);
           controller.enqueue(chunk);  // pass-through,无缓冲
         },
       });
@@ -516,8 +646,10 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
           if (idleTimer !== null) clearInterval(idleTimer);
           // stream 已 settle;处理 sseBuf 残留的最后一段。
           // 非流式响应尤其重要:整 body 一个 JSON 没换行,被 pop 留到了 sseBuf。
-          if (sseBuf.trim()) applyUsageLine(sseBuf, usage);
-          sseBuf = '';
+          if (!sseState.truncated && sseState.sseBuf.trim()) {
+            applyUsageLine(sseState.sseBuf, sseState.usage);
+          }
+          sseState.sseBuf = '';
           const duration = Date.now() - startedAt;
           appendLog(`INFO ${JSON.stringify({
             time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
