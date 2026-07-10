@@ -36,10 +36,21 @@ function isRunning(): boolean {
 }
 
 // ---------- start ----------
+/**
+ * 启动 img-proxy 守护进程 / 前台 server。
+ *
+ * Library 契约(2026-07-10 改):
+ * - 成功(daemon 已起 / 前台 server 监听 / 已在运行 / 另一个进程抢先)→ return void
+ * - 失败(config 关闭 / 端口 bind 失败 / 后台 spawn 超时)→ throw Error
+ * - **不调 process.exit**:library 函数不该杀进程。CLI binding 与 wizard 自己负责 exit /
+ *   决定 throw 后怎么走(wizard 早期版本曾因 parent spawn 完调 process.exit(0) 直接
+ *   把 setup wizard 进程也杀了,导致 launchd 配置步骤永远到不了)。
+ * - signal handler (SIGTERM/SIGINT) 内部的 process.exit(0) **保留**:那是 OS 信号
+ *   触发的清理路径,只发生在真正作为 daemon 跑的 child 进程里,不是 library 行为。
+ */
 export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
   if (!config.get<boolean>('img_proxy.enabled', true)) {
-    console.log(chalk.yellow('⚠️  img_proxy.enabled = false,请在 config.toml 开启'));
-    process.exit(1);
+    throw new Error('img_proxy.enabled = false,请在 config.toml 开启');
   }
   const port = config.get<number>('img_proxy.port', 8765);
   const hostname = config.get<string>('img_proxy.hostname', '127.0.0.1');
@@ -75,13 +86,13 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
       await new Promise(r => setTimeout(r, 100));
     }
     if (!ready) {
-      console.log(chalk.red(`❌ 后台启动失败,查看日志: ${IMG_PROXY_LOG_FILE}`));
-      process.exit(1);
+      // 真实失败:port 冲突 / bun 编译错 / 路由加载错等。throw 让 caller 决定。
+      throw new Error(`后台启动失败,查看日志: ${IMG_PROXY_LOG_FILE}`);
     }
     console.log(chalk.green(`✅ img-proxy 已在后台启动 (PID: ${childPid})`));
     console.log(chalk.cyan(`   监听: http://${hostname}:${port}`));
     console.log(chalk.cyan(`   日志: ${IMG_PROXY_LOG_FILE}   停止: cc-linker img-proxy stop`));
-    process.exit(0);
+    return;
   }
 
   // 分支 2/3:child 或前台 → 起 server
@@ -89,7 +100,7 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
   if (existingPid !== null) {
     if (isPidAlive(existingPid)) {
       console.error(chalk.yellow(`⚠️  代理已在运行 (PID: ${existingPid})`));
-      process.exit(0);
+      return;  // 已在运行 — 视为成功(早返回,library 不该杀进程)
     }
     // stale PID 文件 → 清理
     console.warn(chalk.gray(`⚠️  发现过期 PID 文件 (stale PID: ${existingPid}),清理后继续`));
@@ -98,10 +109,10 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
   mkdirSync(dirname(IMG_PROXY_PID_FILE), { recursive: true });
   // 原子 create-only — 防止并发两个进程都通过 isRunning 检查后互相覆盖 PID
   if (!writePidAtomic(IMG_PROXY_PID_FILE, process.pid)) {
-    // race:另一进程在我们 cleanup 之后抢先写了
+    // race:另一进程在我们 cleanup 之后抢先写了 — 也视为成功(同 alias 已就绪)
     const winner = readPid(IMG_PROXY_PID_FILE);
     console.error(chalk.yellow(`⚠️  代理已被另一进程启动 (PID: ${winner ?? '?'},race condition)`));
-    process.exit(0);
+    return;
   }
 
   // 仅 child 重写 console 到日志;前台保留终端输出
@@ -145,7 +156,7 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
     console.error(chalk.red(`❌ 启动失败: ${err}`));
     console.error(chalk.gray(`   常见原因: 端口 ${port} 被占用 → cc-linker img-proxy stop,或改 config.toml [img_proxy].port`));
     try { if (existsSync(IMG_PROXY_PID_FILE)) unlinkSync(IMG_PROXY_PID_FILE); } catch {}
-    process.exit(1);
+    throw new Error(`img-proxy 启动失败: ${err}`);
   }
 
   console.log(chalk.green(`✅ img-proxy 监听 http://${hostname}:${server.port} (PID ${process.pid})`));
@@ -153,7 +164,7 @@ export async function imgProxyStart(opts: { daemon?: boolean }): Promise<void> {
   const cleanup = (sig: string) => {
     try { server.stop(true); } catch {}
     try { if (existsSync(IMG_PROXY_PID_FILE)) unlinkSync(IMG_PROXY_PID_FILE); } catch {}
-    process.exit(0);
+    process.exit(0);  // OS signal 触发的清理路径,只在 daemon child 里跑,保留 exit
   };
   process.on('SIGTERM', () => cleanup('SIGTERM'));
   process.on('SIGINT', () => cleanup('SIGINT'));

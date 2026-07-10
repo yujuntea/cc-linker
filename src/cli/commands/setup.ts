@@ -303,11 +303,14 @@ async function runImgProxyWizard(): Promise<ImgProxyWizardResult> {
 
   if (startNow) {
     try {
+      // 2026-07-10: imgProxyStart 改 library 化,throw 而不是 process.exit —
+      // 之前 process.exit(0) 会把 wizard 进程也杀了,launchd 步骤永远到不了。
+      // 现在 throw 由这里 catch,wizard 继续往下走 macOS launchd 配置。
       await imgProxyStart({ daemon: true });
       result.started = true;
-      console.log(chalk.green('  ✅ img-proxy 已启动'));
+      // (imgProxyStart 内部已打 "✅ img-proxy 已在后台启动 (PID: ...)",这里不再重复)
     } catch (err) {
-      console.log(chalk.yellow(`  ⚠️ 自动启动失败: ${err}`));
+      console.log(chalk.yellow(`  ⚠️ 自动启动失败: ${(err as Error).message}`));
       console.log(chalk.gray('     可稍后手动执行 cc-linker img-proxy start --daemon'));
     }
   }

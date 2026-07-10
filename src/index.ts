@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { Command, Option } from 'commander';
+import chalk from 'chalk';
 import { RegistryManager } from './registry';
 import { syncBeforeCommand } from './scanner';
 import { handleError } from './utils/errors';
@@ -214,7 +215,18 @@ imgProxyCmd.command('uninstall')
 imgProxyCmd.command('start')
   .description('启动代理 (前台;加 --daemon 后台)')
   .option('-d, --daemon', '后台运行')
-  .action((opts) => imgProxyStart(opts));
+  .action(async (opts) => {
+    // 2026-07-10: imgProxyStart 改 library 化不调 process.exit;CLI 入口自己处理。
+    // 之前 library 在 spawn child 成功后 process.exit(0) 会顺带把 setup wizard
+    // 进程杀了,导致后续 launchd 配置步骤走不到。
+    try {
+      await imgProxyStart(opts);
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`❌ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
 imgProxyCmd.command('stop').description('停止代理').action(() => imgProxyStop());
 imgProxyCmd.command('status').description('查看代理状态').action(() => imgProxyStatus());
 imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL').action(() => imgProxyCurrentUrl());

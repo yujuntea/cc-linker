@@ -39,6 +39,19 @@ All notable changes to cc-linker are documented here. Format follows
 
 ### Fixed
 
+- **img-proxy daemon 开机自启在 setup wizard 里被跳过** —
+  `imgProxyStart` 之前在 parent spawn 完 child 后直接 `process.exit(0)`,
+  这个 exit 顺带把正在跑的 `setup` wizard 进程也杀了,导致 wizard
+  后续的 macOS launchd 配置步骤(`setup.ts:316` "是否配置开机自启?")
+  永远到不了。结果:plist 文件正确写出来了,但 launchctl 没 load,
+  重启后 img-proxy 不会自动起来。
+  修法:`imgProxyStart` 改 library 化,失败 throw、成功或"已在运行"
+  return,不再调 process.exit。CLI binding (`src/index.ts`) 在
+  await 之后自己 process.exit。wizard 的 try/catch 现在能真正
+  接到 throw,继续往 launchd 步骤走。Signal handler 内部
+  (SIGTERM/SIGINT) 的 process.exit(0) 保留 — 那是 OS 信号
+  触发的清理路径,只在真正作为 daemon 跑的 child 里跑。
+
 - **img-proxy cache 重复落盘 + 诱导 Read 循环** — `stripImagesToPaths` 的
   `saveImage` 改为对 base64 算 sha256 取前 32 hex 作文件名,`existsSync` 命中
   即跳过写。修掉两个相关问题:
