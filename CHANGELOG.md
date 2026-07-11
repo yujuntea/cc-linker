@@ -4,6 +4,21 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-07-11
+
+### Fixed
+- `cc-linker img-proxy status` 和 `wrapper status` 输出 hint 中误写 `cc-linker img-proxy wrapper-install`（错的），改为正确的 `wrapper install` 子命令。用户复制粘贴的路径之前会找不到命令。
+
+### Changed
+- 文档 `docs/img-proxy.md` 与 v0.8.1 实际代码对齐：
+  - 候选发现改为 2 路（manual + auto），移除旧的 `[alias]` 假路径
+  - wrapper "它怎么工作" 流程图改为 `cc-switch-settings` + `claude --settings` 单一路径
+  - "为什么必须用 `--settings`" 加 `--settings` 是合并而非替换说明（hooks / permissions / mcpServers 不会丢）
+  - "刷新配置" 段落加 4 状态表（↻ ✅ ⊘ ❌）+ `--all --yes` 实际输出示例 + orphan-route 触发的解释
+  - "3 步启用" 加 wrapper install 实际输出
+  - 故障排除替换为新 wrapper 的 3 条真实错误 + db 损坏/锁定边缘情况
+  - 容易踩的坑加第 7 条：升级 wrapper 函数必须 `uninstall && install && source`（或重开 shell）；含 iTerm2 shell-snapshots 缓存陷阱
+
 ## [Unreleased]
 
 ### Added
