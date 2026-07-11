@@ -268,7 +268,7 @@ export async function imgProxyStatus(): Promise<void> {
       console.log(chalk.green(`   ✅ 已装 (${shell}, ${rcFile})`));
       console.log(chalk.gray(`   提示: 跑 cc-linker-proxy 替代 claude`));
     } else {
-      console.log(chalk.gray(`   ⚠️ 未装 (cc-linker img-proxy wrapper-install)`));
+      console.log(chalk.gray(`   ⚠️ 未装 (cc-linker img-proxy wrapper install)`));
     }
   }
 
@@ -423,7 +423,7 @@ export async function imgProxyWrapperStatus(): Promise<void> {
     console.log(chalk.gray(`   rc:    ${rcFile}`));
   } else {
     console.log(chalk.yellow('⚠️ wrapper 未装'));
-    console.log(chalk.gray('   hint: cc-linker img-proxy wrapper-install'));
+    console.log(chalk.gray('   hint: cc-linker img-proxy wrapper install'));
   }
 }
 
