@@ -18,7 +18,7 @@
   - [`routes.json` 路由表](#routesjson-路由表)
   - [路由解析逻辑](#路由解析逻辑)
 - [智能安装(smart_mode)](#智能安装smart_mode)
-  - [4 路候选发现](#4-路候选发现)
+  - [候选发现 (2 路)](#候选发现-2-路)
   - [模型分类规则](#模型分类规则)
   - [模式行为矩阵](#模式行为矩阵)
 - [Shell wrapper 模式](#shell-wrapper-模式)
@@ -275,13 +275,13 @@ cc-linker img-proxy resolve <realUpstream>
 
 v2 默认行为。`install` 不再是"装哪个"的手动挑选,而是:
 
-1. **自动发现候选**(4 路:manual / auto-synced cc-switch / alias 提示的文件存在性)
+1. **自动发现候选**(2 路:manual / auto-synced cc-switch)
 2. **按模型名分类**(multimodal / text-only / unknown)
 3. **multimodal 自动跳过**(避免破坏图片能力)
 4. **text-only + unknown 默认预选**
 5. **检测到 CC Switch 时问要不要装 wrapper**
 
-### 4 路候选发现
+### 候选发现 (2 路)
 
 `discoverCandidates()` 合并 + 去重(manual 优先):
 
@@ -289,7 +289,6 @@ v2 默认行为。`install` 不再是"装哪个"的手动挑选,而是:
 |------|------|---------------|
 | **manual** | `~/.claude/providers/*.json`(你手写或 install 改过的) | `[manual]` |
 | **auto** | `~/.cc-linker/auto-providers/*.json`(CC Switch 同步) | `[auto]` |
-| **alias hint** | 从 `~/.zshrc`/`~/.bashrc` 扫 `alias cc-X='claude --settings ...'` 推出来的 provider | `[alias]` |
 
 CC Switch 同步(`syncCcSwitchToAutoProviders`)只在每次 install 调用时执行,**带 mtime 检查**:
 
@@ -352,14 +351,14 @@ text_only_model_patterns_extra = ["my-custom-text-*"]
 
 | 命令 | 模式 | 行为 |
 |------|------|------|
-| `install` | smart | 4 路发现 + 分类 + 预选 text-only + unknown + 交互 |
+| `install` | smart | 2 路发现 + 分类 + 预选 text-only + unknown + 交互 |
 | `install --yes` | smart | 同上但不交互(用默认预选) |
 | `install --providers X,Y` | **dumb** | 只装 X,Y, 不过滤 multimodal(在全集 candidates 里查找, 不在 smart-filtered 子集里) |
 | `install --all` | **dumb** | 全装, 不过滤 |
 | `install --mode dumb` | dumb | 同 `--all`,但显式标 mode |
 | `install --mode smart` | smart | 显式 smart(默认就是) |
 
-`smart_mode = false` 可在 config 里关闭(回到 dumb 但用 `install` → 仍会走 4 路发现)。
+`smart_mode = false` 可在 config 里关闭(回到 dumb 但用 `install` → 仍会走 2 路发现)。
 
 **Edge case — `--providers` 显式指定 multimodal**:
 - smart 模式下如果 `candidates.filter(...).length === 0` 且 `multimodalWanted.length > 0`, 抛 `E_IMG_PROXY_MULTIMODAL_PROVIDER`: "<alias> 是 multimodal 模型, smart 模式会跳过。改用 --mode dumb 或 --all"
@@ -399,6 +398,16 @@ shell 函数 cc-linker-proxy() (在 ~/.zshrc)
   ↓
 img-proxy (127.0.0.1:8765) 剥 image block -> 上游纯文本模型
 ```
+
+### 为什么必须用 `--settings`,不能设 shell env
+
+Claude Code 的 env 优先级是 **shell env < `~/.claude/settings.json` env < `--settings` 文件 env**。CC Switch 切换 provider 时把上游 URL 写进 `~/.claude/settings.json` 的 `env.ANTHROPIC_BASE_URL`。如果 wrapper 只是设 shell env `ANTHROPIC_BASE_URL=proxy` 后 exec claude,claude 实际用的是 settings.json 里的上游 URL → 直连上游 → 绕过 img-proxy → 纯文本模型 4xx。
+
+实测确认(2026-07-10):
+- `claude --settings <proxy文件>` → proxy 收到请求,stripped 成功 ✅
+- 设 shell env + settings.json env=上游 → proxy 零请求,claude 直连上游 ❌
+
+所以 v0.8.1 起 wrapper 改成 `claude --settings <auto-providers 文件>`,该文件 env 优先级最高,可靠覆盖 settings.json。
 
 ### 3 步启用
 
@@ -494,15 +503,20 @@ $ cc-linker img-proxy install --yes
 ```bash
 $ cc-switch use glm-5.2
 $ cc-linker-proxy "看这个图"
-# wrapper 自动找 glm-5.2 对应的 proxy URL,设置 ANTHROPIC_BASE_URL 后 exec claude
+# wrapper 调 cc-linker img-proxy cc-switch-settings 拿到 glm-5.2 对应的
+# ~/.cc-linker/auto-providers/glm-5.2.json (BASE_URL 已是 proxy),然后
+# exec: claude --settings <该文件> "看这个图"
+# (claude 的 --settings 文件 env 优先级高于 ~/.claude/settings.json env,确保走 proxy)
 
 $ cc-switch use kimi-for-coding
 $ cc-linker-proxy "看图"
-# 报错:"kimi-for-coding 没在 img-proxy 里,hint: cc-linker img-proxy install"
-# 这是预期行为 —— kimi 是 multimodal,image 走它没问题
+# stderr 报错 + exit 1,例如:
+#   "当前 provider \"kimi-for-coding\" 未装代理"
+#   "  hint: cc-linker img-proxy install --providers kimi-for-coding"
+# 这是预期行为 —— kimi 是 multimodal,本来就不需要 img-proxy
 ```
 
-**管理员不会 break**:`cc-linker-proxy` 只在 routes 里有 upstream 匹配时才替换 BASE_URL,否则 exit 1。手动 `claude "看图"` 完全不变。
+**手动 `claude` 完全不变**:不走 wrapper,直连 CC Switch 写的上游,行为不变。
 
 ### 场景 B:自定义 alias 用户
 
@@ -515,8 +529,8 @@ alias cc-byte-agent='claude --settings ~/.claude/providers/byte-agent-glm.json'
 ```bash
 $ cc-linker img-proxy install --yes
 
-🔍 发现 1 个 provider(来自 manual + alias):
-  ❯ ◯ [alias]  byte-agent-glm   ✅ text-only        glm-5.2[1m]
+🔍 发现 1 个 provider(来自 manual):
+  ❯ ◯ [manual] byte-agent-glm   ✅ text-only        glm-5.2[1m]
 
 ✅ 已装 1 个(smart 模式)
 # 注意:没问 wrapper(没 CC Switch)
@@ -598,9 +612,10 @@ $ cc-linker img-proxy install
 
 ```bash
 $ cc-linker-proxy "echo test"
-# settings.json 是 https://ark.cn-beijing.volces.com/api/plan(CC Switch 刚切了)
-# routes.json 里 ark 这个 alias 的 upstream 是 https://ark.cn-beijing.volces.com/api/plan
-# wrapper resolve 命中 → 走 proxy → OK
+# wrapper 调 cc-linker img-proxy cc-switch-settings -> 拿到当前 provider 的
+# auto-providers 文件 (BASE_URL 已替换成 proxy),然后
+# exec: claude --settings <该文件> "echo test"
+# -> claude 把请求发到 http://127.0.0.1:8765/<alias> -> img-proxy 剥图 -> 上游
 ```
 
 CC Switch 是 img-proxy 的**事实标准入口**。
@@ -645,7 +660,7 @@ $ cc-linker setup
 > y
 
 # (3) 调用 imgProxyInstall({})—— smart install 全自动:
-#     4 路发现 → 分类 → 预选 → interactive(setup 走的也是交互版,不是 --yes)
+#     2 路发现 → 分类 → 预选 → interactive(setup 走的也是交互版,不是 --yes)
 ? 选择要启用图片代理的 provider (空格勾选,回车确认):
   ❯ ◯ [auto]  glm-5.2     ✅ text-only     glm-5.2[1m]
     ◯ [auto]  kimi-for-coding ⏭ skip       kimi-for-coding[256k]
@@ -902,19 +917,25 @@ cc-linker img-proxy stop && cc-linker img-proxy start --daemon
 - 默认 prompt 已指引三种路径(`Read` / MCP / CLI),看模型 response 选了哪条
 - 全没响应:调整 `prompt_template` 用更明确的措辞告诉你的模型该调哪个工具
 
-### `cc-linker-proxy` 报 "找不到当前 provider URL"
+### `cc-linker-proxy` 报 "未检测到 CC Switch"
 
-`~/.claude/settings.json` 没 `env.ANTHROPIC_BASE_URL` 字段:
+系统里没装 CC Switch (`~/.cc-switch/` 不存在):
 
-- CC Switch 用户:在 CC Switch GUI 里选个 provider 激活(会自动写 settings.json)
-- 其他用户:手动加 `"env": { "ANTHROPIC_BASE_URL": "..." }`
+- 装 CC Switch (https://github.com/farion1231/cc-switch),在 GUI 里加 provider 并选一个
+- 或手写 `~/.claude/providers/<name>.json`,然后直接用 `claude --settings <文件>` 走 proxy,不需要 wrapper
 
-### `cc-linker-proxy` 报 "X 没在 img-proxy 里"
+### `cc-linker-proxy` 报 "CC Switch 未选中 claude provider"
 
-当前 CC Switch 激活的 provider 没被你 install 到 img-proxy 里:
+CC Switch 装了但没激活任何 provider(也没法 fallback 到 `is_current=1` 因为 `~/.cc-switch/settings.json` 里的 `currentProviderClaude` 是空的):
 
-- `cc-linker img-proxy install --providers <alias>` 装上
-- 或 `install --yes` 让 smart mode 自动挑(但要 multimodal 才会被忽略)
+- 在 CC Switch GUI 里选一个 provider 激活
+
+### `cc-linker-proxy` 报 "当前 provider \"X\" 未同步" / "未装代理"
+
+CC Switch 激活的 provider `X` 在 `~/.cc-linker/auto-providers/X.json` 里**不存在**(还没 sync 过来)或 BASE_URL 还是上游 URL(没 install):
+
+- 跑 `cc-linker img-proxy install` (smart 自动挑) 或 `install --providers X` (指定)
+- wrapper 只接受已 install 的 provider;没装就跑 `install`,不要手动 `claude` 直接调用(会绕过 proxy)
 
 ### 大量 `cleanup removed N cached images` 日志
 
@@ -1141,12 +1162,12 @@ cc-linker img-proxy stop && cc-linker img-proxy start --daemon
 | `src/img-proxy/transform.ts` | 剥 image block(含递归 tool_result.content)+ 落盘 + `DEFAULT_PROMPT_TEMPLATE` |
 | `src/img-proxy/routes.ts` | 路由表读写 + 加锁(proper-lockfile + sentinel)+ 双向解析 + `disabled` 标志 |
 | `src/img-proxy/provider-scan.ts` | 扫描 + CC Switch 同步(mtime 用最新文件非目录 mtime)+ stale cleanup |
-| `src/img-proxy/provider-config.ts` | install/uninstall 3 态机 + `isAnyProxyUrl` 宽松匹配 |
+| `src/img-proxy/provider-config.ts` | install/uninstall 3 态机 + `isAnyProxyUrl` 宽松匹配 + `updateProvider`(cc-switch 改了 token/model 后的整体替换刷新) |
+| `src/img-proxy/cc-switch-current.ts` | 组件 A: `getCurrentCcSwitchProvider`(读 cc-switch 当前 provider + auto-providers 文件定位)+ `getCcSwitchProviderConfigByName`(update 用) |
 | `src/img-proxy/classify.ts` | 模型分类(builtin + extras, 锚定 MiMo 正则) |
-| `src/img-proxy/aliases.ts` | shell alias 扫描 + 引号感知 comment strip |
-| `src/img-proxy/discover.ts` | 4 路合并 + dedup + baseUrl 过滤 + 触发 CC Switch 同步 |
-| `src/img-proxy/wrapper.ts` | shell wrapper 函数生成 + marker 检测 + shell 探测 |
-| `src/img-proxy/resolve.ts` | 读 settings.json(给 wrapper 调用) |
+| `src/img-proxy/discover.ts` | 2 路(manual + auto)合并 + dedup + baseUrl 过滤 + 触发 CC Switch 同步 |
+| `src/img-proxy/wrapper.ts` | shell wrapper 函数生成(`cc-switch-settings` + `claude --settings` 单一路径)+ marker 检测 + shell 探测 |
+| `src/img-proxy/resolve.ts` | 读 settings.json(给旧 `current-url` / `resolve` 子命令;v0.8.1 后 wrapper 已不调,保留给其他调用方) |
 | `src/img-proxy/types.ts` | `RouteEntry` / `RouteTable` / `TransformResult` / `ProviderFileInfo` |
 | `src/img-proxy/console/api.ts` | Web Console 9 个 endpoint + `handleConsoleRequest` 主入口 + audit log |
 | `src/img-proxy/console/html.ts` | INDEX_HTML(SPA 5-tab 模板, vanilla JS) |
