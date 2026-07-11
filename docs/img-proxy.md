@@ -435,7 +435,17 @@ cc-linker-proxy "echo test"   # 走 proxy
 claude "echo test"             # 直连(不受影响)
 ```
 
+实际 `wrapper install` 输出:
+
+```
+✅ wrapper 已装到 /Users/you/.zshrc
+   备份: /Users/you/.cc-linker/img-proxy/wrapper-backups/wrapper-backup-1720000000000-a1b2c3d4
+   运行 source ~/.zshrc 或重开 shell 激活 cc-linker-proxy
+```
+
 `install --yes` 检测到 CC Switch 且未装 wrapper 时**会自动问一次**(默认 y)。
+
+**升级 wrapper 函数后必须重装**: cc-linker 升级后, `cc-linker img-proxy wrapper uninstall && wrapper install && source ~/.zshrc`(或重开 shell) 才会用上新函数。`bun run deploy` 只换 binary 不动 `~/.zshrc` 里的旧 wrapper 函数。
 
 ### 关键行为
 
@@ -468,10 +478,28 @@ cc-linker img-proxy update --all      # 全部
 cc-linker img-proxy update -p glm-5.2 # 指定
 ```
 
-- 已装的 provider:刷新 env(token/model/新增字段)+ 更新 routes upstream,BASE_URL 保持 proxy URL
-- 未装的 provider:新装(跟 install 一样)
-- manual provider 已装:跳过(直接改文件即可)
-- cc-switch 已删的 provider:路由残留时提示 `uninstall --providers <alias>`
+行为分 4 种:
+
+| 状态 | 标志 | 含义 |
+|------|------|------|
+| 已装 auto (cc-switch 有最新配置) | `↻ <alias>  已刷新` | 整体替换 env(token/model/新增字段), 保持 BASE_URL 是 proxy URL, 同步更新 routes.json upstream |
+| 未装 | `✅ <alias>  新装` | 跟 install 一样: 备份 .bak + 改 BASE_URL + 加路由 |
+| 已装 manual | `⊘ <alias>  manual provider, 直接改文件即可` | manual 不归 cc-switch 管, update 不刷, 用户直接改 `~/.claude/providers/<alias>.json` |
+| 失败 | `❌ <alias>  <err>` | 异常计入 failedCount |
+
+`--all --yes` 时跳过交互,输出类似:
+
+```
+刷新/安装 3 个 provider...
+
+  ↻ Byte-glm-agent  已刷新
+  ✅ new-provider    新装
+  ⊘ my-manual        manual provider, 直接改文件即可
+
+完成: 1 刷新, 1 新装, 1 孤立 route。
+```
+
+末尾 "孤立 route" 来自 P1 修复的 orphan-route 扫描: sync 的 cleanup pass 可能已删 cc-switch 移除的 provider 的 `.json`,但 routes.json + `.bak` 残留(同步只动 `auto-providers/`,不动 routes)。扫到 `provider_path` 已不存在的 route 打印 `⚠ <alias>  provider 文件已删 (cc-switch 移除?), 建议 cc-linker img-proxy uninstall --providers <alias>`。
 
 ---
 
@@ -1165,6 +1193,7 @@ cc-linker img-proxy stop && cc-linker img-proxy start --daemon
 4. **cache 文件 mode 0o600**,有敏感截图别 chmod 放开。
 5. **`cc-linker-proxy` 必须从装了 wrapper 的 shell 跑**(`source ~/.zshrc` 后)。IDE 集成终端有时不 source,需要重启 IDE 或手动 source。
 6. **同一个 provider 别手动 `~/.claude/providers/` + CC Switch 同时管**——manual 优先,auto 的写入会被覆盖,容易分散。
+7. **cc-linker 升级后 wrapper 函数不会自动更新**——`bun run deploy` 只换 binary 不重写 `~/.zshrc` 里的 wrapper 函数块。升级后必须 `cc-linker img-proxy wrapper uninstall && wrapper install && source ~/.zshrc`(或重开 shell)。`iTerm2` 等终端的 `shell-snapshots/snapshot-zsh-*.sh` 也会缓存旧函数,可能需要 `unfunction cc-linker-proxy && source ~/.zshrc` 或重启 shell。
 
 ---
 
