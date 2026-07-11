@@ -409,6 +409,14 @@ Claude Code 的 env 优先级是 **shell env < `~/.claude/settings.json` env < `
 
 所以 v0.8.1 起 wrapper 改成 `claude --settings <auto-providers 文件>`,该文件 env 优先级最高,可靠覆盖 settings.json。
 
+**`--settings` 是合并而非替换**(实测确认, 2026-07-10): claude 的 `--settings` 是 "load additional settings from", 会把指定文件的 env 块叠加到 `~/.claude/settings.json` 之上(`--settings` 文件的 env 覆盖 settings.json 的同名 env)。所以用 `--settings` 指向 auto-providers 文件时:
+
+- `env.ANTHROPIC_BASE_URL` 被替换为 proxy URL ✅
+- `~/.claude/settings.json` 里的 `hooks` / `permissions` / `statusLine` / `enabledPlugins` / `mcpServers` 等字段**完全不动**,继续生效
+- auto-providers 文件里的 `name` / `alias` 等 sync 写入的非 claude 原生字段被 claude 忽略(实测无报错)
+
+也就是说: wrapper 只替换 BASE_URL,你的 hooks / 权限规则 / MCP / 主题等配置不会丢。
+
 ### 3 步启用
 
 ```bash
@@ -926,9 +934,15 @@ cc-linker img-proxy stop && cc-linker img-proxy start --daemon
 
 ### `cc-linker-proxy` 报 "CC Switch 未选中 claude provider"
 
-CC Switch 装了但没激活任何 provider(也没法 fallback 到 `is_current=1` 因为 `~/.cc-switch/settings.json` 里的 `currentProviderClaude` 是空的):
+`~/.cc-switch/settings.json` 的 `currentProviderClaude` 为空, 而且 db 里也没有 `is_current=1` 的 provider:
 
 - 在 CC Switch GUI 里选一个 provider 激活
+
+**如果 CC Switch 已经选了 provider 仍报这个**, 一般是 cc-switch.db 损坏或被锁定(只读打开 `bun:sqlite` 抛错时统一归到 no-current):
+
+- 完全退出 CC Switch app 再打开, 让它把 db 落盘
+- 检查 `~/.cc-switch/cc-switch.db` 权限(`ls -la ~/.cc-switch/`)
+- 极端情况: 备份 `cc-switch.db` + `settings.json` 后删 `~/.cc-switch/`, 重装 CC Switch(配置会丢)
 
 ### `cc-linker-proxy` 报 "当前 provider \"X\" 未同步" / "未装代理"
 
