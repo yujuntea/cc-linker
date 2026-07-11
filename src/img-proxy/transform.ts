@@ -5,10 +5,10 @@ import type { TransformResult } from './types';
 
 export const DEFAULT_PROMPT_TEMPLATE =
   '[用户粘贴的图片已保存到本地文件: {path}]\n' +
-  '当前模型为纯文本模型,请用以下方式之一查看该图片内容:\n' +
-  '1. 调用 Read 工具读取该本地路径(若 Read 支持图片)\n' +
-  '2. 调用你已注册的任何图片识别 MCP 工具(参数名视工具而定,常见如 image_source/image_url/image_path)\n' +
-  '3. 用 Bash 调用本地图片识别 CLI(如 mmx-cli 等,具体命令与参数名以工具文档为准)';
+  '当前模型为纯文本模型,无法直接查看图片,请用以下方式之一获取该图片的文本描述:\n' +
+  '1. 调用你已注册的图片识别 MCP 工具(参数名视工具而定,常见如 image_source/image_url/image_path)\n' +
+  '2. 用 Bash 调用本地图片识别 CLI(如 mmx-cli 等,具体命令与参数名以工具文档为准)\n' +
+  '注意:Read 工具读取图片返回的是 image 块,纯文本模型同样无法消费,请勿使用 Read。';
 
 export interface StripOptions {
   cacheDir: string;

@@ -213,7 +213,7 @@ export async function setup(registry: RegistryManager, opts: SetupOptions = {}):
     console.log('');
     console.log(chalk.gray('  ℹ  img-proxy 让纯文本模型(glm-5.2/qwen/deepseek 等)也能在 Claude Code'));
     console.log(chalk.gray('     里接收粘贴的图片:把图片存成本地文件,模型收到路径文本 + 调 MCP 提示。'));
-    console.log(chalk.gray('     模型需要配图片识别能力(Read 工具 / 图片识别 MCP / mmx-cli 等本地 CLI)才能"看见"。'));
+    console.log(chalk.gray('     模型需要配图片识别能力(图片识别 MCP / mmx-cli 等本地 CLI)才能"看见"。\n     注意:Read 工具不算--读图返回的 image 块纯文本模型同样无法消费。'));
     console.log('');
 
     try {
