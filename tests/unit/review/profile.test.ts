@@ -9,7 +9,7 @@ describe('loadProfile', () => {
     expect(p.work.provider).toBe('qwen3.7');
     expect(p.review.provider).toBe('kimi-coding');
     expect(p.guards.maxRounds).toBe(6);
-    expect(p.prompts.work.self_review.system.template).toBe('review {task}');
+    expect(p.prompts.work.self_review.system.template).toBe('review {task} ; r1_or_r2_instruction={r1_or_r2_instruction}');
   });
 
   it('phase_override scalars win over top-level (code phase)', async () => {
@@ -20,7 +20,7 @@ describe('loadProfile', () => {
 
   it('phase_override tables deep-merge (prompts not in override preserved)', async () => {
     const p = await loadProfile('default', 'code', { profilesDir: 'tests/fixtures/review' });
-    expect(p.prompts.work.self_review.system.template).toBe('review {task}');
+    expect(p.prompts.work.self_review.system.template).toBe('review {task} ; r1_or_r2_instruction={r1_or_r2_instruction}');
   });
 
   it('throws ProfileError if provider not resolvable', async () => {
