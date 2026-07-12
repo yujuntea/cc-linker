@@ -48,9 +48,15 @@ cc-linker review run "帮我修 NPE in auth.ts" --phase code --profile default
 | 429 限额耗尽 | ⏸ PAUSED（显示重置时间，到点自动恢复） |
 | blocked 权限拒绝/异常 | ❌ ABORTED `permission_denied`/`unexpected_blocked` |
 
-### 8.3 飞书交互
+### 8.3 飞书交互（Phase 2 设计，本阶段不实现）
 
-review 跑期间飞书聊天暂时禁用（被 engine 占用）。review 完成后自动恢复。
+> **v2.1.3 P0-5 边界**：Phase 1 仅 CLI，飞书相关行为**全部**留 Phase 2 设计：
+>
+> - review 跑期间飞书聊天"暂时禁用"（行为定义）—— Phase 2 设计，目前不存在
+> - bot `claude -p` 与 review `claude --bg --bare` 共存（资源竞争 + 配额共享）—— Phase 2 设计
+> - 多用户场景下飞书消息路由（owner.lock 单实例边界）—— Phase 2 设计
+>
+> 当前 `cc-linker start` 启动 bot 时，**用户应避免同时跑 review engine**（双方共享 ANTHROPIC 配额，可能同时触发 429 PAUSED）。Phase 2 设计 engine 与 bot 的协调机制（互斥 / 排队 / 共享 PAUSED 队列）。
 
 ### 8.4 review 产物
 
