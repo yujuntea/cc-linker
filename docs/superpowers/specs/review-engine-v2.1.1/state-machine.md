@@ -23,6 +23,7 @@ T9    CLI (watch mode)            ANSI 进度条更新：state=PRODUCING, panes=
 T10   CLI (Claude work bg)        ...处理中...
 T11   CLI (Claude work bg)        state.json.state: 'running' → 'done'
 T12   Adapter.poll(short1)        detect state.json.state == 'done' → emit 'work_produced'
+T12b  Engine                      git -C <cwd> add -A && git commit -m 'pre-produce checkpoint by review engine' → 捕获 SHA 写入 PipelineRecord.preProduceCheckpointSha（P0-1：R1/R2 diff 基线，spec/plan phase 必走）
 T13   Engine                      transition: PRODUCING → SELF_REVIEW_R1 (round=1)
 T14   Engine                      调 adapter.resumeWorkSession({ sessionId, prompt:'review 你的产出（identify only）...', provider:'claude-sonnet-4' })
 T15   Adapter                     Bun.spawn(['claude','--bg','review...','--resume',sessionId,'--reply-on-resume','--settings',sonnetPath])

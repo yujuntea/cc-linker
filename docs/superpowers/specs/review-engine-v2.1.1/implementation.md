@@ -98,6 +98,10 @@ interface PipelineRecord {
   panes: PaneRegistry;
   history: HistoryEvent[];
   parseDegraded?: ParseDegradedEvent[];
+  /** v2.1.3 P0-1：work produce 完成后，engine 在切到 R1 前打的 git checkpoint。
+   *  R1/R2 prompt 用此 SHA 作为 `git diff <sha>..HEAD` 的基线，
+   *  避免模型在 spec/plan phase 看 work 全部产出 + 用户残留未提交改动。 */
+  preProduceCheckpointSha?: string | null;
 }
 
 interface PaneRegistry {
@@ -334,7 +338,12 @@ template = """
 你是工作模型，对自己的产出做自查（identify only，不要修改文件）。
 需求基准（spec/plan 或需求描述）：{task}
 
-请先 cat 上述 spec/plan 理解需求，再自己决定 git diff 范围查看当前改动，
+请先 cat 上述 spec/plan 理解需求，再用以下命令查看 work 本轮的全部改动（**不要**自由选 diff 范围，必须用此基线）：
+  git -C <cwd> diff {pre_produce_checkpoint_sha}..HEAD
+
+（pre_produce_checkpoint_sha 是 engine 在你 produce 完成后打的 git checkpoint，作为 diff 基线。
+ 非 git repo 或 checkpoint 为 null 时：git diff HEAD 看 work + 用户所有未提交改动，自己判断 work 改动 vs 用户改动。）
+
 判断改动是否符合需求、有无 bug，识别问题（不要修改文件）。
 
 {r1_or_r2_instruction}
@@ -346,6 +355,7 @@ template = """
 # R2 initial:  "审查修复后的状态"
 # R1 postfix:  "postfix 循环：复查上一轮 external review 的修复"
 # R2 postfix:  "审查 postfix 修复后的状态"
+# {pre_produce_checkpoint_sha} 在 engine 端替换为 PipelineRecord.preProduceCheckpointSha，null 时降级为 HEAD
 
 [prompts.work.fixing.system]
 template = """
@@ -372,7 +382,13 @@ template = """
 你是外部 Review 模型，对工作模型的产出做交叉评审并**直接修复**（v2.1.3：review 既审又修）。
 需求基准（spec/plan 或需求描述）：{task}
 
-请先 cat 上述 spec/plan 理解需求，再自己决定 git diff 范围查看当前改动，然后：
+请先 cat 上述 spec/plan 理解需求，再用以下命令查看 work 本轮的完整改动（**不要**自由选 diff 范围，必须用此基线）：
+  git -C <cwd> diff {pre_review_checkpoint_sha}..HEAD
+
+（pre_review_checkpoint_sha 是 engine 在 spawn review 前打的 git checkpoint。
+ 非 git repo 或 checkpoint 为 null 时：git diff HEAD 看 work 全部产出，自己判断。）
+
+对每条 issue：
 1. 识别问题，按 severity 分级（P0=Critical / P1=High / P2=Medium / P3=Low）
 2. 逐条确认问题是否 real（避免 hallucination）
 3. 对 real 问题直接修改代码（最小化改动），verify 修复正确
@@ -387,7 +403,8 @@ template = """
   "reasoning": "..."
 }
 """
-# spec/plan phase 用 prompts.review.spec.system / prompts.review.plan.system，结构同上（{task} + 自选 diff + 直接修）
+# spec/plan phase 用 prompts.review.spec.system / prompts.review.plan.system，结构同上（{task} + pre_review_checkpoint_sha + 直接修）
+# {pre_review_checkpoint_sha} 在 engine 端替换为 engine 在 EXTERNAL_REVIEW 前打的 checkpoint SHA（写入 HistoryEvent.checkpointSha，pre-review-fix 标识），null 时降级为 HEAD
 
 # v2.1.3：删 prompts.review.code.preamble -- checkpoint 由 engine 在 spawn review 前自己打
 
@@ -415,6 +432,9 @@ guards.max_rounds = 6
 | 工作区有用户未提交改动 | engine 先 `git stash`（保护用户改动）再打 checkpoint，阶段结束不自动 pop（用户手动 pop） |
 | commit 失败 | `checkpointSha: null` + warn，阶段继续（改动仍可 `git diff` 查看，只是无回滚锚点） |
 | 非 `--bare` 误用导致 worktree | 不会发生--adapter 强制 `--bare`，doctor 校验 |
+| **preProduce checkpoint 时 cwd 为空 git repo** | `preProduceCheckpointSha: null`，R1/R2 prompt 降级用 `git diff HEAD`（此时 work 全部产出 + 用户残留改动混在一起，模型自己判断） |
+| **preProduce checkpoint 时 work 没产生任何文件改动** | `preProduceCheckpointSha` 仍写入（空 commit 也行），R1/R2 prompt `git diff <sha>..HEAD` 输出为空——表示 work 这一轮无产出，触发 F5 处理（spec phase 除外，spec/plan 必有文件改动） |
+| **R1/R2 prompt 中 preProduceCheckpointSha 为 null**（非 git repo）| R1/R2 prompt 显式降级：`git diff HEAD`，标注"无 checkpoint 基线，自己判断 work 改动 vs 用户改动" |
 
 ### 7.3 per-phase 深度 merge 规则
 
