@@ -55,7 +55,7 @@
 
 | # | 事项 | 实测需求 | Phase 1 处理 |
 |---|---|---|---|
-| **P1-4** | blocked bg session 生命周期：429 限流时 bg 进入 blocked，daemon 是否会在挂起几小时后主动清理（gc）？ | 需 spawn 一个持续 blocked 的 bg 观察几天。`appendices.md:336` 自承未实测 | **Phase 1 W1 必实测**：`spawn 1 个 glm-5.2 bg` → 等到 blocked（429） → 每小时 `readJobState` 看 bg 状态 → 24h 后看 daemon 是否 kill。**实施 fallback**：P0-4 唤醒校验兜底——bg 死则 PANE_LOST → 用户 retry |
+| **P1-4** | blocked bg session 生命周期：429 限流时 bg 进入 blocked，daemon 是否会在挂起几小时后主动清理（gc）？ | **2026-07-12 已实测（5分41秒观察，短窗口但信号清晰）**：spawn glm-5.2 bg 触发 429 → state.json 持续 "blocked"，bg 进程（claude bg-spare / claude bg-pty-host）持续存活，daemon roster 重启后重新 attach；daemon 5s idle 自己退出但 bg 不死。**结论**：daemon 不主动 gc blocked bg，bg 状态冻结在 state.json 等待新输入（解限额后通过 daemon injectReply 唤醒）。5 分钟不能 100% 证明 24h，但 POSIX 通常不杀长 idle 子进程；如真出现死 bg，P0-4 兜底 → PANE_LOST。**P0-4 改进点（v2.1.4 待补）**：当前 `readJobState` 只看 state.json，**无法区分**"bg 进程活着 blocked 等输入"vs"bg 进程死了 state 冻结在 blocked"。需加 bg 进程 liveness 检查（如 `ps aux | grep <shortId>` 或查 daemon roster `pid` 字段），死了直接 PANE_LOST 跳过 readJobState。 |
 | **P1-7** | URL 输入支持（`cc-linker review run https://...`） | cat 无效，模型需 webfetch（实测未做） | **Phase 1 不支持**：doctor 检测 `task` 含 `http://`/`https://` → 报错 "URL 输入留 Phase 3，请用本地路径或 git ref" |
 | **P2-5** | cwd 内 `.claude/providers/*.json` 是否被 review engine 读取 | 当前实现走 `providerManager.resolve()` 只查 `~/.claude/providers/` | Phase 1 不支持 cwd 内 providers；如需支持，把 `ProviderManager.scan()` 加 cwd 路径（未来可考虑） |
 | **P2-6** | 6+ bg session 并发实测（3 pipeline × 2 pane） | 当前实测只验过 3 并发 | Phase 1 默认 `max_concurrent_pipelines = 1`，并发压力测试留 Phase 2 飞书集成前做 |
