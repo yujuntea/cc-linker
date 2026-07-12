@@ -1,5 +1,7 @@
 # cc-linker Multi-Model Review Engine v2.1.1 设计
 
+> ⚠️ **版本说明**（v2.1.5 P3-1）：目录名为 v2.1.1，但内容经 v2.1.2/v2.1.3/v2.1.4/v2.1.5 多轮迭代，**当前实际版本 v2.1.5**（2026-07-12 review 修正）。v2.1.5 修正：P0-1 进程模型（后台长驻 engine）/ P0-2 liveness（读 roster）/ P0-3 --bare 反转 / P1-1~P1-6 / P2 系列。**v2.1.6 简化：删整个 checkpoint 体系（engine 不打 checkpoint，全面 review 基于 task+当前状态）+ 删 PAUSED 态（429 一律 ABORTED，依赖 claude code 自身重试）+ 删 review cleanup 命令**。阅读时以文中 v2.1.6 标注为准。
+
 **日期：** 2026-06-15
 **基础版本：** v2.1（`docs/superpowers/specs/2026-06-14-multi-model-review-engine-v2.1-design.md`）
 **版本：** v2.1.1（v2.1 patch：6 项重大变更）
@@ -30,21 +32,25 @@
 | **v2.1.2 (本轮)** | **2026-06-19** | **I9 三档 cascade（compact → reset → abort）+ review opinions 落盘（worker @file 引用）+ 阈值规则修 bug（128K/200K 模型 + 1M 模型提前干预）** |
 | v2.1.2 评审修正 | 2026-06-19 | 4 P0 + 10 P1 修复：per-pipeline 目录结构 / dead config 激活 / cascade N>1 走查 / 边界 case 去矛盾 / 辅助函数定义 / @file 双轨策略 / PhaseDetector 优先级 / 并发排队 queued/ |
 | **v2.1.3 (本轮)** | **2026-07-12** | **简化：删 JUDGE_BY_WORK（review 在 EXTERNAL_REVIEW 内既审又修，反转 I9，靠 work postfix 复查保 cross-model）+ 删 HUMAN_DECIDE + 删 context cascade（裸奔）+ 删成本统计（实测 state.json 无 cost_usd）；补充：无论如何都跑一轮 EXTERNAL_REVIEW + 统一 clean 标准（无 P0/P1/P2，P3 不阻塞）+ 新增 PAUSED 态（429 限额耗尽到点唤醒）。实测修正（附录 A 2.1.207）：spawn 用 --bare 禁 worktree 在原分支改、不传 --cwd/--model、模型从 respawnFlags 取、review 输入用 spec/plan + 模型自选 diff 范围、checkpoint 由 engine 打、复用 providerManager.resolve** |
+| **v2.1.4** | **2026-07-12** | bg 进程 liveness 检查（isBgAlive + kill -0 bgPid）-- v2.1.5 证伪 |
+| **v2.1.5** | **2026-07-12** | review 修正：P0-1 后台长驻 engine / P0-2 liveness 读 roster / P0-3 --bare 反转 / P1-1~P1-6 / P2 系列 |
+| **v2.1.6 (本轮)** | **2026-07-12** | **简化：删整个 checkpoint 体系（engine 不打 checkpoint，self_review/review 基于 task+当前代码状态全面 review，模型自己 git diff/git log/cat）+ 删 PAUSED 态（429 一律 ABORTED unexpected_blocked，依赖 claude code 自身重试）+ 删 review cleanup 命令 + 删 isBgAlive API + 删 liveness/roster 唤醒（PAUSED 不存在）** |
 
 > 详细变更动机 + 决策链：见 [appendices.md → 附录 C](./appendices.md#附录-cv21--v211-变更背景动机--决策--章节索引)
 
 ## Preconditions（v2.1.1）
 
-- **Claude CLI ≥ 2.1.139**（`claude --bg` 稳定；v2.1.3 实测在 2.1.207 上 `--bare`/worktree/429 行为，见附录 A.1）
+- **Claude CLI ≥ 2.1.139**（`claude --bg` 稳定；v2.1.5 实测在 2.1.207 上 worktree/429 行为，见附录 A.1）
 - **cc-linker ≥ 0.6.3**（当前 master，`c5a8b8d`）
 - **`~/.claude/providers/` 至少配置 2 个 provider**（work + 1 review），缺失会由 `cc-linker review doctor` 报错
-- **cwd 推荐为 git 仓库**（commit preamble 要求；如果非 git repo，preamble 会输出 `checkpoint_sha: null` 跳过 commit）
+- **cwd 推荐为 git 仓库**（v2.1.6：engine 不打 checkpoint，但 git 提供改动追踪 + 回滚锚点；非 git repo 改动直接落盘、无 git 历史，报告标注）
 - **v2.1.1 P0-D2 修复：cwd 不能是 monorepo 子目录** —— 如果 cwd 的父级有 `.git` 目录（说明是 monorepo 子目录），doctor 会 warn：
   ```
   ⚠️ cwd 是 monorepo 子目录，git 操作可能影响整个 monorepo
      建议：cd 到 monorepo root 再跑 review，或用 --cwd /path/to/monorepo/root
   ```
   doctor 检查：`git rev-parse --show-toplevel` 返回的 root 如果等于 cwd，OK；如果不等于，warn
+- **v2.1.5 P1-3：工作区必须 clean** -- doctor 校验 `git status --porcelain` 输出为空，有未提交/未跟踪改动则报错拒绝启动（engine 不自动 stash，避免崩溃时丢失用户 WIP）。请先 commit 或 stash 改动。v2.1.6：engine 不打 checkpoint，用户跑 review 前的 HEAD 即回滚锚点，强制 clean tree 保证 HEAD 干净可回滚
 
 ---
 
@@ -60,7 +66,7 @@
 
 由于 Claude Code 限制，不方便在终端直接切换不同模型（kimi-2.6、qwen3.6-plus、mimo-2.5-pro 等），每次评审都需手动换 settings、重新启动进程。同时，多个模型的交叉 Review 意见如何汇总、是否采纳、是否需要仲裁，缺少一个集中的"裁决 + 流程编排"机制。
 
-**v2 的"0 行新代码复用"承诺在 v2.1 已兑现**（adapter 直接 spawn + RendezvousClient.injectReply）。
+**v2 的"0 行新代码复用"承诺在 v2.1 已兑现**（adapter 直接 spawn + 复用 readJobState/roster/stop（v2.1.5：injectReply 退场））。
 
 ## 2. 目标与非目标
 
@@ -73,7 +79,7 @@
 | G3 | 三阶段支持：Spec / Plan / Code，每个阶段可配置不同的提示词、护栏、Review 模型组合 | P0 |
 | G4 | 电脑端便利：CLI 主输出 + `--watch` 模式（rich terminal）实时看 **1+1 pane** 状态（work + 1 review） | P0（Phase 1） |
 | G5 | 可恢复状态机：每次 Review 是一个有状态的、跨进程崩溃可恢复的工作流 | P0 |
-| G6 | **复用 Agent View**：状态读取/注入/停止复用 `readJobState` + `RendezvousClient.injectReply` + `claude stop`（0 行重复）；spawn `claude --bg --bare` + `--settings` 为 adapter 新增代码（v2.1.3 实测修正，见附录 A） | P0 |
+| G6 | **复用 Agent View**：状态读取/停止复用 `readJobState` + `claude stop`（0 行重复）；spawn `claude --bg`（不传 --worktree）+ `--settings` 为 adapter 新增代码（v2.1.5 P0-3 不传 --bare；P1-1 injectReply 退场；v2.1.6 删 isBgAlive/PAUSED/checkpoint，见附录 A） | P0 |
 | G7 | **1+1** 个 bg session 自动出现在 `~/.claude/jobs/`，飞书 `/agents` 列表**免费**看到（Phase 2 飞书集成） | P1 |
 | G8 | **`cc-linker review doctor`** 启动前健康检查（profile 引用 + CLI 版本 + daemon 健康） | P0 |
 
@@ -86,10 +92,10 @@
 - 不做云端协同 / 团队共享（仍是单机单用户）
 - **不做 Phase 1 IDE**（v2.1 砍掉，Phase 1 改 `--watch` rich terminal；Phase 2 单独排期）
 - 不修改 `~/.claude/providers/*.json` 任何内容（只读取）
-- **review / fix 产出不自动 commit / 不创建 PR**（work FIXING 与 review EXTERNAL_REVIEW 均用 `claude --bg --bare` 在**用户原开发分支**直接改文件，不建 worktree；engine 在每个阶段切换前自己打 git checkpoint commit 隔离各阶段改动，verify-first 最小化修改），所有修改可通过 `git diff` 查看、`git checkout <checkpoint>` 回滚；自动 apply/commit/PR 留 Phase 2
+- **review / fix 产出不自动 commit / 不创建 PR**（work FIXING 与 review EXTERNAL_REVIEW 均用 `claude --bg` **不传 --worktree** 在**用户原开发分支**直接改文件，保留 CLAUDE.md/hook/LSP；v2.1.6：engine 不打 checkpoint，改动直接落用户分支，用户跑 review 前的 HEAD 即回滚锚点），所有修改可通过 `git diff`/`git log` 查看、`git reset --hard <review前的commit>` 回滚；自动 apply/commit/PR 留 Phase 2
 - **v2.1.3 反转 I9**：review 模型**既审又修**（在 EXTERNAL_REVIEW 内识别问题、确认方案、直接修复、verify，单 bg turn）。review/work 的输入统一为用户指定的 spec/plan（或 `<task>` 需求文本），模型自己 cat + 自己选 `git diff` 范围，engine 不构造 artifact。跨模型校验靠"review 修完、work postfix R1 复查 review 改动"闭环保证，不再有独立的 JUDGE 裁决节点
 - **v2.1.3 删除**：JUDGE_BY_WORK 状态、HUMAN_DECIDE 状态、context-OK 判断与三档 cascade（compact/reset/abort）、成本统计（`cost_usd` / `totalCostUsd` / `max_cost_usd` 整组移除，实测 state.json 无 cost_usd）。context 用量裸奔，不做主动检测；极端情况下由 max_rounds 兜底收敛
-- **v2.1.3 新增 PAUSED 态**：429 限额耗尽（实测国产模型周/月限额常态）时 pipeline 进 PAUSED + 记录重置时间，reconciler 到点自动唤醒 resume（详见状态机 §5）
+- **v2.1.6 删除 PAUSED 态**：429 限流等 blocked 场景一律 ABORTED `unexpected_blocked`（依赖 claude code 自身重试，review engine 不识别 429/不挂起/不唤醒，详见附录 C.9）。原 v2.1.3 PAUSED + reconciler 到点唤醒 + liveness 整组移除
 - **不**做 cloud-hosted multi-agent reviewcloud-hosted multi-agent review（Anthropic 已有 `claude ultrareview` 但那是云端）
 
 ## 3. 架构总览
@@ -102,8 +108,8 @@
 |------|---------|--------------|
 | Spawn bg session（work / 单 review） | `Bun.spawn(['claude', '--bg', prompt, '--settings', settingsPath])` → 返回 `shortId` 落到 `~/.claude/jobs/<short>/state.json` | ✅ 实测 OK（见 [appendices.md → 附录 A](./appendices.md#附录-aclaude---bg-实测行为2026-06-14)） |
 | Provider 切换 | `--settings ~/.claude/providers/<name>.json` | ✅ 实测 OK |
-| Resume work session 跨 R1/R2/JUDGE/FIX | `--bg <newPrompt> --resume <sessionId> --reply-on-resume` | ✅ 实测 OK（每次新 shortId，sessionId 跨轮不变） |
-| 注入 judge/fix prompt 到 work session | `RendezvousClient.injectReply({ short, text, rendezvousSock, timeoutMs, stateJsonPath })`（`src/agent-view/rendezvous-client.ts`）走 daemon socket + **state.json 轮询**（v2.4.x 新协议）。**必须传 `stateJsonPath`** 才走新协议 | ✅ 0 行逻辑新代码 |
+| Resume work session 跨 R1/R2/FIX（v2.1.5：删 JUDGE） | `--bg <newPrompt> --resume <sessionId> --reply-on-resume` | ✅ 实测 OK（每次新 shortId，sessionId 跨轮不变） |
+| ~~注入 judge/fix prompt 到 work session~~ | ~~`RendezvousClient.injectReply()`~~ | v2.1.5 P1-1 移除：FIXING 改用 resumeWorkSession，injectReply 退场 |
 | 读 pane 状态 | `readJobState(shortId)`（`src/agent-view/job-state.ts`）。**前置**：需扩展 `JobStateFile` 接口加 `output` 字段 | ✅ 0 行**逻辑**新代码 |
 | 偷看 pane 输出 | `resolvePeekContent(shortId, maxChars)` **4 级降级** | ✅ 0 行新代码 |
 | Stop 任意 pane | `Bun.spawn(['claude', 'stop', short])` | ✅ 实测 OK |
@@ -117,23 +123,23 @@
 
 > **v2.1.3 瘦身**：删除 `context-overflow.ts` / `build-context-reset-prompt.ts` / `build-context-compact-prompt.ts` / `review-opinions-writer.ts`（context cascade + review opinions 落盘整组移除）。adapter 砍掉 `getContextUsage`（5 个 API）。`model-parser.ts` 瘦身为只剩模型名解析（删 `KNOWN_CONTEXT_LIMITS` + cost 价格表，见 §3.2.1）。
 >
-> **v2.1.4 补**：adapter 加 `isBgAlive(pid)` API（6 个 API）—reconciler PAUSED 唤醒时 `kill -0 pid` 验证 bg 进程活着，区分"bg 活着 blocked 等输入"vs"bg 死了 state.json 冻结"（详见附录 A.2 P1-4 实测 + 状态机 §5.3.4）。
+> **v2.1.6 删除**：adapter `isBgAlive` API 移除（PAUSED 态删除，reconciler 不再做 liveness 唤醒校验）。adapter 4 API：startSession / resumeWorkSession / poll / stop。
 >
-> **v2.1.3 实测修正**（见附录 A 2.1.207 实测）：adapter spawn 统一用 `claude --bg --bare`（**禁 worktree，bg 直接改主 cwd**，不加 `--bare` 会自动建隔离 worktree 导致主分支不被改动）；**不传 `--cwd`**（CLI 不支持，cwd 由 `Bun.spawn({cwd})` 控制）；**不传 `--model`**（模型由 `--settings` 文件决定，见 §3.2.1）。
+> **v2.1.3 实测修正 / v2.1.5 P0-3 反转**（见附录 A.1 实测）：adapter spawn 用 `claude --bg <prompt> --settings <path>`，**不传 `--bare`**（v2.1.3 以为 --bare 禁 worktree，实测证伪：worktree 由显式 `--worktree` flag 触发，不传即不建；--bare 真实语义是 skip CLAUDE.md/hook/LSP/plugin，会丢项目编码规范）；**不传 `--worktree`**（不建隔离 worktree，bg 直接改主 cwd）；**不传 `--cwd`**（CLI 不支持，cwd 由 `Bun.spawn({cwd})` 控制）；**不传 `--model`**（模型由 `--settings` 文件决定）。v2.1.6：engine 不打 checkpoint、不 spawn 后自检（worktree 不传 --worktree 即不建，无需兜底）。
 
 ```
 src/review/
-├── engine.ts            # 状态机驱动（5 active + 2 trouble[PAUSED/PANE_LOST] + 3 terminals）
+├── engine.ts            # 状态机驱动（5 active + 1 trouble[PANE_LOST] + 3 terminals，v2.1.6 删 PAUSED）
 ├── pipeline-store.ts    # 持久化：5 目录（running / queued / done / failed / aborted）
 ├── pipeline-state.ts    # in-memory active pipeline Map
 ├── profile.ts           # ReviewProfile TOML 加载 + per-phase 深度 merge + provider 校验
 ├── phase-detect.ts      # 启发式：file path -> git ref -> 关键词 -> 文件后缀/行号 -> PhaseUnknownError
-├── adapter.ts           # ClaudeBGAdapter 6 API（startSession / resumeWorkSession / injectReply / poll / stop / isBgAlive，v2.1.4 加）；spawn 用 --bare
+├── adapter.ts           # ClaudeBGAdapter 4 API（startSession / resumeWorkSession / poll / stop）；spawn 不传 --bare/--worktree（v2.1.5 P0-3；v2.1.6 删 isBgAlive）
 ├── model-parser.ts      # parseModelFromRespawnFlags（从 state.json.respawnFlags 读 --model，见 §3.2.1）
 ├── output-contract.ts   # parseBgOutputWithRetry（带 retry 1 次 + timeoutMs）
 ├── cli-watch.ts         # CLI `--watch` 模式（chalk + ANSI）
 ├── review-doctor.ts     # `cc-linker review doctor` 命令
-└── reconciler.ts        # 启动扫描 running/ 恢复 + PAUSED 到点唤醒
+└── reconciler.ts        # 启动扫描 running/ 恢复 + PANE_LOST 24h 超时（v2.1.6 删 PAUSED 唤醒）
 ```
 
 **CLI 子命令注册**：`src/cli/commands/review.ts` 作为 subcommand group 入口（与 `daemon` / `hook` 一致）。
@@ -156,12 +162,15 @@ interface ModelInfo {
 //   -> 找 "--model" 后的值 "glm-5.2[1m]" -> { name:"glm-5.2", contextHint:1_000_000 }
 //   无 --model -> null（报告显示 unknown）
 
-// adapter spawn 契约（实测确定）：
-//   Bun.spawn(["claude","--bg","--bare", prompt, "--settings", settingsPath], { cwd })
-//   - --bare：禁用 worktree，bg 直接在 cwd 主分支改文件（实测：不加 --bare 会自动建隔离 worktree，主 cwd 不被改动）
+// adapter spawn 契约（v2.1.5 P0-3 实测确定）：
+//   Bun.spawn(["claude","--bg", prompt, "--settings", settingsPath], { cwd })
+//   - 不传 --bare：保留 CLAUDE.md/hook/LSP/plugin（项目编码规范不丢）
+//   - 不传 --worktree：worktree 由显式 --worktree flag 触发，不传即不建，bg 直接在 cwd 主分支改文件
+//     （v2.1.3 误以为 --bg 默认建 worktree 需 --bare 抑制--实测证伪，见附录 A.1 H1/H2 修正）
 //   - --settings：决定模型（文件内 ANTHROPIC_MODEL）
 //   - cwd：由 Bun.spawn 的 cwd 选项控制（claude --bg 不接受 --cwd flag，实测 unknown option）
-//   - 不传 --model / --cwd
+//   - 不传 --model / --cwd / --bare / --worktree
+//   - v2.1.6：engine 不打 checkpoint、不 spawn 后自检（worktree 由显式 --worktree 触发，不传即不建，无需自检）
 ```
 
 **settings 路径来源**：复用 `providerManager.resolve(alias).path`（`src/utils/providers.ts`），**不新写 `resolveSettingsPath`**（F9）。
@@ -174,7 +183,7 @@ interface ModelInfo {
 |------|------|
 | **bg session cwd** | `Bun.spawn({cwd})` 的 cwd 选项值；模型 `cat <relative_path>` / `git diff` / `git commit` 都基于此 cwd 解析 |
 | **报告路径 cwd** | 与 bg session cwd 相同（`<cwd>/.claude/reviews/<pipelineId>.md`） |
-| **diff baseline 锚点**（preProduceCheckpointSha / pre-review-fix checkpoint） | 与 bg session cwd 相同（commit 在此 cwd 内） |
+| **回滚锚点**（v2.1.6：engine 不打 checkpoint，回滚靠用户 review 前的 HEAD） | 与 bg session cwd 相同 |
 
 **默认值与覆盖**：
 
@@ -200,26 +209,38 @@ cc-linker review abort <id>
 cc-linker review report <id>    [--format md|json] [--out <file>] [--partial]
 cc-linker review cancel <id>
 cc-linker review skip <id>      [--reason "..."]
-cc-linker review resume <id>    # FAILED network_timeout / PAUSED 限额恢复 后恢复；ABORTED 拒绝（终态不可逆，需 `review run` 重启）
+cc-linker review resume <id>    # 崩溃恢复（engine 死了重新挂载驱动 running/）/ FAILED network_timeout 后恢复；ABORTED 拒绝（终态不可逆，需 `review run` 重启；v2.1.6 删 PAUSED）
+# v2.1.6 删除：cc-linker review cleanup（engine 不打 checkpoint，无需清理；回滚用 git reset --hard <review前的commit>)
 cc-linker review doctor         # 启动前健康检查
 cc-linker review profiles       # 列出 review profiles
 ```
 
 ### 3.4 启动方式
 
+> **v2.1.5 修正 P0-1**：Phase 1 `review run` **fork 一个后台 engine 子进程（长驻）**，而非"一次性前台跑"。这是 G5（可恢复）/ Ctrl-C 后台继续 两项承诺的唯一自洽实现--原 v2.1.3 写"一次性 run"又承诺 Ctrl-C 后台继续 + reconciler 自动唤醒，但 Phase 1 无长驻进程，自相矛盾。（v2.1.6：PAUSED 已删，自动唤醒承诺不再。）
+
 | 命令 | 行为 |
 |------|------|
-| `cc-linker review run <task>` | 一次性跑 pipeline（Phase 1 主力入口） |
-| `cc-linker review status <id> --follow` | 每 500ms 复读 running JSON |
-| `cc-linker review-server` | 长驻 Review Engine（Phase 2） |
-| `cc-linker start` | **不**启动 Review Engine |
+| `cc-linker review run <task>` | **fork 后台 engine 子进程**（写 PID 文件 `~/.cc-linker/review-pipelines/<pipelineId>/engine.pid`），detach 后 engine 长驻驱动状态机 + 跑 reconciler 循环；前台可选 `--watch` attach 看进度，Ctrl-C 仅 detach（pipeline 后台继续）。返回 pipelineId 后立即不阻塞。Phase 1 主力入口 |
+| `cc-linker review status <id> [--follow]` | 读 running JSON；`--follow` 每 500ms 复读 + 渲染（**只读，不驱动状态机**--驱动由后台 engine 负责） |
+| `cc-linker review resume <id>` | 重新挂载并驱动一个 `running/` 中但 engine 已死的 pipeline（**崩溃恢复**）；对 FAILED 也恢复；ABORTED 拒绝（终态不可逆，需 `review run` 重启；v2.1.6 删 PAUSED） |
+| `cc-linker review-server` | 显式启动裸 Review Engine daemon（Phase 2 多 pipeline 调度；Phase 1 由 `review run` 隐式 fork 单 pipeline engine） |
+| `cc-linker start` | **不**启动 Review Engine（bot 与 review engine 共存/配额协调留 Phase 2） |
+
+**后台 engine 生命周期**：
+- `review run` spawn engine 子进程后立即返回 pipelineId，engine 接管状态机推进
+- engine 写 PID 文件；`review abort/stop <id>` 时 SIGTERM engine + cleanup panes
+- engine 进程内常驻 reconciler 循环（每 60s 扫 `running/` 检查 pane 存活 + PANE_LOST 24h 超时，见 §6.4；v2.1.6 删 PAUSED 唤醒）
+- engine 崩溃 -> `running/` 残留 pipeline -> 用户 `review resume <id>` 手动重挂（CLI 不自动推进状态机，见 §6.4）
+- 单 pipeline 单 engine 进程（Phase 1 `max_concurrent_pipelines=1`）；Phase 2 `review-server` 单进程管多 pipeline
+- engine 与 bot 不同时跑（Phase 1 互斥靠用户自律，Phase 2 设计协调机制）
 
 ### 3.5 与现有模块的边界
 
 | 现有模块 | 复用方式 | 新增代码 |
 |---------|-------------|---------|
 | `claude --bg` / `--settings` / `--resume` / `--reply-on-resume` / `stop` / `logs` | adapter 直接 spawn | 0 |
-| `RendezvousClient.injectReply()` | adapter JUDGE/FIXING 注入用 | 0 |
+| ~~`RendezvousClient.injectReply()`~~ | ~~adapter JUDGE/FIXING 注入用~~ | v2.1.5 P1-1 移除（FIXING 改 resumeWorkSession） |
 | `readJobState(shortId)` | engine + adapter + cli-watch 都调 | 0（加类型声明） |
 | `AgentSnapshotFetcher.fetch()` | cli-watch 拉 pane 列表 | 0 |
 | `resolvePeekContent` | cli-watch 拉 pane 详情 | 0 |

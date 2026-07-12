@@ -9,7 +9,7 @@
 ```typescript
 /** Review issue（核心类型，贯穿全流程） */
 interface Issue {
-  id: string;                              // engine 分配的稳定 id（fingerprint 匹配，跨轮不变）
+  id: string;                              // = fingerprint（engine 分配，跨轮稳定）；v2.1.5 P2-8 统一 work+review
   role: 'work' | 'review';                 // 来源角色
   severity: 'P0' | 'P1' | 'P2' | 'P3';    // P0=Critical / P1=High / P2=Medium / P3=Low
   location: string;                        // 文件路径 + 行号
@@ -46,6 +46,7 @@ interface ReviewFixOutput {
   issues: Issue[];                        // 识别出的全部 issues（含 P3）
   perIssue: Array<{
     issueId: string;
+    severity: 'P0' | 'P1' | 'P2' | 'P3';  // v2.1.5 P1-4：内嵌 severity，收敛判定直接用，不反查 issue_id
     verdict: 'real' | 'hallucination';
     verdictReason: string;
     fixApplied: boolean;                  // 是否已修复
@@ -68,15 +69,13 @@ function isClean(issues: Issue[]): boolean {
 ```
 
 ```typescript
-// adapter.poll 检测 state=blocked 时，按 needs/detail 分流（实测 F4）
+// adapter.poll 检测 state=blocked 时（v2.1.6：不再分流，一律 unexpected）
 interface BlockedResult {
-  kind: "rate_limited" | "permission" | "unexpected";
-  resumeAt?: string;   // rate_limited 时：从 detail/needs parse 出的重置时间（ISO）
-  raw: string;         // 原始 needs/detail
+  kind: "unexpected";   // v2.1.6：blocked 一律 unexpected（429/permission/等输入不区分，由 claude code 自身重试）
+  raw: string;          // 原始 needs/detail
 }
-// - needs 含 rate limited/429/使用上限/重置 -> rate_limited（engine 进 PAUSED）
-// - needs 含 permission/allow/denied -> permission（engine ABORTED permission_denied）
-// - 其他 -> unexpected（engine ABORTED unexpected_blocked）
+// - state=blocked -> 一律 unexpected（engine ABORTED unexpected_blocked）
+//   v2.1.6 简化：429 限流由 claude code 自身重试，review engine 不识别 429 / 不进 PAUSED / 不 parse 重置时间
 ```
 
 ### 6.1 PipelineRecord 数据结构
@@ -98,20 +97,17 @@ interface PipelineRecord {
   panes: PaneRegistry;
   history: HistoryEvent[];
   parseDegraded?: ParseDegradedEvent[];
-  /** v2.1.3 P0-1：work produce 完成后，engine 在切到 R1 前打的 git checkpoint。
-   *  R1/R2 prompt 用此 SHA 作为 `git diff <sha>..HEAD` 的基线，
-   *  避免模型在 spec/plan phase 看 work 全部产出 + 用户残留未提交改动。 */
-  preProduceCheckpointSha?: string | null;
+  // v2.1.6：删 preProduceCheckpointSha / preReviewCheckpointSha / HistoryEvent.checkpointSha
+  // -- engine 不打 checkpoint，self_review/review 基于 {task} + 当前代码状态全面 review（模型自己 git diff/git log/cat）
 }
 
 interface PaneRegistry {
   work?: {
     sessionId: string;          // 跨轮不变
     currentRoundShortId?: string;
-    /** v2.1.4：当前轮 work bg 的 OS pid（spawn 时 adapter 记录），用于 P0-4 reconciler 唤醒时 `kill -0` 验证 bg 进程活着 */
-    currentPid?: number;
-    /** v2.1.4：每轮 work bg 的 pid 数组，与 roundShortIds 一一对应 */
-    roundPids?: number[];
+    /** v2.1.5 P0-2：currentPid/roundPids 移除--state.json 无 pid，spawn pid 是 launcher 不可信；liveness 用 currentRoundShortId 读 roster.json workers[short] 实时查 pid */
+    // currentPid?: number;   // v2.1.5 移除
+    // roundPids?: number[];  // v2.1.5 移除
     provider: string;
     startedAt: string;
     roundShortIds: string[];
@@ -120,8 +116,8 @@ interface PaneRegistry {
     role: 'review';
     shortId: string;
     sessionId: string;
-    /** v2.1.4：review bg 的 OS pid（spawn 时记录），用于 P0-4 liveness 检查 */
-    pid?: number;
+    /** v2.1.5 P0-2：pid 移除--liveness 用 shortId 读 roster.json workers[short] 查 pid */
+    // pid?: number;  // v2.1.5 移除
     provider: string;
     round: number;
   };
@@ -150,7 +146,7 @@ interface HistoryEvent {
   outputSizeBytes: number;
   durationMs: number;
   issues?: Issue[];
-  checkpointSha?: string | null;    // v2.1.3：engine 在阶段切换前打的 checkpoint（work FIXING / review EXTERNAL_REVIEW 各一次）
+  // v2.1.6：删 checkpointSha -- engine 不打 checkpoint
 }
 ```
 
@@ -205,7 +201,7 @@ async function transition(pipeline: PipelineRecord, event: EngineEvent): Promise
 
 ### 6.4 Reconciler
 
-**触发时机**：daemon 启动 / 每 60s / daemon crash 后 / 用户手动 `reconcile`。
+**触发时机**（v2.1.5 P0-1 / v2.1.6 简化）：review engine 子进程内**常驻循环**--`review run` fork 的 engine 进程每 60s 调一次 `reconcile()` 扫 `running/` 检查 pane 存活 + PANE_LOST 24h 超时。CLI 命令**不驱动状态机**（避免与后台 engine 双驱动冲突）：任意 `review` CLI 命令启动时只读 `engine.pid` + `kill -0` 判 engine 活否--活着则不干预；死了则提示用户 `review resume <id>` 重挂，**不自动调 reconcileInternal 推进**。不再依赖外部"daemon 启动"（Phase 1 无独立 review daemon；Phase 2 `review-server` 才是独立常驻进程）。
 
 ```typescript
 async function reconcile(): Promise<ReconcileResult> {
@@ -225,11 +221,10 @@ async function reconcile(): Promise<ReconcileResult> {
 | running/ + 所有 pane 活着 | 继续推进 |
 | running/ + 部分 pane 消失 | **PANE_LOST** + 用户决策 |
 | PANE_LOST 24h 超时 | cleanup → ABORTED |
-| running/ + state=PAUSED + resumeAt 已到 | **唤醒前校验**（v2.1.4 P0-4）：对每个 pauseHistory 项依次做：(1) `kill -0 bgPid` 验证 bg 进程还活着 → 失败走 **PANE_LOST**（state.json 可能冻结了，不是真 PAUSED）；(2) `readJobState` → null 或 state=failed 走 **PANE_LOST**；(3) state=blocked + needs 仍含 rate_limited → 推迟唤醒（`resumeAt = max(原, 新)`）；(4) 其余 → 回到 pausedFrom 继续 poll 同一 bg |
-| running/ + state=PAUSED + resumeAt 未到 | 跳过（等下次轮询，间隔 `rate_limit_resume_poll_interval_ms`） |
+
 
 > **v2.1.3 删除**：`human_pending/` 目录扫描 + HUMAN_DECIDE 4h 超时行（HUMAN_DECIDE 移除，无 human_pending 目录）；review opinions 文件恢复增强（review opinions 落盘整组移除，review findings 直接从 review pane 的 `state.json.output` 解析入 history）。
-> **v2.1.4 强化 P0-4**：PAUSED 唤醒--reconciler 每 `rate_limit_resume_poll_interval_ms`（默认 60s）扫描 running/ 中 state=PAUSED 的 pipeline，resumeAt 已到则逐 pauseHistory 项 **校验 bg 进程活着 + state 有效**：`kill -0 bgPid` 失败（bg 进程死了，state.json 冻结）→ **PANE_LOST**；`readJobState` 返回 null/failed → **PANE_LOST**；state=blocked + needs 仍含 rate_limited → 推迟唤醒（限额又触发了，update resumeAt）；其余 → 回到 pausedFrom 继续 poll（bg 进程活着、保持 blocked，唤醒后自然推进）。PAUSED 态不占新 bg，不消耗配额。
+> **v2.1.6 删除**：PAUSED 态 + pauseHistory + reconciler 到点唤醒 + liveness 检查整组移除（429 简化为 blocked 一律 ABORTED，详见状态机 §4.3/§5.1 + 附录 C.9）。reconciler 现只处理 PANE_LOST 24h 超时 + pane 存活检查。
 
 **实施备注（v2.1.3 补充）**：
 
@@ -237,17 +232,43 @@ async function reconcile(): Promise<ReconcileResult> {
 
 2. **FIXING 幂等匹配规则**：`source + inputIssues` 都匹配的判定：
    - `source` 必须完全相等（`'SELF_REVIEW_R1'` 或 `'SELF_REVIEW_R2'`）
-   - `inputIssues` 用**有序指纹数组比较**：对每个 issue 计算 `fingerprint = SHA256(role:severity:location:description).slice(0,8)`（见 §6.0 Issue.fingerprint），按 array index 顺序比较所有 fingerprint 全等才认为匹配
+   - `inputIssues` 用**无序指纹集合比较**（v2.1.5 P2-4：原有序数组比较在模型重排 issues 顺序时误判为新 FIXING）：对每个 issue 计算 `fingerprint = SHA256(role:severity:location:description).slice(0,8)`，用 Set 比较（两集合大小相同 + 每个元素都在对方集合中）才认为匹配
    - 任一不匹配 → 视为新 FIXING（不跳过，正常推进）
 
-3. **review Issue ID 分配规则**：`ReviewFixOutput.issues[].id` 由 review 模型自己生成（engine 不预分配）。生成规则写进 `prompts.review.code.system`：
-   - format: `{role}:{severity}:{location}:{description}` 的 SHA256 前 8 位（hex），role 固定 `'review'`
-   - `per_issue[].issueId` 必须对应 `issues[].id`（engine 据此反查 severity 用于 `isClean` 与 `externalReviewConverges` 判定，见 §5.4.2）
-   - engine parse 失败时 fallback：自动重算 fingerprint 对应 `issueId`
+3. **Issue ID 分配规则**（v2.1.5 P1-4 + P2-8 统一）：work + review 的 `Issue.id` **统一由 engine 用 fingerprint 分配**（`SHA256(role:severity:location:description)` 前 8 位），模型**不生成 id**。模型只输出 severity/location/description，engine 收到后算 fingerprint 填 id。
+   - review 模型 `per_issue[]` 用 `issueId` 引用 engine 分配的 id（engine 先建 issues[].id 再 match per_issue）
+   - `externalReviewConverges` 用 `per_issue.severity` 判定（v2.1.5 P1-4 内嵌），不反查 issue_id，避免模型 id 拼错假收敛
+   - engine parse 时若 per_issue.issueId 对不上 issues[].id，按数组顺序对齐 fallback；对不上的项保守视为 real+blocking（不收敛）
 
 **PANE_LOST retry**：
 - review pane 丢失 → 重新 spawn
 - work pane 丢失 → spawn 新 work session + 回到 R1 entry（检查 max_rounds）
+
+### 6.4.1 `review resume <id>` 重挂流程（v2.1.5 P1-5）
+
+engine 崩溃后 `running/` 残留 pipeline，`review resume <id>` 重新挂载并驱动。流程：
+
+1. **校验 engine 死了**：读 `engine.pid`，`kill -0` 失败（或 PID 已被无关进程复用，见 §6.4.2）才允许 resume；engine 还活着则提示"已在跑，用 `status --follow` 查看"拒绝。
+2. **读 PipelineRecord.state**：确定当前 ReviewState + 当前 pane 的 shortId（`panes.work.currentRoundShortId` 或 `panes.review.shortId`）。
+3. **探测 bg 当前态**（resume 的关键--engine 死期间 bg 在 daemon 下继续跑可能已变）：
+   - `readJobState(shortId)` -> null/failed/stopped = bg 死 -> **PANE_LOST**
+   - state=`done` -> bg 已完成、engine 没来得及 emit -> 直接 emit 对应完成事件推进状态机（如 work done -> 进 R1，v2.1.6 不打 checkpoint）
+   - state=`blocked` -> ABORTED `unexpected_blocked`（v2.1.6：blocked 一律 abort，不区分 429）
+   - state=`running`/`working` -> 续 poll 同一 shortId
+4. **fork 新 engine 子进程**接管：新 engine 进程内长驻循环续跑状态机 + 60s reconcile，写新 `engine.pid`。
+
+> resume 只对 `running/` 中的 pipeline；`done/`/`failed/`/`aborted/` 拒绝（终态不可逆）。FAILED 状态的 running/ pipeline 也可 resume（重试网络类瞬态错误）。
+
+### 6.4.2 engine.pid PID 复用风险（v2.1.5 P1-5）
+
+engine 崩溃后 pidfile 残留，OS 可能把同一 PID 分配给无关进程 -> `review abort/resume` 的 SIGTERM 误杀无辜。
+
+**缓解**：pidfile 写 `{ pid, startTime }`（startTime = engine 进程启动 wall-clock）。SIGTERM/`kill -0` 前先校验进程身份：
+- macOS/Linux：读 `/proc/$pid/stat`（Linux）的 start time，或 `ps -o lstart= -p $pid`（macOS）比对 startTime
+- 不匹配（PID 被复用）= 原 engine 已死，视为"engine 死了"走 resume/abort 的"无 engine"分支，**不**对 $pid 发信号
+- 匹配才 SIGTERM
+
+> Phase 1 可先用简化版（`ps -o command= -p $pid` 含 `cc-linker`/`review` 字样才认），Phase 3 升级 startTime 严格比对。
 
 ### 6.5 并发控制
 
@@ -284,6 +305,7 @@ async function reconcile(): Promise<ReconcileResult> {
 3. `Promise.allSettled(paneShortIds.map(shortId => adapter.stop(shortId)))`
 4. 通知 cli-watch 客户端
 5. 关闭文件锁 + 清理 in-memory state
+6. **SIGTERM engine 子进程**（v2.1.5 P0-1：若 engine 还活着，读 `engine.pid` 发 SIGTERM，等 3s 不退 SIGKILL）+ 删 `engine.pid`
 
 ---
 
@@ -313,8 +335,7 @@ max_concurrent_pipelines = 1
 # parse retry
 parse_retry_timeout_ms = 15000
 
-# 429 限额挂起（v2.1.3 新增 PAUSED 态）
-rate_limit_resume_poll_interval_ms = 60000   # PAUSED 态 reconciler 检查 resumeAt 的轮询间隔
+# v2.1.6 删除：rate_limit_resume_poll_interval_ms / rate_limit_fallback_interval_ms（PAUSED 态移除，429 一律 ABORTED）
 
 # Phase 3 预留（当前 engine 未消费，实施时可忽略）
 # max_token_in = 500000                # 单 pipeline input token 上限
@@ -322,7 +343,7 @@ rate_limit_resume_poll_interval_ms = 60000   # PAUSED 态 reconciler 检查 resu
 # api_rate_limit_strategy = "backoff"  # "backoff" | "fail-fast"
 # api_rate_limit_429_backoff_ms = [2000, 4000, 8000, 16000]
 
-# 模型 context 上限覆盖（v2.1.3：仅供报告展示，不再用于阈值检测）
+# 模型 context 上限覆盖（v2.1.3：仅供报告展示，不驱动任何逻辑；v2.1.5 P3-5：与 parseModelFromRespawnFlags 的 contextHint 冲突时以 respawnFlags 为准）
 [context_limits]
 "claude-sonnet-4-5" = 1000000
 "kimi-for-coding" = 256000
@@ -340,8 +361,8 @@ template = """
 操作步骤（P1-2，**严格按序执行，不要跳步**）：
 1. **理解任务**：读 `{task}`（如果是路径，先 `cat <cwd>/<task>`；如果是 1 句话需求，直接读）
 2. **定位上下文**（code phase 必走）：
-   - `git -C <cwd> status --porcelain` 看工作区
    - `git -C <cwd> log -5 --oneline` 看最近 commit 历史
+   - `git -C <cwd> diff HEAD~3` 看近期改动（P1-3 强制 clean tree，工作区无 WIP）
    - 如果 task 提到具体文件/函数/错误：`find <cwd> -name '<pattern>'` + `cat <相关文件>`
    - 如果 task 是 bug 类（"fix NPE in auth.ts"）：`cat <cwd>/auth.ts` + 跑测试复现
 3. **撰写产出**（按 phase）：
@@ -351,7 +372,7 @@ template = """
 4. **输出**：对 code phase 简述改了哪些文件 + 测试结果；对 spec/plan phase 写完整文档
 
 约束：
-- 不要执行任何 git 操作（commit/stash 全部由 engine 管理）
+- 不要执行 git commit/stash（v2.1.6：engine 也不碰 git，改动直接落你当前分支；回滚由用户用 review 前的 HEAD）
 - cwd 是 `Bun.spawn({cwd})` 控制的，与 `process.cwd()` 一致
 """
 
@@ -360,24 +381,27 @@ template = """
 你是工作模型，对自己的产出做自查（identify only，不要修改文件）。
 需求基准（spec/plan 或需求描述）：{task}
 
-请先 cat 上述 spec/plan 理解需求，再用以下命令查看 work 本轮的全部改动（**不要**自由选 diff 范围，必须用此基线）：
-  git -C <cwd> diff {pre_produce_checkpoint_sha}..HEAD
+请先 cat 上述 spec/plan 理解需求，再用以下命令查看当前代码/产出状态（自己决定查看范围，全面审查）：
+  - git -C <cwd> log -5 --oneline   # 看最近改动历史
+  - git -C <cwd> diff HEAD~N        # 看本轮 produce/fix 的改动（N 自行判断，覆盖本轮所有改动）
+  - cat <相关文件>                  # 按需读文件确认
 
-（pre_produce_checkpoint_sha 是 engine 在你 produce 完成后打的 git checkpoint，作为 diff 基线。
- 非 git repo 或 checkpoint 为 null 时：git diff HEAD 看 work + 用户所有未提交改动，自己判断 work 改动 vs 用户改动。）
+（v2.1.6：engine 不打 checkpoint、不注入 diff baseline。你基于需求 {task} + 当前代码状态全面 review，
+ 自己 git diff/git log/cat 查看本轮所有改动。非 git repo 时直接读文件比对。）
 
 判断改动是否符合需求、有无 bug，识别问题（不要修改文件）。
 
 {r1_or_r2_instruction}
 
-输出 JSON: { "issues": [{ "id","severity","location","description" }], "unfixed_count": N }
+输出 JSON:
+{ "issues": [{ "severity","location","description" }] }
 """
+# v2.1.5 P2-7：删 unfixed_count（identify-only 无"未修复"概念）；P2-8 issues 不输出 id（engine fingerprint 分配）
 # {r1_or_r2_instruction} 在 engine 端替换：
-# R1 initial:  "第一次自查，全面审查"
-# R2 initial:  "审查修复后的状态"
-# R1 postfix:  "postfix 循环：复查上一轮 external review 的修复"
-# R2 postfix:  "审查 postfix 修复后的状态"
-# {pre_produce_checkpoint_sha} 在 engine 端替换为 PipelineRecord.preProduceCheckpointSha，null 时降级为 HEAD
+# R1 initial:  "第一次自查，全面审查产出是否符合需求"
+# R2 initial:  "审查修复后的整体状态是否符合需求、有无新问题"
+# R1 postfix:  "postfix 循环：全面复查上一轮 external review 修复后的整体状态"
+# R2 postfix:  "审查 postfix 修复后的整体状态"
 
 [prompts.work.fixing.system]
 template = """
@@ -390,13 +414,13 @@ template = """
 2. 修复（仅 real），修改要最小化
 3. 验证修复正确
 
-直接在当前分支改文件，不要做 git 操作（checkpoint 由 engine 管理）。
+直接在当前分支改文件，不要做 git 操作（v2.1.6：engine 不打 checkpoint，改动直接落用户分支）。
 
 输出 JSON:
 { "per_issue": [...], "all_real_fixed": bool, "remaining_real_unfixed_count": N }
 """
 
-# v2.1.3：删 prompts.work.fixing.preamble -- checkpoint 由 engine 在 injectReply FIXING 前自己打
+# v2.1.6：engine 不打 checkpoint（删 preamble 体系）；FIXING 改 resumeWorkSession（v2.1.5 P1-1）
 # v2.1.3：删 prompts.work.judge.system（JUDGE_BY_WORK 移除）
 
 [prompts.review.code.system]
@@ -404,11 +428,13 @@ template = """
 你是外部 Review 模型，对工作模型的产出做交叉评审并**直接修复**（v2.1.3：review 既审又修）。
 需求基准（spec/plan 或需求描述）：{task}
 
-请先 cat 上述 spec/plan 理解需求，再用以下命令查看 work 本轮的完整改动（**不要**自由选 diff 范围，必须用此基线）：
-  git -C <cwd> diff {pre_review_checkpoint_sha}..HEAD
+请先 cat 上述 spec/plan 理解需求，再用以下命令查看当前代码/产出状态（自己决定查看范围，全面审查）：
+  - git -C <cwd> log -5 --oneline   # 看最近改动历史
+  - git -C <cwd> diff HEAD~N        # 看本轮 work produce + fix 的全部改动（N 自行判断）
+  - cat <相关文件>                  # 按需读文件确认
 
-（pre_review_checkpoint_sha 是 engine 在 spawn review 前打的 git checkpoint。
- 非 git repo 或 checkpoint 为 null 时：git diff HEAD 看 work 全部产出，自己判断。）
+（v2.1.6：engine 不打 checkpoint、不注入 diff baseline。你基于需求 {task} + 当前代码状态全面 review，
+ 自己 git diff/git log/cat 查看本轮所有改动。非 git repo 时直接读文件。）
 
 Severity 判定标准（per phase，P1-1）：
 - **spec phase**：P0=需求理解错误/与相邻 spec 段落严重矛盾；P1=语义不清/缺关键边界 case；P2=格式错误/术语不一致；P3=小瑕疵
@@ -424,20 +450,17 @@ Severity 判定标准（per phase，P1-1）：
    - code phase：跑测试 + 检查边界 case
 4. P3 问题可修可不修（不阻塞收敛，由你判断性价比）
 
-直接在当前分支改文件，不要做 git 操作（checkpoint 由 engine 管理）。
+直接在当前分支改文件，不要做 git 操作（v2.1.6：engine 不打 checkpoint，改动直接落用户分支）。
 
 输出 JSON:
 {
-  "issues": [{ "id", "severity", "location", "description", "suggestion" }],
-  "per_issue": [{ "issue_id", "verdict": "real"|"hallucination", "verdict_reason", "fix_applied": bool, "fix_summary"? }],
+  "issues": [{ "severity", "location", "description", "suggestion"? }],
+  "per_issue": [{ "issue_id", "severity", "verdict": "real"|"hallucination", "verdict_reason", "fix_applied": bool, "fix_summary"? }],
   "reasoning": "..."
 }
 """
-# spec/plan phase 用 prompts.review.spec.system / prompts.review.plan.system，结构同上（{task} + pre_review_checkpoint_sha + 直接修 + per-phase verify 标准）
-# P1-3 验证：work 这一轮的产出确实与 {task} 描述的需求一致——比如 task 说"fix NPE"，work 应该修了 NPE 那个文件/函数，而不是其他无关改动
-# {pre_review_checkpoint_sha} 在 engine 端替换为 engine 在 EXTERNAL_REVIEW 前打的 checkpoint SHA（写入 HistoryEvent.checkpointSha，pre-review-fix 标识），null 时降级为 HEAD
-
-# v2.1.3：删 prompts.review.code.preamble -- checkpoint 由 engine 在 spawn review 前自己打
+# 注：issues / per_issue 均不输出 id 字段（v2.1.5 P2-8：id 由 engine 用 fingerprint 分配）；per_issue 内嵌 severity（v2.1.5 P1-4：收敛判定直接用，不反查 issue_id）
+# spec/plan phase 用 prompts.review.spec.system / prompts.review.plan.system，结构同上（{task} + 当前状态全面 review + 直接修 + per-phase verify 标准）
 
 [phase_overrides.code]
 review.provider = "kimi-for-coding"
@@ -447,25 +470,24 @@ guards.max_rounds = 6
 > **v2.1.3 prompt 变更**：
 > - 删 `prompts.work.judge.system`（JUDGE_BY_WORK 移除）
 > - 删 `prompts.work.compact_continue.system`（cascade 移除）
-> - 删 `prompts.work.fixing.preamble` + `prompts.review.code.preamble` -- **checkpoint 改由 engine 在阶段切换前自己打**（实测模型 git commit 行为不可控：会自建分支/worktree、commit message 乱来），模型只管改文件、不碰 git
-> - `prompts.work.self_review.system` + `prompts.review.code.system` 统一用 `{task}`（spec/plan 或需求文本）作需求基准，模型自己 cat + 自选 `git diff` 范围，**engine 不构造 `{artifact}`**（删 per-phase artifact 构造逻辑）
+> - 删 `prompts.work.fixing.preamble` + `prompts.review.code.preamble` -- **v2.1.6：engine 完全不打 checkpoint**（原 v2.1.3 改由 engine 打，v2.1.6 进一步删除：基于 {task}+当前状态全面 review，无需 diff baseline 锚点），模型只管改文件、不碰 git
+> - v2.1.6：`prompts.work.self_review.system` + `prompts.review.code.system` 统一为"基于 {task} + 当前代码状态全面 review"，模型自己 `git diff`/`git log`/`cat` 查看本轮改动，**engine 不打 checkpoint、不注入 diff baseline SHA、不构造 artifact**
 > - `prompts.work.fixing.system` 去掉 @file 引用，改回 inline `{input_issues}`，加 `{task}` 上下文
 > - `prompts.review.code.system` 从"只识别 issues"升级为"识别 + 确认 + 直接修 + verify"，输出 JSON 删 `checkpoint_sha`（engine 持有，不依赖模型自报）
-> - 两类 checkpoint SHA（work `pre-fix` / review `pre-review`）由 engine 打，写入 `HistoryEvent.checkpointSha`，报告区分
+> - v2.1.6：删两类 checkpoint SHA（engine 不打），`HistoryEvent.checkpointSha` 字段移除
 
-### 7.2.1 engine checkpoint 边界 case
+### 7.2.1 改动落盘与回滚（v2.1.6 重写）
 
-> v2.1.3：checkpoint 由 **engine** 在每个阶段切换前打（work FIXING 前一次、review EXTERNAL_REVIEW 前一次），模型不做 git 操作。engine 跑 `git -C <cwd> add -A && git commit -m "pre-<stage> checkpoint by review engine"`，捕获 SHA 写入 `HistoryEvent.checkpointSha`。
+> v2.1.6：engine **不打 git checkpoint**。work FIXING 与 review EXTERNAL_REVIEW 的改动直接落用户原开发分支（不传 `--worktree`）。回滚靠用户跑 review 前的 HEAD（P1-3 强制 clean tree 保证 HEAD 干净）。
 
 | 场景 | 处理 |
 |------|------|
-| cwd 不是 git 仓库 | 跳过 checkpoint，`checkpointSha: null`，报告标注"非 git repo，改动无回滚锚点" |
-| 工作区有用户未提交改动 | engine 先 `git stash`（保护用户改动）再打 checkpoint，阶段结束不自动 pop（用户手动 pop） |
-| commit 失败 | `checkpointSha: null` + warn，阶段继续（改动仍可 `git diff` 查看，只是无回滚锚点） |
-| 非 `--bare` 误用导致 worktree | 不会发生--adapter 强制 `--bare`，doctor 校验 |
-| **preProduce checkpoint 时 cwd 为空 git repo** | `preProduceCheckpointSha: null`，R1/R2 prompt 降级用 `git diff HEAD`（此时 work 全部产出 + 用户残留改动混在一起，模型自己判断） |
-| **preProduce checkpoint 时 work 没产生任何文件改动** | `preProduceCheckpointSha` 仍写入（空 commit 也行），R1/R2 prompt `git diff <sha>..HEAD` 输出为空——表示 work 这一轮无产出，触发 F5 处理（spec phase 除外，spec/plan 必有文件改动） |
-| **R1/R2 prompt 中 preProduceCheckpointSha 为 null**（非 git repo）| R1/R2 prompt 显式降级：`git diff HEAD`，标注"无 checkpoint 基线，自己判断 work 改动 vs 用户改动" |
+| 改动落盘 | bg 直接在用户原分支改文件，`git diff` / `git log` 可见全部改动 |
+| 回滚到 review 前 | 用户跑 review 前的 HEAD 即天然回滚点：`git reset --hard <review前的commit>`（P1-3 强制 clean tree 保证 HEAD 干净，无 WIP 丢失风险） |
+| cwd 不是 git 仓库 | 改动直接落 cwd 文件，无 git 历史；报告标注"非 git repo，无回滚锚点，改动直接落盘" |
+| 工作区有未提交改动（v2.1.5 P1-3）| doctor 启动时校验 `git status --porcelain` 为空，有改动则**报错拒绝启动**--engine 不自动 stash |
+| worktree 误建 | 不会发生--adapter 不传 `--worktree`（worktree 由显式 flag 触发） |
+| 模型自选 diff 看漏改动 | prompt 明确要求 `git log` + `git diff HEAD~N` 覆盖本轮所有改动；work postfix R1 全面复查兜底 |
 
 ### 7.3 per-phase 深度 merge 规则
 
@@ -514,7 +536,7 @@ async function resolveSettingsPath(providerAlias: string): Promise<string> {
 ```typescript
 function extractJsonBlock(output: string): unknown {
   // 策略 1: ```json ... ``` markdown fence
-  // 策略 2: 最后一个 { ... } 块
+  // 策略 2: 括号深度匹配取最后一个完整 {...}（v2.1.5 P2-5：原"最后一个 {…} 块"用正则会被嵌套花括号搞错，review 输出 JSON 含嵌套对象；改用 depth counter 从最后一个 '{' 起扫描匹配 '}'）
   // 策略 3: 直接 JSON.parse
 }
 ```
@@ -527,8 +549,7 @@ const SelfReviewOutputSchema = z.object({
     severity: z.enum(['P0', 'P1', 'P2', 'P3']),
     location: z.string(),
     description: z.string(),
-  })),
-  unfixed_count: z.number(),
+  })),  // v2.1.5 P2-7：删 unfixed_count（self_review identify-only 无"未修复"概念）；P2-8 id 由 engine fingerprint 分配
 });
 
 const FixingOutputSchema = z.object({
@@ -545,14 +566,15 @@ const FixingOutputSchema = z.object({
 
 const ReviewOutputSchema = z.object({
   issues: z.array(z.object({
-    id: z.string(),
+    // v2.1.5 P2-8：id 由 engine fingerprint 分配，模型不输出；schema 不要求 id
     severity: z.enum(['P0', 'P1', 'P2', 'P3']),
     location: z.string(),
     description: z.string(),
     suggestion: z.string().optional(),
   })),
   per_issue: z.array(z.object({
-    issue_id: z.string(),
+    issue_id: z.string(),   // engine 分配后回填
+    severity: z.enum(['P0', 'P1', 'P2', 'P3']),  // v2.1.5 P1-4：内嵌，收敛判定用
     verdict: z.enum(['real', 'hallucination']),
     verdict_reason: z.string(),
     fix_applied: z.boolean(),
@@ -563,6 +585,8 @@ const ReviewOutputSchema = z.object({
 ```
 
 > **v2.1.3 schema 变更**：删 `JudgeOutputSchema`（JUDGE_BY_WORK 移除）；`ReviewOutputSchema` 从"只输出 issues"升级为"issues + per_issue(含 fix_applied) + reasoning"（review 既审又修，删 checkpoint_sha--engine 打）。`SelfReviewOutputSchema` / `FixingOutputSchema` 保持不变。
+>
+> **v2.1.5 P1-7 命名约定**：JSON wire 格式（模型输出 + state.json）= **snake_case**（`issue_id` / `verdict_reason` / `fix_applied`）；TS 内存类型 = **camelCase**（`issueId` / `verdictReason` / `fixApplied`，见 §6.0 `ReviewFixOutput.perIssue`）。engine 在 `parseBgOutputWithRetry` parse 后做一次 snake->camel 转换（Zod 的 `transform` 或显式 map）。`Issue.id` / `severity` / `location` / `description` 两边同名无需转换。
 
 #### 7.5.4 Parse 失败处理
 
@@ -573,7 +597,7 @@ async function parseBgOutputWithRetry<T>(
   opts: ParseRetryOptions,
 ): Promise<ParseResult<T>> {
   // 第 1 次 parse
-  // 失败 → retry 1 次（注入 retry prompt，等 bg 重生成，timeoutMs 默认 15s）
+  // 失败 -> retry 1 次（resumeWorkSession 重生成，timeoutMs 默认 15s）
   // 仍失败 → 返 ok:false + parseDegraded:true
 }
 ```
@@ -584,7 +608,7 @@ async function parseBgOutputWithRetry<T>(
 |------|------------|
 | Review pane parse 失败（EXTERNAL_REVIEW） | retry → 仍失败 → `parse_degraded: true` + **ABORTED**（review 既审又修，parse 失败无法判断是否已改代码，不能静默 DONE）|
 | Work R1/R2 parse 失败 | retry → 仍失败 → ABORTED `r1_parse_degraded`（不静默 DONE） |
-| FIXING parse 失败 | retry → 仍失败 → 视为 all_real_fixed=true（保守推进到 R2/EXTERNAL_REVIEW 复查） |
+| FIXING parse 失败 | retry → 仍失败 → 视为 all_real_fixed=true（保守推进到 R2 全面复查；v2.1.6：R2 基于当前代码状态全面 review，能兜住 FIXING 改坏的问题） |
 
 > **v2.1.3 变更**：删 JUDGE parse 失败行（JUDGE_BY_WORK 移除）；Review pane parse 失败从"排除该 review"升级为 ABORTED——因为 review 现在会直接改代码，parse 失败时无法确认 review 是否已落盘修改，静默推进会让未验证的改动混入产物。
 
@@ -643,7 +667,12 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
     if (/\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|swift|kt)$/.test(input.filePath)) return 'code';
   }
 
-  // 优先级 4: 关键词匹配
+  // 优先级 4: 关键词匹配（v2.1.5 P2-3 加中文，飞书中文用户输入不再必 throw）
+  // 中文关键词（cc-linker 面向飞书中文用户，英文不匹配时兜底）
+  if (/(需求|规格|PRD|规格说明书)/.test(input.rawInput)) return 'spec';
+  if (/(设计|架构|方案|实现方案|技术方案)/.test(input.rawInput)) return 'plan';
+  if (/(修|修复|改|重构|实现|优化|bug|崩溃|报错|异常)/.test(input.rawInput)) return 'code';
+  // 英文关键词
   if (/\b(spec|specification|requirements|PRD)\b/i.test(input.rawInput)) return 'spec';
   if (/\b(plan|design|architecture|implementation\s+plan)\b/i.test(input.rawInput)) return 'plan';
   if (/\b(fix|bug|refactor|implement|code|NPE|crash|error)\b/i.test(input.rawInput)) return 'code';
@@ -667,22 +696,20 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
 | JSON parse 失败 | retry 1 次 -> parse_degraded |
 | max_rounds 达到 | ABORTED |
 | review pane parse 失败 | retry -> 仍失败 -> ABORTED（review 已改代码，不能静默推进，详见 §7.5.4） |
-| 429 限额耗尽（blocked + needs rate limited） | PAUSED（parse 重置时间，reconciler 到点唤醒，详见 §5/§6.4） |
-| blocked + needs permission/allow | ABORTED `permission_denied`（--bare 无 permission 通道） |
-| blocked + needs 其他 | ABORTED `unexpected_blocked`（review engine 无交互通道） |
+| bg blocked（含 429 限流长 blocked / permission / 等输入） | ABORTED `unexpected_blocked`（v2.1.6：blocked 一律 abort；429 由 claude code 自身重试，长 blocked 才到此；详见 §4.3） |
 | bg spawn 无效选项（如 `--cwd`） | FAILED（state=failed，实测 exit 1 before init） |
 
 > **v2.1.3 删除**：`Context window 超限`（cascade 整组移除，裸奔）+ `Review opinions 写文件失败`（落盘整组移除）+ `cost 超 max_cost_usd`（成本统计整组移除）三行。
-> **v2.1.3 新增**：429 限额耗尽 -> PAUSED（国产模型周/月限额常态，实测）；blocked 分流（permission/unexpected -> ABORTED）；spawn 无效选项 -> FAILED（实测 `--cwd` 不可用）。
+> **v2.1.3 新增（v2.1.6 简化）**：原 429 -> PAUSED + blocked 三分流（rate_limited/permission/unexpected）简化为 **blocked 一律 ABORTED unexpected_blocked**（429 由 claude code 自身重试，详见 §4.3/附录 C.9）；spawn 无效选项 -> FAILED（实测 `--cwd` 不可用）。
 
 ### 10.2 修复者不变量（v2.1.3 重写）
 
 > 原 §10.2 "cascade 模式约束"（compact/reset 共享的 3 不变量）随 cascade 移除。v2.1.3 下不变量简化为：
 
 1. **work 是自查自修的修复者**（R1/R2 -> FIXING，sessionId 跨轮不变）
-2. **review 是外审+外修的修复者**（EXTERNAL_REVIEW 内 review 模型直接改代码，每轮新 session；checkpoint 由 engine 打）
+2. **review 是外审+外修的修复者**（EXTERNAL_REVIEW 内 review 模型直接改代码，每轮新 session；v2.1.6：engine 不打 checkpoint，改动直接落用户分支）
 3. **跨模型校验靠 postfix 复查闭环**：review 修完 -> work 下一轮 R1 复查 review 改动；verify-first 在两处都生效（work FIXING + review EXTERNAL_REVIEW）
-4. **work/review 都用 `--bare` 在原开发分支改文件**，不建 worktree；engine 用 git checkpoint 隔离各阶段改动
+4. **work/review 都不传 `--worktree`（不建 worktree）在原开发分支改文件，保留 CLAUDE.md/hook/LSP**；v2.1.6：engine 不打 checkpoint，改动直接落用户分支，回滚靠 review 前 HEAD
 
 ### 10.3 Graceful degradation vs fail fast
 
@@ -698,7 +725,7 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
 > Review Engine 不复用 ClaudeSessionManager（后者是 Feishu 通道的），自建两层 retry：
 
 ```typescript
-// Layer 1: parseBgOutputWithRetry（§7.5.4）— JSON parse 失败重试 1 次（injectReply 重生成；v2.1.3：injectReply 仅 work FIXING 用）
+// Layer 1: parseBgOutputWithRetry（§7.5.4）- JSON parse 失败重试 1 次（resumeWorkSession 重生成；v2.1.5 P1-1：FIXING 改 resumeWorkSession，injectReply 退场）
 // Layer 2: adapter 网络重试 — 503/502/timeout 重试 3 次，backoff 2s/4s/8s
 // Layer 3: engine 级重试 — PANE_LOST → user retry → respawn（§5.3.3）
 ```

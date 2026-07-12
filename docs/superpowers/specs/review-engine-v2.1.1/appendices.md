@@ -19,6 +19,8 @@
 
 **结论**：`claude --bg` + `--settings` + `--resume --reply-on-resume` + `stop` + `logs` + `state.json` 全链路可用。直接 `--resume` 在 running bg 上不可用，必须用 daemon rendezvous 协议。
 
+> **v2.1.5 P3-2 注：本节 stale，已被附录 A.1 H7（2026-07-12 实测 `output: { result: string }` 无 cost_usd）覆盖，保留作追溯**
+>
 > **v2.1.2 修正（P1-10）：`state.json.output` 格式待实测确认**
 >
 > §7.5.1 声称 `state.json.output` 是 `{ result: string }` 对象，但 Claude CLI 不同版本的 output 格式可能不同：
@@ -40,41 +42,44 @@
 
 | # | 实测项 | 命令/操作 | 结果 | 设计约束 |
 |---|---|---|---|---|
-| H1 | **bg 默认建隔离 worktree** | `claude --bg "fix bug" --settings <p>` 在 git repo 内 | 改动落在 `.claude/worktrees/<name>` + `worktree-<name>` 分支，**主 cwd 不被改动**，主 `git diff` 为空 | adapter 必须 `--bare` 禁 worktree（否则 review 改动 work 看不到，闭环断） |
-| H2 | **`--bare` 禁 worktree** | `claude --bg --bare "fix bug" --settings <p>` | 改动直接落主 cwd，`git diff` 可见，不建 worktree | adapter spawn 统一加 `--bare` |
+| H1 | **bg 默认建隔离 worktree** -- v2.1.5 实测证伪 | `claude --bg "fix bug" --settings <p>` 在干净 git repo（无 CLAUDE.md/hook） | **不建 worktree**：worktree list 只有主目录、无 .claude/worktrees、state.json.cwd=主 cwd、改动落主 cwd（2026-07-12 隔离实测） | worktree 由显式 `--worktree` flag 触发，不传即不建；v2.1.3 H1 是特定环境（cc-linker+superpowers 插件）误判 |
+| H2 | **`--bare` 禁 worktree** -- v2.1.5 修正因果 | `claude --bg --bare "fix bug" --settings <p>` | --bare 真实语义（claude --help）：skip hooks/LSP/plugin sync/CLAUDE.md auto-discovery；与 worktree 无关 | adapter **不传 --bare**（保留 CLAUDE.md/hook/LSP），不传 --worktree 即不建 worktree；详见 §3.2.1 |
 | H3 | **`--cwd` 不可用** | `claude --bg "..." --cwd /path` | `state=failed`，`detail: "exit 1 before init - error: unknown option '--cwd'"` | cwd 由 `Bun.spawn({cwd})` 控制，不传 `--cwd` |
 | H4 | **模型由 settings 决定** | `claude --bg "..." --settings glm-5.2.json`（不传 --model） | `respawnFlags` 自动含 `--model glm-5.2[1m]`（CLI 从 settings 解析） | engine 只传 `--settings`，不传 `--model` |
 | H5 | **providerEnv 不可信** | 读 `state.json.providerEnv.ANTHROPIC_MODEL` | 显示 `MiniMax-M3[1m]`（base env 占位），与实际跑的 `glm-5.2` 不符 | 模型名从 `respawnFlags` 的 `--model` 取，不从 providerEnv |
 | H6 | **无 cost_usd** | cat done state.json | 顶层无 `cost_usd`，`output.result` 是纯文本回复，仅有粗 `tokens` 总数 | 删成本统计（无可靠来源）；`max_cost_usd` 护栏不可行 |
 | H7 | **`output.result` = 模型回复** | cat done state.json | `output: { result: "HELLO WORLD" }`（纯文本，含 review 输出的 JSON） | §7.5.2 `extractJsonBlock` 从 result 末尾取 JSON 成立 |
-| H8 | **429 走 blocked** | glm-5.2 spawn 后限流 | `state=blocked`，`needs: "rate limited - wait and retry · API Error 429 · ...重置时间"` | 加 PAUSED 态：parse 重置时间 -> 挂起 -> reconciler 到点唤醒 |
-| H9 | **worktree 被 locked** | 清理实测 worktree | `git worktree remove` 报 "locked: claude session"；需 `git worktree unlock` 再 remove | 用 `--bare` 规避 worktree 生命周期管理（路线 Y） |
-| H10 | **injectReply 无过滤** | `RendezvousClient.injectReply({text})` | `{type:'reply', text}` 原样发 daemon，无转义/长度限制 | review/work 任意 prompt 注入可行（review 既审又修协议层成立） |
+| H8 | **429 走 blocked**（v2.1.6：不再进 PAUSED，一律 ABORTED） | glm-5.2 spawn 后限流 | `state=blocked`，`needs: "rate limited - wait and retry · API Error 429 · ...重置时间"` | v2.1.6 简化：blocked 一律 ABORTED unexpected_blocked，429 由 claude code 自身重试，长 blocked 才 abort；删 PAUSED 态 + reconciler 唤醒 + liveness |
+| H9 | **worktree 被 locked** | 清理 v2.1.3 实测残留 worktree | `git worktree remove` 报 "locked: claude session"；需 `git worktree unlock` 再 remove | v2.1.5：不传 `--worktree` 规避（根本不建）；H9 残留是 v2.1.3 误用 --worktree 产生 |
+| H10 | **injectReply 无过滤** | `RendezvousClient.injectReply({text})` | `{type:'reply', text}` 原样发 daemon，无转义/长度限制 | review/work 任意 prompt 注入可行；v2.1.5 P1-1：review engine 改用 resumeWorkSession，injectReply 退场，此条仅作 daemon 协议实测留存 |
 
 ### 附录 A.2：v2.1.3 未实测/待标注事项（2026-07-12）
 
 | # | 事项 | 实测需求 | Phase 1 处理 |
 |---|---|---|---|
-| **P1-4** | blocked bg session 生命周期：429 限流时 bg 进入 blocked，daemon 是否会在挂起几小时后主动清理（gc）？ | **2026-07-12 已实测（5分41秒观察，短窗口但信号清晰）**：spawn glm-5.2 bg 触发 429 → state.json 持续 "blocked"，bg 进程（claude bg-spare / claude bg-pty-host）持续存活，daemon roster 重启后重新 attach；daemon 5s idle 自己退出但 bg 不死。**结论**：daemon 不主动 gc blocked bg，bg 状态冻结在 state.json 等待新输入（解限额后通过 daemon injectReply 唤醒）。5 分钟不能 100% 证明 24h，但 POSIX 通常不杀长 idle 子进程；如真出现死 bg，P0-4 兜底 → PANE_LOST。**P0-4 改进点（v2.1.4 待补）**：当前 `readJobState` 只看 state.json，**无法区分**"bg 进程活着 blocked 等输入"vs"bg 进程死了 state 冻结在 blocked"。需加 bg 进程 liveness 检查（如 `ps aux | grep <shortId>` 或查 daemon roster `pid` 字段），死了直接 PANE_LOST 跳过 readJobState。 |
+| **P1-4** | blocked bg session 生命周期：429 限流时 bg 进入 blocked，daemon 是否会在挂起几小时后主动清理（gc）？ | **2026-07-12 已实测（5分41秒观察，短窗口但信号清晰）**：spawn glm-5.2 bg 触发 429 → state.json 持续 "blocked"，bg 进程（claude bg-spare / claude bg-pty-host）持续存活，daemon roster 重启后重新 attach；daemon 5s idle 自己退出但 bg 不死。**结论**：daemon 不主动 gc blocked bg，bg 状态冻结在 state.json 等待新输入（解限额后通过 daemon injectReply 唤醒（注：review engine v2.1.5 PAUSED 唤醒不用 injectReply，用 poll state.json））。5 分钟不能 100% 证明 24h，但 POSIX 通常不杀长 idle 子进程；如真出现死 bg，P0-4 兜底 → PANE_LOST。**v2.1.5 P0-2 已修正**：liveness 改读 `~/.claude/daemon/roster.json` 的 `workers[<shortId>]` 查 pid（`kill -0`）+ `supervisorPid`（daemon 活着）。实测 state.json 无 pid 字段，v2.1.4 设计的"spawn 时记录 OS pid + kill -0"不成立（spawn pid 是 launcher、backgrounding 后退出）→ 每次唤醒误转 PANE_LOST。复用 readRoster()（src/agent-view/roster-source.ts）。 |
 | **P1-7** | URL 输入支持（`cc-linker review run https://...`） | cat 无效，模型需 webfetch（实测未做） | **Phase 1 不支持**：doctor 检测 `task` 含 `http://`/`https://` → 报错 "URL 输入留 Phase 3，请用本地路径或 git ref" |
 | **P2-5** | cwd 内 `.claude/providers/*.json` 是否被 review engine 读取 | 当前实现走 `providerManager.resolve()` 只查 `~/.claude/providers/` | Phase 1 不支持 cwd 内 providers；如需支持，把 `ProviderManager.scan()` 加 cwd 路径（未来可考虑） |
 | **P2-6** | 6+ bg session 并发实测（3 pipeline × 2 pane） | 当前实测只验过 3 并发 | Phase 1 默认 `max_concurrent_pipelines = 1`，并发压力测试留 Phase 2 飞书集成前做 |
 
 **实测残留清理**：实测产生 6 个 bg session（d5c01dd1/2025e5ff/b26ea912/b4c50366/79145be5/8b16bf27）+ 2 个 worktree（review-fix/fix-add-bug），均已 `claude stop` + `git worktree unlock && remove` + `git branch -D` 清理。
+>
+> **v2.1.5 P3-4 实测注意**：`claude --bg --help` 不是合法用法（--bg 会吞掉 --help，直接 spawn 一个 idle bg session 留垃圾）。doctor 自检 / 测试套件若要验证 CLI 版本，用 `claude --version` 或 `claude --help`（不带 --bg）。
 
 ## 附录 B：复用的 Agent View 模块清单
 
 | 模块 | 路径 | 复用方式 |
 |------|------|---------|
 | `readJobState` | `src/agent-view/job-state.ts` | adapter / engine / cli-watch 全调 |
-| `RendezvousClient.injectReply` | `src/agent-view/rendezvous-client.ts` | adapter FIXING 注入（v2.1.3：仅 work FIXING 用） |
+| ~~`RendezvousClient.injectReply`~~ | ~~`src/agent-view/rendezvous-client.ts`~~ | v2.1.5 P1-1 移除：FIXING 改 resumeWorkSession，review engine 不再复用 injectReply |
 | `resolvePeekContent` | `src/agent-view/manager.ts` | cli-watch pane 详情（4 级降级） |
 | `AgentSnapshotFetcher.fetch` | `src/agent-view/snapshot-fetcher.ts` | cli-watch 列表 |
 | `VersionGuard.check` | `src/agent-view/version-guard.ts` | doctor 校验 CLI 版本 |
 | `DaemonProbe.check` | `src/agent-view/daemon-probe.ts` | doctor 校验 daemon 健康 |
 | `CLAUDE_JOBS_DIR` | `src/utils/paths.ts` | adapter / cli-watch |
+| ~~`readRoster`~~ | ~~`src/agent-view/roster-source.ts`~~ | v2.1.6 移除：PAUSED 态删除，reconciler 不再做 liveness，不再读 roster |
 
-> **v2.1.3 移除**：`readLastAssistantTurn`（原被 `adapter.getContextUsage` 消费，getContextUsage 随 cascade 删除后不再需要——成本改由 `adapter.poll()` 从 `state.json.output.cost_usd` 解析）。
+> **v2.1.3 移除**：`readLastAssistantTurn`（原被 `adapter.getContextUsage` 消费，getContextUsage 随 cascade 删除后不再需要——成本统计已随 cascade 整组移除）。
 
 ## 附录 C：v2.1 → v2.1.1 变更背景（动机 + 决策 + 章节索引）
 
@@ -94,7 +99,7 @@
 
 **决策**：FIXING 启动前 git commit → checkpoint SHA。
 
-**实现**：见 [implementation.md §7.2](./implementation.md#72-完整配置示例) `[prompts.work.fixing.preamble]`。
+**实现**：见 [implementation.md §7.2.1](./implementation.md#721-engine-checkpoint-边界-case)（v2.1.3：preamble 已删，checkpoint 改由 engine 在阶段切换前自己打）。
 
 ### C.3 变更 3：JSON parse 失败不静默
 
@@ -138,7 +143,7 @@
 
 > **v2.1.3 移除**：`getContextUsage` 随 context cascade 整组删除（见 §C.8）。adapter 从 6 API（v2.1 含 getContextUsage）缩为 5 API（startSession / resumeWorkSession / injectReply / poll / stop）。成本提取改由 `adapter.poll()` 在 state=done 时直接从 `state.json.output.cost_usd` 解析，不依赖 `getContextUsage`。
 >
-> **v2.1.4 补**：adapter 加 `isBgAlive(pid)` API（5 → 6 API），用于 P0-4 reconciler PAUSED 唤醒时 `kill -0` 验证 bg 进程活着（详见附录 A.2 P1-4 实测）。
+> **v2.1.4 补**：adapter 加 `isBgAlive(pid)` API（5 → 6 API），用于 P0-4 reconciler PAUSED 唤醒时 `kill -0` 验证 bg 进程活着（详见附录 A.2 P1-4 实测）。（v2.1.5 P0-2：liveness 改读 roster.json，不再 kill -0 spawn pid；P1-1 删 injectReply，adapter 6 -> 5 API：startSession / resumeWorkSession / poll / stop / isBgAlive）
 
 ### C.6 完整决策链
 
@@ -325,14 +330,14 @@ review 修了 ≥1 个 real P0/P1/P2
 | # | 实测发现 | 修正决策 | 影响 |
 |---|---|---|---|
 | F1 | state.json 无 cost_usd，v2.1.3 删的 jsonl usage 路径反而是唯一能用的 | **删成本统计整组**（用户拍板：不需要成本统计）：删 `totalCostUsd`/`costUsd`/`max_cost_usd`/cost 价格表/`budget_exceeded` | §6.1/§7.2/§8/§10 |
-| F2 | 429 限额耗尽走 blocked + 重置时间（国产模型常态） | **新增 PAUSED 态**：parse 重置时间 -> 挂起 -> reconciler 到点唤醒 | §5/§6.4/§10 |
+| F2 | 429 限额耗尽走 blocked + 重置时间（国产模型常态） | ~~**新增 PAUSED 态**~~（v2.1.6 反转：删 PAUSED，blocked 一律 ABORTED，依赖 claude code 自身重试，详见 C.9） | §5/§6.4/§10 |
 | F3 | providerEnv 不可信，模型实际由 settings + respawnFlags 决定 | `parseModelFromRespawnFlags`（从 respawnFlags 的 --model 取），删 `parseModelFromProviderEnv`；engine 只传 `--settings` 不传 `--model` | §3.2.1/§7.4 |
-| F4 | blocked 不止"等用户输入"，rate limit/permission 都走 blocked | `adapter.poll` 返回 `BlockedResult{kind}` 分流：rate_limited->PAUSED，permission/unexpected->ABORTED | §4.3/§10 |
+| F4 | blocked 不止"等用户输入"，rate limit/permission 都走 blocked | ~~`BlockedResult{kind}` 三分流~~（v2.1.6 简化：blocked 一律 unexpected -> ABORTED，不区分，详见 C.9） | §4.3/§10 |
 | F5 | review 输入 artifact 构造未定义 | **用户提议**：review/work 输入统一用 spec/plan（或 `<task>` 需求文本），模型自己 cat + 自选 `git diff` 范围，engine 不构造 artifact；删 EXTERNAL_REVIEW.cycle | §7.2 prompts |
-| F-WT | bg 默认建隔离 worktree，主 cwd 不被改动 | **用户拍板路线 Y**：`--bare` 禁 worktree，work/review 直接在原开发分支改；engine 打 git checkpoint 隔离各阶段 | §2.2/§7.2/§10 |
+| F-WT | bg 默认建隔离 worktree，主 cwd 不被改动 | **v2.1.5 P0-3 反转**：不传 `--worktree`（--bare 禁 worktree 是误判，已修正），work/review 直接在原开发分支改；~~engine 打 git checkpoint~~（v2.1.6 删 checkpoint，详见 C.9） | §2.2/§7.2/§10 |
 | F-CWD | `--cwd` 不可用（exit 1） | cwd 由 `Bun.spawn({cwd})` 控制 | §3.2.1 |
 | F7 | 模型 git commit 行为不可控（自建分支/worktree、message 乱） | **checkpoint 改由 engine 打**（阶段切换前 engine 跑 git commit），模型不碰 git；删 preamble；ReviewFixOutput 删 checkpointSha | §7.2/§7.2.1/§7.5.3 |
-| F8 | "0 行重复代码"误导（src 零 `--bg` spawn 先例） | G6 改为"复用状态读取/注入/停止；spawn --bare 为 adapter 新增" | §2.1 |
+| F8 | "0 行重复代码"误导（src 零 `--bg` spawn 先例） | G6 改为"复用状态读取/liveness/停止；spawn --bg（不传 --worktree）为 adapter 新增" | §2.1 |
 | F9 | resolveSettingsPath 多余 | 复用 `providerManager.resolve(alias).path`（`src/utils/providers.ts`） | §7.4 |
 | F10 | 单轮 turn 数增加（review 修 + postfix 复查） | max_rounds code 8 -> 6 | §5.2 |
 
@@ -341,11 +346,59 @@ review 修了 ≥1 个 real P0/P1/P2
 - **无论如何都跑一轮外审**：R1/R2 clean 不再 -> DONE，一律进 EXTERNAL_REVIEW；429 PAUSED 恢复后也继续跑（不跳过）。
 - **clean 标准**：无 P0/P1/P2 需修复，P3 不阻塞。
 - **context 裸奔**：删 cascade，靠 max_rounds 兜底；Phase 3 可重引入轻量 abort。
-- **checkpoint 由 engine 打**：不信任模型 git 行为。
+- ~~**checkpoint 由 engine 打**~~（v2.1.6 反转：engine 不打 checkpoint，基于 {task}+当前状态全面 review，详见 C.9）：原 v2.1.3 不信任模型 git 行为，v2.1.6 进一步不信任 engine 该不该打 checkpoint。
 
 **第二轮未做**：
-- ❌ 没实现 PAUSED 期间 bg session 死亡的自动 respawn（reconciler 唤醒时校验 session 活着，死了 -> PANE_LOST，由用户 retry）
+- ❌ ~~没实现 PAUSED 期间 bg session 死亡的自动 respawn~~（v2.1.6：PAUSED 态删除，此条无意义）
 - ❌ 没做 review 自选 diff 看漏的检测（靠 work postfix 复查 + prompt 明确要求查全部 diff 兜底）
+
+### C.9 v2.1.6 变更动机 + 决策（2026-07-12，第三轮 review 修正）
+
+#### C.9.1 用户提出的简化
+
+第二轮 review 后，用户提出两点简化：
+
+| # | 简化 | 原话摘要 |
+|---|------|---------|
+| S1 | review/self-review 应结合原始 spec/plan/需求做**全面 review**，而非只看 fix diff；不需要 engine 打 checkpoint | "建议 review 时应该结合原始的 spec,plan 或者原始的需求描述，进行全面的 review，而不是只看 fix diff。建议不需要做 checkpoint 输出。让模型自己去根据现在的实际情况来 review" |
+| S2 | 429 简化处理，claude code 本身已有失败重试，review engine 不用过多参与 | "429 失败时，claude code 本身已经有失败重试机制，我理解我们不用过多参与，简化处理即可" |
+
+#### C.9.2 决策
+
+| 项 | 决策 | 理由 |
+|---|------|------|
+| S1a | **删整个 checkpoint 体系**：engine 不打 preProduce/preReview/pre-FIXING checkpoint，删 HistoryEvent.checkpointSha、PipelineRecord.preProduceCheckpointSha/preReviewCheckpointSha、§7.2.1 边界 case 表、spawn 后自检 | engine 打 checkpoint + 注入 diff baseline SHA 本质是不信任模型能自己看代码状态；但 claude --bg 模型本就能 git diff/git log/cat，给它需求 + 让它自己看当前状态更自然 robust；少打 commit 减少用户分支污染 |
+| S1b | self_review/review prompt 改为"基于需求 {task} + 当前代码/产出状态全面 review"，模型自己 git diff/git log/cat | 全面 review 比窄 diff 复查更 robust（模型看全貌而非窄 diff）；postfix R1 也全面复查当前状态，不再窄看 review diff |
+| S1c | 删 review cleanup 命令 | 无 checkpoint commit 无需清理；回滚靠用户跑 review 前的 HEAD（P1-3 强制 clean tree 保证 HEAD 干净） |
+| S2 | **删 PAUSED 态**：429 等 blocked 场景一律 ABORTED unexpected_blocked，依赖 claude code 自身重试 | claude code 对 429 已有重试；review engine 重做一套限流处理（PAUSED + parse 重置时间 + reconciler 唤醒 + liveness）与之重叠且复杂；blocked 一律 abort 最简，用户 review resume/run 重跑 |
+| S2 配套 | 删 pauseHistory、BlockedResult.rate_limited/permission（只留 unexpected）、rate_limit_* 配置、isBgAlive API、reconciler PAUSED 唤醒 + liveness 整组 | PAUSED 不存在则这些都不需要 |
+
+#### C.9.3 删除的内容
+
+- **状态**：PAUSED（429 限额挂起）
+- **字段**：PipelineRecord.preProduceCheckpointSha / preReviewCheckpointSha、HistoryEvent.checkpointSha、PAUSED.pauseHistory、PaneRegistry.work.currentPid/roundPids、PaneRegistry.review.pid
+- **API**：adapter.isBgAlive（4 API：startSession / resumeWorkSession / poll / stop）
+- **复用**：readRoster()（liveness 不再做）、RendezvousClient.injectReply（v2.1.5 已退场）
+- **配置**：rate_limit_resume_poll_interval_ms / rate_limit_fallback_interval_ms
+- **命令**：review cleanup
+- **reason**：permission_denied / paused_cancelled（blocked 一律 unexpected_blocked）
+- **转换**：任意 active -> PAUSED / PAUSED -> PAUSED / PAUSED -> (pausedFrom) / PAUSED -> ABORTED
+
+#### C.9.4 风险与取舍
+
+| 风险 | 取舍 |
+|------|------|
+| 无 checkpoint 回滚锚点 | 接受：用户跑 review 前的 HEAD 即回滚点（P1-3 强制 clean tree 保证干净）；git reset --hard <review前的commit> 回滚 |
+| 模型自选 diff 看漏改动 | 接受：prompt 明确 git log + git diff HEAD~N 覆盖本轮全部；work postfix R1 全面复查兜底 |
+| 429 月限额场景 pipeline 直接 ABORTED | 接受：用户 review resume/run 重跑；Phase 1 不做长限额挂起，Phase 2 review-server 可重新引入 |
+| FIXING parse 失败保守推进 | 接受：R2 全面 review（基于当前代码状态）能兜住 FIXING 改坏的问题，比原窄 diff 复查更强 |
+
+#### C.9.5 未做的事
+
+- ❌ 没加 checkpoint 的细粒度回滚（pre-FIXING 等中间态）-- MVP 不需要，Phase 2 可考虑
+- ❌ 没做 429 的智能等待/重试 -- 完全依赖 claude code 自身；如实践中月限额频繁致 ABORTED，Phase 2 review-server 可重引入轻量 PAUSED
+- ❌ 没改 max_rounds 默认值（仍是 code=6）
+
 
 ## 附录 D：v2.1.1 评审反馈汇总（2026-06-17）
 
