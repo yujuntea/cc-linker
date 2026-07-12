@@ -1,0 +1,24 @@
+[meta]
+name = "default"
+description = "test profile"
+
+[work]
+provider = "qwen3.7"
+
+[review]
+provider = "kimi-coding"
+
+[guards]
+max_rounds = 6
+max_concurrent_pipelines = 1
+parse_retry_timeout_ms = 15000
+
+[context_limits]
+"claude-sonnet-4-5" = 1000000
+
+[prompts.work.self_review.system]
+template = "review {task}"
+
+[phase_overrides.code]
+review.provider = "kimi-coding"
+guards.max_rounds = 6
