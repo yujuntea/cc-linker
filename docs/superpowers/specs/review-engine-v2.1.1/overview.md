@@ -29,13 +29,13 @@
 | v2.1.1 评审反馈 | 2026-06-17 | 7 P0 + 11 P1 修复 + I9 重设计（删 review_fix，reset 改为注入 issues + worker verify+fix）+ I10/I11 参数调整 |
 | **v2.1.2 (本轮)** | **2026-06-19** | **I9 三档 cascade（compact → reset → abort）+ review opinions 落盘（worker @file 引用）+ 阈值规则修 bug（128K/200K 模型 + 1M 模型提前干预）** |
 | v2.1.2 评审修正 | 2026-06-19 | 4 P0 + 10 P1 修复：per-pipeline 目录结构 / dead config 激活 / cascade N>1 走查 / 边界 case 去矛盾 / 辅助函数定义 / @file 双轨策略 / PhaseDetector 优先级 / 并发排队 queued/ |
-| **v2.1.3 (本轮)** | **2026-07-12** | **两项简化：删 JUDGE_BY_WORK（review 模型在 EXTERNAL_REVIEW 内 review+确认+直接 fix，反转 I9 的 review_fix 决策，靠 work postfix 复查保 cross-model）+ 删 HUMAN_DECIDE；删 context-OK 判断与三档 cascade（裸奔）。两项补充：无论如何都跑一轮 EXTERNAL_REVIEW（self-review clean 不再 → DONE）+ 统一 clean 标准（无 P0/P1/P2 需修复，P3 不阻塞）** |
+| **v2.1.3 (本轮)** | **2026-07-12** | **简化：删 JUDGE_BY_WORK（review 在 EXTERNAL_REVIEW 内既审又修，反转 I9，靠 work postfix 复查保 cross-model）+ 删 HUMAN_DECIDE + 删 context cascade（裸奔）+ 删成本统计（实测 state.json 无 cost_usd）；补充：无论如何都跑一轮 EXTERNAL_REVIEW + 统一 clean 标准（无 P0/P1/P2，P3 不阻塞）+ 新增 PAUSED 态（429 限额耗尽到点唤醒）。实测修正（附录 A 2.1.207）：spawn 用 --bare 禁 worktree 在原分支改、不传 --cwd/--model、模型从 respawnFlags 取、review 输入用 spec/plan + 模型自选 diff 范围、checkpoint 由 engine 打、复用 providerManager.resolve** |
 
 > 详细变更动机 + 决策链：见 [appendices.md → 附录 C](./appendices.md#附录-cv21--v211-变更背景动机--决策--章节索引)
 
 ## Preconditions（v2.1.1）
 
-- **Claude CLI ≥ 2.1.163**（`claude --bg` 稳定；老版本无此能力）
+- **Claude CLI ≥ 2.1.139**（`claude --bg` 稳定；v2.1.3 实测在 2.1.207 上 `--bare`/worktree/429 行为，见附录 A.1）
 - **cc-linker ≥ 0.6.3**（当前 master，`c5a8b8d`）
 - **`~/.claude/providers/` 至少配置 2 个 provider**（work + 1 review），缺失会由 `cc-linker review doctor` 报错
 - **cwd 推荐为 git 仓库**（commit preamble 要求；如果非 git repo，preamble 会输出 `checkpoint_sha: null` 跳过 commit）
@@ -73,7 +73,7 @@
 | G3 | 三阶段支持：Spec / Plan / Code，每个阶段可配置不同的提示词、护栏、Review 模型组合 | P0 |
 | G4 | 电脑端便利：CLI 主输出 + `--watch` 模式（rich terminal）实时看 **1+1 pane** 状态（work + 1 review） | P0（Phase 1） |
 | G5 | 可恢复状态机：每次 Review 是一个有状态的、跨进程崩溃可恢复的工作流 | P0 |
-| G6 | **深度复用 Agent View**：实测 `claude --bg` + `--settings` + `--reply-on-resume` + `state.json` + `readJobState` + `RendezvousClient.injectReply` + `claude stop` 全部 0 行重复代码 | P0 |
+| G6 | **复用 Agent View**：状态读取/注入/停止复用 `readJobState` + `RendezvousClient.injectReply` + `claude stop`（0 行重复）；spawn `claude --bg --bare` + `--settings` 为 adapter 新增代码（v2.1.3 实测修正，见附录 A） | P0 |
 | G7 | **1+1** 个 bg session 自动出现在 `~/.claude/jobs/`，飞书 `/agents` 列表**免费**看到（Phase 2 飞书集成） | P1 |
 | G8 | **`cc-linker review doctor`** 启动前健康检查（profile 引用 + CLI 版本 + daemon 健康） | P0 |
 
@@ -86,10 +86,11 @@
 - 不做云端协同 / 团队共享（仍是单机单用户）
 - **不做 Phase 1 IDE**（v2.1 砍掉，Phase 1 改 `--watch` rich terminal；Phase 2 单独排期）
 - 不修改 `~/.claude/providers/*.json` 任何内容（只读取）
-- **review / fix 产出不自动 commit / 不创建 PR**（FIXING 节点与 EXTERNAL_REVIEW 节点均会在用户 cwd 内修改文件——各自先做 git preamble 打 checkpoint，verify-first 最小化修改），所有修改可通过 `git diff` 查看、`git checkout` 回滚；自动 apply/commit/PR 留 Phase 2
-- **v2.1.3 反转 I9**：review 模型**既审又修**（在 EXTERNAL_REVIEW 内识别问题→确认方案→直接修复→verify，单 bg turn）。跨模型校验靠"review 修完 → work postfix R1 复查 review 改动"闭环保证，不再有独立的 JUDGE 裁决节点
-- **v2.1.3 删除**：JUDGE_BY_WORK 状态、HUMAN_DECIDE 状态、context-OK 判断与三档 cascade（compact/reset/abort）。context 用量裸奔，不做主动检测；极端情况下由 max_rounds 兜底收敛
-- **不**做 cloud-hosted multi-agent review（Anthropic 已有 `claude ultrareview` 但那是云端）
+- **review / fix 产出不自动 commit / 不创建 PR**（work FIXING 与 review EXTERNAL_REVIEW 均用 `claude --bg --bare` 在**用户原开发分支**直接改文件，不建 worktree；engine 在每个阶段切换前自己打 git checkpoint commit 隔离各阶段改动，verify-first 最小化修改），所有修改可通过 `git diff` 查看、`git checkout <checkpoint>` 回滚；自动 apply/commit/PR 留 Phase 2
+- **v2.1.3 反转 I9**：review 模型**既审又修**（在 EXTERNAL_REVIEW 内识别问题、确认方案、直接修复、verify，单 bg turn）。review/work 的输入统一为用户指定的 spec/plan（或 `<task>` 需求文本），模型自己 cat + 自己选 `git diff` 范围，engine 不构造 artifact。跨模型校验靠"review 修完、work postfix R1 复查 review 改动"闭环保证，不再有独立的 JUDGE 裁决节点
+- **v2.1.3 删除**：JUDGE_BY_WORK 状态、HUMAN_DECIDE 状态、context-OK 判断与三档 cascade（compact/reset/abort）、成本统计（`cost_usd` / `totalCostUsd` / `max_cost_usd` 整组移除，实测 state.json 无 cost_usd）。context 用量裸奔，不做主动检测；极端情况下由 max_rounds 兜底收敛
+- **v2.1.3 新增 PAUSED 态**：429 限额耗尽（实测国产模型周/月限额常态）时 pipeline 进 PAUSED + 记录重置时间，reconciler 到点自动唤醒 resume（详见状态机 §5）
+- **不**做 cloud-hosted multi-agent reviewcloud-hosted multi-agent review（Anthropic 已有 `claude ultrareview` 但那是云端）
 
 ## 3. 架构总览
 
@@ -114,55 +115,65 @@
 
 ### 3.2 新建层（11 个模块）
 
-> **v2.1.3 瘦身**：删除 `context-overflow.ts` / `build-context-reset-prompt.ts` / `build-context-compact-prompt.ts` / `review-opinions-writer.ts`（context cascade + review opinions 落盘整组移除）。adapter 砍掉 `getContextUsage`（5 个 API）。`model-parser.ts` 瘦身为只剩 cost 价格表（删 `KNOWN_CONTEXT_LIMITS`）。
+> **v2.1.3 瘦身**：删除 `context-overflow.ts` / `build-context-reset-prompt.ts` / `build-context-compact-prompt.ts` / `review-opinions-writer.ts`（context cascade + review opinions 落盘整组移除）。adapter 砍掉 `getContextUsage`（5 个 API）。`model-parser.ts` 瘦身为只剩模型名解析（删 `KNOWN_CONTEXT_LIMITS` + cost 价格表，见 §3.2.1）。
+>
+> **v2.1.3 实测修正**（见附录 A 2.1.207 实测）：adapter spawn 统一用 `claude --bg --bare`（**禁 worktree，bg 直接改主 cwd**，不加 `--bare` 会自动建隔离 worktree 导致主分支不被改动）；**不传 `--cwd`**（CLI 不支持，cwd 由 `Bun.spawn({cwd})` 控制）；**不传 `--model`**（模型由 `--settings` 文件决定，见 §3.2.1）。
 
 ```
 src/review/
-├── engine.ts            # 状态机驱动（5 active states + 1 trouble + 3 terminals）
+├── engine.ts            # 状态机驱动（5 active + 2 trouble[PAUSED/PANE_LOST] + 3 terminals）
 ├── pipeline-store.ts    # 持久化：5 目录（running / queued / done / failed / aborted）
 ├── pipeline-state.ts    # in-memory active pipeline Map
 ├── profile.ts           # ReviewProfile TOML 加载 + per-phase 深度 merge + provider 校验
-├── phase-detect.ts      # 启发式：file path → git ref → 关键词 → 文件后缀/行号 → PhaseUnknownError
-├── adapter.ts           # ClaudeBGAdapter 暴露 5 个 API（startSession / resumeWorkSession / injectReply / poll / stop）
-├── model-parser.ts      # parseModelFromProviderEnv + cost 价格表（v2.1.3：删 KNOWN_CONTEXT_LIMITS）
+├── phase-detect.ts      # 启发式：file path -> git ref -> 关键词 -> 文件后缀/行号 -> PhaseUnknownError
+├── adapter.ts           # ClaudeBGAdapter 5 API（startSession / resumeWorkSession / injectReply / poll / stop）；spawn 用 --bare
+├── model-parser.ts      # parseModelFromRespawnFlags（从 state.json.respawnFlags 读 --model，见 §3.2.1）
 ├── output-contract.ts   # parseBgOutputWithRetry（带 retry 1 次 + timeoutMs）
 ├── cli-watch.ts         # CLI `--watch` 模式（chalk + ANSI）
 ├── review-doctor.ts     # `cc-linker review doctor` 命令
-└── reconciler.ts        # 启动扫描 running/ 恢复
+└── reconciler.ts        # 启动扫描 running/ 恢复 + PAUSED 到点唤醒
 ```
 
 **CLI 子命令注册**：`src/cli/commands/review.ts` 作为 subcommand group 入口（与 `daemon` / `hook` 一致）。
 
-### 3.2.1 模型解析（`model-parser.ts`）
+### 3.2.1 模型解析与 spawn 契约（`model-parser.ts` + `adapter.ts`）
 
-> **v2.1.3 瘦身**：删 `KNOWN_CONTEXT_LIMITS` / `lookupContextLimit`（context 上限检测随 cascade 整组移除）。`model-parser.ts` 只保留模型名解析（供报告展示）+ cost 价格表（供 `totalCostUsd` 累计 + `max_cost_usd` 护栏）。
+> **v2.1.3 实测重写**（见附录 A 2.1.207 实测）：
+> - 模型由 `--settings <provider>.json` 文件内的 `ANTHROPIC_MODEL` 决定，engine **不传 `--model`**（CLI 会自己从 settings 解析并写入 `state.json.respawnFlags`）。
+> - 读模型名从 `state.json.respawnFlags` 的 `--model` 取，**不从 `providerEnv` 取**（实测 providerEnv 不可信，会被 base env 占位显示别的模型）。
+> - 删 `KNOWN_CONTEXT_LIMITS` / `lookupContextLimit` / `COST_TABLE`（context 阈值检测 + 成本统计整组移除）。
 
 ```typescript
 interface ModelInfo {
-  name: string;              // 纯模型名，如 "claude-sonnet-4-5"
-  contextHint: number | null; // 从后缀解析的 context hint（仅供报告展示，不再用于阈值）
+  name: string;              // 纯模型名，如 "glm-5.2" / "MiniMax-M3"
+  contextHint: number | null; // 从后缀解析（仅供报告展示，不驱动任何阈值）
 }
 
-// parseModelFromProviderEnv(env):
-//   "MiniMax-M3"        → { name: "MiniMax-M3", contextHint: null }
-//   "MiniMax-M3[1m]"    → { name: "MiniMax-M3", contextHint: 1_000_000 }
-//   "kimi-for-coding[256k]" → { name: "kimi-for-coding", contextHint: 256_000 }
+// parseModelFromRespawnFlags(respawnFlags: string[]): ModelInfo | null
+//   state.json.respawnFlags = ["--settings","/.../glm-5.2.json","--model","glm-5.2[1m]"]
+//   -> 找 "--model" 后的值 "glm-5.2[1m]" -> { name:"glm-5.2", contextHint:1_000_000 }
+//   无 --model -> null（报告显示 unknown）
 
-// COST_TABLE 内置价格表（USD per 1M tokens，input/output 分列），
-// 供 adapter.poll() 在 state=done 时从 state.json.output.cost_usd 解析成本
-// （CLI 未返回 cost_usd 时降级为 (in*out price) 计算）。
+// adapter spawn 契约（实测确定）：
+//   Bun.spawn(["claude","--bg","--bare", prompt, "--settings", settingsPath], { cwd })
+//   - --bare：禁用 worktree，bg 直接在 cwd 主分支改文件（实测：不加 --bare 会自动建隔离 worktree，主 cwd 不被改动）
+//   - --settings：决定模型（文件内 ANTHROPIC_MODEL）
+//   - cwd：由 Bun.spawn 的 cwd 选项控制（claude --bg 不接受 --cwd flag，实测 unknown option）
+//   - 不传 --model / --cwd
 ```
+
+**settings 路径来源**：复用 `providerManager.resolve(alias).path`（`src/utils/providers.ts`），**不新写 `resolveSettingsPath`**（F9）。
 
 ### 3.3 CLI 入口
 
 ```bash
-cc-linker review run <task>     [--phase spec|plan|code] [--profile default] [--max-rounds N] [--watch] [--cwd <path>] [--inject-text "..."] [--max-cost 5.00]
+cc-linker review run <task>     [--phase spec|plan|code] [--profile default] [--max-rounds N] [--watch] [--cwd <path>] [--inject-text "..."]
 cc-linker review status <id>    [--follow]
 cc-linker review abort <id>
 cc-linker review report <id>    [--format md|json] [--out <file>] [--partial]
 cc-linker review cancel <id>
 cc-linker review skip <id>      [--reason "..."]
-cc-linker review resume <id>    # 从当前 state 继续（FAILED network_timeout 后恢复）
+cc-linker review resume <id>    # 从当前 state 继续（FAILED network_timeout / PAUSED 限额恢复 后恢复）
 cc-linker review doctor         # 启动前健康检查
 cc-linker review profiles       # 列出 review profiles
 ```

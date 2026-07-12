@@ -51,7 +51,6 @@ interface ReviewFixOutput {
     fixApplied: boolean;                  // 是否已修复
     fixSummary?: string;
   }>;
-  checkpointSha: string | null;            // review preamble 打的 checkpoint（非 git repo → null）
   reasoning: string;
 }
 ```
@@ -66,6 +65,18 @@ interface ReviewFixOutput {
 function isClean(issues: Issue[]): boolean {
   return issues.filter(i => ['P0', 'P1', 'P2'].includes(i.severity)).length === 0;
 }
+```
+
+```typescript
+// adapter.poll 检测 state=blocked 时，按 needs/detail 分流（实测 F4）
+interface BlockedResult {
+  kind: "rate_limited" | "permission" | "unexpected";
+  resumeAt?: string;   // rate_limited 时：从 detail/needs parse 出的重置时间（ISO）
+  raw: string;         // 原始 needs/detail
+}
+// - needs 含 rate limited/429/使用上限/重置 -> rate_limited（engine 进 PAUSED）
+// - needs 含 permission/allow/denied -> permission（engine ABORTED permission_denied）
+// - 其他 -> unexpected（engine ABORTED unexpected_blocked）
 ```
 
 ### 6.1 PipelineRecord 数据结构
@@ -86,7 +97,6 @@ interface PipelineRecord {
   };
   panes: PaneRegistry;
   history: HistoryEvent[];
-  totalCostUsd: number;
   parseDegraded?: ParseDegradedEvent[];
 }
 
@@ -128,14 +138,13 @@ interface HistoryEvent {
   inputDigest: string;
   outputDigest: string;
   outputSizeBytes: number;
-  costUsd: number;
   durationMs: number;
   issues?: Issue[];
-  checkpointSha?: string | null;    // v2.1.3：FIXING 与 EXTERNAL_REVIEW 各自 preamble 打的 checkpoint
+  checkpointSha?: string | null;    // v2.1.3：engine 在阶段切换前打的 checkpoint（work FIXING / review EXTERNAL_REVIEW 各一次）
 }
 ```
 
-> **v2.1.3 删除的字段**：`PipelineRecord.contextResets` / `contextOverflowCount` / `contextFiles` 全部移除（context cascade + review opinions 落盘整组移除）；`PaneRegistry.review.cycle` 移除（review pane 不再区分 initial/postfix，每轮新 session）；`HistoryEvent.verdict` / `fixingCheckpointSha` 合并重命名为统一 `checkpointSha`（FIXING 与 EXTERNAL_REVIEW 共用）。
+> **v2.1.3 删除的字段**：`PipelineRecord.contextResets` / `contextOverflowCount` / `contextFiles` 全部移除（context cascade + review opinions 落盘整组移除）；`PaneRegistry.review.cycle` 移除（review pane 不再区分 initial/postfix，每轮新 session）；`HistoryEvent.verdict` / `fixingCheckpointSha` 合并重命名为统一 `checkpointSha`（engine 打）；`PipelineRecord.totalCostUsd` / `HistoryEvent.costUsd` 移除（成本统计整组移除，实测 state.json 无 cost_usd）。
 
 ### 6.2 持久化目录
 
@@ -206,8 +215,11 @@ async function reconcile(): Promise<ReconcileResult> {
 | running/ + 所有 pane 活着 | 继续推进 |
 | running/ + 部分 pane 消失 | **PANE_LOST** + 用户决策 |
 | PANE_LOST 24h 超时 | cleanup → ABORTED |
+| running/ + state=PAUSED + resumeAt 已到 | 唤醒：回到 pausedFrom，继续 poll 同一 bg session（v2.1.3 新增） |
+| running/ + state=PAUSED + resumeAt 未到 | 跳过（等下次轮询，间隔 `rate_limit_resume_poll_interval_ms`） |
 
 > **v2.1.3 删除**：`human_pending/` 目录扫描 + HUMAN_DECIDE 4h 超时行（HUMAN_DECIDE 移除，无 human_pending 目录）；review opinions 文件恢复增强（review opinions 落盘整组移除，review findings 直接从 review pane 的 `state.json.output` 解析入 history）。
+> **v2.1.3 新增**：PAUSED 唤醒--reconciler 每 `rate_limit_resume_poll_interval_ms`（默认 60s）扫描 running/ 中 state=PAUSED 的 pipeline，resumeAt 已到则回到 pausedFrom 继续 poll（bg session 未杀，保持 blocked，唤醒后自然推进）。PAUSED 态不占新 bg，不消耗配额。
 
 **PANE_LOST retry**：
 - review pane 丢失 → 重新 spawn
@@ -277,10 +289,10 @@ max_concurrent_pipelines = 1
 # parse retry
 parse_retry_timeout_ms = 15000
 
-# 成本硬约束
-max_cost_usd = 5.00
+# 429 限额挂起（v2.1.3 新增 PAUSED 态）
+rate_limit_resume_poll_interval_ms = 60000   # PAUSED 态 reconciler 检查 resumeAt 的轮询间隔
 
-# Phase 3 预留（v2.1.2 评审标注：当前 engine 未消费，实施时可忽略）
+# Phase 3 预留（当前 engine 未消费，实施时可忽略）
 # max_token_in = 500000                # 单 pipeline input token 上限
 # max_token_out = 100000               # 单 pipeline output token 上限
 # api_rate_limit_strategy = "backoff"  # "backoff" | "fail-fast"
@@ -292,7 +304,7 @@ max_cost_usd = 5.00
 "kimi-for-coding" = 256000
 ```
 
-> **v2.1.3 删除的配置**：`human_decide_timeout_ms` / `p0_p1_reject_threshold`（HUMAN_DECIDE + JUDGE 移除）；`context_overflow_threshold_1m` / `context_overflow_threshold_percent` / `context_overflow_strategy` / `max_compact_attempts` / `compact_timeout_ms` / `max_injected_issues` / `max_context_resets_per_pipeline` / `max_reset_duration_ms`（context cascade 整组移除）。`[context_limits]` 保留但仅供报告展示，不再驱动任何阈值判断。
+> **v2.1.3 删除的配置**：`human_decide_timeout_ms` / `p0_p1_reject_threshold`（HUMAN_DECIDE + JUDGE 移除）；`context_overflow_threshold_1m` / `context_overflow_threshold_percent` / `context_overflow_strategy` / `max_compact_attempts` / `compact_timeout_ms` / `max_injected_issues` / `max_context_resets_per_pipeline` / `max_reset_duration_ms`（context cascade 整组移除）；`max_cost_usd`（成本统计整组移除，实测 state.json 无 cost_usd）。`[context_limits]` 保留但仅供报告展示，不再驱动任何阈值判断。
 
 **prompts 模板**见 [state-machine.md → §5.4](./state-machine.md#54-clean-判定与收敛逻辑v213-重写)（v2.1.3：clean 判定 + EXTERNAL_REVIEW 收敛逻辑）和以下 prompt 模板：
 
@@ -305,23 +317,26 @@ template = """
 
 [prompts.work.self_review.system]
 template = """
-你的产出（来自 {previous_stage} 阶段）：
-{artifact}
+你是工作模型，对自己的产出做自查（identify only，不要修改文件）。
+需求基准（spec/plan 或需求描述）：{task}
+
+请先 cat 上述 spec/plan 理解需求，再自己决定 git diff 范围查看当前改动，
+判断改动是否符合需求、有无 bug，识别问题（不要修改文件）。
 
 {r1_or_r2_instruction}
 
-请审查并识别问题（不要修改文件）：
-输出 JSON: { "issues": [...], "unfixed_count": N }
+输出 JSON: { "issues": [{ "id","severity","location","description" }], "unfixed_count": N }
 """
 # {r1_or_r2_instruction} 在 engine 端替换：
 # R1 initial:  "第一次自查，全面审查"
 # R2 initial:  "审查修复后的状态"
-# R1 postfix:  "postfix 循环第一轮自查"
+# R1 postfix:  "postfix 循环：复查上一轮 external review 的修复"
 # R2 postfix:  "审查 postfix 修复后的状态"
 
 [prompts.work.fixing.system]
 template = """
 你是修复节点（FIXING）。调用来源：{source}
+需求基准：{task}
 待处理的问题列表：{input_issues}
 
 严格 verify-first 流程：
@@ -329,97 +344,87 @@ template = """
 2. 修复（仅 real），修改要最小化
 3. 验证修复正确
 
+直接在当前分支改文件，不要做 git 操作（checkpoint 由 engine 管理）。
+
 输出 JSON:
 { "per_issue": [...], "all_real_fixed": bool, "remaining_real_unfixed_count": N }
 """
 
-[prompts.work.fixing.preamble]
-enabled = true
-template = """
-在做任何修改前：
-1. git status --porcelain 检查工作区
-2. 如有用户未提交改动 → git stash
-3. 只 add FIXING 改的文件（不要 git add -A）
-4. git commit -m "pre-fix checkpoint by review engine"
-5. 捕获 checkpoint SHA
-6. 然后开始 verify-first + fix
-"""
-
+# v2.1.3：删 prompts.work.fixing.preamble -- checkpoint 由 engine 在 injectReply FIXING 前自己打
 # v2.1.3：删 prompts.work.judge.system（JUDGE_BY_WORK 移除）
 
 [prompts.review.code.system]
 template = """
-你是外部 Review 模型。对工作产物做交叉评审并**直接修复**（v2.1.3：review 既审又修）。
-工作产物：{artifact}
+你是外部 Review 模型，对工作模型的产出做交叉评审并**直接修复**（v2.1.3：review 既审又修）。
+需求基准（spec/plan 或需求描述）：{task}
 
-流程（单个 turn 内完成）：
+请先 cat 上述 spec/plan 理解需求，再自己决定 git diff 范围查看当前改动，然后：
 1. 识别问题，按 severity 分级（P0=Critical / P1=High / P2=Medium / P3=Low）
 2. 逐条确认问题是否 real（避免 hallucination）
 3. 对 real 问题直接修改代码（最小化改动），verify 修复正确
 4. P3 问题可修可不修（不阻塞收敛，由你判断性价比）
 
+直接在当前分支改文件，不要做 git 操作（checkpoint 由 engine 管理）。
+
 输出 JSON:
 {
   "issues": [{ "id", "severity", "location", "description", "suggestion" }],
   "per_issue": [{ "issue_id", "verdict": "real"|"hallucination", "verdict_reason", "fix_applied": bool, "fix_summary"? }],
-  "checkpoint_sha": "<git preamble 打的 SHA，非 git repo 则 null>",
   "reasoning": "..."
 }
 """
+# spec/plan phase 用 prompts.review.spec.system / prompts.review.plan.system，结构同上（{task} + 自选 diff + 直接修）
 
-[prompts.review.code.preamble]
-enabled = true
-template = """
-在做任何修改前：
-1. git status --porcelain 检查工作区
-2. 如有用户未提交改动 → git stash
-3. 只 add review 改的文件（不要 git add -A）
-4. git commit -m "pre-review-fix checkpoint by review engine"
-5. 捕获 checkpoint SHA 填入输出 JSON 的 checkpoint_sha
-6. 然后开始识别 + verify-first + 修复
-"""
+# v2.1.3：删 prompts.review.code.preamble -- checkpoint 由 engine 在 spawn review 前自己打
 
 [phase_overrides.code]
 review.provider = "kimi-for-coding"
-guards.max_rounds = 8
+guards.max_rounds = 6
 ```
 
 > **v2.1.3 prompt 变更**：
 > - 删 `prompts.work.judge.system`（JUDGE_BY_WORK 移除）
 > - 删 `prompts.work.compact_continue.system`（cascade 移除）
-> - `prompts.work.fixing.system` 去掉对 review opinions 文件的 @file 引用，改回 inline `{input_issues}`（review opinions 落盘移除）
-> - `prompts.review.code.system` 从"只识别 issues"升级为"识别 + 确认 + 直接修 + verify + 输出 checkpoint_sha"
-> - 新增 `prompts.review.code.preamble`：review 修复前打 checkpoint（与 work FIXING 同构，便于回滚）
-> - `prompts.work.fixing.preamble` 的 commit message 保持 `pre-fix checkpoint`，review 用 `pre-review-fix checkpoint`，报告里区分两类 SHA
+> - 删 `prompts.work.fixing.preamble` + `prompts.review.code.preamble` -- **checkpoint 改由 engine 在阶段切换前自己打**（实测模型 git commit 行为不可控：会自建分支/worktree、commit message 乱来），模型只管改文件、不碰 git
+> - `prompts.work.self_review.system` + `prompts.review.code.system` 统一用 `{task}`（spec/plan 或需求文本）作需求基准，模型自己 cat + 自选 `git diff` 范围，**engine 不构造 `{artifact}`**（删 per-phase artifact 构造逻辑）
+> - `prompts.work.fixing.system` 去掉 @file 引用，改回 inline `{input_issues}`，加 `{task}` 上下文
+> - `prompts.review.code.system` 从"只识别 issues"升级为"识别 + 确认 + 直接修 + verify"，输出 JSON 删 `checkpoint_sha`（engine 持有，不依赖模型自报）
+> - 两类 checkpoint SHA（work `pre-fix` / review `pre-review`）由 engine 打，写入 `HistoryEvent.checkpointSha`，报告区分
 
-### 7.2.1 commit preamble 边界 case
+### 7.2.1 engine checkpoint 边界 case
 
-> v2.1.3：preamble 现有两处——work FIXING 与 review EXTERNAL_REVIEW，规则同构，下表对两者都适用。
+> v2.1.3：checkpoint 由 **engine** 在每个阶段切换前打（work FIXING 前一次、review EXTERNAL_REVIEW 前一次），模型不做 git 操作。engine 跑 `git -C <cwd> add -A && git commit -m "pre-<stage> checkpoint by review engine"`，捕获 SHA 写入 `HistoryEvent.checkpointSha`。
 
 | 场景 | 处理 |
 |------|------|
-| cwd 不是 git 仓库 | `checkpoint_sha: null` |
-| `preamble.enabled = false` | 跳过前置指令 |
-| commit 失败 | `checkpoint_sha: null` + warn |
+| cwd 不是 git 仓库 | 跳过 checkpoint，`checkpointSha: null`，报告标注"非 git repo，改动无回滚锚点" |
+| 工作区有用户未提交改动 | engine 先 `git stash`（保护用户改动）再打 checkpoint，阶段结束不自动 pop（用户手动 pop） |
+| commit 失败 | `checkpointSha: null` + warn，阶段继续（改动仍可 `git diff` 查看，只是无回滚锚点） |
+| 非 `--bare` 误用导致 worktree | 不会发生--adapter 强制 `--bare`，doctor 校验 |
 
 ### 7.3 per-phase 深度 merge 规则
 
 - 标量字段：phase 值完全覆盖 top-level
 - table 字段（prompts）：深度 merge
 
-### 7.4 Provider 字段 → settingsPath 映射
+### 7.4 Provider 字段 -> settingsPath 映射
+
+> **v2.1.3（F9）**：不新写 `resolveSettingsPath`，直接复用现有 `providerManager.resolve(alias).path`（`src/utils/providers.ts:38-49`，`feishu/bot.ts` 已有调用先例）。
 
 ```typescript
-async function resolveSettingsPath(provider: string): Promise<string> {
-  const path = `${process.env.HOME}/.claude/providers/${provider}.json`;
-  if (!existsSync(path)) {
+import { providerManager } from '../utils/providers';
+
+async function resolveSettingsPath(providerAlias: string): Promise<string> {
+  await providerManager.scan();                        // 扫 ~/.claude/providers/*.json
+  const cfg = providerManager.resolve(providerAlias);  // -> { alias, name, path, isTemp }
+  if (!cfg) {
     throw new ProfileError({
       code: 'PROVIDER_NOT_FOUND',
-      message: `provider '${provider}' 不在 ~/.claude/providers/`,
-      remediation: `放置 ~/.claude/providers/${provider}.json`,
+      message: `provider '${providerAlias}' 不在 ~/.claude/providers/`,
+      remediation: `放置 ~/.claude/providers/${providerAlias}.json`,
     });
   }
-  return path;
+  return cfg.path;   // settings 文件绝对路径，直接喂 --settings
 }
 ```
 
@@ -427,11 +432,11 @@ async function resolveSettingsPath(provider: string): Promise<string> {
 
 | 来源 | 用途 |
 |------|------|
-| provider 文件名后缀（如 `kimi-for-coding[256k]`） | `parseModelFromProviderEnv` 解析为 `contextHint`，写入报告 |
-| profile `[context_limits]` 覆盖 | profile 级显式声明，优先于后缀 |
-| 都没有 | `contextHint = null`，报告中显示 "unknown" |
+| `state.json.respawnFlags` 的 `--model`（如 `glm-5.2[1m]`） | `parseModelFromRespawnFlags` 解析为 `ModelInfo`，写入报告（实测：respawnFlags 由 CLI 从 settings 解析写入，可信；`providerEnv` 不可信） |
+| provider 文件名后缀 | 备用（respawnFlags 无 `--model` 时） |
+| profile `[context_limits]` 覆盖 | profile 级显式声明，仅供报告 |
 
-> **v2.1.3 变更**：删除内置 `KNOWN_CONTEXT_LIMITS` 表（context 上限不再用于阈值检测）。原表中的常见模型上限仍可作为 profile `[context_limits]` 的参考值填写，但 engine 不再内置硬编码。
+> **v2.1.3 变更**：模型名从 `respawnFlags` 取（非 `providerEnv`，实测 F3）；删内置 `KNOWN_CONTEXT_LIMITS` 表（context 上限不再用于阈值检测）；删 cost 价格表（成本统计整组移除）。
 
 ### 7.5 Output Contract
 
@@ -488,12 +493,11 @@ const ReviewOutputSchema = z.object({
     fix_applied: z.boolean(),
     fix_summary: z.string().optional(),
   })),
-  checkpoint_sha: z.string().nullable(),
   reasoning: z.string(),
 });
 ```
 
-> **v2.1.3 schema 变更**：删 `JudgeOutputSchema`（JUDGE_BY_WORK 移除）；`ReviewOutputSchema` 从"只输出 issues"升级为"issues + per_issue(含 fix_applied) + checkpoint_sha + reasoning"（review 既审又修）。`SelfReviewOutputSchema` / `FixingOutputSchema` 保持不变。
+> **v2.1.3 schema 变更**：删 `JudgeOutputSchema`（JUDGE_BY_WORK 移除）；`ReviewOutputSchema` 从"只输出 issues"升级为"issues + per_issue(含 fix_applied) + reasoning"（review 既审又修，删 checkpoint_sha--engine 打）。`SelfReviewOutputSchema` / `FixingOutputSchema` 保持不变。
 
 #### 7.5.4 Parse 失败处理
 
@@ -541,7 +545,7 @@ type ExtendedJobStateFile = JobStateFile & {
 
 > **v2.1.3 整组删除**：context-OK 判断与三档 cascade（compact / reset / abort）+ review opinions 落盘 / @file 引用，随『裸奔』决策整组移除。
 >
-> 移除理由：删 JUDGE_BY_WORK 后 work 不再做 judge / 外审 fix，context 累积速度大幅下降；常规 2-4 轮不会 overflow，主动检测 + cascade 的复杂度不再划算。极端情况下由 `max_rounds` + `max_cost_usd` 兜底收敛。
+> 移除理由：删 JUDGE_BY_WORK 后 work 不再做 judge / 外审 fix，context 累积速度大幅下降；常规 2-4 轮不会 overflow，主动检测 + cascade 的复杂度不再划算。极端情况下由 `max_rounds` 兜底收敛（v2.1.3 删成本统计，无 max_cost_usd）。
 >
 > 删除的模块：`context-overflow.ts` / `build-context-reset-prompt.ts` / `build-context-compact-prompt.ts` / `review-opinions-writer.ts`。
 > 删除的 adapter API：`getContextUsage`。
@@ -594,21 +598,26 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
 | CLI 版本过低 | doctor fail fast |
 | daemon 不健康 | PANE_LOST |
 | bg session 消失 | PANE_LOST |
-| 网络瞬态 503 | retry 3 次 + backoff → FAILED `network_timeout` |
-| JSON parse 失败 | retry 1 次 → parse_degraded |
+| 网络瞬态 503 | retry 3 次 + backoff -> FAILED `network_timeout` |
+| JSON parse 失败 | retry 1 次 -> parse_degraded |
 | max_rounds 达到 | ABORTED |
-| review pane parse 失败 | retry → 仍失败 → ABORTED（review 已改代码，不能静默推进，详见 §7.5.4） |
-| cost 超 max_cost_usd | ABORTED `budget_exceeded` |
+| review pane parse 失败 | retry -> 仍失败 -> ABORTED（review 已改代码，不能静默推进，详见 §7.5.4） |
+| 429 限额耗尽（blocked + needs rate limited） | PAUSED（parse 重置时间，reconciler 到点唤醒，详见 §5/§6.4） |
+| blocked + needs permission/allow | ABORTED `permission_denied`（--bare 无 permission 通道） |
+| blocked + needs 其他 | ABORTED `unexpected_blocked`（review engine 无交互通道） |
+| bg spawn 无效选项（如 `--cwd`） | FAILED（state=failed，实测 exit 1 before init） |
 
-> **v2.1.3 删除**：`Context window 超限`（cascade 整组移除，裸奔）+ `Review opinions 写文件失败`（落盘整组移除）两行。
+> **v2.1.3 删除**：`Context window 超限`（cascade 整组移除，裸奔）+ `Review opinions 写文件失败`（落盘整组移除）+ `cost 超 max_cost_usd`（成本统计整组移除）三行。
+> **v2.1.3 新增**：429 限额耗尽 -> PAUSED（国产模型周/月限额常态，实测）；blocked 分流（permission/unexpected -> ABORTED）；spawn 无效选项 -> FAILED（实测 `--cwd` 不可用）。
 
 ### 10.2 修复者不变量（v2.1.3 重写）
 
 > 原 §10.2 "cascade 模式约束"（compact/reset 共享的 3 不变量）随 cascade 移除。v2.1.3 下不变量简化为：
 
-1. **work 是自查自修的唯一修复者**（R1/R2 → FIXING，sessionId 跨轮不变）
-2. **review 是外审+外修的修复者**（EXTERNAL_REVIEW 内 review 模型直接改代码，每轮新 session + 自己的 checkpoint）
-3. **跨模型校验靠 postfix 复查闭环**：review 修完 → work 下一轮 R1 复查 review 改动；verify-first 在两处都生效（work FIXING + review EXTERNAL_REVIEW）
+1. **work 是自查自修的修复者**（R1/R2 -> FIXING，sessionId 跨轮不变）
+2. **review 是外审+外修的修复者**（EXTERNAL_REVIEW 内 review 模型直接改代码，每轮新 session；checkpoint 由 engine 打）
+3. **跨模型校验靠 postfix 复查闭环**：review 修完 -> work 下一轮 R1 复查 review 改动；verify-first 在两处都生效（work FIXING + review EXTERNAL_REVIEW）
+4. **work/review 都用 `--bare` 在原开发分支改文件**，不建 worktree；engine 用 git checkpoint 隔离各阶段改动
 
 ### 10.3 Graceful degradation vs fail fast
 
@@ -633,7 +642,7 @@ function detect(input: { rawInput: string; filePath?: string; gitRef?: string })
 
 ```bash
 cc-linker review doctor
-# ✓ Claude CLI: 2.1.163
+# ✓ Claude CLI: 2.1.207 (≥ 2.1.139)
 # ✓ Daemon: healthy
 # ✓ Profile 'default' loaded
 # ✓ Provider 'claude-sonnet-4' (work): exists

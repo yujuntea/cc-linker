@@ -34,6 +34,25 @@
 >
 > 如格式与预期不符，需同步修改 §7.5.1 的 `ExtendedJobStateFile` 类型声明和 `parseBgOutputWithRetry` 的 JSON 提取策略。
 
+### 附录 A.1：Claude CLI 2.1.207 实测硬约束（2026-07-12，v2.1.3）
+
+> 本节为 v2.1.3 实施前的端到端实测结论，是 adapter/engine 设计的硬约束（实测环境：Claude CLI 2.1.207 on macOS 24.6.0，providers：minimax-m2.7 / byte-agent-glm-new / glm-5.2）。
+
+| # | 实测项 | 命令/操作 | 结果 | 设计约束 |
+|---|---|---|---|---|
+| H1 | **bg 默认建隔离 worktree** | `claude --bg "fix bug" --settings <p>` 在 git repo 内 | 改动落在 `.claude/worktrees/<name>` + `worktree-<name>` 分支，**主 cwd 不被改动**，主 `git diff` 为空 | adapter 必须 `--bare` 禁 worktree（否则 review 改动 work 看不到，闭环断） |
+| H2 | **`--bare` 禁 worktree** | `claude --bg --bare "fix bug" --settings <p>` | 改动直接落主 cwd，`git diff` 可见，不建 worktree | adapter spawn 统一加 `--bare` |
+| H3 | **`--cwd` 不可用** | `claude --bg "..." --cwd /path` | `state=failed`，`detail: "exit 1 before init - error: unknown option '--cwd'"` | cwd 由 `Bun.spawn({cwd})` 控制，不传 `--cwd` |
+| H4 | **模型由 settings 决定** | `claude --bg "..." --settings glm-5.2.json`（不传 --model） | `respawnFlags` 自动含 `--model glm-5.2[1m]`（CLI 从 settings 解析） | engine 只传 `--settings`，不传 `--model` |
+| H5 | **providerEnv 不可信** | 读 `state.json.providerEnv.ANTHROPIC_MODEL` | 显示 `MiniMax-M3[1m]`（base env 占位），与实际跑的 `glm-5.2` 不符 | 模型名从 `respawnFlags` 的 `--model` 取，不从 providerEnv |
+| H6 | **无 cost_usd** | cat done state.json | 顶层无 `cost_usd`，`output.result` 是纯文本回复，仅有粗 `tokens` 总数 | 删成本统计（无可靠来源）；`max_cost_usd` 护栏不可行 |
+| H7 | **`output.result` = 模型回复** | cat done state.json | `output: { result: "HELLO WORLD" }`（纯文本，含 review 输出的 JSON） | §7.5.2 `extractJsonBlock` 从 result 末尾取 JSON 成立 |
+| H8 | **429 走 blocked** | glm-5.2 spawn 后限流 | `state=blocked`，`needs: "rate limited - wait and retry · API Error 429 · ...重置时间"` | 加 PAUSED 态：parse 重置时间 -> 挂起 -> reconciler 到点唤醒 |
+| H9 | **worktree 被 locked** | 清理实测 worktree | `git worktree remove` 报 "locked: claude session"；需 `git worktree unlock` 再 remove | 用 `--bare` 规避 worktree 生命周期管理（路线 Y） |
+| H10 | **injectReply 无过滤** | `RendezvousClient.injectReply({text})` | `{type:'reply', text}` 原样发 daemon，无转义/长度限制 | review/work 任意 prompt 注入可行（review 既审又修协议层成立） |
+
+**实测残留清理**：实测产生 6 个 bg session（d5c01dd1/2025e5ff/b26ea912/b4c50366/79145be5/8b16bf27）+ 2 个 worktree（review-fix/fix-add-bug），均已 `claude stop` + `git worktree unlock && remove` + `git branch -D` 清理。
+
 ## 附录 B：复用的 Agent View 模块清单
 
 | 模块 | 路径 | 复用方式 |
@@ -270,21 +289,52 @@ review 修了 ≥1 个 real P0/P1/P2
 | 风险 | 取舍 |
 |------|------|
 | review 改未写过的代码，fix 质量可能不如 work | 接受：work postfix 复查会兜住 review 的劣质修复；verify-first 在 review 侧也生效 |
-| context 裸奔，极端长任务撑爆无主动干预 | 接受：max_rounds + max_cost_usd 是硬兜底；Phase 3 可重引入轻量 abort（不做 cascade） |
+| context 裸奔，极端长任务撑爆无主动干预 | 接受：max_rounds 兜底（v2.1.3 删成本统计，无 max_cost_usd）；Phase 3 可重引入轻量 abort（不做 cascade） |
 | review 改代码与 work 串行假设 | 状态机保证：work state=done 才进 EXTERNAL_REVIEW，两 pane 串行，不会并发改文件 |
 | 删 HUMAN_DECIDE 失去高分歧人工兜底 | 接受：MVP 自动化优先；max_rounds 到顶 ABORTED 后人工可 `review resume` / 手动介入 |
 
-#### C.8.5 未做的事
+#### C.8.5 未做的事（第一轮，实测前）
 
 **主动保留**：
-- ❌ 没改 max_rounds 默认值（仍是 code=8 / plan=5 / spec=4 / global=6）——删 JUDGE 后收敛路径变短，默认值偏宽但安全
+- ❌ ~~没改 max_rounds 默认值（仍是 code=8）~~ -> **C.8.6 实测后改为 code=6**
 - ❌ 没改 parse_retry_timeout 15s
 - ❌ 没动 PANE_LOST（bg session 仍可能死，与本次简化正交）
 - ❌ 没改 R1/R2 的触发与结构（只改了 clean 的去向：从 DONE 改为 EXTERNAL_REVIEW）
 
 **Phase 3 可重新引入**：
-- context 用量轻量 abort 兜底（单档，不做 cascade）——若实践中确实出现撑爆
+- context 用量轻量 abort 兜底（单档，不做 cascade）--若实践中确实出现撑爆
 - review 修复质量打分 / 人工复核高分歧
+
+#### C.8.6 v2.1.3 实测修正决策（2026-07-12 第二轮，端到端实测后）
+
+> 第一轮（C.8.1-C.8.5）基于纸面分析。本节为用真实 claude 2.1.207 + minimax/glm/byte providers 端到端实测后的修正决策（实测硬约束见附录 A.1）。
+
+**实测发现的问题与修正**：
+
+| # | 实测发现 | 修正决策 | 影响 |
+|---|---|---|---|
+| F1 | state.json 无 cost_usd，v2.1.3 删的 jsonl usage 路径反而是唯一能用的 | **删成本统计整组**（用户拍板：不需要成本统计）：删 `totalCostUsd`/`costUsd`/`max_cost_usd`/cost 价格表/`budget_exceeded` | §6.1/§7.2/§8/§10 |
+| F2 | 429 限额耗尽走 blocked + 重置时间（国产模型常态） | **新增 PAUSED 态**：parse 重置时间 -> 挂起 -> reconciler 到点唤醒 | §5/§6.4/§10 |
+| F3 | providerEnv 不可信，模型实际由 settings + respawnFlags 决定 | `parseModelFromRespawnFlags`（从 respawnFlags 的 --model 取），删 `parseModelFromProviderEnv`；engine 只传 `--settings` 不传 `--model` | §3.2.1/§7.4 |
+| F4 | blocked 不止"等用户输入"，rate limit/permission 都走 blocked | `adapter.poll` 返回 `BlockedResult{kind}` 分流：rate_limited->PAUSED，permission/unexpected->ABORTED | §4.3/§10 |
+| F5 | review 输入 artifact 构造未定义 | **用户提议**：review/work 输入统一用 spec/plan（或 `<task>` 需求文本），模型自己 cat + 自选 `git diff` 范围，engine 不构造 artifact；删 EXTERNAL_REVIEW.cycle | §7.2 prompts |
+| F-WT | bg 默认建隔离 worktree，主 cwd 不被改动 | **用户拍板路线 Y**：`--bare` 禁 worktree，work/review 直接在原开发分支改；engine 打 git checkpoint 隔离各阶段 | §2.2/§7.2/§10 |
+| F-CWD | `--cwd` 不可用（exit 1） | cwd 由 `Bun.spawn({cwd})` 控制 | §3.2.1 |
+| F7 | 模型 git commit 行为不可控（自建分支/worktree、message 乱） | **checkpoint 改由 engine 打**（阶段切换前 engine 跑 git commit），模型不碰 git；删 preamble；ReviewFixOutput 删 checkpointSha | §7.2/§7.2.1/§7.5.3 |
+| F8 | "0 行重复代码"误导（src 零 `--bg` spawn 先例） | G6 改为"复用状态读取/注入/停止；spawn --bare 为 adapter 新增" | §2.1 |
+| F9 | resolveSettingsPath 多余 | 复用 `providerManager.resolve(alias).path`（`src/utils/providers.ts`） | §7.4 |
+| F10 | 单轮 turn 数增加（review 修 + postfix 复查） | max_rounds code 8 -> 6 | §5.2 |
+
+**关键设计取舍（用户拍板）**：
+- **review 既审又修**（反转 I9）：review 在 EXTERNAL_REVIEW 单 turn 内识别+确认+直接修+verify；cross-model 靠 work postfix R1 复查闭环。
+- **无论如何都跑一轮外审**：R1/R2 clean 不再 -> DONE，一律进 EXTERNAL_REVIEW；429 PAUSED 恢复后也继续跑（不跳过）。
+- **clean 标准**：无 P0/P1/P2 需修复，P3 不阻塞。
+- **context 裸奔**：删 cascade，靠 max_rounds 兜底；Phase 3 可重引入轻量 abort。
+- **checkpoint 由 engine 打**：不信任模型 git 行为。
+
+**第二轮未做**：
+- ❌ 没实现 PAUSED 期间 bg session 死亡的自动 respawn（reconciler 唤醒时校验 session 活着，死了 -> PANE_LOST，由用户 retry）
+- ❌ 没做 review 自选 diff 看漏的检测（靠 work postfix 复查 + prompt 明确要求查全部 diff 兜底）
 
 ## 附录 D：v2.1.1 评审反馈汇总（2026-06-17）
 

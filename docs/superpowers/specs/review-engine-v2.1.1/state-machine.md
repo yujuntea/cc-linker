@@ -10,7 +10,7 @@
 时间轴  组件                       动作
 ─────  ─────────────────         ────────────────────────────────────────────────
 T0    用户                        cc-linker review run "帮我修 NPE in auth.ts"
-T1    CLI (review doctor)         验证：profile.default 引用 provider + CLI ≥ 2.1.163 + daemon 健康
+T1    CLI (review doctor)         验证：profile.default 引用 provider + CLI ≥ 2.1.139 + daemon 健康
 T2    Engine                      调 phase-detect.detect(...) → 'code'
 T3    Engine                      调 profile.load('default') → merged profile
 T4    Engine                      调 adapter.startSession({ role:'work', provider:'claude-sonnet-4', prompt:'NPE in auth.ts', isNew:true })
@@ -66,20 +66,27 @@ T47   Engine                      写 PipelineRecord 到 done/，CLI 输出 stat
 
 > **v2.1.3 注**：JUDGE_BY_WORK 已删除，injectReply 现在只剩 work 的 FIXING 一个调用点。EXTERNAL_REVIEW 的修复由 review 模型在自己的 bg session 内完成（spawn 时一次性给 prompt），不需要 injectReply。
 
-### 4.3 判定"work 产出完成" / "review 收齐"
+### 4.3 判定"work 产出完成" / "review 收齐" / "blocked 分流"
 
 不自己 parse 进程 stdout，**只**看 `~/.claude/jobs/<short>/state.json.state`：
 
 | state 值 | 含义 |
 |---------|------|
 | `running` / `working` + tempo=`active` | 还在跑 |
-| `running` / `working` + tempo=`blocked` + `needs` 非空 | 等用户输入 |
-| `blocked` | 等用户输入 |
-| `done` | 已完成（看 `output` 字段拿最终输出文本） |
+| `done` | 已完成（看 `output.result` 拿最终输出文本） |
 | `stopped` | 被 stop 或用户中止 |
-| `failed` | Claude 进程异常 |
+| `failed` | Claude 进程异常（如 `--cwd` 等无效选项 exit 1，实测） |
+| `blocked` + tempo=`blocked` + `needs` 非空 | **分流**（见下，v2.1.3 实测：rate limit / permission / 等输入都走 blocked，必须看 `needs` 内容区分） |
 
-**实现**：`adapter.poll(shortId, timeoutMs)` 包装 `readJobState` 轮询（500ms 一次），超时抛 `PollTimeoutError`。
+**`blocked` 分流（v2.1.3 实测修正 F4）**：`adapter.poll` 检测到 `state=blocked` 时，按 `needs`/`detail` 内容分流：
+
+| `needs`/`detail` 含 | 分流 | engine 动作 |
+|---|---|---|
+| `rate limited` / `429` / `使用上限` / `重置` | **限流** | parse 重置时间 -> 进 **PAUSED** 态（§5），reconciler 到点唤醒 |
+| `permission` / `allow` / `denied` | **权限拒绝** | review/work 跑在 `--bare` 无 permission 通道，直接 ABORTED `permission_denied` |
+| 其他（真等用户输入） | **异常** | review engine 无交互通道，ABORTED `unexpected_blocked` |
+
+**实现**：`adapter.poll(shortId, timeoutMs)` 包装 `readJobState` 轮询（500ms 一次），超时抛 `PollTimeoutError`。检测到 blocked 时返回 `BlockedResult{ kind: 'rate_limited'|'permission'|'unexpected', resumeAt?, raw }` 交 engine 决策。
 
 ### 4.4 并发控制
 
@@ -111,33 +118,41 @@ async function watchPipeline(pipelineId: string): Promise<void> {
 
 ### 5.1 ReviewState 枚举
 
-> **v2.1.3 瘦身**：删除 `JUDGE_BY_WORK` / `HUMAN_DECIDE` / `DecisionContext`；FIXING source 收窄为 `R1 | R2`；删除 `contextOverflowApplied` / `injectedIssues`（context cascade 整组移除）。active state 9 → 5，terminal 3 不变，trouble 1 不变。
+> **v2.1.3 瘦身**：删除 `JUDGE_BY_WORK` / `HUMAN_DECIDE` / `DecisionContext`；FIXING source 收窄为 `R1 | R2`；删除 `contextOverflowApplied` / `injectedIssues`（context cascade 整组移除）；删 `EXTERNAL_REVIEW.cycle`（review 每轮输入统一为 spec/plan，不再区分 initial/postfix）；删 `totalCostUsd`（成本统计整组移除）。active 5、trouble 2（+PAUSED）、terminal 3。
+>
+> **v2.1.3 新增 PAUSED**：429 限额耗尽时挂起，reconciler 到点唤醒。
 
 ```typescript
 type ReviewState =
   // === Produce 阶段 ===
-  | { kind: 'PRODUCING';         pipelineId; round: number; pane: 'work' }
+  | { kind: PRODUCING;         pipelineId; round: number; pane: work }
   // === 自查阶段（identify-only，fix 在后续 FIXING 节点）===
-  | { kind: 'SELF_REVIEW_R1';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
-  | { kind: 'SELF_REVIEW_R2';    pipelineId; round: number; cycle: 'initial' | 'postfix'; pane: 'work' }
+  | { kind: SELF_REVIEW_R1;    pipelineId; round: number; cycle: initial | postfix; pane: work }
+  | { kind: SELF_REVIEW_R2;    pipelineId; round: number; cycle: initial | postfix; pane: work }
   // === 修复节点（从 R1/R2 两个调用点进入；v2.1.3 删 JUDGE/HUMAN source）===
-  | { kind: 'FIXING';            pipelineId; round: number; pane: 'work';
-                                  source: 'SELF_REVIEW_R1' | 'SELF_REVIEW_R2';
+  | { kind: FIXING;            pipelineId; round: number; pane: work;
+                                  source: SELF_REVIEW_R1 | SELF_REVIEW_R2;
                                   inputIssues: Issue[] }
   // inputIssues 语义：当轮自查发现的 issues（不跨轮累积），每轮 FIXING 独立替换；
   // 追踪历史所有 issues 通过 pipeline.history[].issues 回溯
-  // === 外审 + 直接修复（单一 review session，v2.1.3：review 既审又修）===
-  | { kind: 'EXTERNAL_REVIEW';   pipelineId; round: number; cycle: 'initial' | 'postfix';
-                                  pane: { role: 'review'; shortId: string } }
+  // === 外审 + 直接修复（单一 review session，v2.1.3：review 既审又修，每轮输入=spec/plan）===
+  | { kind: EXTERNAL_REVIEW;   pipelineId; round: number;
+                                  pane: { role: review; shortId: string } }
+  // === 限额挂起（v2.1.3 新增）===
+  | { kind: PAUSED;            pipelineId; round: number;
+                                  pausedFrom: ReviewState[kind];   // 被挂起时所处的状态
+                                  resumeAt: string;                  // 限额重置时间（ISO）
+                                  reason: string;                    // 原始 needs/detail
+                                  detectedAt: string }
   // === pane 丢失（用户询问，不直接 FAILED）===
-  | { kind: 'PANE_LOST';         pipelineId; round: number;
-                                  lostPane?: { role: 'work' | 'review'; shortId: string };
+  | { kind: PANE_LOST;         pipelineId; round: number;
+                                  lostPane?: { role: work | review; shortId: string };
                                   detectedAt: string;
-                                  retryTarget: ReviewState['kind'] }
+                                  retryTarget: ReviewState[kind] }
   // === 终态 ===
-  | { kind: 'DONE';              pipelineId; round: number; totalCostUsd; issueTrail }
-  | { kind: 'FAILED';            pipelineId; round: number; reason; totalCostUsd }
-  | { kind: 'ABORTED';           pipelineId; round: number; reason; abortedBefore };
+  | { kind: DONE;              pipelineId; round: number; issueTrail }
+  | { kind: FAILED;            pipelineId; round: number; reason }
+  | { kind: ABORTED;           pipelineId; round: number; reason; abortedBefore };
 ```
 
 > **v2.1.3 删除的类型**：`DecisionContext`（HUMAN_DECIDE 的载荷）、`WorkDecision`（JUDGE 产出）已移除，相关定义见 [implementation.md §6.0](./implementation.md#60-共享类型定义)。
@@ -160,7 +175,7 @@ type ReviewState =
 |-------|------|------|
 | Spec  | 4 cycles | 最多跑 4 轮 |
 | Plan  | 5 cycles | 最多跑 5 轮 |
-| Code  | 8 cycles | 最多跑 8 轮 |
+| Code  | 6 cycles | 最多跑 6 轮（v2.1.3：从 8 调到 6，删 JUDGE 后单轮变短但加 review 修复 + postfix 复查） |
 | Global | 6 cycles | 全局默认 6 轮 |
 
 ### 5.3 状态转换图
@@ -170,10 +185,10 @@ type ReviewState =
 | Lane | 状态 | 驱动者 |
 |------|------|--------|
 | **Engine lane** | PRODUCING / R1 / R2 / FIXING / EXTERNAL_REVIEW | Engine 自动 |
-| **Trouble lane** | PANE_LOST | User + Engine |
+| **Trouble lane** | PAUSED / PANE_LOST | Engine + Reconciler（PAUSED 到点唤醒）/ User |
 | **Terminal** | DONE / FAILED / ABORTED | — |
 
-> **v2.1.3 注**：Human lane（HUMAN_DECIDE）已删除，全流程由 Engine 自动驱动，无需人工裁决介入。
+> **v2.1.3 注**：Human lane（HUMAN_DECIDE）已删除，全流程由 Engine 自动驱动，无需人工裁决介入。 PAUSED 加入 Trouble lane（429 限额耗尽挂起，reconciler 到点自动唤醒，不需人工）。
 
 #### 5.3.1 主状态机（Mermaid）
 
@@ -192,7 +207,15 @@ stateDiagram-v2
     SELF_REVIEW_R2 --> EXTERNAL_REVIEW : R2 clean (no P0/P1/P2)
     FIXING --> EXTERNAL_REVIEW : verify and fix done (source R2)
     EXTERNAL_REVIEW --> DONE : review found no real P0/P1/P2 to fix
-    EXTERNAL_REVIEW --> SELF_REVIEW_R1 : review fixed ≥1 real P0/P1/P2, round + 1 (work postfix 复查)
+    EXTERNAL_REVIEW --> SELF_REVIEW_R1 : review fixed >=1 real P0/P1/P2, round + 1 (work postfix 复查)
+
+    PRODUCING --> PAUSED : 429 rate limited (blocked + needs rate limited)
+    SELF_REVIEW_R1 --> PAUSED : 429 rate limited
+    SELF_REVIEW_R2 --> PAUSED : 429 rate limited
+    FIXING --> PAUSED : 429 rate limited
+    EXTERNAL_REVIEW --> PAUSED : 429 rate limited
+    PAUSED --> PRODUCING : resumeAt reached (reconciler 唤醒，回到 pausedFrom)
+    PAUSED --> ABORTED : user cancel
 
     PANE_LOST --> ABORTED : user abort or 24h timeout
 
@@ -210,12 +233,22 @@ stateDiagram-v2
 
     note right of EXTERNAL_REVIEW
       v2.1.3：review 模型在单个 bg turn 内完成
-      识别问题 → 确认方案 → git preamble 打 checkpoint → verify-first 修复 → 输出 JSON
-      （反转 I9 的 review_fix 决策，review 既审又修）
+      识别问题、确认方案、verify-first 直接修复、输出 JSON
+      （反转 I9，review 既审又修；用 --bare 在原分支改，不建 worktree）
+      输入 = 用户 spec/plan（或 task 需求文本），模型自己 cat + 自选 git diff 范围
+      checkpoint 由 engine 在 spawn review 前打（不由模型打）
 
       收敛判定（engine 侧，统一 clean 标准）：
-      - real P0/P1/P2 数 == 0  → DONE（仅 P3 / hallucination / 无问题 都算 clean）
-      - real P0/P1/P2 数 > 0   → SELF_REVIEW_R1(postfix, round+1)，work 复查 review 修复
+      - real P0/P1/P2 数 == 0  -> DONE（仅 P3 / hallucination / 无问题 都算 clean）
+      - real P0/P1/P2 数 > 0   -> SELF_REVIEW_R1(postfix, round+1)，work 复查 review 修复
+    end note
+
+    note right of PAUSED
+      v2.1.3 新增：429 限额耗尽（国产模型周/月限额常态）
+      adapter.poll 检测 state=blocked + needs 含 rate limited/429/重置
+      -> parse 重置时间 -> PAUSED(resumeAt)
+      reconciler 到点唤醒 -> 回到 pausedFrom 继续
+      bg session 不杀（保持 blocked），唤醒后继续 poll
     end note
 ```
 
@@ -290,6 +323,9 @@ stateDiagram-v2
 | **FIXING (source=R2)** | done | EXTERNAL_REVIEW | 同上 | work | 不变 |
 | **EXTERNAL_REVIEW** | review state=`done`，real P0/P1/P2 数 == 0 | DONE | 收集 review findings 入 issueTrail + 生成 report + 移到 `done/` | review (×1) | 不变 |
 | **EXTERNAL_REVIEW** | review state=`done`，review 修复了 ≥1 real P0/P1/P2 | SELF_REVIEW_R1 | cycle=`postfix`, **round += 1**（work 复查 review 修复） | work (R1 postfix) | +1 |
+| **任意 active 状态 X** | adapter.poll 检测 blocked + needs 含 rate limited/429/重置 | PAUSED | parse 重置时间写入 resumeAt，pausedFrom=X；bg session 不杀（保持 blocked） | 当前 pane | 不变 |
+| **PAUSED** | reconciler 到 resumeAt 唤醒 | (pausedFrom) | 回到被挂起状态继续 poll 同一 bg | - | 不变 |
+| **PAUSED** | user cancel | ABORTED | cleanup + stop bg | - | 不变 |
 | **任意状态 X** | bg session 消失 | PANE_LOST | 记录 lostPane + detectedAt | lost pane | 不变 |
 | **任意状态 X** | user cancel | ABORTED | cleanup | — | 不变 |
 | **进入 SELF_REVIEW_R1** | round ≥ max_rounds | ABORTED | reason=`max_rounds_exceeded` | — | 超过 |
@@ -308,9 +344,11 @@ stateDiagram-v2
 | **ABORTED** | `pane_lost_timeout` | PANE_LOST 24h |
 | **ABORTED** | `work_session_lost_exceeds_max_rounds` | retry PANE_LOST 触发 |
 | **ABORTED** | `user_cancelled` | `cc-linker review cancel` |
-| **ABORTED** | `budget_exceeded` | costUsd > max_cost_usd |
+| **ABORTED** | `permission_denied` | blocked + needs 含 permission/allow/denied（--bare 无 permission 通道） |
+| **ABORTED** | `unexpected_blocked` | blocked 但 needs 不匹配限流/权限（review engine 无交互通道） |
+| **ABORTED** | `paused_cancelled` | PAUSED 态用户 cancel |
 
-> **v2.1.3 删除的 reason**：`human_decision_timeout`（HUMAN_DECIDE 移除）、`context_overflow_max_attempts` / `context_reset_spawn_failed` / `review_opinions_write_failed` / `reset_loop` / `reset_timeout`（context cascade 整组移除）。
+> **v2.1.3 删除的 reason**：`human_decision_timeout`（HUMAN_DECIDE 移除）、`context_overflow_max_attempts` / `context_reset_spawn_failed` / `review_opinions_write_failed` / `reset_loop` / `reset_timeout`（context cascade 整组移除）、`budget_exceeded`（成本统计整组移除，实测 state.json 无 cost_usd）。
 
 #### 5.3.5 走查示例
 

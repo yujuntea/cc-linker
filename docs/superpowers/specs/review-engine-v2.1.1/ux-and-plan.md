@@ -9,20 +9,20 @@
 ```bash
 cc-linker review run "帮我修 NPE in auth.ts" --phase code --profile default
 
-# ╭─ cc-linker Review Engine v2.1 ─────────────────────────────────╮
+# ╭─ cc-linker Review Engine v2.1.3 ───────────────────────────────╮
 # │ Pipeline: 01HXYZK9... │ Phase: code │ Profile: default          │
-# │ Round: 3/8  │ Cost: $0.42  │ ⏱ 12:34  │ State: EXTERNAL_REVIEW  │
+# │ Round: 3/6  │ ⏱ 12:34  │ State: EXTERNAL_REVIEW                  │
 # ╰──────────────────────────────────────────────────────────────────╯
 #
 # Pane Status:
-#   🔧 work       short2 (claude-sonnet-4)  done       $0.10  8.2s
-#   👁 review     short5 (kimi-for-coding)  busy       $0.05  4.2s
+#   🔧 work       short2 (MiniMax-M3)  done       8.2s
+#   👁 review     short5 (glm-5.2)     busy       4.2s
 #
 # Timeline:
-#   [12:30] ✓ PRODUCING (short1, sonnet)         $0.012  2.3s
-#   [12:31] ✓ SELF_REVIEW_R1 (short2, sonnet)    $0.008  1.8s
-#   [12:32] ⚠ SELF_REVIEW_R2 (short2, sonnet)    $0.009  2.1s  (2 issues)
-#   [12:33] ⟳ EXTERNAL_REVIEW (short5, kimi)     -       -
+#   [12:30] ✓ PRODUCING (short1, MiniMax-M3)         2.3s
+#   [12:31] ✓ SELF_REVIEW_R1 (short2, MiniMax-M3)    1.8s
+#   [12:32] ⚠ SELF_REVIEW_R2 (short2, MiniMax-M3)    2.1s  (2 issues)
+#   [12:33] ⟳ EXTERNAL_REVIEW (short5, glm-5.2)      -
 #
 # [Ctrl-C] detach; pipeline 继续在后台跑
 # 重连: cc-linker review status 01HXYZK9... --follow
@@ -41,10 +41,12 @@ cc-linker review run "帮我修 NPE in auth.ts" --phase code --profile default
 | Provider 找不到 | ❌ + remediation |
 | CLI 版本过低 | ❌ + `claude update` |
 | daemon crash | ⚠️ PANE_LOST |
-| bg session 启动失败 | ❌ FAILED |
-| 网络瞬态 503 | 🔄 retry 3 次 → FAILED |
+| bg session 启动失败 / `--cwd` 无效选项 | ❌ FAILED（state=failed） |
+| 网络瞬态 503 | 🔄 retry 3 次 -> FAILED |
 | review pane parse 失败 | ❌ ABORTED（review 已改代码，不能静默推进） |
 | max_rounds 达到 | ⚠️ ABORTED `max_rounds_exceeded` |
+| 429 限额耗尽 | ⏸ PAUSED（显示重置时间，到点自动恢复） |
+| blocked 权限拒绝/异常 | ❌ ABORTED `permission_denied`/`unexpected_blocked` |
 
 ### 8.3 飞书交互
 
@@ -54,18 +56,16 @@ review 跑期间飞书聊天暂时禁用（被 engine 占用）。review 完成�
 
 ```
 <cwd>/.claude/reviews/<pipelineId>.md
-├── Header: pipelineId / createdAt / phase / profile / totalCostUsd
-├── Checkpoints: 每个 FIXING（work）与每个 EXTERNAL_REVIEW（review）的 checkpoint SHA
+├── Header: pipelineId / createdAt / phase / profile
+├── Checkpoints: 每个 FIXING（work）与每个 EXTERNAL_REVIEW（review）的 checkpoint SHA（engine 打）
 ├── Parse Degradation Events（如有）
-├── Timeline: 所有 state transition 摘要
+├── Timeline: 所有 state transition 摘要（含 PAUSED 挂起/恢复事件）
 ├── Issues: 去重 + 按 severity 排序（含 P3 记录，标注是否阻塞收敛）
 ├── Fixes: 每个 real issue 的 verdict + fix_applied + 来源（work FIXING / review EXTERNAL_REVIEW）
 └── Report: 自然语言总结
 ```
 
-FIXING（work）与 EXTERNAL_REVIEW（review）均做最小化修改（各自先 git preamble 打 checkpoint，`git diff` 可查看、`git checkout` 回滚）。自动 commit/PR 留 Phase 2。
-
----
+work FIXING 与 review EXTERNAL_REVIEW 均用 `--bare` 在原开发分支做最小化修改（engine 在阶段切换前打 git checkpoint，`git diff <checkpoint>` 可查看、`git checkout <checkpoint>` 回滚）。自动 commit/PR 留 Phase 2。
 
 ## 11. 测试策略
 
@@ -90,18 +90,25 @@ FIXING（work）与 EXTERNAL_REVIEW（review）均做最小化修改（各自先
 **v2.1.1 新增 4 个**：
 
 5. 单一 review pane 流程
-6. commit preamble + checkpoint SHA
+6. commit preamble + checkpoint SHA（v2.1.3：改由 engine 打，非模型）
 7. JSON parse retry + parse_degraded
 8. ~~context overflow 策略 + injectedIssues~~（v2.1.3 删除）
 
-**v2.1.3 新增 6 个**（本轮，替换原 v2.1.2 cascade / review opinions 系列）：
+**v2.1.3 新增 13 个**（本轮，替换原 v2.1.2 cascade / review opinions 系列 + 实测修正）：
 
-9. EXTERNAL_REVIEW review+fix 单 turn：review 模型识别 + 确认 + git preamble + verify-first 修复 + 输出含 `checkpoint_sha` 的 JSON
-10. EXTERNAL_REVIEW 收敛判定：real P0/P1/P2 == 0 → DONE；> 0 → SELF_REVIEW_R1(postfix, round+1)
-11. work postfix 复查：review 修完 → work R1 复查发现新 P0/P1/P2 → FIXING → R2 → EXTERNAL_REVIEW，构成跨模型闭环
-12. clean 标准边界：R1/R2 只发现 P3 → clean → EXTERNAL_REVIEW；EXTERNAL_REVIEW 只发现 P3/hallucination → DONE（P3 不触发新一轮）
-13. 无论如何都跑一轮外审：R1 clean / R2 clean 不再 → DONE，一律进 EXTERNAL_REVIEW
-14. review pane parse 失败 → ABORTED（非静默，review 已改代码）
+9. **`--bare` spawn 集成**：bg 直接在原分支改文件，不建 worktree；`git diff` 可见改动（实测：不加 --bare 会建隔离 worktree）
+10. **`--cwd` 不可用实测**：adapter 用 `Bun.spawn({cwd})` 控 cwd，不传 `--cwd`（实测 unknown option -> failed）
+11. **模型名从 respawnFlags 取**：`parseModelFromRespawnFlags` 读 `--model`，非 providerEnv（实测 providerEnv 不可信）
+12. EXTERNAL_REVIEW review+fix 单 turn：review 模型识别 + 确认 + verify-first 直接修 + 输出 JSON（无 checkpoint_sha，engine 打 checkpoint）
+13. EXTERNAL_REVIEW 收敛判定：real P0/P1/P2 == 0 -> DONE；> 0 -> SELF_REVIEW_R1(postfix, round+1)
+14. work postfix 复查：review 修完 -> work R1 复查发现新 P0/P1/P2 -> FIXING -> R2 -> EXTERNAL_REVIEW，构成跨模型闭环
+15. clean 标准边界：R1/R2 只发现 P3 -> clean -> EXTERNAL_REVIEW；EXTERNAL_REVIEW 只发现 P3/hallucination -> DONE（P3 不触发新一轮）
+16. 无论如何都跑一轮外审：R1 clean / R2 clean 不再 -> DONE，一律进 EXTERNAL_REVIEW
+17. review pane parse 失败 -> ABORTED（非静默，review 已改代码）
+18. **429 限额 -> PAUSED**：adapter.poll 检测 blocked + needs rate limited -> parse 重置时间 -> PAUSED；reconciler 到 resumeAt 唤醒 -> 回到 pausedFrom 继续（实测国产模型周/月限额）
+19. **blocked 分流**：rate limited -> PAUSED；permission -> ABORTED permission_denied；其他 -> ABORTED unexpected_blocked
+20. **engine checkpoint**：阶段切换前 engine 打 git commit，模型不碰 git；非 git repo -> null + warn
+21. **review 输入用 spec/plan + 自选 diff**：engine 不构造 artifact，模型自己 cat spec + 自选 git diff 范围
 
 **v2.1.2 评审修正保留 3 个**（v2.1.3 仍适用）：
 
@@ -195,33 +202,39 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重 / 
 
 ### 13.4 v2.1.3 新增（本轮）
 
-- [ ] EXTERNAL_REVIEW 单 turn 内 review+fix 是否稳定？review 既审又修的输出 JSON（含 `checkpoint_sha`）是否可靠？
-- [ ] work postfix 复查是否真正构成跨模型闭环（review 修 → work 复查 → 不一致再修）？
+- [ ] **`--bare` 是否真的禁 worktree**？bg 改动是否直接落在原开发分支、`git diff` 可见？（实测：不加 --bare 会建隔离 worktree）
+- [ ] **adapter 不传 `--cwd`**？cwd 由 `Bun.spawn({cwd})` 控制？（实测 `--cwd` -> failed）
+- [ ] **模型名从 respawnFlags 取**？providerEnv 不可信是否规避？
+- [ ] EXTERNAL_REVIEW 单 turn 内 review+fix 是否稳定？review 既审又修的输出 JSON 是否可靠？（无 checkpoint_sha，engine 打）
+- [ ] work postfix 复查是否真正构成跨模型闭环（review 修 -> work 复查 -> 不一致再修）？
 - [ ] clean 标准统一：P0/P1/P2 阻塞、P3 不阻塞，三处（R1/R2/EXTERNAL_REVIEW）判定是否一致？
 - [ ] 无论如何都跑一轮外审：R1 clean / R2 clean 是否都正确进 EXTERNAL_REVIEW 而非 DONE？
-- [ ] review pane parse 失败 → ABORTED（非静默）是否覆盖？避免未验证的 review 修改混入产物。
-- [ ] review 在 cwd 内改代码与 work FIXING 是否会冲突？（设计上串行，但需验证 work bg 已 done 才 spawn review）
+- [ ] review pane parse 失败 -> ABORTED（非静默）是否覆盖？避免未验证的 review 修改混入产物。
+- [ ] review 与 work 都在原分支改代码，是否串行不冲突？（状态机保证 work done 才 spawn review；engine checkpoint 隔离各阶段）
 - [ ] 删 JUDGE/HUMAN 后 max_rounds 兜底是否足够？反复分歧场景是否在 max_rounds 内 ABORTED？
+- [ ] **429 -> PAUSED**：adapter.poll 检测 blocked + needs rate limited 是否准确？parse 重置时间是否健壮（不同 provider 文案）？reconciler 到点唤醒是否可靠？PAUSED 期间 bg session 是否保持 blocked 不死？
+- [ ] **blocked 分流**：rate limited / permission / unexpected 三类是否正确区分？
+- [ ] **engine checkpoint**：阶段切换前 git commit 是否成功？非 git repo 降级是否正确？用户未提交改动 stash 是否安全？
+- [ ] **review 输入 spec/plan + 自选 diff**：模型是否能稳定 cat spec + 自选合理 diff 范围？是否会出现看漏 diff？
 - [ ] **P1-7 验证**：超出 `max_concurrent_pipelines` 时新 pipeline 进入 `queued/`；前一个完成后 queued 自动启动。
 - [ ] **P1-9 验证**：PhaseDetector 优先级：git ref > 文件后缀:行号 > 路径后缀 > 关键词 > throw。
-
-> **v2.1.3 删除的 checklist 项**（原 v2.1.2 §13.4）：cascade compact/reset/abort 验证、review opinions 落盘 json/md、128K/200K/1M 阈值边界、cascade n 计数、@file 引用路径、`max_context_resets_per_pipeline` / `max_reset_duration_ms`、`injectReply` @{path} 展开、`state.json.output` 格式——这些随 cascade + 落盘 + getContextUsage 整组移除。
-
----
-
 ## 14. 关键风险
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| CLI 版本 < 2.1.163 | `claude --bg` 不可用 | doctor fail fast |
-| `claude --bg` 行为变化 | spawn 行为改变 | VersionGuard + 测试 |
+| CLI 版本 < 2.1.139 | `claude --bg` 不可用 | doctor fail fast |
+| `claude --bg` 行为变化（如 worktree 默认行为） | spawn 行为改变 | VersionGuard + `--bare` 强制 + 测试 |
 | work session resume 链断裂 | sessionId 变化 | Adapter 每次 resume 前验证 |
 | Provider 中途修改 | 走错模型 | PipelineRecord 锁住 provider + snapshot |
-| daemon crash | 所有 bg session 瘫 | Reconciler → PANE_LOST |
+| daemon crash | 所有 bg session 瘫 | Reconciler -> PANE_LOST |
 | JSON parse 退化 | 静默 false positive | retry + parse_degraded 标记 |
 | **review 既审又修质量回归**（v2.1.3 反转 I9） | review 模型改未写过的代码，fix 质量不如 work | work postfix R1 复查闭环 + verify-first + max_rounds 兜底 |
-| **context 裸奔**（v2.1.3 删 cascade） | 极端长任务可能撑爆 context 无主动干预 | max_rounds + max_cost_usd 兜底；Phase 3 可重引入轻量 abort |
-| **review 改代码与 work 串行假设破坏** | 若 work bg 未 done 就 spawn review，并发改文件冲突 | engine 确保 work state=done 后才进 EXTERNAL_REVIEW；串行由状态机保证 |
+| **context 裸奔**（v2.1.3 删 cascade） | 极端长任务可能撑爆 context 无主动干预 | max_rounds 兜底（v2.1.3 删成本统计，无 max_cost_usd）；Phase 3 可重引入轻量 abort |
+| **review 改代码与 work 串行假设破坏** | 若 work bg 未 done 就 spawn review，并发改文件冲突 | engine 确保 work state=done 后才进 EXTERNAL_REVIEW；串行由状态机保证；engine checkpoint 隔离各阶段 |
+| **429 限额耗尽**（实测国产模型常态） | review/work bg 卡 blocked，pipeline 停滞 | PAUSED 态 + reconciler 到点唤醒（不 retry 烧配额） |
+| **PAUSED 期间 bg session 死亡** | 限额恢复后唤醒发现 bg 已死 | reconciler 唤醒时先 readJobState 校验 session 活着，死了则 PANE_LOST -> respawn |
+| **模型自选 diff 看漏改动**（review 输入用 spec/plan） | review 漏看部分 diff，遗漏问题 | work postfix R1 复查兜底；prompt 明确要求 `git diff` 查看全部改动 |
+| **engine checkpoint 失败**（非 git repo / commit 失败） | 阶段改动无回滚锚点 | 降级 null + warn，阶段继续；报告标注无 checkpoint |
 
 ---
 
@@ -252,16 +265,16 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重 / 
 | §7.5.8.5 (v2.1.2 评审修正) | **@file 引用双轨策略 + 实测验证计划**（P1-8） | 中 |
 | §9 (v2.1.2 评审修正) | **PhaseDetector 优先级明确定义**（P1-9） | 小 |
 | §12.1 | 排期 5-6 周 → 6-7 周 → 7-8 周（v2.1.2 加 1 周） → **5-6 周（v2.1.3 缩减）** | 中 |
-| **§2.1 / §2.2 (v2.1.3)** | **删 G9；G2 改"自评自修+外审外修+postfix 复查"；review-fix 反转** | **大** |
-| **§3.2 / §3.2.1 (v2.1.3)** | **模块 15→11；删 getContextUsage；model-parser 瘦身删 KNOWN_CONTEXT_LIMITS** | **大** |
-| **§5.1 / §5.3 / §5.4 (v2.1.3)** | **删 JUDGE_BY_WORK/HUMAN_DECIDE/DecisionContext；状态机重画；§5.4 重写为 clean 判定+收敛** | **大** |
-| **§6.0 / §6.1 / §6.2 (v2.1.3)** | **删 ContextCheckResult/WorkDecision/ContextResetEvent；PipelineRecord 砍 context 字段；目录 6→5** | **大** |
-| **§7.2 / §7.4 / §7.5.3 (v2.1.3)** | **删 context/cascade 配置 + judge prompt；加 review-fix prompt + preamble；ReviewOutputSchema 升级含 fix_applied** | **大** |
+| **§2.1 / §2.2 (v2.1.3)** | **删 G9；G2 改"自评自修+外审外修+postfix 复查"；review-fix 反转；--bare 在原分支改；删成本统计；加 PAUSED** | **大** |
+| **§3.2 / §3.2.1 (v2.1.3)** | **模块 15->11；删 getContextUsage；model-parser 瘦身（删 KNOWN_CONTEXT_LIMITS + cost 表）；spawn 用 --bare；模型从 respawnFlags 取；复用 providerManager.resolve** | **大** |
+| **§5.1 / §5.3 / §5.4 (v2.1.3)** | **删 JUDGE/HUMAN/DecisionContext；加 PAUSED 态；删 EXTERNAL_REVIEW.cycle；状态机重画；§5.4 重写为 clean 判定+收敛；§4.3 blocked 分流** | **大** |
+| **§6.0 / §6.1 / §6.2 (v2.1.3)** | **删 ContextCheckResult/WorkDecision/ContextResetEvent；加 BlockedResult；PipelineRecord 砍 context/cost 字段；目录 6->5；§6.4 加 PAUSED 唤醒** | **大** |
+| **§7.2 / §7.4 / §7.5.3 (v2.1.3)** | **删 context/cascade/cost 配置；review prompt 改 spec/plan 输入+自选 diff；engine 打 checkpoint（删 preamble）；ReviewOutputSchema 升级删 checkpoint_sha；§7.4 复用 providerManager.resolve** | **大** |
 | **§7.5.7 / §7.5.8 (v2.1.3)** | **整组删除：context cascade + review opinions 落盘** | **大** |
-| **§10 (v2.1.3)** | **错误分类删 context/review-opinions 行；§10.2 重写为修复者不变量；删 §10.5 HUMAN_DECIDE 接收** | 中 |
+| **§10 (v2.1.3)** | **错误分类删 context/review-opinions/cost 行，加 429 PAUSED + blocked 分流 + spawn 无效选项；§10.2 重写为修复者不变量（+--bare 原分支）** | 中 |
 
 **新增文件**（v2.1.3 净变化）：
-- `src/review/model-parser.ts`（保留，瘦身）
+- `src/review/model-parser.ts`（保留，瘦身：仅 `parseModelFromRespawnFlags`）
 
 **删除文件**（v2.1.3）：
 - ~~`src/review/context-overflow.ts`~~
@@ -270,14 +283,13 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重 / 
 - ~~`src/review/review-opinions-writer.ts`~~
 
 **修改文件**：
-- `src/review/adapter.ts`（v2.1.3：删 getContextUsage，5 API）
-- `src/review/engine.ts`（v2.1.3：删 context check / JUDGE / HUMAN 分支；加 clean 判定 + EXTERNAL_REVIEW 收敛）
-- `src/review/types.ts`（v2.1.3：删 context 字段、DecisionContext、WorkDecision；ReviewOpinion→ReviewFixOutput）
-- `src/review/output-contract.ts`（v2.1.3：删 JudgeOutputSchema，ReviewOutputSchema 升级）
-- `src/review/profile.ts`（v2.1.3：删 context/cascade 配置，加 review preamble）
-- `src/cli/commands/review.ts`（v2.1.3：删 `decide` 子命令）
-
----
+- `src/review/adapter.ts`（v2.1.3：删 getContextUsage，5 API；spawn 用 `--bare` + `Bun.spawn({cwd})`，不传 `--cwd`/`--model`；poll 加 blocked 分流返回 BlockedResult）
+- `src/review/engine.ts`（v2.1.3：删 context check / JUDGE / HUMAN 分支；加 clean 判定 + EXTERNAL_REVIEW 收敛 + PAUSED 态 + engine 打 checkpoint）
+- `src/review/types.ts`（v2.1.3：删 context/cost 字段、DecisionContext、WorkDecision；ReviewOpinion->ReviewFixOutput 去 checkpointSha；加 PAUSED/BlockedResult）
+- `src/review/output-contract.ts`（v2.1.3：删 JudgeOutputSchema，ReviewOutputSchema 升级删 checkpoint_sha）
+- `src/review/profile.ts`（v2.1.3：删 context/cascade/cost 配置；review prompt 改 spec/plan 输入；删 preamble）
+- `src/review/model-parser.ts`（v2.1.3：parseModelFromProviderEnv -> parseModelFromRespawnFlags，删 KNOWN_CONTEXT_LIMITS + COST_TABLE）
+- `src/cli/commands/review.ts`（v2.1.3：删 `decide` 子命令；doctor 加 `--bare`/spawn 校验）
 
 ## 16. 文档链接
 
