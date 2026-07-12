@@ -270,14 +270,44 @@ function verifyNewVersion(version) {
   // 等 daemon 写入启动 banner (P1-4 修: 用 spin 替代 Atomics.wait)
   spinUntil(3000);
 
-  const logContent = readFileSync(LOG_FILE, 'utf8');
-  // 找最新 "cc-linker daemon started" 段
-  const startedMatches = [...logContent.matchAll(/\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[INFO\] cc-linker daemon started/g)];
-  if (startedMatches.length === 0) {
-    logErr('daemon log 没找到 "cc-linker daemon started" 段');
+  // v2.7.5 修: 之前用 readFileSync(LOG_FILE, 'utf8') 读整个 log 进内存,
+  // 780MB log 直接撞 V8 string 限制 0x1fffffe8 (~512MB),抛
+  // "Cannot create a string longer than 0x1fffffe8 characters" → 整个
+  // deploy 误判失败 → 触发 rollback no-op(脚本 bug 报"已恢复 backup"
+  // 但 backup 已不存在),用户看不到 deploy 真正成功的状态。
+  //
+  // v2.7.5.1 进一步修: daemon logger 不是 append-only — 重启时新内容写到
+  // 文件头,把旧内容往后推。`grep ... | tail -1` 拿的是行号最大的 banner
+  // (可能是文件中段的某条历史 broken banner,缺 timestamp),regex 不匹配
+  // → 误报"没找到 banner"。
+  //
+  // 改法:grep 全文件,过滤出带合法 timestamp 前缀的 banner 行,按 timestamp
+  // 字符串字典序(YYYY-MM-DD HH:MM:SS 排序等价于时间序)取最大。grep 流式
+  // 不加载整文件,只把匹配行(几十字节)写 stdout,maxBuffer 限制单次输出。
+  const logSizeMB = (statSync(LOG_FILE).size / 1024 / 1024).toFixed(1);
+  let latestStartedAt = null;
+  try {
+    const grepOut = execSync(
+      `grep -E "cc-linker daemon started|启动完成" ${LOG_FILE}`,
+      { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 },
+    );
+    // 每行匹配 `^\[YYYY-MM-DD HH:MM:SS\] ... banner`，取 timestamp 最大的
+    const bannerRe = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/;
+    for (const line of grepOut.split('\n')) {
+      const m = line.match(bannerRe);
+      if (m && (!latestStartedAt || m[1] > latestStartedAt)) {
+        latestStartedAt = m[1];
+      }
+    }
+  } catch (e) {
+    logErr(`grep daemon log 失败 (${logSizeMB}MB): ${e.message}`);
     die('post-deploy 版本验证失败', 1);
   }
-  const latestStartedAt = startedMatches[startedMatches.length - 1][1];
+  log(`  daemon log: ${logSizeMB}MB, grep + 按 timestamp 排序取最新 (避免 V8 string 上限)`);
+  if (!latestStartedAt) {
+    logErr('daemon log 没找到带合法 timestamp 的 "cc-linker daemon started" banner');
+    die('post-deploy 版本验证失败', 1);
+  }
   // 跟 backup 的 mtime 比 (新 binary mtime > backup mtime)
   // 用 local time 格式跟 log 时间戳对齐 (log 是 local time, mtime.toISOString 是 UTC)
   let backupMtimeStr = 'N/A';

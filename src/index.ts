@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
+import chalk from 'chalk';
 import { RegistryManager } from './registry';
 import { syncBeforeCommand } from './scanner';
 import { handleError } from './utils/errors';
@@ -21,6 +22,16 @@ import { initWecom } from './cli/commands/init-wecom';
 import { setup } from './cli/commands/setup';
 import { activityHook } from './cli/commands/activity-hook';
 import { installDaemon, uninstallDaemon, daemonStatus as daemonServiceStatus } from './cli/commands/daemon';
+import {
+  imgProxyStart, imgProxyStop, imgProxyStatus, shouldExitAfterImgProxyStart,
+  imgProxyInstall, imgProxyUninstall, imgProxyUpdate,
+  imgProxyDaemonInstall, imgProxyDaemonUninstall,
+  imgProxyCurrentUrl,
+  imgProxyResolve,
+  imgProxyCcSwitchSettings,
+  imgProxyWrapperInstall, imgProxyWrapperUninstall, imgProxyWrapperStatus,
+  imgProxyConsoleEnable, imgProxyConsoleDisable, imgProxyConsoleStatus,
+} from './cli/commands/img-proxy';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -188,11 +199,112 @@ daemonCmd.command('install').description('配置开机自动启动').action(() =
 daemonCmd.command('uninstall').description('移除开机自动启动').action(() => uninstallDaemon());
 daemonCmd.command('status').description('查看后台服务状态').action(() => daemonServiceStatus());
 
+const imgProxyCmd = program.command('img-proxy').description('管理图片剥离代理 (让纯文本模型接受粘贴图片)');
+imgProxyCmd.command('install')
+  .description('把选定 provider 的 BASE_URL 改写为指向本地代理 (smart 默认,自动跳过多模态)')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部 provider(dumb 模式)')
+  .option('--yes', 'smart 默认预选,不交互')
+  // Fix I-8: choices 校验 --mode 只接受 smart/dumb — Commander 在 .option() 之后
+  // .choices() 在 JS 运行时有效(链上 this),但 TS 类型只在 Option 类上声明,
+  // 用 addOption + Option 实例显式表达意图,同时让 TS 类型也满意
+  .addOption(
+    new Option('--mode <mode>', 'smart 或 dumb(显式模式,默认根据是否有 flag 自动判断)')
+      .choices(['smart', 'dumb'] as const),
+  )
+  .action((opts) => { imgProxyInstall(opts); });
+imgProxyCmd.command('uninstall')
+  .description('还原 provider 的 BASE_URL')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部已 install 的 provider')
+  .action((opts) => imgProxyUninstall(opts));
+imgProxyCmd.command('update')
+  .description('刷新已装 provider 的 cc-switch 最新配置 (token/model/新增字段); 未装的会新装')
+  .option('-p, --providers <aliases>', '逗号分隔的 provider 文件名 stem')
+  .option('--all', '全部 provider')
+  .option('--yes', 'smart 默认预选,不交互')
+  .addOption(
+    new Option('--mode <mode>', 'smart 或 dumb').choices(['smart', 'dumb'] as const),
+  )
+  .action((opts) => { imgProxyUpdate(opts); });
+imgProxyCmd.command('start')
+  .description('启动代理 (前台;加 --daemon 后台)')
+  .option('-d, --daemon', '后台运行')
+  .action(async (opts) => {
+    // 2026-07-10: imgProxyStart 改 library 化不调 process.exit;CLI 入口自己处理。
+    // 关键:必须用 shouldExitAfterImgProxyStart 决定是否 exit —— parent 分支
+    // (--daemon) 返回后 parent 该退出,child/foreground 分支返回后 server 会保活,
+    // 不能 process.exit 否则自杀。bug 历史:launchd 启的 child 走 child 分支,
+    // 旧版 CLI binding 无脑 process.exit(0),server 起完立刻被杀,launchd 反复
+    // 重启触发 throttle,daemon 永远起不来。
+    try {
+      await imgProxyStart(opts);
+      if (shouldExitAfterImgProxyStart(opts)) process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`❌ ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+imgProxyCmd.command('stop').description('停止代理').action(() => imgProxyStop());
+imgProxyCmd.command('status').description('查看代理状态').action(() => imgProxyStatus());
+imgProxyCmd.command('current-url').description('读 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL').action(() => {
+  // 2026-07-10: imgProxyCurrentUrl 改 library 化 throw 而不 process.exit(同
+  // imgProxyStart / daemon install)。CLI 入口负责 process.exit — 同 sibling。
+  try {
+    return imgProxyCurrentUrl();
+  } catch (err) {
+    console.error(chalk.red(`❌ ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
+imgProxyCmd.command('resolve <upstream>').description('按真实 upstream URL 查 proxy URL').action((upstream) => imgProxyResolve({ upstream }));
+imgProxyCmd.command('cc-switch-settings').description('输出当前 cc-switch provider 的代理 settings 文件路径 (给 cc-linker-proxy wrapper 用)').action(() => imgProxyCcSwitchSettings());
+const wrapperCmd = imgProxyCmd.command('wrapper').description('管理 shell wrapper (cc-linker-proxy)');
+wrapperCmd.command('install').description('装 wrapper 到 ~/.zshrc').action(() => imgProxyWrapperInstall());
+wrapperCmd.command('uninstall').description('从 ~/.zshrc 移除 wrapper').action(() => imgProxyWrapperUninstall());
+wrapperCmd.command('status').description('查看 wrapper 状态').action(() => imgProxyWrapperStatus());
+const imgProxyDaemonCmd = imgProxyCmd.command('daemon').description('开机自启管理 (macOS launchd)');
+imgProxyDaemonCmd.command('install').description('配置开机自启').action(async () => {
+  // 2026-07-10: imgProxyDaemonInstall 改 library 化 throw 而不 process.exit。
+  // 之前失败时 process.exit(1) 会顺带把 setup wizard 进程杀了(同 imgProxyStart
+  // 的 bug),现在 throw 让 wizard 的 try/catch 能接住。
+  try {
+    await imgProxyDaemonInstall();
+  } catch (err) {
+    console.error(chalk.red(`❌ ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
+imgProxyDaemonCmd.command('uninstall').description('卸载开机自启').action(() => imgProxyDaemonUninstall());
+const imgProxyConsoleCmd = imgProxyCmd.command('console').description('管理 Web Console 监控后台 (http://127.0.0.1:8765/)');
+// 2026-07-10: imgProxyConsoleEnable / imgProxyConsoleDisable 改 library 化 throw
+// 而不 process.exit(同 daemon install / imgProxyStart)。CLI 入口负责 process.exit —
+// 跟 sibling 函数对齐。如果这里直接调,wizard 未来若 wrap 它会被 process.exit 杀掉
+// (同 launchd child 自杀 bug 的源模式)。
+imgProxyConsoleCmd.command('enable').description('启用 Web Console,改 [img_proxy]console_enabled=true').action(() => {
+  try {
+    return imgProxyConsoleEnable();
+  } catch (err) {
+    console.error(chalk.red(`❌ 启用失败: ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
+imgProxyConsoleCmd.command('disable').description('禁用 Web Console,改 [img_proxy]console_enabled=false').action(() => {
+  try {
+    return imgProxyConsoleDisable();
+  } catch (err) {
+    console.error(chalk.red(`❌ 禁用失败: ${(err as Error).message}`));
+    process.exit(1);
+  }
+});
+imgProxyConsoleCmd.command('status').description('查看 Web Console 当前状态 + URL').action(() => imgProxyConsoleStatus());
+
 program
   .command('setup')
-  .description('一键配置向导（初始化 + 安装钩子 + 配置飞书 Bot）')
+  .description('一键配置向导（初始化 + 安装钩子 + 配置飞书 Bot + 启用图片代理）')
   .option('--skip-feishu', '跳过飞书 Bot 配置')
   .option('--skip-hook', '跳过 Claude Code 钩子安装')
+  .option('--skip-img-proxy', '跳过图片代理 (img-proxy) 配置')
   .action((opts) => withSync(async (registry) => {
     await setup(registry, opts);
   }, true));

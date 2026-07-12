@@ -4,6 +4,447 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-07-11
+
+### Fixed
+- `cc-linker img-proxy status` 和 `wrapper status` 输出 hint 中误写 `cc-linker img-proxy wrapper-install`（错的），改为正确的 `wrapper install` 子命令。用户复制粘贴的路径之前会找不到命令。
+
+### Changed
+- 文档 `docs/img-proxy.md` 与 v0.8.1 实际代码对齐：
+  - 候选发现改为 2 路（manual + auto），移除旧的 `[alias]` 假路径
+  - wrapper "它怎么工作" 流程图改为 `cc-switch-settings` + `claude --settings` 单一路径
+  - "为什么必须用 `--settings`" 加 `--settings` 是合并而非替换说明（hooks / permissions / mcpServers 不会丢）
+  - "刷新配置" 段落加 4 状态表（↻ ✅ ⊘ ❌）+ `--all --yes` 实际输出示例 + orphan-route 触发的解释
+  - "3 步启用" 加 wrapper install 实际输出
+  - 故障排除替换为新 wrapper 的 3 条真实错误 + db 损坏/锁定边缘情况
+  - 容易踩的坑加第 7 条：升级 wrapper 函数必须 `uninstall && install && source`（或重开 shell）；含 iTerm2 shell-snapshots 缓存陷阱
+
+## [Unreleased]
+
+### Added
+
+- **img-proxy 模型调用 token 统计** — 之前 Dashboard 只有 transport-level
+  `bytes` (响应体明文字节数),看不到具体花了多少 model tokens。新加从
+  upstream 响应 SSE/JSON 解析 `usage` 字段的逻辑(`applyUsageLine` 在
+  `server.ts`),自动识别:
+  - **Anthropic 格式**:`message_start` 拿 `input_tokens` +
+    `cache_read_input_tokens` + `cache_creation_input_tokens`,
+    `message_delta` 拿最终 `output_tokens`
+  - **OpenAI-compat 格式**(glm / qwen / deepseek / OpenAI 自身):
+    `usage.prompt_tokens` + `usage.completion_tokens`
+  - 同时支持流式(SSE 多 event)与非流式(单 JSON body)— 整 body
+    无换行时由 `piping.finally` flush 残留的 sseBuf
+  累加语义 max-of:同一请求内重复声明同一字段取最大值,防 message_start
+  里的 `output_tokens=1` 被 message_delta 后的旧值回退。
+
+  累计到 per-alias 聚合(`AliasStats`) + per-request 环形 buffer
+  (`RecentEntry`) + log JSON 行(Log tab 可用)。Dashboard Per Alias 表
+  新增 4 列:In Tokens / Out Tokens / Cache Read / Cache Create;
+  Log 表 4 列同位置。
+
+- **img-proxy daemon install 后健康检查** — `cc-linker img-proxy daemon
+  install` 之前在 `launchctl load/start` 之后只 print 成功,没有真正验证
+  launchd 是否进入 running + 8765 端口是否可访问。`src/utils/daemon-health.ts`
+  新模块把检查抽象成可注入的 `HealthCheck` 列表(`retryHealthCheck` +
+  `runPostInstallHealthChecks`),生产代码传 launchctl / curl 实测,测试
+  可传 stub 避免副作用。失败时显式 exit 1 + 打印失败项,不再"静默成功"。
+  配套:`executable.ts` 新增 `getLaunchdExecutablePath()`,launchd 对
+  daemon 不走用户 shell 的 PATH,之前写裸 `cc-linker` → `EX_CONFIG (78)`,
+  KeepAlive 永远重启失败;plist 改写绝对路径修掉。
+
+### Fixed
+
+- **img-proxy daemon 开机自启在 setup wizard 里被跳过** —
+  `imgProxyStart` 之前在 parent spawn 完 child 后直接 `process.exit(0)`,
+  这个 exit 顺带把正在跑的 `setup` wizard 进程也杀了,导致 wizard
+  后续的 macOS launchd 配置步骤(`setup.ts:316` "是否配置开机自启?")
+  永远到不了。结果:plist 文件正确写出来了,但 launchctl 没 load,
+  重启后 img-proxy 不会自动起来。
+  修法:`imgProxyStart` 改 library 化,失败 throw、成功或"已在运行"
+  return,不再调 process.exit。CLI binding (`src/index.ts`) 在
+  await 之后自己 process.exit。wizard 的 try/catch 现在能真正
+  接到 throw,继续往 launchd 步骤走。Signal handler 内部
+  (SIGTERM/SIGINT) 的 process.exit(0) 保留 — 那是 OS 信号
+  触发的清理路径,只在真正作为 daemon 跑的 child 里跑。
+
+- **img-proxy launchd child 启完秒死 + launchd throttle 死锁** —
+  上条 fix 引入的二级 bug:CLI binding 写成 `await imgProxyStart(opts);
+  process.exit(0)`,**没区分** parent 分支(应 exit)和 child /
+  foreground 分支(应让 server 保活)。launchd 启的 child 走
+  `cc-linker img-proxy start`(无 --daemon flag,带
+  CC_LINKER_IMG_PROXY_DAEMON=1)→ child 分支,server 监听
+  8765 写 "img-proxy listening" 后 CLI binding 无脑 process.exit(0)
+  把进程杀了。launchd KeepAlive 立刻重启 → 同样的 5 秒内死循环
+  → 5+ 次失败后 launchd 内部 throttle(`state = spawn scheduled` +
+  `active count = 0`),daemon 永远起不来。修法:加 helper
+  `shouldExitAfterImgProxyStart(opts)` 显式表达"该不该 exit",
+  CLI binding 改成 `if (shouldExitAfterImgProxyStart(opts)) process.exit(0)`。
+  parent 分支(daemon=true)exit;child / foreground 分支(daemon 缺省
+  或 false)让 server 保活,不再自杀。新 e2e 测试
+  (`tests/unit/cli/img-proxy-start-library.test.ts`) 跑真实
+  binary 2 秒验子进程不被自杀。
+
+- **setup wizard 双问 startNow(P0-1)** — 上一轮 P1-1 在 imgProxyInstall 内部
+  加了 promptStartDaemon,但 wizard (`setup.ts`) 自己也问 startNow 调
+  imgProxyStart,runImgProxyWizard 调 imgProxyInstall 之后又问一次。
+  用户跑 setup 时被问两次同样的"是否现在启动 daemon?"。修法:删
+  wizard 自己的 startNow 步骤,改用 installResult.startedNow 字段(从
+  imgProxyInstall 的 promptStartDaemon 拿)。一行 import 也清掉
+  (imgProxyStart 没人调了)。
+
+- **sseBuf 截断时无 log(observability regression,P1-1)** — 上一轮 P2-1
+  抽 processChunkForUsage 时丢了截断时的 appendLog WARN,畸形 SSE
+  event 来时 admin 看不到任何日志。修法:加 onTruncate 回调参数,
+  TransformStream caller 传 appendLog 回调(打 WARN log)。test 加
+  truncateCalls 计数验证回调被调一次。
+
+- **Web Console enable 后无"需 daemon restart"提示(P1-2)** — console
+  enable 改 config.toml 但 daemon 启动时才读。promptStartDaemon Yes
+  时会自然 restart(console 生效);No 时用户得自己 restart — 加
+  一行黄色提示免得用户看 8765/ 发现 console 还是 disabled 困惑。
+  放在 promptStartDaemon 之后(那时 startedNow 已知)。
+
+- **escapePlistString 测试覆盖不全(P1-3)** — 之前只测 `& " <`,
+  漏了 `> '` 和 unicode 路径。加 2 个 case:XML 关闭 + 单引号,
+  Chinese / emoji home 路径,确保 escapePlistString 不过度转义
+  unicode 也不会漏 XML 关键字符。
+- **img-proxy daemon install 失败时 process.exit 杀 wizard(同类 bug)** —
+  `imgProxyDaemonInstall` 在 setup wizard 里被 try/catch 包
+  (`setup.ts:327`) 期望它 throw,但函数用了 3 处 `process.exit(1)`
+  (非 darwin / launchctl load 失败 / 健康检查失败)。`process.exit`
+  不可 catch,直接杀 wizard 进程 — 同 imgProxyStart 上一条 fix 的
+  同一类反模式。修法:3 处全改 `throw new Error(...)`,
+  `index.ts:242` 的 CLI binding 加 try/catch 维持 CLI 行为。
+  新增 spy-on-process.exit 测试验证(`img-proxy-daemon-install-library.test.ts`)。
+
+- **imgProxyInstall 装完不立即启动 daemon(只引导 launchd)** —
+  之前 install 完只写 plist + 引导 launchd,daemon 没在用户眼皮底下起,
+  装完立刻用不了。修法:加 `promptStartDaemon({ yes })` 抽函数(对齐
+  `promptLaunchdAutoStart` 模式),在 console enable 之后、launchd 引导之前
+  问 startNow。Yes 调 `imgProxyStart({daemon:true})` 触发 restart,
+  让 console enable 自然生效(daemon 启动时读 config — P1-2 顺带解决)。
+  失败 log + 不 throw(providers 已装好,daemon 起不来不回滚)。
+  return type 加 `startedNow: boolean`。
+
+- **wrapper install 在 --yes 模式下阻塞 CI/脚本** —
+  之前 wrapper confirm 块无 `!opts.yes` 跳过,`cc-linker img-proxy install --all --yes`
+  在 CI 会被 inquirer 阻塞。修法:仿 console enable 那块的 `!opts.yes` 跳过模式,
+  `--yes` 时自动 yes 装 wrapper(不调 inquirer)。
+
+- **imgProxyDaemonInstall 抽 deps 注入层,test 100% 纯净** —
+  之前的 daemon-install test 必须跑真实 `imgProxyDaemonInstall` →
+  写 `~/Library/LaunchAgents/com.cclinker.img-proxy.plist` + 跑
+  `launchctl load`,污染 CI runner 的 launchd 状态。修法:
+  - 抽 `buildLaunchdPlistContent(opts)` 纯函数(不读文件不起子进程)
+  - 抽 `LaunchdInstallDeps` interface + `runLaunchdInstallWithDeps(deps)`
+    主体(所有 side effect 通过 deps 注入:writePlist / runLaunchctl /
+    killProcess / probeHttp / etc.)
+  - `imgProxyDaemonInstall()` 变成 default deps 调 `runLaunchdInstallWithDeps`
+    的薄壳(行为 100% 兼容)
+  - 新 test `img-proxy-daemon-install-inject.test.ts` 12 个 case 全用 fake deps,
+    不污染环境
+
+- **sseBuf 内存无上限,DoS 风险(P2-1)** —
+  之前 sseBuf 跨 chunk 累积无 size cap,上游畸形 SSE event 一个 data 行
+  100MB 没换行会 OOM。修法:抽 `processChunkForUsage(chunk, state)` 出来
+  + 加 `MAX_SSE_BUF_BYTES = 4MB`,超了截断 + 标记 truncated,后续 chunk
+  不再 tracking usage(本请求 usage 全 0),但 controller.enqueue 仍
+  pass-through,响应不受影响。
+
+- **log 文件无 size cap(P2-2)** —
+  appendLog 之前只 append,log 文件无限增长(daemon log 1.5MB、
+  img-proxy log 780MB 已是现状)。修法:加 size-based rotation,
+  `LOG_MAX_BYTES = 50MB` 自动 rotate,保留 3 个 backups ≈ 200MB 上限。
+  状态缓存在 module-level `Map<logPath, size>` — Bun JS 单线程 +
+  `appendFileSync` 同步,无 race。
+
+- **cache 目录无总大小 cap(P2-3)** —
+  cleanupOldCache 之前只按 mtime 7 天清,用户每天粘 1000 张图
+  (×1MB) 7 天就涨到 7GB,7 天后才清。修法:加 `cacheMaxBytes` 参数
+  (默认 1GB,从 config `img_proxy.cache_max_bytes` 读,env 覆盖
+  `CC_LINKER_IMG_PROXY_CACHE_BYTES`)。超了按 mtime 升序从最旧删,直到
+  totalSize ≤ cap。
+
+- **piping.finally 回调无 try/catch,unhandled rejection 自杀** —
+  `src/img-proxy/server.ts` 的 `piping.finally(() => { ... })` 回调里
+  `applyUsageLine / appendLog / updateByAlias / pushRecent` 任一处
+  throw 都会变成 unhandled promise rejection → Bun 默认让 process
+  exit with non-zero → launchd KeepAlive 把 child 当成失败 →
+  反复重启 + 5+ 次后 throttle。和上一条 launchd child 自杀是同源
+  问题(都是 process 自杀 → launchd 反复重启 → throttle)。
+  修法:整个 finally 回调包 try/catch,任何错误 log + swallow,
+  保证 finally 永远 resolve,daemon 不会因埋点 bug 自杀。
+
+- **cache dedup 命中后 mtime 不刷,热图被 7 天 TTL 误清** —
+  `transform.ts` 的 dedup 命中分支 `if (!existsSync)` skip write,
+  文件 mtime 永远停在第一次写入。`cleanupOldCache` 用 mtime 判 7
+  天 TTL → 用户每天粘同一张图,第 8 天被误清 → 模型下次看到
+  同一图要重新 download + prompt cache 失效,既烧 token 又慢。
+  修法:dedup 命中时 `utimesSync` 刷 mtime(无 IO,只 touch),
+  让 cleanupOldCache 知道这是热图。
+
+### Added
+
+- **img-proxy install 完后引导配置 launchd 开机自启** —
+  之前 `cc-linker img-proxy install` 装完 providers 就结束,不问
+  launchd。用户跑这个命令后 daemon 不会开机自启(只有 setup wizard
+  才引导)。修法:install 完后(macOS only、TTY 必备)问一句"是否
+  配置开机自启",Yes 调 `imgProxyDaemonInstall`。
+  - 失败 log + 不 throw(providers 已装好,launchd 失败不回滚)
+  - 非 darwin 平台跳过,无 TTY 自动跳过(脚本友好)
+  - `--yes` flag 默认 Yes(脚本场景),无 flag 默认 No(交互,保守)
+  - 抽出 `promptLaunchdAutoStart()` 独立函数方便单测
+  - return type 加 `autoStart: boolean` 字段
+
+- **img-proxy cache 重复落盘 + 诱导 Read 循环** — `stripImagesToPaths` 的
+  `saveImage` 改为对 base64 算 sha256 取前 32 hex 作文件名,`existsSync` 命中
+  即跳过写。修掉两个相关问题:
+  1. 磁盘:Read 工具读图后 Claude Code 把图塞回 `tool_result.content`,
+     proxy 递归 strip 每次都生成新文件名(`Date.now()-<random>`),同一张图
+     在多次 Read 反馈循环里被反复落盘。**实测 11 张唯一图涨到 1483 份
+     (183 MB),sha256 去重后只需 11 份 (<1 MB),浪费率 99.5%**。
+  2. Token:每次新文件名被模型视为"未访问过的文件",模型会反复调 Read
+     看同一张图,每轮多花的 tool call + tool_result 文案 token 是真钱。
+     改用 content-hash 文件名后,模型两轮看到的是同一 path,Read 循环
+     自然终止。`cleanupOldCache` 的 7 天 mtime TTL 行为保留(Bun.write
+     覆盖会刷新 mtime → 热图自然留住)。
+
+## [0.8.1] - 2026-07-11
+
+### Fixed
+- `cc-linker-proxy` 不再静默绕过 img-proxy:CC Switch 用户的 `~/.claude/settings.json` env 会覆盖 shell env,旧 wrapper 设 env 的机制失效。改为读 cc-switch 当前 provider + `claude --settings` 指向已替换 proxy URL 的 auto-providers 文件,可靠走代理。
+
+### Added
+- `cc-linker img-proxy update` 命令:CC Switch 改了 provider 配置(token/model/新增字段)后刷新 auto-providers 文件 + routes upstream。已装刷新、未装新装、manual 跳过、cc-switch 已删提示 uninstall。
+- `cc-linker img-proxy cc-switch-settings` 子命令:输出当前 cc-switch provider 的代理 settings 文件路径(给 wrapper 用)。
+
+### Changed
+- wrapper 函数重写:单一路径(cc-switch-settings + `claude --settings`),删除旧 4-branch(env 检测/resolve/fall-back)死代码。
+
+### Upgrade
+- 跑过 `cc-linker img-proxy install` 的用户:`cc-linker img-proxy wrapper uninstall && wrapper install && source ~/.zshrc`(或重开 shell)更新 wrapper 函数。
+
+## [0.8.0] - 2026-07-09
+
+### Added
+
+- **CLI Image Proxy (`cc-linker img-proxy`)** — 让纯文本模型(glm-5.2、
+  qwen3-max、deepseek、mimo-pro 等)在 Claude Code 里也能接收粘贴的图片。本地
+  反向代理 `127.0.0.1:8765`,拦截出站请求里的 inline `image` content block,
+  落盘到 `~/.cc-linker/img-proxy/cache/`,替换成"图片本地路径 + 引导调 Read /
+  图片识别 MCP / 本地 CLI"的 text block,再转发给真实上游。**多模态模型
+  (Claude/Kimi/GPT-4v 等)完全不受影响**(不经 proxy)。
+  - 路由键 = **provider 文件名 stem**(`byte-agent-glm.json` → `/byte-agent-glm`),
+    不用 `ProviderManager.generateShortAlias`(它会截断/冲突)。
+  - `src/img-proxy/server.ts` — `Bun.serve` 反向代理,SSE 流式透传。
+    POST `/v1/messages` 禁 `idleTimeout`(Bun 默认 10s 在长 thinking/tool
+    调用会断连),请求/响应头 `content-encoding`/`accept-encoding` 收口
+    (避免上游 gzip 响应被客户端二次解压崩),启动+每小时清过期缓存。
+  - `src/img-proxy/transform.ts` — `stripImagesToPaths` 递归处理
+    `tool_result.content` 嵌套 image block(Read 工具读 PNG 后 Claude Code
+    会嵌套塞进 tool_result),`{path}` 模板缺失时回退默认文案。
+  - `src/img-proxy/provider-config.ts` — `installProvider` 3 态机(真幂等
+    / 跨 port/hostname 重装 / 首次),`.bak` 生命周期(原始 upstream 永远
+    从 `.bak` 读)。`isAnyProxyUrl` 宽松匹配识别"我们装过的代理 URL"。
+  - `src/img-proxy/routes.ts` — `routes.json` 用 `proper-lockfile` + sentinel
+    互斥写,`disabled` 标志支持 console 软禁用。
+  - `cc-linker img-proxy install [--yes|--providers|--all] / uninstall / start
+    [--daemon] / stop / status / daemon install|uninstall`。Daemon 三分支
+    (parent/child/前台),launchd 用 `CC_LINKER_IMG_PROXY_DAEMON=1` env 注入
+    避免双重 fork,parent poll PID + `isPidAlive` 双重判定避免 EADDRINUSE
+    假阳性。
+
+- **Smart install with multimodal classification** — `img-proxy install`
+  默认 smart 模式: 4 路发现(manual / CC Switch auto / shell alias hint /
+  provider-scan)+ 内置分类(Claude/GPT/Gemini/Qwen/GLM/Kimi/MiniMax/MiMo
+  /Doubao/Stepfun 等),自动跳过 multimodal,只装 text-only + unknown。
+  可通过 `[img_proxy] smart_mode` 关闭,通过
+  `vision_model_patterns_extra` / `text_only_model_patterns_extra` 自定义
+  patterns。`--providers` 显式指定 multimodal 会抛 `E_IMG_PROXY_MULTIMODAL_PROVIDER`
+  而不是静默装。
+
+- **Shell wrapper (`cc-linker-proxy`)** — `img-proxy wrapper install` 写
+  shell 函数到 `~/.zshrc` / `~/.bashrc`。给 CC Switch 用户用(他们没自定义
+  `cc-X` alias,直接 `claude` 读 `~/.claude/settings.json`):wrapper 自动
+  从 settings.json 读当前 provider,查 routes.json,设
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8765/<alias>` 后 exec claude。递归
+  防护(幂等):已设为 proxy URL(resolve 返同 URL)直接 exec(E7 invariant);
+  已设为已装的 upstream URL 改写为 proxy URL + stderr warn;陌生 / stale
+  inherited URL fall back 到 settings.json + stderr warn;env 未设走
+  settings.json 路径。`wrapper install` 期间写备份到 `wrapper-backups/`。
+
+- **Web Console (Phase 2)** — `http://127.0.0.1:8765/`(`console_enabled = true`),
+  5 个 Tab:
+  - **Dashboard** — 实时 totalRequests / strippedImages / uptime / cache
+    文件数+大小,5min 状态分布,per-alias 聚合
+    (requests / stripped / chunks / bytes / avgDuration / lastAt)
+  - **Log** — 最近 200 条请求表格,按 alias / status / streamStatus /
+    时间过滤,可手动刷新
+  - **Config** — 改 `console_enabled` / `upstream_timeout_ms` /
+    `stream_idle_timeout_ms`(`console_enabled` 热开关,其它需重启)
+  - **Routes** — 每行 Enable / Disable 按钮(写 `disabled` 软禁用)
+  - **Cache** — 概览 + "立即清理" 按钮(调用 `cleanupOldCache(0)`)
+  - 所有写操作 audit log 到 `img-proxy.log`(`console_action` + `trigger: console`)
+  - CLI: `cc-linker img-proxy console enable|disable|status`
+
+- **New config keys** (`[img_proxy]` in `~/.cc-linker/config.toml`):
+  - `console_enabled` (default `false`) — Web Console 开关
+  - `upstream_timeout_ms` (default `0`) — upstream fetch 整体超时
+  - `stream_idle_timeout_ms` (default `0`) — 距最后 chunk 超过 N ms 判 stalled
+  - `smart_mode` (default `true`) — 跳过 multimodal
+  - `cache_max_age_hours` (default `168`) — 缓存保留 7 天
+  - 对应 env vars: `CC_LINKER_IMG_PROXY_UPSTREAM_TIMEOUT_MS` /
+    `CC_LINKER_IMG_PROXY_STREAM_IDLE_TIMEOUT_MS` / etc.
+
+- **README + 详细文档** — `README.md` 和 `README_en.md` 新增 img-proxy 核心
+  特性行、6 个 CLI 命令、新章节"纯文本模型也能接收图片 (img-proxy)"、详细
+  文档表链接。`docs/img-proxy.md` 全量覆盖:架构、4 路发现、模型分类、3 态
+  install、CC Switch / 自定义 alias / cold-start 场景、Web Console、11 个
+  踩坑点 + 修法。
+
+### Fixed
+
+- **handleAttach guard 只做精确匹配** (`src/agent-view/manager.ts:580-586`) —
+  v2.2.15 commit 注释声称"守卫同时认 short 和 full",但实现只精确匹配
+  `s.sessionId === sessionId`。当 card 传 short hash,snapshot 只有 full
+  UUID 时,守卫误报"会话已不存在",entry 写不下去。改为:先精确匹配,
+  失败但 sessionId 是 8-hex short → 找 snapshot 中 36-char full 且以它
+  开头,命中则把 sessionId 替换成 full(后续 CAS 写 full,SDK 不拒)。
+- **POST `/v1/messages` SSE 长静默期断连** — Bun.serve 默认
+  `idleTimeout=10s` 在 extended thinking / tool execution / 长 token
+  生成期间会关 client TCP → 客户端 `Connection closed mid-response`。
+  进入 fetch 前 `server.timeout(req, 0)` 禁该请求 idleTimeout。
+- **`content-encoding` 双解压导致客户端崩** — Bun.fetch 自动解压但保留
+  `content-encoding` + 过期 `content-length`,客户端对已被解压的明文
+  再 gunzip → 流解析崩 → pipeTo reject undefined。`sanitizeProxyResponseHeaders`
+  剥 content-encoding / content-length,`sanitizeProxyRequestHeaders` 把
+  `accept-encoding` 收口到 `gzip, deflate, br`。
+- **`tool_result.content` 嵌套 image 块不剥** — Claude Code 让 Read 工具
+  读 PNG 后塞进 `tool_result.content` 数组,老 strip 只扫顶层漏掉,纯文本
+  模型 4xx。`stripImagesToPaths` 抽 `processBlocks(blocks)` 命名函数递归。
+- **MiMo 正则老 lookahead bug** — 老 `/mimo-v\d+(?!-pro)/` backtrack 跳掉
+  pro 前缀,把 `mimo-v2.5-pro` 误判 multimodal。改为锚定
+  `/^mimo-v\d+(\.\d+)?$/` + 显式 `/^mimo-.*-pro/` 拦截 Pro 变体。
+- **launchd daemon install 留旧 PID 占 :8765** — 重装时 KeepAlive 在新
+  child 起来前把 port 给旧 child,新 child EADDRINUSE crash。daemon install
+  进入前先 `launchctl stop` + 轮询 SIGKILL 兜底 + `unload` + 清 PID 文件。
+- **parent spawn child 后 PID 文件"碰巧留下"假阳性** — 老 parent 盲目等
+  1200ms 后报"成功",child 可能 EADDRINUSE crash 后 PID 文件刚好留着。
+  改为 poll `PID_FILE === child.pid && isPidAlive(childPid)` 5s。
+- **CC Switch 同步 mtime 陷阱** — 老用 `auto-providers/` 目录 mtime,目录
+  mtime 在文件删除时跳到 NOW → 误判已同步。改为目录下**最新文件** mtime。
+- **`DEFAULT_PROMPT_TEMPLATE` 硬编码特定 MCP** — 改为工具无关,指引
+  Read / 任何图片 MCP / `mmx-cli`,用户可改 `prompt_template` 调。
+
+## [Unreleased]
+
+## [0.7.5] - 2026-07-02
+
+### Fixed
+
+- **Agent View /agents 在 29 sessions 时只显示 fallback 文本** —
+  v2.7.4 给所有 status 加 Reply 按钮后,每 session 多 1 button →
+  配合未限制的 busy/waiting/idle,29 sessions 必超飞书 25KB 卡上限
+  → `sendOrFallback` 触发 → 用户看到 `"📋 Agent View · 29 sessions ·
+  /agents to refresh"` 这条 fallback 文本,而不是真正的 list 卡(含
+  Peek/Reply/Stop 按钮)。
+  - `src/agent-view/manager.ts:33-44` — `buildCappedCard` 新增
+    `MAX_ACTIVE_ITEMS = 7` (busy/waiting 各上限)、`MAX_IDLE_ITEMS = 4`,
+    溢出进 `hasMore`。
+  - `src/agent-view/card.ts:166-173` — `truncateCwd` 加 40 字符绝对上限
+    (保留尾段 project 名),降低单 session 体积,留出 4-20KB 余量给
+    long-cwd 场景。
+  - 实测: 1 busy + 28 idle (用户场景) 30.8KB → 5.3KB (有 19.7KB 余量);
+    50 sessions 极端 24.2KB → 18.1KB。
+- **deploy-local.js 读 818MB log 撞 V8 string 限制崩溃** —
+  `verifyNewVersion` 用 `readFileSync(LOG_FILE, 'utf8')` 把 818MB log
+  整文件读进内存,V8 单 string 限制 0x1fffffe8 (~512MB) → 抛
+  `"Cannot create a string longer than 0x1fffffe8 characters"` →
+  整个 deploy 误判失败 → 触发 rollback no-op(脚本 bug 报"已恢复
+  backup"但 backup 已不存在)。
+  - `scripts/deploy-local.js:273-299` — 改用 `grep -E` 流式读 banner,
+    7s on 780MB log(可接受)。**不用** `readFileSync`。
+- **deploy-local.js banner 选取逻辑错** — daemon logger 非 append-only
+  (重启时新内容写到文件头),`grep ... | tail -1` 拿的是行号最大的
+  banner,可能是文件中段的某条历史 broken banner(缺 timestamp),
+  regex `\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]` 不匹配 → 误报
+  "没找到 banner"。
+  - `scripts/deploy-local.js:289-296` — 改为 grep 全文件,过滤出带
+    合法 timestamp 前缀的 banner,按 timestamp 字符串字典序(YYYY-MM-DD
+    HH:MM:SS 排序等价于时间序)取最新。
+
+### Tests
+
+- 新增 `tests/unit/agent-view/manager.test.ts` regression test —
+  v2.7.5: 29 mixed sessions (用户场景) → 渲染不超 25KB,无 fallback。
+  模拟用户实际分布 (7 busy + 5 waiting + 6 idle + 11 completed) + 长
+  cwd,断言 `cardReplyFn` 收到卡(不是 fallback text)、卡大小 < 25KB、
+  hasMore 非 0、各 status group 至少展示 1 个 session。
+- 更新 `v2.3.2: active 优先 — busy 全进,completed 限额 5` 测试 —
+  25 busy 现 cap 到 7 rows + hasMore=18(原契约 25 全进已不成立)。
+- 更新 `exceeds 25KB triggers text fallback` 测试 — 用 30 sessions ×
+  5KB name 仍能触发 fallback(原 10 × 3KB 测试在 v2.7.5 后只渲染 7
+  sessions = 21KB < 25KB,不再触发 fallback)。
+
+## [0.7.3] - 2026-07-02
+
+### Added
+
+- **多平台 IM 抽象层**（wecom 集成 PR 1）— 新增 `src/platform/` 子目录,
+  抽出与具体 IM 平台解耦的 4 个模块,飞书之外的平台（企微/钉钉/Slack 等）
+  可以基于这套接口实现 adapter,不需改 bot 主流程:
+  - `src/platform/types.ts` (`PlatformAdapter` / `PlatformMessage` /
+    `PlatformUser` / `PlatformStreamUpdater` 接口) — 统一消息模型,
+    `userId` + `platform` 字段一起做 serialKey。
+  - `src/platform/command-handler.ts` — `isCommandMessage()` /
+    `extractCommand()` 静态 helper,把"是否命令"判定从飞书专属逻辑
+    中抽出来,任何平台都可复用。
+  - `src/platform/stream-updater.ts` — `PlatformStreamUpdater` 抽象类,
+    封装 throttled 卡片更新 + 状态机 (processing → streaming → complete
+    /error)。
+  - `src/platform/user-state.ts` — 平台无关的 `PendingReply` 描述,
+    `userId + platform` 取代纯 `openId` 作为 user-mapping key。
+- **`src/feishu/stream-updater.ts`** — 从 `src/feishu/bot.ts` 抽出
+  `FeishuStreamUpdater` (继承 `PlatformStreamUpdater`),保持原有
+  CardUpdater 行为不变,bot 主流程代码减少约 20 行。
+
+### Changed
+
+- **`src/feishu/bot.ts`** — `handleChatStreaming` 改用新抽象的
+  `PlatformStreamUpdater`,原先在 bot.ts 里的 stream 卡片更新逻辑
+  下沉到 `FeishuStreamUpdater`。bot.ts 净减约 20 行。
+- **`src/feishu/mapping.ts`** — UserManager key 拼接 `userId` 和
+  `platform`,为后续多平台并存做准备;旧的纯 `openId` key 仍兼容
+  读取。
+
+### Fixed
+
+- **legacy spool 文件 userId/platform 字段缺失** (`src/queue/spool.ts`) —
+  v0.7.x 之前的 spool 消息没有 `userId` / `platform` 字段,worker
+  pool claim 时会因找不到 key 而无法分发。现在 enqueue 时自动
+  backfill 默认值 (`userId = openId`, `platform = 'feishu'`),
+  旧 spool 文件可正常 drain。
+- **`[STREAM-5]` / `[STREAM-7]` plan spec args index 拼写错误** —
+  plan 文档把 `args[index]` 写成了 `args[0]`,plan reviewer 之前漏检。
+  修复后对齐真实实现 (`args[3]` / `args[5]`)。
+
+### Refactored
+
+- **`src/feishu/bot.ts` 复用 `platform/command-handler`** — 删掉
+  本地的 `isCommandMessage` 实现,改为 `import { isCommandMessage }
+  from '../platform/command-handler'`。与新抽象层对齐。
+
+### Tests
+
+- 新增 `tests/unit/platform/types.test.ts` (104 行) — PlatformAdapter /
+  PlatformMessage 等接口的 contract 测试。
+- 新增 `tests/unit/platform/user-state.test.ts` (44 行)。
+- 新增 `tests/unit/platform/command-handler.test.ts` (55 行)。
+- 新增 `tests/unit/platform/stream-updater.test.ts` (44 行)。
+- 新增 `tests/unit/feishu/stream-updater.test.ts` (71 行) — 验证抽
+  出后的 FeishuStreamUpdater 行为与原 inline 实现一致。
+- 新增 `tests/unit/feishu/bot-stream-updater.test.ts` (58 行)。
+
 ## [0.7.1] - 2026-06-17
 
 ### Added

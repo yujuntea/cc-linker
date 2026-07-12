@@ -204,9 +204,76 @@ describe('handleList', () => {
     expect(sentCard.elements[0].content).toContain('daemon not running');
   });
 
-  test('v2.3.2: active 优先 — busy 全进,completed 限额 5', async () => {
+  test('v2.7.5: 29 mixed sessions (用户场景) → 渲染不超 25KB,无 fallback', async () => {
+    const { mgr, cardReplyFn, replyFn } = makeMgrWithSpies();
+    // v2.7.5 修复的根因:用户 2026-07-02 反馈 /agents 显示 "29 sessions /
+    // /agents to refresh" 是 LIST_FALLBACK_TEXT(说明 buildListCard 产出的卡
+    // 超过 25KB,被 sendOrFallback 降级为纯文本)。
+    //
+    // v2.7.4 给所有 status 加 Reply 按钮后,每 session 多 1 button;v2.3.2 旧
+    // 截断只限 completed 不限 busy/waiting/idle → 29 mixed sessions 直接爆。
+    //
+    // 此测试模拟用户实际分布(7 busy + 5 waiting + 6 idle + 11 completed),
+    // 长 cwd 压住边界,断言卡 < 25KB 走 cardReplyFn(不是 fallback)。
+    const mixed = [
+      ...Array.from({ length: 7 }, (_, i) =>
+        makeBusySession({
+          sessionId: `aaaaaaaa-bbbb-cccc-dddd-busy-${String(i).padStart(8, '0')}`,
+          name: `busy-${i}`,
+          cwd: `/Users/wuyujun/projects/repo-${i}/very/deep/subdir/path/to/the/working/directory`,
+        })),
+      ...Array.from({ length: 5 }, (_, i) =>
+        makeBusySession({
+          sessionId: `aaaaaaaa-bbbb-cccc-dddd-wait-${String(i).padStart(8, '0')}`,
+          name: `wait-${i}`,
+          status: 'waiting',
+          cwd: `/Users/wuyujun/projects/repo-${i}/very/deep/subdir/path`,
+          waitingFor: 'continue?',
+        })),
+      ...Array.from({ length: 6 }, (_, i) =>
+        makeBusySession({
+          sessionId: `aaaaaaaa-bbbb-cccc-dddd-idle-${String(i).padStart(8, '0')}`,
+          name: `idle-${i}`,
+          status: 'idle',
+          cwd: `/Users/wuyujun/projects/old-${i}/path`,
+        })),
+      ...Array.from({ length: 11 }, (_, i) =>
+        makeBusySession({
+          sessionId: `aaaaaaaa-bbbb-cccc-dddd-done-${String(i).padStart(8, '0')}`,
+          name: `done-${i}`,
+          status: 'idle',
+          completed: true,
+          cwd: `/Users/wuyujun/projects/done-${i}/path`,
+        })),
+    ];
+    (AgentSnapshotFetcher as any).fetch = mock(async () => ({
+      ok: true,
+      sessions: mixed,
+    }));
+
+    await mgr.handleList('ou_test_user_scenario');
+
+    // 关键断言:cardReplyFn 收到卡(不是 fallback text)
+    expect(cardReplyFn).toHaveBeenCalledTimes(1);
+    expect(replyFn).not.toHaveBeenCalled();
+    // 卡大小实测必须 < 25KB(MAX_CARD_BYTES)
+    const cardStr = cardReplyFn.mock.calls[0][0] as string;
+    const size = new TextEncoder().encode(cardStr).length;
+    expect(size).toBeLessThan(25_000);
+    // hasMore 必须非 0(用户看到溢出提示)
+    const sentCard = JSON.parse(cardStr);
+    const hasMoreText = sentCard.elements.find((e: any) =>
+      e.tag === 'markdown' && /more/.test(e.content || ''));
+    expect(hasMoreText).toBeDefined();
+    // 每个非空 status group 至少展示 1 个 session
+    expect(sentCard.elements.filter((e: any) => e.tag === 'markdown' && /✽/.test(e.content || '')).length).toBeGreaterThan(0);
+    expect(sentCard.elements.filter((e: any) => e.tag === 'markdown' && /✋/.test(e.content || '')).length).toBeGreaterThan(0);
+  });
+
+  test('v2.7.5: 25 busy → cap MAX_ACTIVE_ITEMS=7 + hasMore=18 (card size protection)', async () => {
     const { mgr, cardReplyFn } = makeMgrWithSpies();
-    // 25 个 busy(active), 0 completed → 25 个全进(hasMore=0)
+    // v2.7.4 Reply-on-all-statuses 之后,busy 每行多 1 个 button + 长 cwd 会让
+    // 25 个 busy 突破 25KB 飞书卡上限。v2.7.5 给 busy/waiting 设上限 MAX_ACTIVE_ITEMS=7。
     const manySessions = Array.from({ length: 25 }, (_, i) =>
       makeBusySession({
         sessionId: `aaaaaaaa-bbbb-cccc-dddd-${String(i).padStart(12, '0')}`,
@@ -224,11 +291,11 @@ describe('handleList', () => {
     const sessionRows = sentCard.elements.filter(
       (e: any) => e.tag === 'markdown' && /✽|✋|⏹/.test(e.content || ''),
     );
-    expect(sessionRows).toHaveLength(25);  // 全进,不再 cap 10
-    // 验证 hasMore=0(所有 active 都展示了)
-    const hasMoreText = sentCard.elements.find((e: any) =>
-      e.tag === 'markdown' && /more/.test(e.content || ''));
-    expect(hasMoreText).toBeUndefined();
+    // v2.7.5: busy 限额 7,溢出 18 进 hasMore
+    expect(sessionRows).toHaveLength(7);
+    // 验证 hasMore 提示 18 个被截断(25 - 7 = 18)
+    const sentCardStr = JSON.stringify(sentCard);
+    expect(sentCardStr).toMatch(/…\s*18\s*more/);
   });
 
   test('v2.3.2: 11 个 done + 0 active → 只展示 5 个最近 done,hasMore=6', async () => {
@@ -296,12 +363,14 @@ describe('handleList', () => {
 
   test('exceeds 25KB triggers text fallback (no card sent)', async () => {
     const { mgr, cardReplyFn, replyFn } = makeMgrWithSpies();
-    // 构造大量超长 session 让 buildListCard 超过 25KB
-    const huge = Array.from({ length: 10 }, (_, i) =>
+    // v2.7.5: busy cap MAX_ACTIVE_ITEMS=7,但即便 cap 后 7 个 5KB+ name 仍
+    // 突破 25KB 飞书卡上限,应触发 fallback。多 session 类型确保覆盖
+    // 多种 group(限 busy+waiting 各 7、idle 4、completed 5,共 23 进卡)。
+    const huge = Array.from({ length: 30 }, (_, i) =>
       makeBusySession({
         sessionId: `aaaaaaaa-bbbb-cccc-dddd-${String(i).padStart(12, '0')}`,
-        name: 'x'.repeat(3000) + `-${i}`, // 每个 3KB+,10 个 > 30KB
-        cwd: '/very/very/very/long/path/' + 'y'.repeat(200) + '/' + i,
+        name: 'x'.repeat(5000) + `-${i}`, // 每个 5KB+,就算 cap 后 7 个也 > 35KB
+        cwd: '/very/very/very/long/path/' + 'y'.repeat(500) + '/' + i,
       }),
     );
     (AgentSnapshotFetcher as any).fetch = mock(async () => ({
@@ -315,7 +384,7 @@ describe('handleList', () => {
     expect(replyFn).toHaveBeenCalledTimes(1);
     const fallback = replyFn.mock.calls[0][0] as string;
     expect(fallback).toContain('Agent View');
-    expect(fallback).toContain('10 sessions');
+    expect(fallback).toContain('30 sessions');
   });
 });
 
