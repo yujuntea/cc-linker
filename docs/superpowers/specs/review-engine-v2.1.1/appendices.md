@@ -291,7 +291,7 @@ review 修了 ≥1 个 real P0/P1/P2
 | review 改未写过的代码，fix 质量可能不如 work | 接受：work postfix 复查会兜住 review 的劣质修复；verify-first 在 review 侧也生效 |
 | context 裸奔，极端长任务撑爆无主动干预 | 接受：max_rounds 兜底（v2.1.3 删成本统计，无 max_cost_usd）；Phase 3 可重引入轻量 abort（不做 cascade） |
 | review 改代码与 work 串行假设 | 状态机保证：work state=done 才进 EXTERNAL_REVIEW，两 pane 串行，不会并发改文件 |
-| 删 HUMAN_DECIDE 失去高分歧人工兜底 | 接受：MVP 自动化优先；max_rounds 到顶 ABORTED 后人工可 `review resume` / 手动介入 |
+| 删 HUMAN_DECIDE 失去高分歧人工兜底 | 接受：MVP 自动化优先；max_rounds 到顶 ABORTED 后，`review resume` **拒绝**（终态不可逆）；用户需 `cc-linker review run` 重新开始，或手动介入已落到 `aborted/` 的 PipelineRecord 检查历史 checkpoint 手动 rollback |
 
 #### C.8.5 未做的事（第一轮，实测前）
 

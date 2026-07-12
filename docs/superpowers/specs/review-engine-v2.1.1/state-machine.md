@@ -223,6 +223,11 @@ stateDiagram-v2
     FAILED --> [*]
     ABORTED --> [*]
 
+    note right of ABORTED
+      ABORTED 是不可逆终态，`review resume` 对 ABORTED no-op（拒绝 + 提示重启）。
+      v2.1.3 删除 JUDGE/HUMAN 后不再有"人工兜底"分支；max_rounds 到顶 / user cancel / permission_denied / unexpected_blocked / paused_cancelled 都直接 ABORTED。
+    end note
+
     note right of FIXING
       FIXING prompt requires verify-first:
       1. Re-read code/context for each input issue
@@ -328,7 +333,7 @@ stateDiagram-v2
 | **PAUSED** | user cancel | ABORTED | cleanup + stop bg | - | 不变 |
 | **任意状态 X** | bg session 消失 | PANE_LOST | 记录 lostPane + detectedAt | lost pane | 不变 |
 | **任意状态 X** | user cancel | ABORTED | cleanup | — | 不变 |
-| **进入 SELF_REVIEW_R1** | round ≥ max_rounds | ABORTED | reason=`max_rounds_exceeded` | — | 超过 |
+| **进入 SELF_REVIEW_R1** | round ≥ max_rounds | ABORTED | reason=`max_rounds_exceeded` | — | ≥ |
 | **PANE_LOST** | user retry/abort/skip / 24h timeout | 见 §5.3.3 | — | — | — |
 
 > **v2.1.3 删除的转换**：JUDGE_BY_WORK → FIXING/HUMAN_DECIDE、HUMAN_DECIDE → FIXING/ABORTED、EXTERNAL_REVIEW → JUDGE_BY_WORK/SELF_REVIEW_R1(reset)/ABORTED(context overflow) 全部移除；FIXING(source=JUDGE/HUMAN) 转换移除。

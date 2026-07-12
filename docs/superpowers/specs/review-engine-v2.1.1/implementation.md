@@ -221,6 +221,20 @@ async function reconcile(): Promise<ReconcileResult> {
 > **v2.1.3 删除**：`human_pending/` 目录扫描 + HUMAN_DECIDE 4h 超时行（HUMAN_DECIDE 移除，无 human_pending 目录）；review opinions 文件恢复增强（review opinions 落盘整组移除，review findings 直接从 review pane 的 `state.json.output` 解析入 history）。
 > **v2.1.3 新增**：PAUSED 唤醒--reconciler 每 `rate_limit_resume_poll_interval_ms`（默认 60s）扫描 running/ 中 state=PAUSED 的 pipeline，resumeAt 已到则回到 pausedFrom 继续 poll（bg session 未杀，保持 blocked，唤醒后自然推进）。PAUSED 态不占新 bg，不消耗配额。
 
+**实施备注（v2.1.3 补充）**：
+
+1. **PANE_LOST 24h 触发机制**：reconciler 每 60s 扫 running/ 中所有 PANE_LOST pipeline，对每个比较 `Date.now() - new Date(lostPane.detectedAt).getTime() >= 24 * 3600 * 1000` → 走 cleanup → ABORTED 路径（`reason=pane_lost_timeout`，移到 aborted/）。`detectedAt` 由 §4.4 reconcile 首次发现 pane 缺失时写入（基于 `state.json.state ∈ {failed, stopped}` 或 `readJobState` 返回 null）。
+
+2. **FIXING 幂等匹配规则**：`source + inputIssues` 都匹配的判定：
+   - `source` 必须完全相等（`'SELF_REVIEW_R1'` 或 `'SELF_REVIEW_R2'`）
+   - `inputIssues` 用**有序指纹数组比较**：对每个 issue 计算 `fingerprint = SHA256(role:severity:location:description).slice(0,8)`（见 §6.0 Issue.fingerprint），按 array index 顺序比较所有 fingerprint 全等才认为匹配
+   - 任一不匹配 → 视为新 FIXING（不跳过，正常推进）
+
+3. **review Issue ID 分配规则**：`ReviewFixOutput.issues[].id` 由 review 模型自己生成（engine 不预分配）。生成规则写进 `prompts.review.code.system`：
+   - format: `{role}:{severity}:{location}:{description}` 的 SHA256 前 8 位（hex），role 固定 `'review'`
+   - `per_issue[].issueId` 必须对应 `issues[].id`（engine 据此反查 severity 用于 `isClean` 与 `externalReviewConverges` 判定，见 §5.4.2）
+   - engine parse 失败时 fallback：自动重算 fingerprint 对应 `issueId`
+
 **PANE_LOST retry**：
 - review pane 丢失 → 重新 spawn
 - work pane 丢失 → spawn 新 work session + 回到 R1 entry（检查 max_rounds）

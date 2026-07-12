@@ -173,7 +173,7 @@ cc-linker review abort <id>
 cc-linker review report <id>    [--format md|json] [--out <file>] [--partial]
 cc-linker review cancel <id>
 cc-linker review skip <id>      [--reason "..."]
-cc-linker review resume <id>    # 从当前 state 继续（FAILED network_timeout / PAUSED 限额恢复 后恢复）
+cc-linker review resume <id>    # FAILED network_timeout / PAUSED 限额恢复 后恢复；ABORTED 拒绝（终态不可逆，需 `review run` 重启）
 cc-linker review doctor         # 启动前健康检查
 cc-linker review profiles       # 列出 review profiles
 ```
