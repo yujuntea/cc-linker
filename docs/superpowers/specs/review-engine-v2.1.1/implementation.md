@@ -219,11 +219,11 @@ async function reconcile(): Promise<ReconcileResult> {
 | running/ + 所有 pane 活着 | 继续推进 |
 | running/ + 部分 pane 消失 | **PANE_LOST** + 用户决策 |
 | PANE_LOST 24h 超时 | cleanup → ABORTED |
-| running/ + state=PAUSED + resumeAt 已到 | 唤醒：回到 pausedFrom，继续 poll 同一 bg session（v2.1.3 新增） |
+| running/ + state=PAUSED + resumeAt 已到 | **唤醒前校验**：对每个 pauseHistory 项 `readJobState(bgShortId)` → `null` 或 `state=failed` 走 **PANE_LOST** 路径；`state=blocked + needs 仍含 rate_limited` 推迟唤醒（`resumeAt = max(原 resumeAt, 解析出的新 resumeAt)`）；其余 → 回到 pausedFrom，继续 poll 同一 bg session |
 | running/ + state=PAUSED + resumeAt 未到 | 跳过（等下次轮询，间隔 `rate_limit_resume_poll_interval_ms`） |
 
 > **v2.1.3 删除**：`human_pending/` 目录扫描 + HUMAN_DECIDE 4h 超时行（HUMAN_DECIDE 移除，无 human_pending 目录）；review opinions 文件恢复增强（review opinions 落盘整组移除，review findings 直接从 review pane 的 `state.json.output` 解析入 history）。
-> **v2.1.3 新增**：PAUSED 唤醒--reconciler 每 `rate_limit_resume_poll_interval_ms`（默认 60s）扫描 running/ 中 state=PAUSED 的 pipeline，resumeAt 已到则回到 pausedFrom 继续 poll（bg session 未杀，保持 blocked，唤醒后自然推进）。PAUSED 态不占新 bg，不消耗配额。
+> **v2.1.3 新增**：PAUSED 唤醒--reconciler 每 `rate_limit_resume_poll_interval_ms`（默认 60s）扫描 running/ 中 state=PAUSED 的 pipeline，resumeAt 已到则逐 pauseHistory 项 **校验 bg session 活着**（P0-4）：`readJobState` 返回 null/failed → **PANE_LOST**；`state=blocked + needs 仍含 rate_limited` → 推迟唤醒（限额又触发了，update resumeAt）；其余 → 回到 pausedFrom 继续 poll（bg session 未杀，保持 blocked，唤醒后自然推进）。PAUSED 态不占新 bg，不消耗配额。
 
 **实施备注（v2.1.3 补充）**：
 

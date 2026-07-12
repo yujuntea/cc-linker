@@ -139,12 +139,20 @@ type ReviewState =
   // === 外审 + 直接修复（单一 review session，v2.1.3：review 既审又修，每轮输入=spec/plan）===
   | { kind: EXTERNAL_REVIEW;   pipelineId; round: number;
                                   pane: { role: review; shortId: string } }
-  // === 限额挂起（v2.1.3 新增）===
+  // === 限额挂起（v2.1.3 新增；v2.1.3 P0-2 强化 pauseHistory）===
   | { kind: PAUSED;            pipelineId; round: number;
-                                  pausedFrom: ReviewState[kind];   // 被挂起时所处的状态
-                                  resumeAt: string;                  // 限额重置时间（ISO）
+                                  pausedFrom: ReviewState['kind'];   // 被挂起时所处的状态
+                                  resumeAt: string;                  // 当前唤醒时间（ISO，所有 pauseHistory 中最晚）
                                   reason: string;                    // 原始 needs/detail
-                                  detectedAt: string }
+                                  detectedAt: string;                // 首次进入 PAUSED 时间
+                                  // v2.1.3 P0-2：连续 429 幂等
+                                  pauseHistory: Array<{
+                                    state: ReviewState['kind'];     // 该次挂起的源状态
+                                    resumeAt: string;                // 该次的限额重置时间
+                                    detectedAt: string;              // 该次检测时间
+                                    bgShortId: string;              // 被挂起的 bg shortId
+                                    bgSessionId?: string;           // bg session id（dead 时 null）
+                                  }> }
   // === pane 丢失（用户询问，不直接 FAILED）===
   | { kind: PANE_LOST;         pipelineId; round: number;
                                   lostPane?: { role: work | review; shortId: string };
@@ -329,7 +337,8 @@ stateDiagram-v2
 | **FIXING (source=R2)** | done | EXTERNAL_REVIEW | 同上 | work | 不变 |
 | **EXTERNAL_REVIEW** | review state=`done`，real P0/P1/P2 数 == 0 | DONE | 收集 review findings 入 issueTrail + 生成 report + 移到 `done/` | review (×1) | 不变 |
 | **EXTERNAL_REVIEW** | review state=`done`，review 修复了 ≥1 real P0/P1/P2 | SELF_REVIEW_R1 | cycle=`postfix`, **round += 1**（work 复查 review 修复） | work (R1 postfix) | +1 |
-| **任意 active 状态 X** | adapter.poll 检测 blocked + needs 含 rate limited/429/重置 | PAUSED | parse 重置时间写入 resumeAt，pausedFrom=X；bg session 不杀（保持 blocked） | 当前 pane | 不变 |
+| **任意 active 状态 X** | adapter.poll 检测 blocked + needs 含 rate limited/429/重置 | PAUSED | parse 重置时间写入 resumeAt，pausedFrom=X；append pauseHistory；bg session 不杀（保持 blocked） | 当前 pane | 不变 |
+| **PAUSED** | adapter.poll 检测另一 pane blocked + needs rate limited | PAUSED | resumeAt = max(旧, 新)；append pauseHistory（P0-2 连续 429 幂等） | 当前 pane | 不变 |
 | **PAUSED** | reconciler 到 resumeAt 唤醒 | (pausedFrom) | 回到被挂起状态继续 poll 同一 bg | - | 不变 |
 | **PAUSED** | user cancel | ABORTED | cleanup + stop bg | - | 不变 |
 | **任意状态 X** | bg session 消失 | PANE_LOST | 记录 lostPane + detectedAt | lost pane | 不变 |
