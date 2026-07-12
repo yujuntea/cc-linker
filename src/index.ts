@@ -31,6 +31,7 @@ import {
   imgProxyWrapperInstall, imgProxyWrapperUninstall, imgProxyWrapperStatus,
   imgProxyConsoleEnable, imgProxyConsoleDisable, imgProxyConsoleStatus,
 } from './cli/commands/img-proxy';
+import { reviewCommand } from './cli/commands/review';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -316,6 +317,9 @@ program
   .option('--action <action>', 'start, end, or heartbeat', 'heartbeat')
   .option('--session <uuid>', 'session UUID (default: $CLAUDE_SESSION_ID)')
   .action(activityHook);
+
+// Review engine CLI group (T7 + v2.1.6.1 patches C2c/C3/C4b/M2/M3)
+reviewCommand(program);
 
 // Parse and handle errors
 program.parseAsync(process.argv).catch(handleError);
