@@ -329,8 +329,24 @@ rate_limit_resume_poll_interval_ms = 60000   # PAUSED 态 reconciler 检查 resu
 ```toml
 [prompts.work.produce.system]
 template = """
-你正在编写一份 {phase}。
-{task}
+你正在编写一份 {phase} 阶段的产出。需求描述：{task}
+
+操作步骤（P1-2，**严格按序执行，不要跳步**）：
+1. **理解任务**：读 `{task}`（如果是路径，先 `cat <cwd>/<task>`；如果是 1 句话需求，直接读）
+2. **定位上下文**（code phase 必走）：
+   - `git -C <cwd> status --porcelain` 看工作区
+   - `git -C <cwd> log -5 --oneline` 看最近 commit 历史
+   - 如果 task 提到具体文件/函数/错误：`find <cwd> -name '<pattern>'` + `cat <相关文件>`
+   - 如果 task 是 bug 类（"fix NPE in auth.ts"）：`cat <cwd>/auth.ts` + 跑测试复现
+3. **撰写产出**（按 phase）：
+   - **spec phase**：写 `.md` 文档（需求/接口/验收标准）
+   - **plan phase**：写 `.md` 设计文档（架构/数据流/边界 case）
+   - **code phase**：直接修改/新建源文件 + 跑测试验证
+4. **输出**：对 code phase 简述改了哪些文件 + 测试结果；对 spec/plan phase 写完整文档
+
+约束：
+- 不要执行任何 git 操作（commit/stash 全部由 engine 管理）
+- cwd 是 `Bun.spawn({cwd})` 控制的，与 `process.cwd()` 一致
 """
 
 [prompts.work.self_review.system]
@@ -388,10 +404,18 @@ template = """
 （pre_review_checkpoint_sha 是 engine 在 spawn review 前打的 git checkpoint。
  非 git repo 或 checkpoint 为 null 时：git diff HEAD 看 work 全部产出，自己判断。）
 
+Severity 判定标准（per phase，P1-1）：
+- **spec phase**：P0=需求理解错误/与相邻 spec 段落严重矛盾；P1=语义不清/缺关键边界 case；P2=格式错误/术语不一致；P3=小瑕疵
+- **plan phase**：P0=架构根本不可行/关键数据流错误；P1=缺重要边界 case/性能问题；P2=术语不一致/可读性问题；P3=小瑕疵
+- **code phase**：P0=bug/crash/安全漏洞/数据丢失；P1=明显功能错误/性能严重问题；P2=边界 case 未处理/可维护性问题；P3=代码风格/命名
+
 对每条 issue：
-1. 识别问题，按 severity 分级（P0=Critical / P1=High / P2=Medium / P3=Low）
-2. 逐条确认问题是否 real（避免 hallucination）
-3. 对 real 问题直接修改代码（最小化改动），verify 修复正确
+1. 识别问题，按上述 per-phase 标准分级
+2. 逐条确认问题是否 real（避免 hallucination）：**spec phase re-read 全文 + 检查语义一致性**；**plan phase 验证关键数据流**；**code phase 跑测试或检查边界**
+3. 对 real 问题直接修改（最小化改动），并按 per-phase verify 标准重新验证：
+   - spec phase：re-read 改后段落，确保与其他段落语义连贯
+   - plan phase：对照需求走一遍关键场景，确认数据流通顺
+   - code phase：跑测试 + 检查边界 case
 4. P3 问题可修可不修（不阻塞收敛，由你判断性价比）
 
 直接在当前分支改文件，不要做 git 操作（checkpoint 由 engine 管理）。
@@ -403,7 +427,8 @@ template = """
   "reasoning": "..."
 }
 """
-# spec/plan phase 用 prompts.review.spec.system / prompts.review.plan.system，结构同上（{task} + pre_review_checkpoint_sha + 直接修）
+# spec/plan phase 用 prompts.review.spec.system / prompts.review.plan.system，结构同上（{task} + pre_review_checkpoint_sha + 直接修 + per-phase verify 标准）
+# P1-3 验证：work 这一轮的产出确实与 {task} 描述的需求一致——比如 task 说"fix NPE"，work 应该修了 NPE 那个文件/函数，而不是其他无关改动
 # {pre_review_checkpoint_sha} 在 engine 端替换为 engine 在 EXTERNAL_REVIEW 前打的 checkpoint SHA（写入 HistoryEvent.checkpointSha，pre-review-fix 标识），null 时降级为 HEAD
 
 # v2.1.3：删 prompts.review.code.preamble -- checkpoint 由 engine 在 spawn review 前自己打
