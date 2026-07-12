@@ -28,16 +28,16 @@ template = "produce for {phase}: {task}"
 template = "review {task}"
 
 [prompts.work.fixing.system]
-template = "fix {task}; issues={input_issues}"
+template = "fix {task}; issues={input_issues}; DO NOT git commit"
 
 [prompts.review.spec.system]
-template = "review spec {task}"
+template = "review spec {task}; after fixing, git -C <cwd> add -A && git commit --no-verify -m 'review(spec): fix it'"
 
 [prompts.review.plan.system]
-template = "review plan {task}"
+template = "review plan {task}; after fixing, git -C <cwd> add -A && git commit --no-verify -m 'review(plan): fix it'"
 
 [prompts.review.code.system]
-template = "review code {task}"
+template = "review code {task}; after fixing, git -C <cwd> add -A && git commit --no-verify -m 'review(code): fix it'"
 
 [phase_overrides.code]
 review.provider = "kimi-coding"

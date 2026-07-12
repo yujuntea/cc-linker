@@ -28,6 +28,20 @@ describe('extractJsonBlock', () => {
     expect(extractJsonBlock('trivial clean repo confirmed; no issues found; looks good'))
       .toEqual({ issues: [] });
   });
+
+  // Phase 2 acceptance: model said "no P0–P3 issues on trivial README-only repo"
+  // before commit; previous heuristic missed P[0-3]-prefix. Add explicit tests
+  // for common prose variants from qwen3.6 / GLM / minimax families.
+  it('v2.1.6.1.1: tolerant P[0-3] prefix + critical/blocker qualifiers', () => {
+    expect(extractJsonBlock('no P0–P3 issues on trivial README-only repo'))
+      .toEqual({ issues: [] });
+    expect(extractJsonBlock('no P0 issues, no P1 issues, no P2 issues'))
+      .toEqual({ issues: [] });
+    expect(extractJsonBlock('no critical bugs found'))
+      .toEqual({ issues: [] });
+    expect(extractJsonBlock('no severe defects, repo clean'))
+      .toEqual({ issues: [] });
+  });
   it('v2.1.6.1.1: rejects when defect markers present alongside "clean"', () => {
     expect(extractJsonBlock('mostly clean, but found one P1 issue in auth.ts'))
       .toBeNull();

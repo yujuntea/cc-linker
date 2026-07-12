@@ -75,29 +75,44 @@ function autoQuoteJson(s: string): string {
 
 /**
  * v2.1.6.1.1: detect "no issues" prose from non-JSON models (qwen / GLM / MiniMax).
- * Returns true ONLY when the output mentions clean/no-issues markers AND lacks any
- * defect markers — so the engine's failure mode stays conservative (specific
- * defect mentions still surface as parse_failed -> ABORTED).
+ *
+ * Strategy:
+ *  1. Substring scan for explicit clean phrases (all clean / looks good / 0 issues,
+ *     Chinese 工作正常/无问题 etc.) — matches everywhere in the text.
+ *  2. REGEX for "denial" patterns (no/without/zero) within ~80 chars of a defect
+ *     noun (issues/defects/bugs/problems/concerns/findings). Tolerant of qualifiers
+ *     in between ("no P0–P3 issues", "no critical bugs" etc.).
+ *  3. Reject if the text ALSO contains explicit defect signals
+ *     (P[0-3] issue / critical issue / found N issues / found bug).
+ *
+ * Output: returns true ONLY when (1 OR 2) AND NOT 3.
  */
 function looksCleanNoIssues(text: string): boolean {
   const lower = text.toLowerCase();
-  const cleanMarkers = [
-    'no defects', 'no issues', 'no problems', 'all clean', 'clean repo',
-    'trivial clean', 'nothing to do', 'no issues found', 'looks good',
-    'looks clean', 'everything looks', '工作正常', '没有发现问题', '无问题',
-    'all good', 'clean and correct', 'no real issues', 'no fixes needed',
-    'no changes needed',
-  ];
-  const hasClean = cleanMarkers.some((m) => lower.includes(m));
-  if (!hasClean) return false;
-  // Reject if the output ALSO mentions specific defect indicators.
-  const defectMarkers = [
-    'p0 issue', 'p1 issue', 'p2 issue', 'critical issue', 'bug found',
-    'must fix', 'needs to be fixed', 'severe bug', 'severity: p',
-    '必须修复', '发现问题', '有缺陷',
-  ];
-  const hasDefect = defectMarkers.some((m) => lower.includes(m));
-  return !hasDefect;
+
+  // (1) explicit clean phrases — substring-ish
+  const explicitCleanPhrase = new RegExp(
+    '\\b(?:all\\s+clean|clean\\s+repo|trivial\\s+clean|looks?\\s+(?:good|clean)|everything\\s+looks?|all\\s+good|clean\\s+and\\s+correct|0\\s+(?:defects?|issues?|problems?|bugs?))\\b|' +
+    '工作正常|没有发现(?:问题|缺陷)|无问题|没有缺陷|没有问题|nothing\\s+to\\s+(?:fix|do)|not\\s+found\\s+any',
+    'i',
+  );
+
+  // (2) denial pattern: "no [X] noun" within ~80 chars
+  const denialRegex = new RegExp(
+    '\\b(?:no|without|zero)\\b[^.!?:]{0,80}\\b(?:defects?|issues?|problems?|bugs?|concerns?|findings?)\\b',
+    'i',
+  );
+
+  const matchedClean = explicitCleanPhrase.test(lower) || denialRegex.test(lower);
+  if (!matchedClean) return false;
+
+  // (3) reject if explicit defect signals (stronger than denial)
+  const defectSignals = new RegExp(
+    '\\b(?:found\\s+\\d+\\s+(?:issues?|defects?|bugs?|problems?)|p[0-3]\\s+(?:issue|defect|bug|problem)|critical\\s+(?:issue|defect|bug|problem)|severe\\s+(?:issue|bug)|must\\s+fix|severity:\\s*p[0-3]|needs?\\s+to\\s+be\\s+fixed)\\b|' +
+    '必须修复|发现(?:问题|缺陷|严重)',
+    'i',
+  );
+  return !defectSignals.test(lower);
 }
 
 const SeveritySchema = z.enum(['P0', 'P1', 'P2', 'P3']);
