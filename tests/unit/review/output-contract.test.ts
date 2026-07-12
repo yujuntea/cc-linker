@@ -1,0 +1,67 @@
+// tests/unit/review/output-contract.test.ts
+import { describe, it, expect } from 'bun:test';
+import { extractJsonBlock, SelfReviewOutputSchema, ReviewOutputSchema, assignIssueFingerprints } from '../../../src/review/output-contract';
+
+describe('extractJsonBlock', () => {
+  it('extracts ```json fenced block', () => {
+    const out = 'here is review\n```json\n{"issues":[]}\n```\ndone';
+    expect(extractJsonBlock(out)).toEqual({ issues: [] });
+  });
+
+  it('extracts last balanced {} via depth counter (v2.1.5 P2-5)', () => {
+    const out = 'text {"a":1} more {"issues":[{"x":{"y":2}}]}';
+    expect(extractJsonBlock(out)).toEqual({ issues: [{ x: { y: 2 } }] });
+  });
+
+  it('direct JSON.parse fallback', () => {
+    expect(extractJsonBlock('{"foo":"bar"}')).toEqual({ foo: 'bar' });
+  });
+
+  it('returns null if no JSON', () => {
+    expect(extractJsonBlock('just text no json')).toBeNull();
+  });
+});
+
+describe('SelfReviewOutputSchema', () => {
+  it('validates issues without id (engine assigns)', () => {
+    const r = SelfReviewOutputSchema.safeParse({ issues: [{ severity: 'P1', location: 'a.ts:1', description: 'x' }] });
+    expect(r.success).toBe(true);
+  });
+  it('rejects unknown severity', () => {
+    const r = SelfReviewOutputSchema.safeParse({ issues: [{ severity: 'P9', location: '', description: '' }] });
+    expect(r.success).toBe(false);
+  });
+});
+
+describe('ReviewOutputSchema', () => {
+  it('validates issues + per_issue with embedded severity', () => {
+    const r = ReviewOutputSchema.safeParse({
+      issues: [{ severity: 'P0', location: 'a', description: 'b' }],
+      per_issue: [{ issue_id: 'x', severity: 'P0', verdict: 'real', verdict_reason: 'y', fix_applied: true }],
+      reasoning: 'z',
+    });
+    expect(r.success).toBe(true);
+  });
+});
+
+describe('assignIssueFingerprints', () => {
+  it('assigns id = fingerprint (first 8 hex of SHA256)', () => {
+    const issues = assignIssueFingerprints(
+      [{ severity: 'P1', location: 'a.ts:1', description: 'bug' }],
+      'work',
+    );
+    expect(issues[0].id).toMatch(/^[0-9a-f]{8}$/);
+    expect(issues[0].id).toBe(issues[0].fingerprint);
+    expect(issues[0].role).toBe('work');
+  });
+  it('same content -> same fingerprint (stable across rounds)', () => {
+    const a = assignIssueFingerprints([{ severity: 'P1', location: 'a.ts:1', description: 'bug' }], 'work');
+    const b = assignIssueFingerprints([{ severity: 'P1', location: 'a.ts:1', description: 'bug' }], 'work');
+    expect(a[0].fingerprint).toBe(b[0].fingerprint);
+  });
+  it('different role -> different fingerprint', () => {
+    const a = assignIssueFingerprints([{ severity: 'P1', location: 'a.ts:1', description: 'bug' }], 'work');
+    const b = assignIssueFingerprints([{ severity: 'P1', location: 'a.ts:1', description: 'bug' }], 'review');
+    expect(a[0].fingerprint).not.toBe(b[0].fingerprint);
+  });
+});
