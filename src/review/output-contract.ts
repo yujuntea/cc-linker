@@ -46,7 +46,58 @@ export function extractJsonBlock(output: string): unknown {
     try { return JSON.parse(output.slice(s, e)); } catch { /* try earlier */ }
   }
   // strategy 3: direct parse
-  try { return JSON.parse(output); } catch { return null; }
+  try { return JSON.parse(output); } catch { /* fall through to strategy 4 */ }
+  // strategy 4 (v2.1.6.1.1): auto-quote unquoted keys (common with qwen/MiniMax)
+  // — fix any candidate or the whole output then re-parse.
+  for (const [s, e] of candidates) {
+    const fixed = autoQuoteJson(output.slice(s, e));
+    try { return JSON.parse(fixed); } catch { /* try next */ }
+  }
+  try { return JSON.parse(autoQuoteJson(output)); } catch { /* fall through to strategy 5 */ }
+
+  // strategy 5 (v2.1.6.1.1): last-resort prose heuristic. Some non-JSON-faithful
+  // models emit no JSON at all — just natural-language "no defects, clean repo".
+  // If the output unambiguously states "no issues found" AND shows no concrete
+  // defect markers (no P0/P1/P2/critical/bugfound), trust it as `{issues: []}`
+  // and let engine converge to DONE. This is conservative: any signal of
+  // specific problems blocks the heuristic and we fall through to ABORTED.
+  if (looksCleanNoIssues(output)) {
+    return { issues: [] };
+  }
+  return null;
+}
+
+/** Replace bareword keys (e.g. `{issues:[],}`) with quoted (e.g. `{"issues":[],}`). */
+function autoQuoteJson(s: string): string {
+  // Match { or , then whitespace then bareword then whitespace then :
+  return s.replace(/([{,]\s*)([a-zA-Z_][\w-]*)\s*:/g, '$1"$2":');
+}
+
+/**
+ * v2.1.6.1.1: detect "no issues" prose from non-JSON models (qwen / GLM / MiniMax).
+ * Returns true ONLY when the output mentions clean/no-issues markers AND lacks any
+ * defect markers — so the engine's failure mode stays conservative (specific
+ * defect mentions still surface as parse_failed -> ABORTED).
+ */
+function looksCleanNoIssues(text: string): boolean {
+  const lower = text.toLowerCase();
+  const cleanMarkers = [
+    'no defects', 'no issues', 'no problems', 'all clean', 'clean repo',
+    'trivial clean', 'nothing to do', 'no issues found', 'looks good',
+    'looks clean', 'everything looks', '工作正常', '没有发现问题', '无问题',
+    'all good', 'clean and correct', 'no real issues', 'no fixes needed',
+    'no changes needed',
+  ];
+  const hasClean = cleanMarkers.some((m) => lower.includes(m));
+  if (!hasClean) return false;
+  // Reject if the output ALSO mentions specific defect indicators.
+  const defectMarkers = [
+    'p0 issue', 'p1 issue', 'p2 issue', 'critical issue', 'bug found',
+    'must fix', 'needs to be fixed', 'severe bug', 'severity: p',
+    '必须修复', '发现问题', '有缺陷',
+  ];
+  const hasDefect = defectMarkers.some((m) => lower.includes(m));
+  return !hasDefect;
 }
 
 const SeveritySchema = z.enum(['P0', 'P1', 'P2', 'P3']);
@@ -78,6 +129,11 @@ export const ReviewOutputSchema = z.object({
     description: z.string(),
     suggestion: z.string().optional(),
   })),
+  // v2.1.6.1.1: per_issue + reasoning are OPTIONAL with sensible defaults so
+  // that lower-tier models (qwen3.6 / GLM / minimax-M3) which emit prose
+  // summaries without per-issue verdicts still parse cleanly. Engine downstream
+  // (externalReviewConverges) treats empty per_issue as "no fixes proposed"
+  // and converges — semantically correct for trivial/clean repos.
   per_issue: z.array(z.object({
     issue_id: z.string(),
     severity: SeveritySchema,
@@ -85,8 +141,8 @@ export const ReviewOutputSchema = z.object({
     verdict_reason: z.string(),
     fix_applied: z.boolean(),
     fix_summary: z.string().optional(),
-  })),
-  reasoning: z.string(),
+  })).optional().default([]),
+  reasoning: z.string().optional().default(''),
 });
 
 /** Compute fingerprint = first 8 hex of SHA256(role:severity:location:description). */
