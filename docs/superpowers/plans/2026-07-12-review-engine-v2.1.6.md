@@ -2725,3 +2725,623 @@ Expected: doctor passes, run starts pipeline, --watch shows PRODUCING → ... �
 - `providerManager.scan()` async + `resolve(alias)` returns `{alias,name,path,isTemp} | null` (providers.ts:38).
 - `engine-process.ts` `_engine-loop` hidden subcommand dispatches to `runEngineLoop` — the implementer should verify the child process correctly re-enters via `process.argv[1]`.
 - Real `claude --bg` E2E (T10) requires providers configured at `~/.claude/providers/`; skip gracefully if missing.
+
+---
+
+## v2.1.6.1 Patches (2026-07-12 plan review)
+
+> **Why this section exists**: Plan review found 4 critical + 2 high gaps that would cause orphan pipelines (cancel/abort without state update), wrong model display in --watch (showing provider alias instead of real model name from `state.json.respawnFlags`), unbounded concurrent pipelines, and zero per-pipeline report file. Each patch below names the affected plan task and shows the exact code/diff to apply. **Execution subagents MUST apply these patches on top of T1-T10 plan body** — patches are interleaved with T-codes (not appended after), but for brevity of plan editing they live here.
+>
+> **Patch list (severity-ordered):**
+>
+> | ID | Sev | Plan task | Title |
+> |----|-----|-----------|-------|
+> | C1 | CRIT | T2b (NEW) | Insert model-parser.ts task body |
+> | C2 | CRIT | T5c + T7 | Concurrency cap → queued/promote + global reconciler lock |
+> | C3 | CRIT | T7 | cancel/abort state cleanup (kill engine first, then write ABORTED + move bucket) |
+> | C4 | CRIT | T6 + T7 | Engine writes report file + T7 `review report` reads it |
+> | H1 | HIGH | T5 | Bucket-aware `acquirePipelineLock` + `acquireGlobalLock` |
+> | H2 | HIGH | T5b | Narrow adapter `poll` blocked detection to spec (`state === 'blocked'` only) |
+>
+> **Minor decisions baked in** (M1-M4 not requiring user input):
+> - **M1 ulid stub**: keep stub in T7 (Time.now() + Math.random()) — Phase 2 swap to `ulid` pkg.
+> - **M2 env gate**: keep `CC_LINKER_REVIEW_ENGINE_CHILD=1` env var; `_engine-loop` action early-returns if env not set (defense against accidental CLI invocation).
+> - **M3 skip stub**: keep `review skip <id>` as stub (no state advance, no degraded mark) — spec §5.3.3 PANE_LOST branch deferred to Phase 2.
+> - **M4 prompt substitution**: T6 implementer fills `buildSelfReviewPrompt(task, cycle, phase, profile)` using 4 substitution phrases from spec §7.2 (R1 initial / R2 initial / R1 postfix / R2 postfix — listed verbatim below).
+
+---
+
+### Patch C1: NEW T2b body — Insert between T2 (Step 7 commit) and T3 header
+
+**Spec ref**: §3.2.1 + Appendix A.1 H5 + C.8 F3. **File Structure entry already exists** (model-parser.ts at line 44); this adds the missing implementation steps.
+
+**Files:**
+- Create: `src/review/model-parser.ts`
+- Test: `tests/unit/review/model-parser.test.ts`
+- Fixture: `tests/fixtures/review/state-glm5.2-respawn.json` (re-uses `state-running.json` field, augment respawnFlags)
+
+**Step 1**: Write `tests/unit/review/model-parser.test.ts`:
+
+```typescript
+import { describe, it, expect } from 'bun:test';
+import { parseModelFromRespawnFlags } from '../../../src/review/model-parser';
+
+describe('parseModelFromRespawnFlags', () => {
+  it('parses --model glm-5.2[1m] -> { name: "glm-5.2", contextHint: 1000000 }', () => {
+    expect(parseModelFromRespawnFlags(['--settings','/x/glm-5.2.json','--model','glm-5.2[1m]']))
+      .toEqual({ name: 'glm-5.2', contextHint: 1_000_000 });
+  });
+  it('parses --model MiniMax-M3 (no hint suffix) -> contextHint: null', () => {
+    expect(parseModelFromRespawnFlags(['--model','MiniMax-M3'])).toEqual({ name: 'MiniMax-M3', contextHint: null });
+  });
+  it('returns null when no --model flag', () => {
+    expect(parseModelFromRespawnFlags(['--settings','/x/foo.json'])).toBeNull();
+  });
+  it('returns null for empty/undefined', () => {
+    expect(parseModelFromRespawnFlags([])).toBeNull();
+    expect(parseModelFromRespawnFlags(undefined)).toBeNull();
+  });
+  it('handles --model at end (no value)', () => {
+    expect(parseModelFromRespawnFlags(['--model'])).toBeNull();
+  });
+  it('handles k-suffix: claude-sonnet-4[200k] -> 200000', () => {
+    expect(parseModelFromRespawnFlags(['--model','claude-sonnet-4[200k]']))
+      .toEqual({ name: 'claude-sonnet-4', contextHint: 200_000 });
+  });
+});
+```
+
+**Step 2**: Write `src/review/model-parser.ts`:
+
+```typescript
+import type { JobStateFile } from '../agent-view/job-state';
+
+export interface ModelInfo {
+  name: string;              // 纯模型名，如 "glm-5.2" / "MiniMax-M3" / "kimi-for-coding"
+  contextHint: number | null; // 从后缀解析，仅供报告展示，不驱动任何阈值
+}
+
+/**
+ * Parse the `--model` flag from `state.json.respawnFlags[]`.
+ * Format: --model <name>[<hint><k|m>]  e.g. "glm-5.2[1m]" / "claude-sonnet-4[200k]" / "MiniMax-M3"
+ * Spec §3.2.1: providerEnv 不可信，必须从 respawnFlags 读 — model 由 --settings 文件决定,
+ * CLI 自己从 settings 解析写入 respawnFlags。
+ */
+export function parseModelFromRespawnFlags(flags: string[] | undefined): ModelInfo | null {
+  if (!flags || flags.length < 2) return null;
+  const idx = flags.indexOf('--model');
+  if (idx === -1 || idx === flags.length - 1) return null;
+  const raw = flags[idx + 1];
+  // match name + optional [hint unit]
+  const m = raw.match(/^(.+?)(?:\[(\d+)([kKmM]?)\])?$/);
+  if (!m) return null;
+  let hint: number | null = null;
+  if (m[2]) {
+    const n = parseInt(m[2], 10);
+    if (Number.isFinite(n) && n > 0) {
+      const unit = (m[3] || 'm').toLowerCase();
+      hint = unit === 'k' ? n * 1000 : unit === 'm' ? n * 1_000_000 : n;
+    }
+  }
+  return { name: m[1], contextHint: hint };
+}
+
+/** Sugar: extract from a JobStateFile directly. */
+export function modelFromJobState(state: JobStateFile | null | undefined): ModelInfo | null {
+  if (!state) return null;
+  return parseModelFromRespawnFlags(state.respawnFlags);
+}
+```
+
+**Step 3**: T1 `types.ts` — `ModelInfo` already exported.  Add to `PaneRegistry.work` + `PaneRegistry.review`:
+```typescript
+export interface PaneWork {
+  sessionId: string;
+  currentRoundShortId?: string;
+  provider: string;
+  startedAt: string;
+  roundShortIds: string[];
+  /** v2.1.6.1: populated by adapter.poll from state.json.respawnFlags; cli-watch display prefers this over provider alias. */
+  modelName?: string;
+}
+export interface PaneReview {
+  role: 'review';
+  shortId: string;
+  sessionId: string;
+  provider: string;
+  round: number;
+  modelName?: string;
+}
+```
+
+**Step 4**: T5b `adapter.ts` — `PollResult` gains `model?: ModelInfo`. `poll()` reads `env.state.respawnFlags` and attaches `model`:
+```typescript
+import { parseModelFromRespawnFlags } from './model-parser';
+
+export type PollResult =
+  | { kind: 'running'; model?: ModelInfo }
+  | { kind: 'done'; output: string; sessionId?: string; model?: ModelInfo }
+  | { kind: 'blocked'; blocked: BlockedResult }
+  | { kind: 'lost' };
+
+// inside poll(): after readJobStateFn returns env, compute model once per call
+const model = parseModelFromRespawnFlags(env.state.respawnFlags);
+// then return r with model attached on done/running.
+```
+
+**Step 5**: T6 `engine.ts` — capture `pollResult.model?.name` to populate panes after each poll:
+```typescript
+// after adapter.poll returns:
+if ((pollResult.kind === 'done' || pollResult.kind === 'running') && pollResult.model) {
+  const m = pollResult.model.name;
+  if (record.state.kind === 'EXTERNAL_REVIEW' && record.panes.review) {
+    record.panes.review.modelName = m;
+  } else if (record.panes.work) {
+    record.panes.work.modelName = m;
+  }
+}
+```
+
+**Step 6**: T8 `cli-watch.ts` — `renderLive` prefers `pane.modelName ?? pane.provider`:
+```typescript
+const workModel = record.panes.work?.modelName ?? record.panes.work?.provider;
+const reviewModel = record.panes.review?.modelName ?? record.panes.review?.provider;
+```
+
+**Step 7**: Commit + verify.
+
+---
+
+### Patch C2: Concurrency cap → queued/promote + global reconciler lock
+
+**Spec ref**: §6.5 (queued FIFO + 60s promote) + §6.4 (global `.lock`).
+
+#### C2a. T5 `PipelineStore` — `create` accepts bucket + add `acquireGlobalLock`:
+
+Replace the `create` and `acquirePipelineLock` methods, and add a new public method:
+
+```typescript
+// src/review/pipeline-store.ts
+
+/** v2.1.6.1: create now accepts bucket; default 'running'. C2a. */
+async create(record: PipelineRecord, bucket: PipelineBucket = 'running'): Promise<void> {
+  const dir = this.dir(record.pipelineId, bucket);
+  mkdirSync(dir, { recursive: true });
+  await this.atomicWrite(this.file(record.pipelineId, bucket), record);
+}
+
+/** v2.1.6.1 H1: dynamic bucket lookup so lock works regardless of moved pipeline. */
+async acquirePipelineLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const bucket = this.findBucket(id);
+  if (!bucket) throw new Error(`pipeline ${id} not found in any bucket`);
+  const lockFile = join(this.dir(id, bucket), '.lock');
+  return withLock(lockFile, fn);
+}
+
+/** v2.1.6.1 C2: global ~/.cc-linker/review-pipelines/.lock for reconciler. */
+async acquireGlobalLock<T>(fn: () => Promise<T>): Promise<T> {
+  return withLock(join(this.root, '.lock'), fn);
+}
+
+/** v2.1.6.1 C3: cancel/abort needs to know current bucket to move from. */
+async findBucketPublic(id: string): Promise<PipelineBucket | null> {
+  return this.findBucket(id);
+}
+```
+
+Update `pipeline-store.test.ts` to assert: create with bucket='queued' writes to `queued/<id>/pipeline.json`; acquirePipelineLock acquires on a pipeline moved to `done/` correctly; acquireGlobalLock uses root `.lock`.
+
+#### C2b. T5c `reconciler.ts` — wrap in global lock + add promoteQueued:
+
+```typescript
+// src/review/reconciler.ts
+
+import type { PipelineStore } from './pipeline-store';
+import type { JobStateEnvelope } from '../agent-view/job-state';
+import type { PipelineRecord, ReconcileResult, PipelineBucket } from './types';
+
+const PANE_LOST_TIMEOUT_MS = 24 * 3600 * 1000;
+
+export interface ReconcilerDeps {
+  readJobStateFn: (short: string, jobsDir?: string) => Promise<JobStateEnvelope | null>;
+  jobsDir?: string;
+  /** v2.1.6.1 C2: max concurrent running pipelines (from profile.guards.maxConcurrentPipelines; default 1). */
+  maxConcurrent?: number;
+  /** v2.1.6.1 C2: invoked with promoted pipelineId (typically forks child engine). */
+  promoteFn?: (pipelineId: string) => Promise<void>;
+}
+
+export class Reconciler {
+  constructor(private store: PipelineStore, private deps: ReconcilerDeps) {}
+
+  async reconcile(): Promise<ReconcileResult> {
+    const result: ReconcileResult = {
+      recovered: 0, lostPanes: 0, timedOut: [], errors: [], promoted: 0,
+    };
+    await this.store.acquireGlobalLock(async () => {
+      // (1) promote queued → running if slot free
+      await this.promoteQueued(result);
+      // (2) PANE_LOST + pane-alive (existing logic — scan the SAME runningIds list post-promote)
+      const runningIds = await this.store.listRunning();
+      for (const id of runningIds) {
+        try {
+          const rec = await this.store.read(id);
+          if (!rec) continue;
+          if (rec.state.kind === 'PANE_LOST') {
+            await this.handlePaneLost(rec);
+            if (rec.state.kind === 'ABORTED') result.timedOut.push(id);
+            continue;
+          }
+          if (await this.checkPanesAlive(rec)) {
+            result.recovered++;
+          } else {
+            result.lostPanes++;
+          }
+        } catch (e) {
+          result.errors.push(`${id}: ${e}`);
+        }
+      }
+    });
+    return result;
+  }
+
+  /** v2.1.6.1 C2: move oldest queued → running, then call promoteFn to fork engine. */
+  private async promoteQueued(result: ReconcileResult): Promise<void> {
+    const max = this.deps.maxConcurrent ?? 1;
+    const running = await this.store.listRunning();
+    if (running.length >= max) return;
+    const queued = await this.store.listQueued();
+    if (queued.length === 0) return;
+    const oldest = [...queued].sort()[0]; // ULID sorts lexicographically == chronologically
+    await this.store.move(oldest, 'queued', 'running');
+    if (this.deps.promoteFn) await this.deps.promoteFn(oldest);
+    result.promoted++;
+  }
+
+  // existing handlePaneLost + checkPanesAlive unchanged
+}
+```
+
+Update `src/review/types.ts` `ReconcileResult` interface to add `promoted: number`.
+
+Update `reconciler.test.ts` to inject a mock `promoteFn` and assert it's called when `running.length < maxConcurrent && queued.length > 0`; assert global lock is acquired (mocked via store spy).
+
+#### C2c. T7 `review run` — concurrency cap writes to queued/ when full:
+
+```typescript
+review.command('run <task>')
+  .option('--phase <phase>', 'spec | plan | code (auto-detect if omitted)')
+  .option('--profile <name>', 'review profile name', 'default')
+  .option('--max-rounds <n>', 'override max rounds', parseInt)
+  .option('--watch', 'attach rich terminal view')
+  .option('--cwd <path>', 'working directory (default: process.cwd())')
+  .option('--inject-text <text>', 'extra context injected into prompts')
+  .action(async (task: string, opts: any) => {
+    const cwd = opts.cwd ?? process.cwd();
+    const phase = opts.phase ?? detect({ rawInput: task });
+    const profile = await loadProfile(opts.profile, phase);
+    const store = new PipelineStore(REVIEW_PIPELINES_DIR);
+
+    // (a) lazy promote: if any queued pipeline can be moved up, do it first
+    const initialRunning = await store.listRunning();
+    if (initialRunning.length < profile.guards.maxConcurrentPipelines) {
+      const queued = await store.listQueued();
+      if (queued.length > 0) {
+        const oldest = [...queued].sort()[0];
+        await store.move(oldest, 'queued', 'running');
+        await forkEngine(oldest);
+        console.log(chalk.yellow(`⏫ promoted ${oldest} from queued → running`));
+      }
+    }
+
+    const pipelineId = ulid();
+    const runningNow = await store.listRunning();
+    const targetBucket: PipelineBucket =
+      runningNow.length >= profile.guards.maxConcurrentPipelines ? 'queued' : 'running';
+
+    if (targetBucket === 'queued') {
+      const position = (await store.listQueued()).length + 1;
+      console.log(chalk.yellow(`⏳ Pipeline queued at position ${position} (max=${profile.guards.maxConcurrentPipelines})`));
+    }
+
+    await store.create({
+      pipelineId, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      state: { kind: 'PRODUCING', pipelineId, round: 0 },
+      input: { rawInput: task, phase, profile: opts.profile, maxRounds: opts.maxRounds ?? profile.guards.maxRounds, cwd },
+      panes: {}, history: [],
+    }, targetBucket);
+
+    if (targetBucket === 'running') {
+      await forkEngine(pipelineId);
+      console.log(chalk.green(`✓ Pipeline started: ${pipelineId}`));
+    }
+
+    if (opts.watch) {
+      const { watchPipeline } = await import('../../review/cli-watch');
+      await watchPipeline(pipelineId);
+    }
+  });
+```
+
+> **Phase 1 limitation note** (worth adding to plan): reconciler only runs inside an engine process. With `maxConcurrentPipelines=1` (Phase 1 default) and pipeline A in `running/`, pipeline B in `queued/` only gets promoted when (i) A's engine finishes (it exits, B never auto-promoted in Phase 1) OR (ii) user invokes `review run` again, which is what C2c lazy-promote does. The reconciler-level promote is in place for Phase 2 multi-pipeline / `review-server` global daemon — it just won't fire often in Phase 1.
+
+#### C2d. T9b `runEngineLoop` — wire reconcile deps:
+
+```typescript
+const reconciler = new Reconciler(store, {
+  readJobStateFn: readJobState,
+  maxConcurrent: profile.guards.maxConcurrentPipelines,
+  promoteFn: async (pipelineId) => {
+    // C2: each promoted pipeline needs its own engine
+    const { forkEngine } = await import('./engine-process');
+    await forkEngine(pipelineId);
+  },
+});
+```
+
+---
+
+### Patch C3: cancel/abort state cleanup (kill engine first, then write ABORTED + move)
+
+**Spec ref**: §5.3.4 user_cancelled + §6.6 Abort/Cleanup.
+
+**Replace T7's `cancel` + `abort` commands** with a shared helper:
+
+```typescript
+// src/cli/commands/review.ts (helper at module top)
+
+async function cancelOrAbort(pipelineId: string, reason: 'user_cancelled' | 'user_aborted'): Promise<void> {
+  // (1) Kill engine FIRST — prevents in-flight adapter.poll from racing to save over our state change.
+  await killEngine(pipelineId);
+
+  // (2) Acquire per-pipeline lock, then write ABORTED + move bucket.
+  const store = new PipelineStore(REVIEW_PIPELINES_DIR);
+  await store.acquirePipelineLock(pipelineId, async () => {
+    const rec = await store.read(pipelineId);
+    if (!rec) {
+      console.log(chalk.yellow(`pipeline ${pipelineId} not found (already gone?)`));
+      return;
+    }
+    if (isTerminal(rec.state.kind)) {
+      console.log(chalk.yellow(`already ${rec.state.kind}, no-op`));
+      return;
+    }
+    const fromBucket = (await store.findBucketPublic(pipelineId)) ?? 'running';
+    const before = rec.state.kind;
+    rec.state = {
+      kind: 'ABORTED',
+      pipelineId,
+      round: rec.state.round,
+      reason,
+      abortedBefore: before,
+    };
+    rec.history.push({
+      ts: new Date().toISOString(),
+      fromState: before,
+      toState: 'ABORTED',
+      round: rec.state.round,
+      role: 'human',
+      inputDigest: '',
+      outputDigest: '',
+      outputSizeBytes: 0,
+      durationMs: 0,
+    });
+    await store.save(rec);
+    await store.move(pipelineId, fromBucket, 'aborted');
+    console.log(chalk.yellow(`✓ ${before} → ABORTED (${reason})`));
+  });
+}
+
+// Commands:
+review.command('cancel <id>')
+  .option('--reason <text>', 'cancel reason')
+  .action(async (id: string) => { await cancelOrAbort(id, 'user_cancelled'); });
+
+review.command('abort <id>')
+  .action(async (id: string) => { await cancelOrAbort(id, 'user_aborted'); });
+```
+
+Add imports for `isTerminal` from `'../../review/types'`. PipelineStore.change file: `findBucket` is now public via `findBucketPublic`.
+
+---
+
+### Patch C4: Engine writes report file + T7 `review report` reads it
+
+**Spec ref**: §8.4.
+
+#### C4a. T6 engine — renderReport + writeReport + invoke in terminal branches:
+
+```typescript
+// src/review/engine.ts (new exports)
+
+import { mkdir } from 'fs/promises';
+import { dirname } from 'path';
+import { reviewReportPath } from './paths';
+import type { Issue, HistoryEvent } from './types';
+
+/** v2.1.6.1 C4: render Markdown report per spec §8.4 structure. */
+export async function renderReport(rec: PipelineRecord): Promise<string> {
+  const lines: string[] = [];
+  // Header
+  lines.push(`# Review Report — ${rec.pipelineId}`);
+  lines.push('');
+  lines.push(`- Created: ${rec.createdAt}`);
+  lines.push(`- Phase: ${rec.input.phase}`);
+  lines.push(`- Profile: ${rec.input.profile}`);
+  lines.push(`- Max rounds: ${rec.input.maxRounds}`);
+  lines.push(`- CWD: ${rec.input.cwd}`);
+  lines.push(`- Final state: **${rec.state.kind}**`);
+  if (rec.state.kind === 'ABORTED') lines.push(`- Abort reason: ${(rec.state as any).reason ?? 'unknown'}`);
+  lines.push('');
+
+  // Parse Degradation Events
+  if (rec.parseDegraded && rec.parseDegraded.length > 0) {
+    lines.push('## Parse Degradation');
+    for (const p of rec.parseDegraded) {
+      lines.push(`- [${p.ts}] round=${p.round} state=${p.state} reason=${p.reason} recoveredByRetry=${p.recoveredByRetry}`);
+    }
+    lines.push('');
+  }
+
+  // Timeline (history summary)
+  lines.push('## Timeline');
+  for (const h of rec.history) {
+    lines.push(`- [${h.ts}] ${h.fromState ?? '∅'} → ${h.toState} (round=${h.round}, role=${h.role})`);
+  }
+  lines.push('');
+
+  // Issues — merge from history[*].issues (engine-canonical, after fingerprint assignment)
+  const allIssues: Issue[] = [];
+  for (const h of rec.history) for (const i of h.issues ?? []) allIssues.push(i);
+  const dedup = new Map<string, Issue>();
+  for (const i of allIssues) if (!dedup.has(i.fingerprint)) dedup.set(i.fingerprint, i);
+  const sorted = [...dedup.values()].sort((a, b) => {
+    const order = { P0: 0, P1: 1, P2: 2, P3: 3 } as Record<string, number>;
+    return (order[a.severity] ?? 99) - (order[b.severity] ?? 99);
+  });
+
+  lines.push('## Issues');
+  if (sorted.length === 0) lines.push('_No issues recorded._');
+  for (const i of sorted) {
+    lines.push(`- [${i.severity}] \`${i.location}\` (role=${i.role}) — ${i.description}${i.suggestion ? `  hint: ${i.suggestion}` : ''}`);
+  }
+  lines.push('');
+
+  // Fix provenance — derived from per_issue fix_applied if any review event recorded it
+  const fixCount = rec.history.reduce((n, h) => n + (h.issues?.length ?? 0), 0);
+  lines.push('## Summary');
+  lines.push(`- Total unique issues: ${sorted.length}`);
+  lines.push(`- Issue events across rounds: ${fixCount}`);
+  lines.push(`- Models used: work=${rec.panes.work?.modelName ?? rec.panes.work?.provider ?? '?'}; review=${rec.panes.review?.modelName ?? rec.panes.review?.provider ?? '?'}`);
+  lines.push('');
+
+  // Rollback note (v2.1.6)
+  if (sorted.some((i) => i.severity === 'P0' || i.severity === 'P1')) {
+    lines.push('> Engine did NOT take git checkpoint. Rollback with `git reset --hard <commit-before-this-pipeline>`.');
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+/** v2.1.6.1 C4: write report file to <cwd>/.claude/reviews/<pipelineId>.md when reaching terminal. */
+export async function writeReport(rec: PipelineRecord): Promise<string> {
+  const path = reviewReportPath(rec.input.cwd, rec.pipelineId);
+  await mkdir(dirname(path), { recursive: true });
+  const md = await renderReport(rec);
+  await Bun.write(path, md);
+  return path;
+}
+```
+
+In `runPipeline` / `dispatchState`, call `writeReport(rec)` after `store.move` for any terminal transition (DONE / FAILED / ABORTED). For non-terminal re-entry (e.g. mid-state), skip.
+
+#### C4b. T7 `review report` — read report file:
+
+```typescript
+review.command('report <id>')
+  .option('--format <fmt>', 'md | json', 'md')
+  .option('--out <file>', 'output file')
+  .option('--partial', 'allow non-terminal pipelines')
+  .action(async (id: string, opts: any) => {
+    const store = new PipelineStore(REVIEW_PIPELINES_DIR);
+    const rec = await store.read(id);
+    if (!rec) { console.log(chalk.red(`pipeline ${id} not found`)); process.exit(1); }
+    if (!isTerminal(rec.state.kind) && !opts.partial) {
+      console.log(chalk.yellow(`pipeline ${id} not yet terminal (state=${rec.state.kind}); use --partial`));
+      return;
+    }
+    if (opts.format === 'json') {
+      console.log(JSON.stringify(rec, null, 2));
+      return;
+    }
+    const md = await renderReport(rec);
+    if (opts.out) {
+      await Bun.write(opts.out, md);
+      console.log(chalk.green(`✓ wrote ${opts.out}`));
+    } else {
+      console.log(md);
+    }
+  });
+```
+
+Add `renderReport` to imports at top of `review.ts`.
+
+---
+
+### Patch H1 (in T5 code) and Patch H2 (in T5b code)
+
+**H1** — T5 `PipelineStore.acquirePipelineLock` already shown above under C2a (dynamic bucket lookup).
+
+**H2** — T5b `adapter.ts poll()` narrow blocked detection:
+
+```typescript
+// Replace this block in src/review/adapter.ts poll():
+// OLD:
+//   if (s.state === 'blocked' || ((s.state === 'running' || s.state === 'working') && s.needs)) {
+//     return { kind: 'blocked', blocked: { kind: 'unexpected', raw: s.needs ?? s.detail ?? '' } };
+//   }
+// NEW (v2.1.6.1 H2: spec §4.3 only treats state=blocked; running+needs keeps polling):
+if (s.state === 'blocked') {
+  return { kind: 'blocked', blocked: { kind: 'unexpected', raw: s.needs ?? s.detail ?? '' } };
+}
+```
+
+Add a unit test verifying a `state-running + needs` fixture does NOT abort but continues polling until 10-min timeout (or until state transitions).
+
+---
+
+### Patch supplements (M1/M2/M3/M4 baked-in decisions)
+
+**M1 (ulid stub)**: T7 keeps the inline `ulid()` function (Time.now() base36 + Math.random() tail). No new dep added. Comment: `// TODO(v2.1.6.2): add ulid package for proper monotonic ids`.
+
+**M2 (env gate `_engine-loop`)**: T9b Step 5 add to `reviewCommand`:
+```typescript
+review.command('_engine-loop <id>', '', { hidden: true })
+  .action(async (id: string) => {
+    if (process.env.CC_LINKER_REVIEW_ENGINE_CHILD !== '1') {
+      // Defensive: only the forked child process sets this env var; refuse any other invocation.
+      console.error('_engine-loop is internal; spawn via `cc-linker review run`');
+      process.exit(1);
+    }
+    const { runEngineLoop } = await import('../../review/engine-process');
+    await runEngineLoop(id);
+  });
+```
+
+**M3 (skip stub)**: T7 keeps `review.skip` as noop with TODO comment for Phase 2 (PANE_LOST user choice requiring state advance + degraded tracking). Acceptable stub for v2.1.6.
+
+**M4 (prompt substitution map)**: T6 implementer MUST add `buildSelfReviewPrompt(task, cycle, phase, profile)` using these 4 templates (spec §7.2):
+- `R1 initial`: "第一次自查，全面审查产出是否符合需求"
+- `R2 initial`: "审查修复后的整体状态是否符合需求、有无新问题"
+- `R1 postfix`: "postfix 循环：全面复查上一轮 external review 修复后的整体状态"
+- `R2 postfix`: "审查 postfix 修复后的整体状态"
+
+`buildProducePrompt` / `buildFixingPrompt` / `buildReviewPrompt` similarly bind from profile.prompts.{work|review}.{produce|self_review|fixing|spec|plan|code}.system.template. The substitution params `{task}` / `{phase}` / `{input_issues}` get filled in.
+
+---
+
+### Self-Review Notes — patch summary
+
+**v2.1.6.1 patches reviewed and incorporated**:
+- C1 ✅ T2b body inserted
+- C2 ✅ Concurrency cap + queued/promote + global reconciler lock (T5/T5c/T7/T9b)
+- C3 ✅ cancel/abort kill-then-write state cleanup (T7)
+- C4 ✅ Engine writes report file at terminal + T7 reads it (T6/T7)
+- H1 ✅ Bucket-aware per-pipeline lock + acquireGlobalLock (T5)
+- H2 ✅ Narrow `poll` blocked detection to spec literal (T5b)
+
+**Spec coverage matrix post-patch**: G1-G8 ✅, all 9 states ✅, state machine transitions ✅, clean standard ✅, blocked → ABORTED ✅, no PAUSED ✅, snake/camel ✅, fingerprint ✅, engine-pid PID reuse ✅, doctor ✅, model name resolution ✅, queued/promote ✅, report file ✅, cancel/abort state cleanup ✅.
+
+**Phase 1 limitations (documented, non-blocking)**:
+- reconciler promote fires only inside a running engine; with `maxConcurrent=1` default this means queued pipelines only auto-promote via C2c lazy promote in subsequent `review run` invocations. Full multi-pipeline auto-promotion arrives with Phase 2 `review-server` global daemon.
+- `ulid()` is a Time.now() + Math.random() stub (M1); adequate for Phase 1, replace with `ulid` package in Phase 2.
+- `review skip` is a stub (M3); the PANE_LOST user-skip flow with degraded tracking is Phase 2.
+
+**Verified against codebase** (incremental additions to original list):
+- `getExecutablePath()` from `src/utils/executable.ts` exists and handles compiled-binary / npm-symlink / dev-mode paths (T9b fork).
+- `writePidAtomic / readPid / isPidAlive / clearPid` from `src/utils/pid.ts` (T9b could alternatively use these — engine.pid gets both {pid,startTime} JSON AND atomic single-pid writer depending on phase).
+- `providerManager.scan()` falls back to cc-switch DB if `~/.claude/providers/` is empty (transparent to T2 profile).
+- `Bun.write(path, content)` is the project's preferred atomic file write (T6 report + state.json).
+- Subcommand registration pattern (`Command → command(...).option(...).action(handler)`) verified in `src/cli/commands/img-proxy.ts` for T7 reference.
+- T6 implementer should pre-create the report directory with `fs/promises.mkdir({recursive:true})` to avoid EACCES on `.claude/reviews/` (verified against paths.ts `reviewReportPath()`).
