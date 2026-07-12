@@ -117,6 +117,8 @@
 
 > **v2.1.3 瘦身**：删除 `context-overflow.ts` / `build-context-reset-prompt.ts` / `build-context-compact-prompt.ts` / `review-opinions-writer.ts`（context cascade + review opinions 落盘整组移除）。adapter 砍掉 `getContextUsage`（5 个 API）。`model-parser.ts` 瘦身为只剩模型名解析（删 `KNOWN_CONTEXT_LIMITS` + cost 价格表，见 §3.2.1）。
 >
+> **v2.1.4 补**：adapter 加 `isBgAlive(pid)` API（6 个 API）—reconciler PAUSED 唤醒时 `kill -0 pid` 验证 bg 进程活着，区分"bg 活着 blocked 等输入"vs"bg 死了 state.json 冻结"（详见附录 A.2 P1-4 实测 + 状态机 §5.3.4）。
+>
 > **v2.1.3 实测修正**（见附录 A 2.1.207 实测）：adapter spawn 统一用 `claude --bg --bare`（**禁 worktree，bg 直接改主 cwd**，不加 `--bare` 会自动建隔离 worktree 导致主分支不被改动）；**不传 `--cwd`**（CLI 不支持，cwd 由 `Bun.spawn({cwd})` 控制）；**不传 `--model`**（模型由 `--settings` 文件决定，见 §3.2.1）。
 
 ```
@@ -126,7 +128,7 @@ src/review/
 ├── pipeline-state.ts    # in-memory active pipeline Map
 ├── profile.ts           # ReviewProfile TOML 加载 + per-phase 深度 merge + provider 校验
 ├── phase-detect.ts      # 启发式：file path -> git ref -> 关键词 -> 文件后缀/行号 -> PhaseUnknownError
-├── adapter.ts           # ClaudeBGAdapter 5 API（startSession / resumeWorkSession / injectReply / poll / stop）；spawn 用 --bare
+├── adapter.ts           # ClaudeBGAdapter 6 API（startSession / resumeWorkSession / injectReply / poll / stop / isBgAlive，v2.1.4 加）；spawn 用 --bare
 ├── model-parser.ts      # parseModelFromRespawnFlags（从 state.json.respawnFlags 读 --model，见 §3.2.1）
 ├── output-contract.ts   # parseBgOutputWithRetry（带 retry 1 次 + timeoutMs）
 ├── cli-watch.ts         # CLI `--watch` 模式（chalk + ANSI）

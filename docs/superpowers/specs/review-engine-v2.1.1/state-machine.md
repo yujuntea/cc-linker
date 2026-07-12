@@ -145,13 +145,14 @@ type ReviewState =
                                   resumeAt: string;                  // 当前唤醒时间（ISO，所有 pauseHistory 中最晚）
                                   reason: string;                    // 原始 needs/detail
                                   detectedAt: string;                // 首次进入 PAUSED 时间
-                                  // v2.1.3 P0-2：连续 429 幂等
+                                  // v2.1.3 P0-2：连续 429 幂等；v2.1.4 补 bg 进程 liveness
                                   pauseHistory: Array<{
                                     state: ReviewState['kind'];     // 该次挂起的源状态
                                     resumeAt: string;                // 该次的限额重置时间
                                     detectedAt: string;              // 该次检测时间
                                     bgShortId: string;              // 被挂起的 bg shortId
                                     bgSessionId?: string;           // bg session id（dead 时 null）
+                                    bgPid?: number;                  // v2.1.4：spawn 时记录的 OS pid，reconciler 唤醒时 `kill -0 bgPid` 验证进程活着
                                   }> }
   // === pane 丢失（用户询问，不直接 FAILED）===
   | { kind: PANE_LOST;         pipelineId; round: number;
@@ -339,7 +340,7 @@ stateDiagram-v2
 | **EXTERNAL_REVIEW** | review state=`done`，review 修复了 ≥1 real P0/P1/P2 | SELF_REVIEW_R1 | cycle=`postfix`, **round += 1**（work 复查 review 修复） | work (R1 postfix) | +1 |
 | **任意 active 状态 X** | adapter.poll 检测 blocked + needs 含 rate limited/429/重置 | PAUSED | parse 重置时间写入 resumeAt，pausedFrom=X；append pauseHistory；bg session 不杀（保持 blocked） | 当前 pane | 不变 |
 | **PAUSED** | adapter.poll 检测另一 pane blocked + needs rate limited | PAUSED | resumeAt = max(旧, 新)；append pauseHistory（P0-2 连续 429 幂等） | 当前 pane | 不变 |
-| **PAUSED** | reconciler 到 resumeAt 唤醒 | (pausedFrom) | 回到被挂起状态继续 poll 同一 bg | - | 不变 |
+| **PAUSED** | reconciler 到 resumeAt 唤醒 + **bg 进程 liveness 检查**（v2.1.4） | (pausedFrom) | 对每个 pauseHistory 项 `kill -0 bgPid` 验证 bg 活着：null/失败 → **PANE_LOST**；blocked + needs 仍 rate_limited → 推迟唤醒（resumeAt 更新）；其余 → 回到 pausedFrom 继续 poll 同一 bg | - | 不变 |
 | **PAUSED** | user cancel | ABORTED | cleanup + stop bg | - | 不变 |
 | **任意状态 X** | bg session 消失 | PANE_LOST | 记录 lostPane + detectedAt | lost pane | 不变 |
 | **任意状态 X** | user cancel | ABORTED | cleanup | — | 不变 |

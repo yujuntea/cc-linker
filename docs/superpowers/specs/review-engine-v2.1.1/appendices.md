@@ -136,7 +136,9 @@
 
 **实现**：见 [overview.md §3.2](./overview.md#32-新建层15-个模块) adapter.ts 说明。
 
-> **v2.1.3 移除**：`getContextUsage` 随 context cascade 整组删除（见 §C.8）。adapter 从 6 API 缩为 5 API（startSession / resumeWorkSession / injectReply / poll / stop）。成本提取改由 `adapter.poll()` 在 state=done 时直接从 `state.json.output.cost_usd` 解析，不依赖 `getContextUsage`。
+> **v2.1.3 移除**：`getContextUsage` 随 context cascade 整组删除（见 §C.8）。adapter 从 6 API（v2.1 含 getContextUsage）缩为 5 API（startSession / resumeWorkSession / injectReply / poll / stop）。成本提取改由 `adapter.poll()` 在 state=done 时直接从 `state.json.output.cost_usd` 解析，不依赖 `getContextUsage`。
+>
+> **v2.1.4 补**：adapter 加 `isBgAlive(pid)` API（5 → 6 API），用于 P0-4 reconciler PAUSED 唤醒时 `kill -0` 验证 bg 进程活着（详见附录 A.2 P1-4 实测）。
 
 ### C.6 完整决策链
 

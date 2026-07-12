@@ -160,7 +160,7 @@ work FIXING 与 review EXTERNAL_REVIEW 均用 `--bare` 在原开发分支做最�
 | W1 | T1 Profile + doctor | `profile.ts` + `review-doctor.ts` + 单测 |
 | W1 | T2 PipelineStore + Reconciler | `pipeline-store.ts` + `reconciler.ts` + 集成测试 |
 | W2 | T3 PhaseDetector | `phase-detect.ts` + 单测 |
-| W2 | T4 Adapter | `adapter.ts` + 集成测试（5 API，无 getContextUsage）|
+| W2 | T4 Adapter | `adapter.ts` + 集成测试（6 API，含 v2.1.4 加的 isBgAlive）|
 | W3-W4 | T5 Engine 5 active states | `engine.ts` + 单测（v2.1.3：删 JUDGE/HUMAN/cascade，状态少 4 个）|
 | W5 | T7 CLI 命令 | `review.ts` 子命令（v2.1.3：删 `decide`）|
 | W5-W6 | T8 CLI `--watch` | `cli-watch.ts` |
@@ -289,7 +289,7 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重 / 
 - ~~`src/review/review-opinions-writer.ts`~~
 
 **修改文件**：
-- `src/review/adapter.ts`（v2.1.3：删 getContextUsage，5 API；spawn 用 `--bare` + `Bun.spawn({cwd})`，不传 `--cwd`/`--model`；poll 加 blocked 分流返回 BlockedResult）
+- `src/review/adapter.ts`（v2.1.3：删 getContextUsage，5 API；v2.1.4 加 isBgAlive，6 API；spawn 用 `--bare` + `Bun.spawn({cwd})`，不传 `--cwd`/`--model`；poll 加 blocked 分流返回 BlockedResult）
 - `src/review/engine.ts`（v2.1.3：删 context check / JUDGE / HUMAN 分支；加 clean 判定 + EXTERNAL_REVIEW 收敛 + PAUSED 态 + engine 打 checkpoint）
 - `src/review/types.ts`（v2.1.3：删 context/cost 字段、DecisionContext、WorkDecision；ReviewOpinion->ReviewFixOutput 去 checkpointSha；加 PAUSED/BlockedResult）
 - `src/review/output-contract.ts`（v2.1.3：删 JudgeOutputSchema，ReviewOutputSchema 升级删 checkpoint_sha）
