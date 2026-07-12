@@ -31,4 +31,10 @@ describe('parseModelFromRespawnFlags', () => {
     expect(parseModelFromRespawnFlags(['--model', 'claude-sonnet-4[200k]']))
       .toEqual({ name: 'claude-sonnet-4', contextHint: 200_000 });
   });
+
+  it('v2.1.6.1 H2: rejects model value starting with `-` (defends against `--model --resume <sid>`)', () => {
+    expect(parseModelFromRespawnFlags(['--model', '--resume', 'uuid-abc'])).toBeNull();
+    expect(parseModelFromRespawnFlags(['--model', '--bare'])).toBeNull();
+    expect(parseModelFromRespawnFlags(['--model', '--settings'])).toBeNull();
+  });
 });

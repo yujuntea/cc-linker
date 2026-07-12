@@ -16,8 +16,9 @@ import { runDoctor } from '../../review/review-doctor';
 import { loadProfile } from '../../review/profile';
 import { detect } from '../../review/phase-detect';
 import { PipelineStore } from '../../review/pipeline-store';
-import { renderReport } from '../../review/engine';
+import { renderReport, writeReport } from '../../review/engine';
 import { isTerminal } from '../../review/types';
+import type { PipelineRecord } from '../../review/types';
 import {
   REVIEW_PIPELINES_DIR,
   REVIEW_PROFILES_DIR,
@@ -61,8 +62,9 @@ async function cancelOrAbort(
     console.log(chalk.yellow(`killEngine warning: ${(e as Error).message}`));
   }
 
-  // (2) Acquire per-pipeline lock, then write ABORTED + move bucket.
+  // (2) Acquire per-pipeline lock, then write ABORTED + move bucket + write report.
   const store = new PipelineStore(REVIEW_PIPELINES_DIR);
+  let abortedRec: PipelineRecord | null = null;
   await store.acquirePipelineLock(pipelineId, async () => {
     const rec = await store.read(pipelineId);
     if (!rec) {
@@ -95,8 +97,19 @@ async function cancelOrAbort(
     });
     await store.save(rec);
     await store.move(pipelineId, fromBucket, 'aborted');
+    abortedRec = rec;
     console.log(chalk.yellow(`✓ ${before} → ABORTED (${reason})`));
   });
+  // v2.1.6.1 post-review fix (M4): also write the report file outside the lock
+  // so that `review report <id>` immediately after cancel returns useful content.
+  // Best-effort: writeReport failures (e.g. cwd deleted) don't roll back the abort.
+  if (abortedRec) {
+    try {
+      await writeReport(abortedRec);
+    } catch (e) {
+      console.log(chalk.yellow(`writeReport warning: ${(e as Error).message}`));
+    }
+  }
 }
 
 // M1: inline ulid() stub. Adequate for Phase 1; replace with `ulid` package in v2.1.6.2.
@@ -202,7 +215,7 @@ export function reviewCommand(program: Command): void {
   // --- status ---
   review
     .command('status <id>')
-    .description('查看 pipeline 当前状态')
+    .description('查看 pipeline 当前状态 (queued 显示 QUEUED (position=N))')
     .option('--follow', 'poll every 500ms')
     .action(async (id: string, opts: any) => {
       const store = new PipelineStore(REVIEW_PIPELINES_DIR);
@@ -211,7 +224,21 @@ export function reviewCommand(program: Command): void {
         console.log(chalk.red(`pipeline ${id} not found`));
         process.exit(1);
       }
-      console.log(chalk.cyan(`Pipeline ${id}: ${rec.state.kind} (round ${rec.state.round})`));
+      // v2.1.6.1 post-review fix (H1): queued pipelines display as
+      // `QUEUED (position=N)` per spec §6.5 — bucket determines presentation,
+      // not state.kind (which is still PRODUCING for queued).
+      const bucket = await store.findBucketPublic(id);
+      if (bucket === 'queued') {
+        const queuedIds = await store.listQueued();
+        const position = queuedIds.indexOf(id) + 1;
+        console.log(
+          chalk.yellow(
+            `Pipeline ${id}: QUEUED (position=${position}, state=${rec.state.kind})`,
+          ),
+        );
+      } else {
+        console.log(chalk.cyan(`Pipeline ${id}: ${rec.state.kind} (round ${rec.state.round})`));
+      }
       if (opts.follow) {
         const { watchPipeline } = await import('../../review/cli-watch');
         await watchPipeline(id);
@@ -244,15 +271,34 @@ export function reviewCommand(program: Command): void {
     .description('skip current round (Phase 2 — stub in v2.1.6)')
     .option('--reason <text>', 'skip reason')
     .action(async (id: string) => {
-      // TODO(v2.1.6.2): implement PANE_LOST skip flow + degraded tracking.
-      console.log(chalk.gray(`skip ${id} (degraded) — stub in v2.1.6`));
+      // TODO(v2.1.6.2): implement PANE_LOST skip flow + state advance + degraded tracking.
+      // v2.1.6.1 (M3): write to stderr so the message is visible to the user — `console.log`
+      // was writing to stdout with chalk.gray which is invisible in many terminals.
+      console.error(`skip ${id} — not yet implemented (Phase 2 stub); specify --reason anyway.`);
     });
 
   // --- resume ---
   review
     .command('resume <id>')
-    .description('re-attach engine to an existing pipeline')
+    .description('re-attach engine to a running pipeline (spec §6.4.1: running/ only)')
     .action(async (id: string) => {
+      // v2.1.6.1 post-review fix (C3): only resume pipelines currently in running/.
+      // done / failed / aborted / queued refuse to resume — terminal states are
+      // irreversible (per §6.4.1).
+      const store = new PipelineStore(REVIEW_PIPELINES_DIR);
+      const bucket = await store.findBucketPublic(id);
+      if (bucket === null) {
+        console.log(chalk.red(`pipeline ${id} not found`));
+        process.exit(1);
+      }
+      if (bucket !== 'running') {
+        const hint =
+          bucket === 'queued'
+            ? 'pipelines in queued/ are auto-promoted on next review run; no manual resume needed'
+            : `pipelines in ${bucket}/ cannot be resumed (terminal states are irreversible)`;
+        console.log(chalk.yellow(`${id}: ${hint}`));
+        return;
+      }
       let alive = false;
       try {
         const engineMod = await loadEngineProcess();

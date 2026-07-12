@@ -22,6 +22,7 @@ export type { ModelInfo };
  * - undefined / 空数组 → null(没有 respawnFlags 可读)
  * - 没有 --model 标记 → null
  * - --model 在末尾(没有 value)→ null
+ * - value 以 `-` 开头(其它 flag like `--resume` / `--bare`) → null(v2.1.6.1 H2 防御)
  * - 没有 `[hint]` 后缀 → contextHint = null
  * - `[hint]` 后缀:
  *     `[200k]` → 200 * 1000   = 200_000
@@ -33,6 +34,10 @@ export function parseModelFromRespawnFlags(flags: string[] | undefined | null): 
   const idx = flags.indexOf('--model');
   if (idx === -1 || idx === flags.length - 1) return null;
   const raw = flags[idx + 1];
+  // v2.1.6.1 H2 defence: the value after `--model` must NOT look like another
+  // CLI flag. Without this guard, `['--model','--resume','uuid-abc']` would
+  // happily return `{name:'--resume', contextHint:null}` (silent garbage display).
+  if (raw.startsWith('-')) return null;
   // match `name` + optional `[<digits><k|m>]` suffix
   const m = raw.match(/^(.+?)(?:\[(\d+)([kKmM]?)\])?$/);
   if (!m) return null;

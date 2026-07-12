@@ -4,10 +4,14 @@
 //   v2.1.6.1 C2b — wrap reconcile() in store.acquireGlobalLock
 //                  add maxConcurrent + promoteFn deps + promoteQueued private method
 //                  add promoted field to ReconcileResult (already in types.ts)
+//   v2.1.6.1 L2  — handlePaneLost (24h timeout → ABORTED) writes report file before
+//                  moving to aborted/, so `review report <id>` after a long-lost
+//                  pipeline sees the full history.
 
 import type { PipelineStore } from './pipeline-store';
 import type { JobStateEnvelope } from '../agent-view/job-state';
 import type { PipelineRecord, ReconcileResult, ReviewState } from './types';
+import { writeReport } from './engine';
 
 const PANE_LOST_TIMEOUT_MS = 24 * 3600 * 1000;
 
@@ -86,6 +90,15 @@ export class Reconciler {
         abortedBefore: 'PANE_LOST',
       };
       rec.state = aborted;
+      // v2.1.6.1 L2: write the report under the lock so the file inside
+      // `<cwd>/.claude/reviews/<id>.md` reflects the ABORTED transition before
+      // the user might `review report <id>` outside this reconciler cycle.
+      // Best-effort — writeReport failures (e.g. cwd deleted) don't fail reconcile.
+      try {
+        await writeReport(rec);
+      } catch (e) {
+        // swallow — see comment above
+      }
       await this.store.save(rec);
       await this.store.move(rec.pipelineId, 'running', 'aborted');
     }

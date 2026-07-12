@@ -43,4 +43,21 @@ describe('loadProfile', () => {
       loadProfile('nonexistent', 'code', { profilesDir: 'tests/fixtures/review' }),
     ).rejects.toThrow(ProfileError);
   });
+
+  it('v2.1.6.1 M2: rejects profile missing required prompt templates', async () => {
+    // `incomplete.toml` only declares one of the six required templates.
+    // loadProfile must surface that as ProfileError('PROFILE_INVALID') rather
+    // than letting engine.buildXxxPrompt crash on undefined.template.
+    let caught: unknown = null;
+    try {
+      await loadProfile('incomplete', 'code', { profilesDir: 'tests/fixtures/review' });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ProfileError);
+    expect((caught as InstanceType<typeof ProfileError>).code).toBe('PROFILE_INVALID');
+    expect((caught as InstanceType<typeof ProfileError>).message).toMatch(
+      /prompts\.work\.self_review\.system\.template/,
+    );
+  });
 });

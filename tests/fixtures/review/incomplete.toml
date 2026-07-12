@@ -1,0 +1,16 @@
+[meta]
+name = "incomplete"
+description = "missing required prompts — exercises M2 validation"
+
+[work]
+provider = "qwen3.7"
+
+[review]
+provider = "kimi-coding"
+
+[guards]
+max_rounds = 4
+
+# only one template declared — validation must reject.
+[prompts.work.produce.system]
+template = "produce {task}"

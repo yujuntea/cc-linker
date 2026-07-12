@@ -63,6 +63,10 @@ export function isEngineAlive(pipelineId: string): boolean {
  * Fork the engine as a detached background process running `review _engine-loop <id>`.
  * Uses getExecutablePath() (matches start.ts/img-proxy pattern) so argv[1] resolves
  * correctly under compiled-binary mode.
+ *
+ * v2.1.6.1 post-review fix (M5): when `child.pid` is undefined (fork failed silently),
+ * the cli claims `✓ Pipeline started` but no engine is alive. Throw so callers
+ * (review run / cancelOrAbort / reconciler promote) surface the failure.
  */
 export async function forkEngine(pipelineId: string): Promise<void> {
   const { getExecutablePath } = await import('../utils/executable');
@@ -75,9 +79,10 @@ export async function forkEngine(pipelineId: string): Promise<void> {
     env: { ...process.env, CC_LINKER_REVIEW_ENGINE_CHILD: '1' },
   });
   child.unref();
-  if (child.pid !== undefined) {
-    writeEnginePid(pidFile, child.pid, Date.now());
+  if (child.pid === undefined) {
+    throw new Error(`forkEngine: child.pid is undefined for pipeline ${pipelineId} (spawn failed silently)`);
   }
+  writeEnginePid(pidFile, child.pid, Date.now());
 }
 
 /** SIGTERM the engine (graceful, 3s grace), then SIGKILL + clear pidfile. */

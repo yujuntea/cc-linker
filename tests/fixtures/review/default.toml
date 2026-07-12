@@ -16,8 +16,28 @@ parse_retry_timeout_ms = 15000
 [context_limits]
 "claude-sonnet-4-5" = 1000000
 
+# v2.1.6.1 M2: loadProfile validates all 6 required prompt templates. The fixture
+# declares every one so basic load tests stay happy. Other test paths use the
+# `tests/fixtures/review/incomplete-profile.toml` fixture to exercise the
+# "missing required template" failure branch.
+
+[prompts.work.produce.system]
+template = "produce for {phase}: {task}"
+
 [prompts.work.self_review.system]
 template = "review {task}"
+
+[prompts.work.fixing.system]
+template = "fix {task}; issues={input_issues}"
+
+[prompts.review.spec.system]
+template = "review spec {task}"
+
+[prompts.review.plan.system]
+template = "review plan {task}"
+
+[prompts.review.code.system]
+template = "review code {task}"
 
 [phase_overrides.code]
 review.provider = "kimi-coding"

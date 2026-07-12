@@ -121,7 +121,11 @@ export class ClaudeBGAdapter {
   }
 
   async stop(shortId: string): Promise<void> {
-    this.runClaude(['claude', 'stop', shortId], process.cwd());
+    // Use '/' as a stable cwd: `claude stop <short>` is a daemon-scope op that does
+    // not depend on per-session cwd. Avoiding `process.cwd()` removes the ENOENT
+    // risk when the user's working directory is deleted between fork and stop
+    // (e.g. cancel/abort flow during an `rm -rf cwd`).
+    this.runClaude(['claude', 'stop', shortId], '/');
   }
 
   private runClaude(args: string[], cwd: string): { stdout: string; stderr: string; shortId: string } {

@@ -255,7 +255,13 @@ export class ReviewEngine {
         await this.store.save(record);
         return;
       }
-      if (pollResult.kind !== 'done') continue; // running, keep polling
+      // adapter.poll returns `{kind:'running'}` snapshot for running/working panes —
+      // throttle before re-polling so the engine doesn't 100% CPU on alive bg sessions.
+      if (pollResult.kind !== 'done') {
+        await new Promise<void>((r) => setTimeout(r, 500));
+        continue;
+      }
+      // done: dispatch per current state
 
       // done: dispatch per current state
       record = await this.dispatchState(record, task, phase, profile, pollResult.output);

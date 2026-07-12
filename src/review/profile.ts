@@ -90,6 +90,29 @@ export async function loadProfile(name: string, phase: Phase, opts: LoadOptions 
     throw new ProfileError('PROFILE_INVALID', 'profile must define [work].provider and [review].provider');
   }
 
+  // v2.1.6.1 M2: validate the prompt structure up front so engine.buildXxxPrompt
+  // doesn't crash with "Cannot read properties of undefined" when a phase-specific
+  // override accidentally drops a required template.
+  const prompts = merged.prompts ?? {};
+  const w = prompts.work ?? {};
+  const r = prompts.review ?? {};
+  const required: Array<[string, unknown]> = [
+    ['prompts.work.produce.system.template', w.produce?.system?.template],
+    ['prompts.work.self_review.system.template', w.self_review?.system?.template],
+    ['prompts.work.fixing.system.template', w.fixing?.system?.template],
+    ['prompts.review.spec.system.template', r.spec?.system?.template],
+    ['prompts.review.plan.system.template', r.plan?.system?.template],
+    ['prompts.review.code.system.template', r.code?.system?.template],
+  ];
+  for (const [key, val] of required) {
+    if (typeof val !== 'string' || val.length === 0) {
+      throw new ProfileError(
+        'PROFILE_INVALID',
+        `profile missing required template: ${key} (must be a non-empty string)`,
+      );
+    }
+  }
+
   const [workSettingsPath, reviewSettingsPath] = await Promise.all([
     resolveSettingsPath(workProvider),
     resolveSettingsPath(reviewProvider),
