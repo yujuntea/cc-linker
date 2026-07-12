@@ -39,13 +39,14 @@
 | 模块 | 路径 | 复用方式 |
 |------|------|---------|
 | `readJobState` | `src/agent-view/job-state.ts` | adapter / engine / cli-watch 全调 |
-| `RendezvousClient.injectReply` | `src/agent-view/rendezvous-client.ts` | adapter JUDGE/FIXING 注入 |
+| `RendezvousClient.injectReply` | `src/agent-view/rendezvous-client.ts` | adapter FIXING 注入（v2.1.3：仅 work FIXING 用） |
 | `resolvePeekContent` | `src/agent-view/manager.ts` | cli-watch pane 详情（4 级降级） |
 | `AgentSnapshotFetcher.fetch` | `src/agent-view/snapshot-fetcher.ts` | cli-watch 列表 |
 | `VersionGuard.check` | `src/agent-view/version-guard.ts` | doctor 校验 CLI 版本 |
 | `DaemonProbe.check` | `src/agent-view/daemon-probe.ts` | doctor 校验 daemon 健康 |
 | `CLAUDE_JOBS_DIR` | `src/utils/paths.ts` | adapter / cli-watch |
-| `readLastAssistantTurn` | `src/agent-view/jsonl-last-assistant.ts` | adapter getContextUsage |
+
+> **v2.1.3 移除**：`readLastAssistantTurn`（原被 `adapter.getContextUsage` 消费，getContextUsage 随 cascade 删除后不再需要——成本改由 `adapter.poll()` 从 `state.json.output.cost_usd` 解析）。
 
 ## 附录 C：v2.1 → v2.1.1 变更背景（动机 + 决策 + 章节索引）
 
@@ -97,13 +98,17 @@
 - 阈值规则修 bug（v2.1.1 对 128K 模型**永不会触发** overflow 检查；200K 模型只在 100% 才触发）
 - 新增 review opinions 落盘（worker 用 @file 引用，避免 prompt 膨胀）
 
-**实现**：见 [implementation.md §7.5.7](./implementation.md#757-context-window-策略化处理)、[§7.5.8](./implementation.md#758-review-opinions-落盘v212-新增)。
+**v2.1.3 反转 I9（2026-07-12）**：用户决定进一步简化——删 JUDGE_BY_WORK，让 review 模型在 EXTERNAL_REVIEW 内**既审又修**（识别→确认→直接修复→verify，单 bg turn），等于复活了 v2.1.1 删掉的 `review_fix`。但与原 `review_fix` 的关键差异：跨模型校验靠"review 修完 → work postfix R1 复查 review 改动"闭环保留（work 仍是复查者，只是不再做 accept/reject 裁决门）。同时删 HUMAN_DECIDE（JUDGE reject 分支的兜底，无 JUDGE 即无存在理由）+ 删 context cascade（裸奔，靠 max_rounds + max_cost_usd 兜底）。决策详见 §C.8。
+
+**实现**：见 [implementation.md §7.5.7](./implementation.md#757-context-window-策略化处理)（v2.1.3 已整组删除）、[§7.5.8](./implementation.md#758-review-opinions-落盘v212-新增)（v2.1.3 已整组删除）。
 
 ### C.5 变更 5：`adapter.getContextUsage` API
 
 **动机**：C.4 需要 engine 查 work session context 用量。
 
 **实现**：见 [overview.md §3.2](./overview.md#32-新建层15-个模块) adapter.ts 说明。
+
+> **v2.1.3 移除**：`getContextUsage` 随 context cascade 整组删除（见 §C.8）。adapter 从 6 API 缩为 5 API（startSession / resumeWorkSession / injectReply / poll / stop）。成本提取改由 `adapter.poll()` 在 state=done 时直接从 `state.json.output.cost_usd` 解析，不依赖 `getContextUsage`。
 
 ### C.6 完整决策链
 
@@ -115,8 +120,11 @@
 | 2026-06-15 | v2.1.1：6 项 patch |
 | 2026-06-17 | 评审反馈 7 P0 + 11 P1 + I9 重设计 |
 | 2026-06-19 | v2.1.2：I9 三档 cascade（compact → reset → abort）+ review opinions 落盘 + 阈值规则修 bug |
+| 2026-07-12 | v2.1.3：删 JUDGE_BY_WORK（review 既审又修，反转 I9）+ 删 HUMAN_DECIDE + 删 context cascade（裸奔）+ 无论如何都跑一轮外审 + 统一 clean 标准 |
 
 ### C.7 v2.1.2 变更动机 + 决策（本轮）
+
+> **v2.1.3 注**：本节记录 v2.1.2 的 context cascade + review opinions 落盘决策，**两者均在 v2.1.3 被移除**（见 §C.8）。保留本节作为决策追溯，不代表当前设计。
 
 #### C.7.1 变更动机
 
@@ -178,6 +186,8 @@
 
 #### C.7.6 ReviewState enum 变更
 
+> **v2.1.3 注**：本 diff 块记录 v2.1.2 对 enum 的改动。其中 `JUDGE_BY_WORK` / `contextOverflowApplied` / `injectedIssues` / `DONE.contextOverflowApplied` 已在 v2.1.3 全部移除（JUDGE_BY_WORK 删除、cascade 整组移除）。保留此 diff 仅作 v2.1.2 决策追溯。
+
 ```diff
   | { kind: 'SELF_REVIEW_R1'; ...;
 -     contextReset?: boolean;
@@ -194,10 +204,12 @@
 
 #### C.7.7 未做的事
 
-**主动保留（明确不改）**：
-- ❌ 没用 profile 内 `[context_limits]` 改 max 模型表（保留 v2.1.1 的 KNOWN_CONTEXT_LIMITS 内置表）
+> **v2.1.3 注**：本节是 v2.1.2 的"未做"记录。其中"主动保留"第 1 条（KNOWN_CONTEXT_LIMITS 内置表）与第 3 条（HUMAN_DECIDE 4h timeout）已在 v2.1.3 反转——v2.1.3 删了 KNOWN_CONTEXT_LIMITS + 删了 HUMAN_DECIDE。"已知限制"全部随 cascade + 落盘整组移除。
+
+**主动保留（明确不改，v2.1.2 视角）**：
+- ❌ 没用 profile 内 `[context_limits]` 改 max 模型表（保留 v2.1.1 的 KNOWN_CONTEXT_LIMITS 内置表）→ **v2.1.3 已删 KNOWN_CONTEXT_LIMITS**
 - ❌ 没改 max_rounds 默认值（仍是 code=8 / plan=5 / spec=4 / global=6）
-- ❌ 没动 HUMAN_DECIDE 4h timeout（I10 已在 v2.1.1 调到 4h）
+- ❌ 没动 HUMAN_DECIDE 4h timeout（I10 已在 v2.1.1 调到 4h）→ **v2.1.3 已删 HUMAN_DECIDE**
 - ❌ 没动 parse_retry_timeout 15s（I11 已在 v2.1.1 调到 15s）
 
 **已知限制 / 未实现（评审需知）**：
@@ -207,6 +219,72 @@
 - ❌ **写文件失败 → abort 而非 inline fallback**（已在 §7.5.8.7 改）：inline 注入会让 context 二次超限（恶性循环），所以写失败直接 ABORTED reason=review_opinions_write_failed，提示用户排查。
 - ❌ **post-compact usage 检查时机 race**：poll done 是等 worker 完成 turn，但 worker 可能 compact 后又自动调 tool（不该发生但理论可能），导致 usage 没降反升。Phase 3 可加 post-compact 强校验。
 - ❌ **cascade 升级路径的 n 语义**：compact 失败升级 reset 时 n 仍是 1（不是 2），避免在 1 次 EXTERNAL_REVIEW 内累计 2 次。已在 §7.5.7.1 cascade dispatch 代码隐含。
+
+> **v2.1.3 注**：§C.7.7 列的"已知限制"（FIXING 期间 context 检测 / threshold per-phase / cascade 档位 / 写文件失败 / post-compact race / n 语义）随 context cascade + review opinions 落盘整组移除，不再是当前设计的限制。
+
+### C.8 v2.1.3 变更动机 + 决策（本轮，2026-07-12）
+
+#### C.8.1 用户提出的简化
+
+用户认为 v2.1.2 方案过复杂，提出两点简化（原话摘要）：
+
+| # | 简化 | 原话摘要 |
+|---|------|---------|
+| S1 | EXTERNAL_REVIEW 后不再 JUDGE_BY_WORK，review 模型完成 review 后直接在 EXTERNAL_REVIEW 内修复，不再来回传递；fix 完成后再重复一轮 review+fix | "复杂 review 的模型完成 review 后…直接在 EXTERNAL_REVIEW 中进行修复，不再来回传递" |
+| S2 | 去除 HUMAN_DECIDE；去除复杂的 context OK 判断 | "去除复杂的 HUMAN_DECIDE 处理…去除复杂的 context ok 判断，也不再需要" |
+
+实施前与用户确认了关键分叉（review 发现的问题由谁修），用户选择**路线 A：review 模型自己修 + context check 完全删（裸奔）**。随后用户补充两点：
+
+| # | 补充 | 原话 |
+|---|------|------|
+| A1 | 无论如何都跑一轮 external review | "无论如何都跑一轮 external review" |
+| A2 | clean 标准：无 Critical/High/Medium 需修复的问题 | "判断是否 clean 的标准…要求无 Critical, High, Medium 需要修复的问题" |
+
+#### C.8.2 决策
+
+| 项 | 决策 | 理由 |
+|---|------|------|
+| S1 | **review 既审又修**（单 bg turn：识别→确认→git preamble→verify-first 修复→输出 JSON）。反转 v2.1.1 I9 的 `review_fix` 删除决策 | 用户优先简化；跨模型校验靠 work postfix 复查闭环保留，不靠 JUDGE 裁决门 |
+| S1 配套 | 删 JUDGE_BY_WORK 状态 + `computeVerdict` + `WorkDecision` + `DecisionContext` + `JudgeOutputSchema` + `prompts.work.judge` | JUDGE 的 accept/reject 过滤职责与 FIXING 的 verify-first（real/hallucination 判定）冗余，删之无损 |
+| S2a | 删 HUMAN_DECIDE 状态 + `review decide` 子命令 + `human_pending/` 目录 + `human_decide_timeout_ms` 配置 + `human_decision_timeout` reason | HUMAN_DECIDE 是 JUDGE reject 分支的兜底；无 JUDGE 即无 reject 分支，无存在理由 |
+| S2b | 删 context-OK 判断 + 三档 cascade（compact/reset/abort）整组 + `getContextUsage` API + 4 个模块（`context-overflow.ts` / `build-context-reset-prompt.ts` / `build-context-compact-prompt.ts` / `review-opinions-writer.ts`）+ 全部 context/cascade 配置 + review opinions 落盘 + @file 引用机制 | 删 JUDGE 后 work 不再做 judge/外审 fix，context 累积速度大幅下降；常规 2-4 轮不会 overflow；主动检测 + cascade 复杂度不再划算。极端情况靠 `max_rounds` + `max_cost_usd` 兜底 |
+| A1 | R1 clean / R2 clean 不再 → DONE，一律进 EXTERNAL_REVIEW；DONE 只在 EXTERNAL_REVIEW 收敛时达成 | 用户明确要求"无论如何都跑一轮外审"——self-review 全清时仍需外部模型把关，避免 work 自审盲区 |
+| A2 | 统一 clean 标准 `isClean(issues) = 无 P0/P1/P2`，P3 不阻塞（记入报告但不触发新一轮 fix）。用于 R1/R2 clean 判定 + EXTERNAL_REVIEW 收敛判定 | 用户明确"P0/P1/P2 需修才阻塞，P3 可忽略"；统一三处判定避免不一致 |
+
+#### C.8.3 跨模型校验如何保留（关键论证）
+
+反转 I9 后，"work 是唯一修复者"不变量被打破：review 模型现在也改代码。**cross-model 校验通过以下闭环保留**：
+
+```
+review 修了 ≥1 个 real P0/P1/P2
+  → EXTERNAL_REVIEW → SELF_REVIEW_R1(postfix, round+1)
+  → work 复查 review 改的代码（work 是不同模型，构成交叉）
+  → work 若发现新 P0/P1/P2 → FIXING → R2 → EXTERNAL_REVIEW → review 再修 → ...
+  → 收敛于 EXTERNAL_REVIEW 发现 0 个 real P0/P1/P2 → DONE
+```
+
+即：**review 修、work 复查**，两个模型互相挑错直到都满意。原 JUDGE_BY_WORK 的 accept/reject 是"work 单方面裁决 review 意见"，现在改为"work 用 R1 复查 review 的实际代码改动"——更直接、更符合代码评审直觉。受 `max_rounds` 兜底，反复分歧不会无限循环。
+
+#### C.8.4 风险与取舍
+
+| 风险 | 取舍 |
+|------|------|
+| review 改未写过的代码，fix 质量可能不如 work | 接受：work postfix 复查会兜住 review 的劣质修复；verify-first 在 review 侧也生效 |
+| context 裸奔，极端长任务撑爆无主动干预 | 接受：max_rounds + max_cost_usd 是硬兜底；Phase 3 可重引入轻量 abort（不做 cascade） |
+| review 改代码与 work 串行假设 | 状态机保证：work state=done 才进 EXTERNAL_REVIEW，两 pane 串行，不会并发改文件 |
+| 删 HUMAN_DECIDE 失去高分歧人工兜底 | 接受：MVP 自动化优先；max_rounds 到顶 ABORTED 后人工可 `review resume` / 手动介入 |
+
+#### C.8.5 未做的事
+
+**主动保留**：
+- ❌ 没改 max_rounds 默认值（仍是 code=8 / plan=5 / spec=4 / global=6）——删 JUDGE 后收敛路径变短，默认值偏宽但安全
+- ❌ 没改 parse_retry_timeout 15s
+- ❌ 没动 PANE_LOST（bg session 仍可能死，与本次简化正交）
+- ❌ 没改 R1/R2 的触发与结构（只改了 clean 的去向：从 DONE 改为 EXTERNAL_REVIEW）
+
+**Phase 3 可重新引入**：
+- context 用量轻量 abort 兜底（单档，不做 cascade）——若实践中确实出现撑爆
+- review 修复质量打分 / 人工复核高分歧
 
 ## 附录 D：v2.1.1 评审反馈汇总（2026-06-17）
 

@@ -43,7 +43,8 @@ cc-linker review run "帮我修 NPE in auth.ts" --phase code --profile default
 | daemon crash | ⚠️ PANE_LOST |
 | bg session 启动失败 | ❌ FAILED |
 | 网络瞬态 503 | 🔄 retry 3 次 → FAILED |
-| HUMAN_DECIDE 4h 超时 | ABORTED |
+| review pane parse 失败 | ❌ ABORTED（review 已改代码，不能静默推进） |
+| max_rounds 达到 | ⚠️ ABORTED `max_rounds_exceeded` |
 
 ### 8.3 飞书交互
 
@@ -54,15 +55,15 @@ review 跑期间飞书聊天暂时禁用（被 engine 占用）。review 完成�
 ```
 <cwd>/.claude/reviews/<pipelineId>.md
 ├── Header: pipelineId / createdAt / phase / profile / totalCostUsd
-├── Checkpoints: pre-fix R1 SHA / pre-fix JUDGE SHA
+├── Checkpoints: 每个 FIXING（work）与每个 EXTERNAL_REVIEW（review）的 checkpoint SHA
 ├── Parse Degradation Events（如有）
 ├── Timeline: 所有 state transition 摘要
-├── Issues: 去重 + 按 severity 排序
-├── Decisions: 每个 issue 的 verdict + 理由
+├── Issues: 去重 + 按 severity 排序（含 P3 记录，标注是否阻塞收敛）
+├── Fixes: 每个 real issue 的 verdict + fix_applied + 来源（work FIXING / review EXTERNAL_REVIEW）
 └── Report: 自然语言总结
 ```
 
-FIXING 做最小化修改（`git diff` 可查看、`git checkout` 可回滚）。自动 commit/PR 留 Phase 2。
+FIXING（work）与 EXTERNAL_REVIEW（review）均做最小化修改（各自先 git preamble 打 checkpoint，`git diff` 可查看、`git checkout` 回滚）。自动 commit/PR 留 Phase 2。
 
 ---
 
@@ -91,27 +92,32 @@ FIXING 做最小化修改（`git diff` 可查看、`git checkout` 可回滚）�
 5. 单一 review pane 流程
 6. commit preamble + checkpoint SHA
 7. JSON parse retry + parse_degraded
-8. context overflow 策略 + injectedIssues
+8. ~~context overflow 策略 + injectedIssues~~（v2.1.3 删除）
 
-**v2.1.2 新增 5 个**（本轮）：
+**v2.1.3 新增 6 个**（本轮，替换原 v2.1.2 cascade / review opinions 系列）：
 
-9. cascade compact 成功（同 session 继续 + usage 降到阈值下）
-10. cascade compact 失败 → reset 升级（写文件 + 新 session + @file 引用）
-11. cascade 二次超阈值 → 直接 reset（跳过 compact）
-12. cascade 三次超阈值 → abort（max attempts reached）
-13. review opinions 落盘：json + md 正确性 + Reconciler 恢复时可直接读
-14. 阈值规则边界：128K 模型 / 200K / 1M 模型分别在边界 usage 下触发正确
+9. EXTERNAL_REVIEW review+fix 单 turn：review 模型识别 + 确认 + git preamble + verify-first 修复 + 输出含 `checkpoint_sha` 的 JSON
+10. EXTERNAL_REVIEW 收敛判定：real P0/P1/P2 == 0 → DONE；> 0 → SELF_REVIEW_R1(postfix, round+1)
+11. work postfix 复查：review 修完 → work R1 复查发现新 P0/P1/P2 → FIXING → R2 → EXTERNAL_REVIEW，构成跨模型闭环
+12. clean 标准边界：R1/R2 只发现 P3 → clean → EXTERNAL_REVIEW；EXTERNAL_REVIEW 只发现 P3/hallucination → DONE（P3 不触发新一轮）
+13. 无论如何都跑一轮外审：R1 clean / R2 clean 不再 → DONE，一律进 EXTERNAL_REVIEW
+14. review pane parse 失败 → ABORTED（非静默，review 已改代码）
 
-**v2.1.2 评审修正新增 6 个**：
+**v2.1.2 评审修正保留 3 个**（v2.1.3 仍适用）：
 
-15. per-pipeline 目录迁移：running→done/failed/aborted 原子性 + state/ 随迁
-16. `max_context_resets_per_pipeline` 超限 → ABORTED `reset_loop`
-17. `max_reset_duration_ms` 超时 → ABORTED `reset_timeout`
-18. `queued/` 排队：超限 pipeline 入队 + 前一个完成后自动启动
-19. PhaseDetector 优先级：git ref > 文件:行号 > 路径后缀 > 关键词 > throw
-20. `state.json.output` 格式实测 + `ExtendedJobStateFile` 类型验证
+15. per-pipeline 目录迁移：running→done/failed/aborted 原子性（v2.1.3：无 state/ 子目录）
+16. `queued/` 排队：超限 pipeline 入队 + 前一个完成后自动启动
+17. PhaseDetector 优先级：git ref > 文件:行号 > 路径后缀 > 关键词 > throw
 
-> 基础 12 个场景定义在 v2.1 spec（`docs/superpowers/specs/2026-06-14-multi-model-review-engine-v2.1-design.md` §11.2），此处仅列出 v2.1/v2.1.1/v2.1.2 增量。
+**v2.1.3 删除的测试场景**（原 v2.1.2 第 9-14 + 评审修正 16-17、20）：
+
+- ~~cascade compact 成功 / 失败 → reset / 二次超阈值 → reset / 三次超阈值 → abort~~（cascade 整组移除）
+- ~~review opinions 落盘 json+md / Reconciler 恢复读文件~~（落盘整组移除）
+- ~~阈值规则边界：128K/200K/1M 模型触发~~（阈值检测移除）
+- ~~`max_context_resets_per_pipeline` → reset_loop~~ / ~~`max_reset_duration_ms` → reset_timeout~~（reset 移除）
+- ~~`state.json.output` 格式实测 + ExtendedJobStateFile~~（cost 解析改在 adapter.poll，不再依赖 getContextUsage，但 output 格式实测仍建议在 W1 做一次，归入场景 20 的轻量版）
+
+> 基础 12 个场景定义在 v2.1 spec（`docs/superpowers/specs/2026-06-14-multi-model-review-engine-v2.1-design.md` §11.2），此处仅列出 v2.1/v2.1.1/v2.1.3 增量。
 
 ### 11.3 单测覆盖目标
 
@@ -124,11 +130,9 @@ FIXING 做最小化修改（`git diff` 可查看、`git checkout` 可回滚）�
 | `reconciler.ts` | 85%+ |
 | `phase-detect.ts` | 90%+ |
 | `model-parser.ts` | 90%+ |
-| `context-overflow.ts` | 85%+ |
 | `output-contract.ts` | 85%+ |
-| `build-context-reset-prompt.ts` | 80%+ |
-| `build-context-compact-prompt.ts` | 80%+（v2.1.2 新增） |
-| `review-opinions-writer.ts` | 85%+（v2.1.2 新增） |
+
+> **v2.1.3 删除的覆盖目标行**：`context-overflow.ts` / `build-context-reset-prompt.ts` / `build-context-compact-prompt.ts` / `review-opinions-writer.ts`（4 个模块整组移除）。`engine.ts` 覆盖目标不变（状态变少，更易达标）。
 
 ---
 
@@ -136,26 +140,29 @@ FIXING 做最小化修改（`git diff` 可查看、`git checkout` 可回滚）�
 
 ### 12.1 Phase 1：MVP（6-7 周）
 
+### 12.1 Phase 1：MVP（5-6 周，v2.1.3 缩减）
+
 | Week | 任务 | 交付 |
 |------|------|------|
 | W1 | T1 Profile + doctor | `profile.ts` + `review-doctor.ts` + 单测 |
 | W1 | T2 PipelineStore + Reconciler | `pipeline-store.ts` + `reconciler.ts` + 集成测试 |
 | W2 | T3 PhaseDetector | `phase-detect.ts` + 单测 |
-| W2 | T4 Adapter | `adapter.ts` + 集成测试 |
-| W3-W4 | T5 Engine 基础 9 states | `engine.ts` + 单测 |
-| W4 | T6 Engine 扩展 1 state | HUMAN_DECIDE + 集成测试 |
-| W5 | T7 CLI 命令 | `review.ts` 7 个子命令 |
+| W2 | T4 Adapter | `adapter.ts` + 集成测试（5 API，无 getContextUsage）|
+| W3-W4 | T5 Engine 5 active states | `engine.ts` + 单测（v2.1.3：删 JUDGE/HUMAN/cascade，状态少 4 个）|
+| W5 | T7 CLI 命令 | `review.ts` 子命令（v2.1.3：删 `decide`）|
 | W5-W6 | T8 CLI `--watch` | `cli-watch.ts` |
 
-**依赖**：T1/T2/T3/T4 可并行 → T5 → T6 → T7/T8 可并行 → E2E。
+> **v2.1.3 排期变化**：删 T6（HUMAN_DECIDE + 集成测试）+ 删 context-overflow / build-*-prompt / review-opinions-writer 4 模块的实现与测试 → 从 6-7 周缩到 5-6 周。
+
+**依赖**：T1/T2/T3/T4 可并行 → T5 → T7/T8 可并行 → E2E（T6 移除，不再有 T5→T6→T7 串行链）。
 
 ### 12.2 Phase 2：体验优化（+4-5 周）
 
-IDE / 飞书集成 / 自动 apply fixes / 报告生成 / HUMAN_DECIDE IDE 按钮。
+IDE / 飞书集成 / 自动 apply fixes / 报告生成（v2.1.3：删 "HUMAN_DECIDE IDE 按钮"，HUMAN_DECIDE 已移除）。
 
 ### 12.3 Phase 3：进阶（+2-3 周）
 
-LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重。
+LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重 / 可选 context 用量监测（v2.1.3 移除的 cascade 若实践中确实撑爆，可作为 Phase 3 重新引入的轻量 abort 兜底）。
 
 ---
 
@@ -165,7 +172,7 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重。
 
 - [ ] 状态机转换是否覆盖所有设计路径？
 - [ ] max_rounds 计数规则是否一致？
-- [ ] PipelineStore 6 目录（running/queued/human_pending/done/failed/aborted）是否覆盖所有状态？
+- [ ] PipelineStore 5 目录（running/queued/done/failed/aborted）是否覆盖所有状态？（v2.1.3：删 human_pending）
 - [ ] Reconciler 幂等性是否充分？
 - [ ] per-phase 覆盖机制是否清晰？
 - [ ] 错误处理是否覆盖常见故障？
@@ -173,35 +180,32 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重。
 ### 13.2 实现（v2.1 新增）
 
 - [ ] `claude --bg` spawn 行为是否稳定？
-- [ ] `RendezvousClient.injectReply` 是否正确接收 + 处理？
+- [ ] `RendezvousClient.injectReply` 是否正确接收 + 处理？（v2.1.3：仅 work FIXING 用）
 - [ ] work session 跨轮 sessionId 是否一致？
 - [ ] doctor fail fast 是否覆盖所有启动错误？
 - [ ] Output Contract：模型是否能稳定输出 JSON？
-- [ ] Context window 膨胀：reset 策略是否充分？
+- [ ] ~~Context window 膨胀：reset 策略是否充分？~~（v2.1.3 删除，裸奔）
 
 ### 13.3 v2.1.1 新增
 
 - [ ] 单一 review 模型迁移是否平滑？
-- [ ] commit preamble 是否会让"不想 commit"的用户卡住？
+- [ ] commit preamble 是否会让"不想 commit"的用户卡住？（v2.1.3：work + review 两处 preamble）
 - [ ] JSON parse retry 15s 是否合理？
-- [ ] context overflow reset 延迟 + round 增加是否可接受？
+- [ ] ~~context overflow reset 延迟 + round 增加是否可接受？~~（v2.1.3 删除）
 
-### 13.4 v2.1.2 新增（本轮）
+### 13.4 v2.1.3 新增（本轮）
 
-- [ ] cascade compact 成功后 worker 是否真的能继续？verify-first 是否仍生效？
-- [ ] compact 失败时升级 reset 是否平滑（不会让 worker 看到 reset 消息后困惑）？
-- [ ] review opinions 落盘的 json / md 内容是否一致？md 渲染对 P0/P1/P2/P3 分组是否清晰？
-- [ ] 128K / 200K / 1M 模型分别在边界 usage 下 cascade 是否触发正确？
-- [ ] cascade n 计数是否正确：compact 失败升级到 reset 后，n 是否还是 1（不变成 2）？
-- [ ] prompt 模板里的 @file 引用路径是否存在（pipeline 跨崩溃恢复时）？
-- [ ] **P0-1 验证**：per-pipeline 目录迁移（running→done/failed/aborted）是否原子？state/ 子目录是否随迁？
-- [ ] **P0-2 验证**：`max_context_resets_per_pipeline` 超限是否触发 `reset_loop` ABORTED？`max_reset_duration_ms` 超时是否触发 `reset_timeout` ABORTED？
-- [ ] **P0-3 验证**：`max_compact_attempts=2` 时 4 档 cascade 行为是否符合 §5.3.5.3 走查？
-- [ ] **P0-4 验证**：初始写文件失败 → ABORTED；跨崩溃恢复文件丢失 → inline fallback + warn。两种路径分别测试。
+- [ ] EXTERNAL_REVIEW 单 turn 内 review+fix 是否稳定？review 既审又修的输出 JSON（含 `checkpoint_sha`）是否可靠？
+- [ ] work postfix 复查是否真正构成跨模型闭环（review 修 → work 复查 → 不一致再修）？
+- [ ] clean 标准统一：P0/P1/P2 阻塞、P3 不阻塞，三处（R1/R2/EXTERNAL_REVIEW）判定是否一致？
+- [ ] 无论如何都跑一轮外审：R1 clean / R2 clean 是否都正确进 EXTERNAL_REVIEW 而非 DONE？
+- [ ] review pane parse 失败 → ABORTED（非静默）是否覆盖？避免未验证的 review 修改混入产物。
+- [ ] review 在 cwd 内改代码与 work FIXING 是否会冲突？（设计上串行，但需验证 work bg 已 done 才 spawn review）
+- [ ] 删 JUDGE/HUMAN 后 max_rounds 兜底是否足够？反复分歧场景是否在 max_rounds 内 ABORTED？
 - [ ] **P1-7 验证**：超出 `max_concurrent_pipelines` 时新 pipeline 进入 `queued/`；前一个完成后 queued 自动启动。
-- [ ] **P1-8 验证**：`injectReply` 传 `@{path}` — daemon 是否自动展开？不展开则 Engine 侧 `expandFileRefs` 预展开。
 - [ ] **P1-9 验证**：PhaseDetector 优先级：git ref > 文件后缀:行号 > 路径后缀 > 关键词 > throw。
-- [ ] **P1-10 验证**：`state.json.output` 实际类型是否与 `ExtendedJobStateFile` 声明一致？
+
+> **v2.1.3 删除的 checklist 项**（原 v2.1.2 §13.4）：cascade compact/reset/abort 验证、review opinions 落盘 json/md、128K/200K/1M 阈值边界、cascade n 计数、@file 引用路径、`max_context_resets_per_pipeline` / `max_reset_duration_ms`、`injectReply` @{path} 展开、`state.json.output` 格式——这些随 cascade + 落盘 + getContextUsage 整组移除。
 
 ---
 
@@ -214,8 +218,10 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重。
 | work session resume 链断裂 | sessionId 变化 | Adapter 每次 resume 前验证 |
 | Provider 中途修改 | 走错模型 | PipelineRecord 锁住 provider + snapshot |
 | daemon crash | 所有 bg session 瘫 | Reconciler → PANE_LOST |
-| Context window 膨胀 | 注意力稀释 | cascade 三档（compact → reset → abort）+ 阈值按模型分档（1M=460K / 其他=80%） |
 | JSON parse 退化 | 静默 false positive | retry + parse_degraded 标记 |
+| **review 既审又修质量回归**（v2.1.3 反转 I9） | review 模型改未写过的代码，fix 质量不如 work | work postfix R1 复查闭环 + verify-first + max_rounds 兜底 |
+| **context 裸奔**（v2.1.3 删 cascade） | 极端长任务可能撑爆 context 无主动干预 | max_rounds + max_cost_usd 兜底；Phase 3 可重引入轻量 abort |
+| **review 改代码与 work 串行假设破坏** | 若 work bg 未 done 就 spawn review，并发改文件冲突 | engine 确保 work state=done 后才进 EXTERNAL_REVIEW；串行由状态机保证 |
 
 ---
 
@@ -245,22 +251,31 @@ LLM 分类 / 配置热更新 / Pipeline 并行 / Token 预算 / Review 去重。
 | §6.5 (v2.1.2 评审修正) | **新增 queued/ 目录 + 排队机制**（P1-7） | 中 |
 | §7.5.8.5 (v2.1.2 评审修正) | **@file 引用双轨策略 + 实测验证计划**（P1-8） | 中 |
 | §9 (v2.1.2 评审修正) | **PhaseDetector 优先级明确定义**（P1-9） | 小 |
-| §12.1 | 排期 5-6 周 → 6-7 周 → **7-8 周（v2.1.2 加 1 周）** | 中 |
+| §12.1 | 排期 5-6 周 → 6-7 周 → 7-8 周（v2.1.2 加 1 周） → **5-6 周（v2.1.3 缩减）** | 中 |
+| **§2.1 / §2.2 (v2.1.3)** | **删 G9；G2 改"自评自修+外审外修+postfix 复查"；review-fix 反转** | **大** |
+| **§3.2 / §3.2.1 (v2.1.3)** | **模块 15→11；删 getContextUsage；model-parser 瘦身删 KNOWN_CONTEXT_LIMITS** | **大** |
+| **§5.1 / §5.3 / §5.4 (v2.1.3)** | **删 JUDGE_BY_WORK/HUMAN_DECIDE/DecisionContext；状态机重画；§5.4 重写为 clean 判定+收敛** | **大** |
+| **§6.0 / §6.1 / §6.2 (v2.1.3)** | **删 ContextCheckResult/WorkDecision/ContextResetEvent；PipelineRecord 砍 context 字段；目录 6→5** | **大** |
+| **§7.2 / §7.4 / §7.5.3 (v2.1.3)** | **删 context/cascade 配置 + judge prompt；加 review-fix prompt + preamble；ReviewOutputSchema 升级含 fix_applied** | **大** |
+| **§7.5.7 / §7.5.8 (v2.1.3)** | **整组删除：context cascade + review opinions 落盘** | **大** |
+| **§10 (v2.1.3)** | **错误分类删 context/review-opinions 行；§10.2 重写为修复者不变量；删 §10.5 HUMAN_DECIDE 接收** | 中 |
 
-**新增文件**：
-- `src/review/model-parser.ts`
-- `src/review/context-overflow.ts`
-- `src/review/build-context-reset-prompt.ts`
-- `src/review/build-context-compact-prompt.ts`（v2.1.2 新增）
-- `src/review/review-opinions-writer.ts`（v2.1.2 新增）
+**新增文件**（v2.1.3 净变化）：
+- `src/review/model-parser.ts`（保留，瘦身）
+
+**删除文件**（v2.1.3）：
+- ~~`src/review/context-overflow.ts`~~
+- ~~`src/review/build-context-reset-prompt.ts`~~
+- ~~`src/review/build-context-compact-prompt.ts`~~
+- ~~`src/review/review-opinions-writer.ts`~~
 
 **修改文件**：
-- `src/review/adapter.ts`（+getContextUsage）
-- `src/review/engine.ts`（+context check +parseWithRetry）
-- `src/review/types.ts`（单数 + 新字段，v2.1.2 +contextOverflowCount +contextFiles）
-- `src/review/output-contract.ts`（parseBgOutputWithRetry）
-- `src/review/profile.ts`（新配置，v2.1.2 cascade 默认值）
-- `src/cli/commands/review.ts`（doctor 扩展）
+- `src/review/adapter.ts`（v2.1.3：删 getContextUsage，5 API）
+- `src/review/engine.ts`（v2.1.3：删 context check / JUDGE / HUMAN 分支；加 clean 判定 + EXTERNAL_REVIEW 收敛）
+- `src/review/types.ts`（v2.1.3：删 context 字段、DecisionContext、WorkDecision；ReviewOpinion→ReviewFixOutput）
+- `src/review/output-contract.ts`（v2.1.3：删 JudgeOutputSchema，ReviewOutputSchema 升级）
+- `src/review/profile.ts`（v2.1.3：删 context/cascade 配置，加 review preamble）
+- `src/cli/commands/review.ts`（v2.1.3：删 `decide` 子命令）
 
 ---
 
