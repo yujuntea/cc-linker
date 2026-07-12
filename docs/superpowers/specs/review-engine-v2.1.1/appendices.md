@@ -51,6 +51,15 @@
 | H9 | **worktree 被 locked** | 清理实测 worktree | `git worktree remove` 报 "locked: claude session"；需 `git worktree unlock` 再 remove | 用 `--bare` 规避 worktree 生命周期管理（路线 Y） |
 | H10 | **injectReply 无过滤** | `RendezvousClient.injectReply({text})` | `{type:'reply', text}` 原样发 daemon，无转义/长度限制 | review/work 任意 prompt 注入可行（review 既审又修协议层成立） |
 
+### 附录 A.2：v2.1.3 未实测/待标注事项（2026-07-12）
+
+| # | 事项 | 实测需求 | Phase 1 处理 |
+|---|---|---|---|
+| **P1-4** | blocked bg session 生命周期：429 限流时 bg 进入 blocked，daemon 是否会在挂起几小时后主动清理（gc）？ | 需 spawn 一个持续 blocked 的 bg 观察几天。`appendices.md:336` 自承未实测 | **Phase 1 W1 必实测**：`spawn 1 个 glm-5.2 bg` → 等到 blocked（429） → 每小时 `readJobState` 看 bg 状态 → 24h 后看 daemon 是否 kill。**实施 fallback**：P0-4 唤醒校验兜底——bg 死则 PANE_LOST → 用户 retry |
+| **P1-7** | URL 输入支持（`cc-linker review run https://...`） | cat 无效，模型需 webfetch（实测未做） | **Phase 1 不支持**：doctor 检测 `task` 含 `http://`/`https://` → 报错 "URL 输入留 Phase 3，请用本地路径或 git ref" |
+| **P2-5** | cwd 内 `.claude/providers/*.json` 是否被 review engine 读取 | 当前实现走 `providerManager.resolve()` 只查 `~/.claude/providers/` | Phase 1 不支持 cwd 内 providers；如需支持，把 `ProviderManager.scan()` 加 cwd 路径（未来可考虑） |
+| **P2-6** | 6+ bg session 并发实测（3 pipeline × 2 pane） | 当前实测只验过 3 并发 | Phase 1 默认 `max_concurrent_pipelines = 1`，并发压力测试留 Phase 2 飞书集成前做 |
+
 **实测残留清理**：实测产生 6 个 bg session（d5c01dd1/2025e5ff/b26ea912/b4c50366/79145be5/8b16bf27）+ 2 个 worktree（review-fix/fix-add-bug），均已 `claude stop` + `git worktree unlock && remove` + `git branch -D` 清理。
 
 ## 附录 B：复用的 Agent View 模块清单
