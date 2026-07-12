@@ -1,0 +1,1 @@
+{ "state": "running", "tempo": "active", "detail": null, "needs": null, "sessionId": "uuid-1", "respawnFlags": ["--settings","/x/glm-5.2.json","--model","glm-5.2[1m]"] }

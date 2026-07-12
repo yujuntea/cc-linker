@@ -1,0 +1,1 @@
+{ "state": "blocked", "tempo": "blocked", "detail": "rate limited", "needs": "rate limited - wait and retry", "sessionId": "uuid-1" }
