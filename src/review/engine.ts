@@ -3,7 +3,7 @@
 
 import { mkdir } from 'fs/promises';
 import { dirname } from 'path';
-import type { Issue, PipelineRecord, ReviewFixOutput, ReviewState } from './types';
+import type { Issue, PipelineRecord, ReviewFixOutput, ReviewState, Role, StateKind, HistoryEvent } from './types';
 import { isTerminal } from './types';
 import type { ResolvedProfile } from './profile';
 import type { ClaudeBGAdapter } from './adapter';
@@ -242,7 +242,9 @@ export class ReviewEngine {
       }
 
       if (pollResult.kind === 'blocked') {
+        const fromKind = record.state.kind;
         record.state = computeNextState(record.state, { type: 'blocked', raw: pollResult.blocked.raw }, profile.guards.maxRounds);
+        this.pushHistory(record, fromKind, fromKind === 'EXTERNAL_REVIEW' ? 'review' : 'work');
         await this.store.save(record);
         if (record.state.kind === 'ABORTED') {
           await this.store.move(pipelineId, 'running', 'aborted');
@@ -251,7 +253,10 @@ export class ReviewEngine {
         return;
       }
       if (pollResult.kind === 'lost') {
-        record.state = { kind: 'PANE_LOST', pipelineId, round: record.state.round, detectedAt: new Date().toISOString(), retryTarget: record.state.kind };
+        const fromKind = record.state.kind;
+        const role: Role = fromKind === 'EXTERNAL_REVIEW' ? 'review' : 'work';
+        record.state = { kind: 'PANE_LOST', pipelineId, round: record.state.round, detectedAt: new Date().toISOString(), retryTarget: fromKind };
+        this.pushHistory(record, fromKind, role);
         await this.store.save(record);
         return;
       }
@@ -298,6 +303,7 @@ export class ReviewEngine {
     if (state.kind === 'PRODUCING') {
       // No JSON parse for produce — output is on disk
       record.state = computeNextState(state, { type: 'work_done', clean: true }, maxR);
+      this.pushHistory(record, 'PRODUCING', 'work');
       if (record.state.kind === 'SELF_REVIEW_R1') {
         await this.spawnWorkRound(record, this.buildSelfReviewPrompt(task, 'SELF_REVIEW_R1', record.state.cycle, profile), profile);
       }
@@ -329,12 +335,14 @@ export class ReviewEngine {
       if (!parsed.ok) {
         const reasonTag = state.kind === 'SELF_REVIEW_R1' ? 'r1_parse_degraded' : 'r2_parse_degraded';
         record.state = { kind: 'ABORTED', pipelineId: pid, round: state.round, reason: reasonTag, abortedBefore: state.kind };
+        this.pushHistory(record, state.kind, 'work');
         await this.store.save(record);
         return record;
       }
       const issues = assignIssueFingerprints(parsed.data.issues, 'work');
       const clean = isClean(issues);
       record.state = computeNextState(state, { type: 'review_done', clean, issues }, maxR);
+      this.pushHistory(record, state.kind, 'work', issues);
       if (record.state.kind === 'FIXING') {
         await this.spawnWorkRound(record, this.buildFixingPrompt(task, record.state.inputIssues, profile), profile);
       } else if (record.state.kind === 'EXTERNAL_REVIEW') {
@@ -353,6 +361,7 @@ export class ReviewEngine {
         async () => '',
       );
       record.state = computeNextState(state, { type: 'fix_done' }, maxR);
+      this.pushHistory(record, 'FIXING', 'work');
       if (record.state.kind === 'SELF_REVIEW_R2') {
         await this.spawnWorkRound(record, this.buildSelfReviewPrompt(task, 'SELF_REVIEW_R2', 'initial', profile), profile);
       } else if (record.state.kind === 'EXTERNAL_REVIEW') {
@@ -371,6 +380,7 @@ export class ReviewEngine {
       );
       if (!parsed.ok) {
         record.state = { kind: 'ABORTED', pipelineId: pid, round: state.round, reason: 'review_parse_degraded', abortedBefore: state.kind };
+        this.pushHistory(record, 'EXTERNAL_REVIEW', 'review');
         await this.store.save(record);
         return record;
       }
@@ -386,6 +396,7 @@ export class ReviewEngine {
       const out: ReviewFixOutput = { role: 'review', issues, perIssue, reasoning: parsed.data.reasoning };
       const converges = externalReviewConverges(out);
       record.state = computeNextState(state, { type: 'external_done', converges, output: out }, maxR);
+      this.pushHistory(record, 'EXTERNAL_REVIEW', 'review', issues);
       if (record.state.kind === 'SELF_REVIEW_R1') {
         await this.spawnWorkRound(record, this.buildSelfReviewPrompt(task, 'SELF_REVIEW_R1', 'postfix', profile), profile);
       }
@@ -395,6 +406,34 @@ export class ReviewEngine {
 
     // PANE_LOST / terminal: nothing to dispatch
     return record;
+  }
+
+  /**
+   * Append a HistoryEvent for an engine-driven transition. `fromKind` must be the
+   * state kind BEFORE the caller's mutation; `record.state` is expected to already
+   * hold the post-transition kind. `issues` is attached for review/self-review
+   * transitions where the parsed issues carry signal.
+   */
+  private pushHistory(
+    record: PipelineRecord,
+    fromKind: StateKind,
+    role: 'work' | 'review' | 'human',
+    issues?: Issue[],
+  ): void {
+    const toState = record.state;
+    const evt = {
+      ts: new Date().toISOString(),
+      fromState: fromKind,
+      toState: toState.kind,
+      round: toState.round,
+      role,
+      inputDigest: '',
+      outputDigest: '',
+      outputSizeBytes: 0,
+      durationMs: 0,
+    } as HistoryEvent;
+    if (issues && issues.length > 0) (evt as HistoryEvent).issues = issues;
+    record.history.push(evt);
   }
 
   private async spawnWorkRound(record: PipelineRecord, prompt: string, profile: ResolvedProfile): Promise<void> {

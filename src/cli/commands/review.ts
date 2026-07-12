@@ -366,8 +366,9 @@ export function reviewCommand(program: Command): void {
   review
     .command('doctor')
     .description('健康检查: CLI 版本 / daemon / profile / clean tree / pipeline dir')
-    .action(async () => {
-      const ok = await runDoctor();
+    .option('--cwd <path>', 'check this cwd instead of process.cwd()')
+    .action(async (opts: any) => {
+      const ok = await runDoctor(opts.cwd ? { cwd: opts.cwd } : {});
       if (!ok) process.exit(1);
     });
 
