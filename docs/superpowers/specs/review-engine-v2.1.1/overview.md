@@ -164,6 +164,31 @@ interface ModelInfo {
 
 **settings 路径来源**：复用 `providerManager.resolve(alias).path`（`src/utils/providers.ts`），**不新写 `resolveSettingsPath`**（F9）。
 
+### 3.2.2 cwd 语义统一（v2.1.3 P1-6 + P1-8）
+
+> 本节明确所有"cwd"相关概念的统一规则，避免实施时猜测。
+
+| 概念 | 取值 |
+|------|------|
+| **bg session cwd** | `Bun.spawn({cwd})` 的 cwd 选项值；模型 `cat <relative_path>` / `git diff` / `git commit` 都基于此 cwd 解析 |
+| **报告路径 cwd** | 与 bg session cwd 相同（`<cwd>/.claude/reviews/<pipelineId>.md`） |
+| **diff baseline 锚点**（preProduceCheckpointSha / pre-review-fix checkpoint） | 与 bg session cwd 相同（commit 在此 cwd 内） |
+
+**默认值与覆盖**：
+
+| 来源 | 行为 |
+|------|------|
+| `cc-linker review run --cwd <path>` 显式传 | cwd = `<path>`（绝对路径） |
+| 用户未传 `--cwd` | cwd = 用户当前 shell 的 cwd（`process.cwd()`） |
+| `task` 是相对路径（如 `docs/spec.md`） | 从 cwd 解析；不推断为 task 文件所在目录 |
+| `task` 是绝对路径（如 `/Users/foo/proj/docs/spec.md`） | cwd 与 task 路径无关；spec 路径在 prompt 里字面传给模型 |
+
+**不支持**（Phase 1 明确不实现）：
+- ❌ URL 输入（如 `https://...`），cat 对 URL 无效——留 Phase 3（P1-7）
+- ❌ cwd 内 `.claude/providers/*.json`：review engine 只读 `~/.claude/providers/`，与 img-proxy 路由约定（P2-5）
+
+**实施校验**：doctor 启动时 `process.cwd() == <--cwd 值>`，防止 cc-linker 内部 cwd 与 bg session cwd 不一致。
+
 ### 3.3 CLI 入口
 
 ```bash
