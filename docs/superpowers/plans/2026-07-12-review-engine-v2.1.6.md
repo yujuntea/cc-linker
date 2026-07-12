@@ -454,7 +454,7 @@ Expected: FAIL — module not found
 // src/review/profile.ts
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { parse as parseTOML } from 'toml';  // already a dep (config.ts uses TOML)
+import { parse as parseTOML } from '@iarna/toml';  // already a dep (config.ts uses @iarna/toml)
 import { providerManager } from '../utils/providers';
 import { CCLinkerError } from '../utils/errors';
 import { REVIEW_PROFILES_DIR } from './paths';
@@ -2208,9 +2208,9 @@ export async function runDoctor(opts: { cwd?: string; profileName?: string; gitE
   const gitExec = opts.gitExec ?? defaultGitExec;
   let allPass = true;
 
-  // 1. CLI version
-  const versionCheck = VersionGuard.check(MIN_CLI_VERSION);
-  console.log(versionCheck.ok ? chalk.green(`✓ Claude CLI: ${versionCheck.actual} (≥ ${MIN_CLI_VERSION})`) : chalk.red(`✗ Claude CLI: ${versionCheck.actual} (< ${MIN_CLI_VERSION})`));
+  // 1. CLI version (VersionGuard.check takes no args, hardcodes MIN_VERSION=2.1.139)
+  const versionCheck = await VersionGuard.check();
+  console.log(versionCheck.ok ? chalk.green(`✓ Claude CLI: ${versionCheck.version} (≥ ${MIN_CLI_VERSION})`) : chalk.red(`✗ Claude CLI: ${versionCheck.version ?? versionCheck.reason} (< ${MIN_CLI_VERSION})`));
   if (!versionCheck.ok) allPass = false;
 
   // 2. Daemon healthy
@@ -2598,6 +2598,15 @@ Expected: doctor passes, run starts pipeline, --watch shows PRODUCING → ... �
 
 **Known gaps to flag:**
 - T6 `runPipeline` loop body (per-state prompt dispatch + parse) is described but not fully coded in the test — the implementer must flesh out each state's prompt building (using `profile.prompts.*` templates) + `parseBgOutputWithRetry` + `computeNextState` + `store.save`. The pure functions are tested; the orchestration is verified in T10 E2E.
-- T7 `review run` action uses `ulid()` stub — replace with `ulid` package if already a dep, else keep the stub.
+- T7 `review run` action uses `ulid()` stub — replace with `ulid` package in deps, keep the stub (or add pkg if preferred).
+
+**Verified against codebase:**
+- TOML parser: `@iarna/toml` (not `toml`) - `import { parse } from "@iarna/toml"` (config.ts:4).
+- `VersionGuard.check()` takes NO args, hardcodes `MIN_VERSION=2.1.139`, returns `Promise<{ok, version?, reason?}>` - read `.version` not `.actual`.
+- `DaemonProbe.check()` takes optional `claudeHome`, returns boolean.
+- `withLock(filePath, fn, options?)` signature confirmed (lock.ts:80).
+- `readJobState(short, jobsDir?)` returns `Promise<JobStateEnvelope | null>` (job-state.ts:88).
+- Commander: `import { Command } from "commander"` (index.ts:2).
+- `providerManager.scan()` async + `resolve(alias)` returns `{alias,name,path,isTemp} | null` (providers.ts:38).
 - `engine-process.ts` `_engine-loop` hidden subcommand dispatches to `runEngineLoop` — the implementer should verify the child process correctly re-enters via `process.argv[1]`.
 - Real `claude --bg` E2E (T10) requires providers configured at `~/.claude/providers/`; skip gracefully if missing.
