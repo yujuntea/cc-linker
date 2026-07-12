@@ -1160,7 +1160,7 @@ git commit -m "feat(review): add PipelineStore with 5-dir atomic moves (T5)"
 // tests/unit/review/adapter.test.ts
 import { describe, it, expect, mock } from 'bun:test';
 import { ClaudeBGAdapter } from '../../../src/review/adapter';
-import { readJobState } from '../../agent-view/job-state';
+import { readJobState } from '../../../src/agent-view/job-state';
 
 describe('ClaudeBGAdapter.poll', () => {
   it('returns done with output when state=done', async () => {
@@ -1581,7 +1581,8 @@ describe('computeNextState', () => {
   it('PRODUCING + work_done -> SELF_REVIEW_R1 round=1', () => {
     const s: ReviewState = { kind: 'PRODUCING', pipelineId: 'p', round: 0 };
     const next = computeNextState(s, { type: 'work_done', clean: true }, 6);
-    expect(next.kind).toBe('EXTERNAL_REVIEW'); // v2.1.3: clean R1 still goes to EXTERNAL_REVIEW
+    expect(next.kind).toBe('SELF_REVIEW_R1'); // PRODUCING done -> R1 (round 1)
+    if (next.kind === 'SELF_REVIEW_R1') expect(next.round).toBe(1);
   });
   it('SELF_REVIEW_R1 + found P0/P1/P2 -> FIXING source=R1', () => {
     const s: ReviewState = { kind: 'SELF_REVIEW_R1', pipelineId: 'p', round: 1, cycle: 'initial' };
@@ -1739,9 +1740,21 @@ export class ReviewEngine {
     record.panes.work = { sessionId, currentRoundShortId: shortId, provider: profile.work.provider, startedAt: new Date().toISOString(), roundShortIds: [shortId] };
     await this.store.save(record);
 
-    // main loop
+    // main loop: poll current pane, dispatch per state
     while (!isTerminal(record.state.kind)) {
-      const pollResult = await this.adapter.poll(record.panes.work!.currentRoundShortId!, 600_000);
+      const paneShort = this.currentShortId(record);
+      if (!paneShort) { record.state = { kind: 'FAILED', pipelineId, round: record.state.round, reason: 'no_active_pane' }; await this.store.save(record); return; }
+
+      let pollResult;
+      try {
+        pollResult = await this.adapter.poll(paneShort, 600_000);
+      } catch (e) {
+        // PollTimeout -> treat as lost (bg stuck)
+        record.state = { kind: 'PANE_LOST', pipelineId, round: record.state.round, detectedAt: new Date().toISOString(), retryTarget: record.state.kind };
+        await this.store.save(record);
+        return;
+      }
+
       if (pollResult.kind === 'blocked') {
         record.state = computeNextState(record.state, { type: 'blocked', raw: pollResult.blocked.raw }, profile.guards.maxRounds);
         await this.store.save(record);
@@ -1755,12 +1768,109 @@ export class ReviewEngine {
       }
       if (pollResult.kind !== 'done') continue; // running, keep polling
 
-      // done: parse output, transition
-      // (full parse + transition logic — omitted for brevity in this test, but the real
-      //  impl handles PRODUCING->R1, R1->FIXING/EXTERNAL, FIXING->R2, EXTERNAL->DONE/R1)
-      // ... [real implementation continues with parseBgOutputWithRetry per state] ...
-      break; // placeholder — real loop continues until terminal
+      // done: dispatch per current state
+      record = await this.dispatchState(record, task, phase, profile, pollResult.output);
+      if (record.state.kind === 'DONE') { await this.store.move(pipelineId, 'running', 'done'); return; }
+      if (record.state.kind === 'FAILED') { await this.store.move(pipelineId, 'running', 'failed'); return; }
+      if (record.state.kind === 'ABORTED') { await this.store.move(pipelineId, 'running', 'aborted'); return; }
     }
+  }
+
+  /** Per-state dispatch on bg done. Returns updated record (state transitioned + next pane spawned). */
+  private async dispatchState(record: PipelineRecord, task: string, phase: string, profile: ResolvedProfile, output: string): Promise<PipelineRecord> {
+    const pid = record.pipelineId;
+    const maxR = profile.guards.maxRounds;
+    const state = record.state;
+
+    if (state.kind === 'PRODUCING') {
+      // produce done -> R1 (round 1). Produce output is code/spec/plan on disk, no JSON to parse.
+      record.state = computeNextState(state, { type: 'work_done', clean: true }, maxR);
+      if (record.state.kind === 'SELF_REVIEW_R1') {
+        await this.spawnWorkRound(record, this.buildSelfReviewPrompt(task, record.state.cycle, profile), profile);
+      }
+      await this.store.save(record);
+      return record;
+    }
+
+    if (state.kind === 'SELF_REVIEW_R1' || state.kind === 'SELF_REVIEW_R2') {
+      const retryRegen = async (): Promise<string> => {
+        const regen = await this.adapter.resumeWorkSession({ sessionId: record.panes.work!.sessionId, prompt: this.buildSelfReviewPrompt(task, state.cycle, profile), settingsPath: profile.workSettingsPath, cwd: record.input.cwd });
+        record.panes.work!.currentRoundShortId = regen.shortId; record.panes.work!.roundShortIds.push(regen.shortId);
+        await this.store.save(record);
+        const r = await this.adapter.poll(regen.shortId, 600_000);
+        return r.kind === 'done' ? r.output : '';
+      };
+      const parsed = await parseBgOutputWithRetry(output, SelfReviewOutputSchema, { timeoutMs: profile.guards.parseRetryTimeoutMs }, retryRegen);
+      if (!parsed.ok) {
+        record.state = { kind: 'ABORTED', pipelineId: pid, round: state.round, reason: 'r1_parse_degraded', abortedBefore: state.kind };
+        await this.store.save(record); return record;
+      }
+      const issues = assignIssueFingerprints(parsed.data.issues, 'work');
+      const clean = isClean(issues);
+      record.state = computeNextState(state, { type: 'review_done', clean, issues }, maxR);
+      if (record.state.kind === 'FIXING') {
+        await this.spawnWorkRound(record, this.buildFixingPrompt(task, record.state.inputIssues, profile), profile);
+      } else if (record.state.kind === 'EXTERNAL_REVIEW') {
+        await this.spawnReview(record, task, phase, profile);
+      }
+      await this.store.save(record);
+      return record;
+    }
+
+    if (state.kind === 'FIXING') {
+      // FIXING parse fail -> conservative advance (all_real_fixed=true), R2 全面复查兜底
+      await parseBgOutputWithRetry(output, FixingOutputSchema, { timeoutMs: profile.guards.parseRetryTimeoutMs }, async () => '');
+      record.state = computeNextState(state, { type: 'fix_done' }, maxR);
+      if (record.state.kind === 'SELF_REVIEW_R2') {
+        await this.spawnWorkRound(record, this.buildSelfReviewPrompt(task, 'initial', profile), profile);
+      } else if (record.state.kind === 'EXTERNAL_REVIEW') {
+        await this.spawnReview(record, task, phase, profile);
+      }
+      await this.store.save(record);
+      return record;
+    }
+
+    if (state.kind === 'EXTERNAL_REVIEW') {
+      // review parse fail -> ABORTED (review changed code, cannot silently advance)
+      const parsed = await parseBgOutputWithRetry(output, ReviewOutputSchema, { timeoutMs: profile.guards.parseRetryTimeoutMs }, async () => '');
+      if (!parsed.ok) {
+        record.state = { kind: 'ABORTED', pipelineId: pid, round: state.round, reason: 'review_parse_degraded', abortedBefore: state.kind };
+        await this.store.save(record); return record;
+      }
+      const issues = assignIssueFingerprints(parsed.data.issues, 'review');
+      const perIssue = parsed.data.per_issue.map((p) => ({ issueId: p.issue_id, severity: p.severity, verdict: p.verdict, verdictReason: p.verdict_reason, fixApplied: p.fix_applied, fixSummary: p.fix_summary }));
+      const out: ReviewFixOutput = { role: 'review', issues, perIssue, reasoning: parsed.data.reasoning };
+      const converges = externalReviewConverges(out);
+      record.state = computeNextState(state, { type: 'external_done', converges, output: out }, maxR);
+      if (record.state.kind === 'SELF_REVIEW_R1') {
+        // postfix: work reviews the review changes
+        await this.spawnWorkRound(record, this.buildSelfReviewPrompt(task, 'postfix', profile), profile);
+      }
+      await this.store.save(record);
+      return record;
+    }
+
+    // PANE_LOST / terminal: no dispatch
+    return record;
+  }
+
+  /** Spawn a new work round (resume same sessionId). Updates panes.work.currentRoundShortId. */
+  private async spawnWorkRound(record: PipelineRecord, prompt: string, profile: ResolvedProfile): Promise<void> {
+    const { shortId } = await this.adapter.resumeWorkSession({ sessionId: record.panes.work!.sessionId, prompt, settingsPath: profile.workSettingsPath, cwd: record.input.cwd });
+    record.panes.work!.currentRoundShortId = shortId;
+    record.panes.work!.roundShortIds.push(shortId);
+  }
+
+  /** Spawn a fresh review session (new each round). */
+  private async spawnReview(record: PipelineRecord, task: string, phase: string, profile: ResolvedProfile): Promise<void> {
+    const prompt = this.buildReviewPrompt(task, phase, profile);
+    const { shortId, sessionId } = await this.adapter.startSession({ prompt, settingsPath: profile.reviewSettingsPath, cwd: record.input.cwd });
+    record.panes.review = { role: 'review', shortId, sessionId, provider: profile.review.provider, round: record.state.round };
+  }
+
+  private currentShortId(record: PipelineRecord): string | undefined {
+    if (record.state.kind === 'EXTERNAL_REVIEW' && record.panes.review?.shortId) return record.panes.review.shortId;
+    return record.panes.work?.currentRoundShortId;
   }
 
   private buildProducePrompt(task: string, phase: string, profile: ResolvedProfile): string {
@@ -2385,11 +2495,16 @@ export function isEngineAlive(pipelineId: string): boolean {
   return readEnginePidWithCheck(enginePidPath(pipelineId)) !== null;
 }
 
-/** Fork the engine as a detached background process running runEngineLoop. */
+/** Fork the engine as a detached background process running runEngineLoop.
+ * Uses getExecutablePath() (compiled-binary-safe, matches start.ts:690 pattern) --
+ * process.execPath+process.argv[1] breaks for compiled binaries (argv[1] is internal Bun path).
+ */
 export async function forkEngine(pipelineId: string): Promise<void> {
+  const { getExecutablePath } = await import('../utils/executable');
   const pidFile = enginePidPath(pipelineId);
   mkdirSync(dirname(pidFile), { recursive: true });
-  const child = spawn(process.execPath, [process.argv[1], 'review', '_engine-loop', pipelineId], {
+  const exe = getExecutablePath();
+  const child = spawn(exe, ['review', '_engine-loop', pipelineId], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, CC_LINKER_REVIEW_ENGINE_CHILD: '1' },
@@ -2423,7 +2538,7 @@ export async function killEngine(pipelineId: string): Promise<void> {
  * Drives the pipeline state machine + 60s reconcile cycle.
  */
 export async function runEngineLoop(pipelineId: string): Promise<void> {
-  const store = new PipelineStore(REVIEW_RUNNING_DIR.replace('/running', ''));
+  const store = new PipelineStore(REVIEW_PIPELINES_DIR);
   const adapter = new ClaudeBGAdapter();
   const engine = new ReviewEngine(store, adapter);
   const reconciler = new Reconciler(store, { readJobStateFn: readJobState });
@@ -2443,7 +2558,7 @@ export async function runEngineLoop(pipelineId: string): Promise<void> {
   }
 }
 
-async function loadProfileForRecord(rec: any): Promise<any> {
+async function loadProfileForRecord(rec: PipelineRecord): Promise<ResolvedProfile> {
   const { loadProfile } = await import('./profile');
   return loadProfile(rec.input.profile, rec.input.phase);
 }
