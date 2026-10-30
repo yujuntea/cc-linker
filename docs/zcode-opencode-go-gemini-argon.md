@@ -1,8 +1,10 @@
 # ZCode 接入 OpenCode Go 的 Gemini 4 Argon —— 完整实操方案
 
-> 适用范围：ZCode 桌面端 3.17.1 + OpenCode Go（`opencode.ai/zen/go`）+ Gemini 4 Argon。
-> 文中所有"实测"数据均来自 2026-10-30 当天的逐项对照实验（含对照组），证据可复现。
-> 配套实现：本仓库 `cc-linker` 的 img-proxy 路由级能力（commit `30ec748`）。
+> 适用：ZCode 桌面端 3.17.1 + OpenCode Go（`opencode.ai/zen/go`）+ Gemini 4 Argon。
+> 文中所有"实测"数据来自 2026-10-30 的逐项对照实验（每条都有对照组），证据可复现。
+>
+> **不需要 cc-linker**：§4.1 给的是一份零依赖的独立代理（Python 标准库）+ 安装/验证脚本，
+> 拷贝即用；cc-linker 只是我们内部的一种实现选择，见 §4.2。
 
 ---
 
@@ -10,11 +12,11 @@
 
 | 问题 | 结论 |
 |---|---|
-| 能不能直连 `https://opencode.ai/zen/go/v1`？ | **不能**。ZCode 3.17.1 的自定义 api-key provider 永远拿不到网关强制的 `x-opencode-session` 头 → 400 → 退避重试 → **会话卡死** |
-| 本地代理是可选优化还是必须？ | **必须**。不是"保险"，是唯一可行路径（证据见 §3） |
-| 用 ZCode 内置模板 provider（`opencode-go-chat`）行不行？ | **不行**。模板由后端下发，本机 `api` 为 `null`、客户端无定义、日志零调用 |
-| Gemini 4 Argon 的 ZCode 配置怎么填？ | 1M 上下文 / 65,536 输出上限 / 思考档位 low·medium·high / 图+视频输入 / 结构化输出（官方规格逐项对齐，见 §2） |
-| 最容易踩的坑 | ① 直连卡死 ② 输出上限设太小被思考 token 吃光 ③ 字段方言导致 503 ④ 12-01 价格翻倍 |
+| 能不能直连 `https://opencode.ai/zen/go/v1`？ | **不能**。ZCode 3.17.1 的自定义 api-key provider 永远拿不到网关强制的 `x-opencode-session` 头 → 400 → 退避重试 → **会话卡死**（证据见 §3） |
+| 需要什么？ | 一个**本地代理**（补头 + 改字段 + 长流不断），ZCode 的 Base URL 指向它。独立脚本见 §4.1，**不依赖 cc-linker** |
+| 用 ZCode 内置模板 provider（`opencode-go-chat`）行不行？ | **不行**。模板由后端下发，本机 `api` 为 `null`、客户端无定义、日志零调用（§3 障碍⑤） |
+| Gemini 4 Argon 的 ZCode 配置怎么填？ | 1M 上下文 / 65,536 输出上限 / 思考档位 low·medium·high / 图+视频输入 / 结构化输出（官方规格逐项对齐，见 §1） |
+| 最容易踩的坑 | ① 直连卡死 ② 输出上限设太小被思考 token 吃光 ③ 字段方言导致 503 ④ 12-01 价格翻倍 ⑤ 悬空模型规则导致同名模型多条 |
 
 ---
 
@@ -70,8 +72,8 @@ ZCode 的模型级配置写在 `provider_config.json` 的 `modelConfigRules.prov
 | ZCode 字段 | 取值 | 官方依据 | 配错的后果 |
 |---|---|---|---|
 | `contextWindow` | `1048576` | 统一 1M 窗口 | 配成 128K 会让长上下文会话提前截断；配成 1,000,000（K 数）会低估 4.8% |
-| `maxOutputTokens.max` | `65536` | 流式上限 65,536 | 配 256000（OpenCode 目录里 `opencode-go-chat` 模板给的值）**超过官方流式上限**；配太小则思考吃光预算 → 空回复 |
-| `reasoningLevel.values` | `low/medium/high` | 官方三档 | 出现 `max`/`xhigh` 等非官方档位 → 网关按最高档处理，行为不可控且费 token |
+| `maxOutputTokens.max` | `65536` | 流式上限 65,536（非流式 32,768） | 配 256000 **超过官方流式上限**；配太小则思考吃光预算 → 空回复 |
+| `reasoningLevel.values` | `low/medium/high` | 官方三档（medium 为默认） | 出现 `max`/`xhigh` 等非官方档位 → 网关按最高档处理，行为不可控且费 token |
 | `supportsImage` / `supportsVideo` | `true` | 输入模态含 image/video | 配 `false` 则 ZCode 不允许上传图片/视频（多模态能力被废） |
 | `supportsJsonSchemaOutput` | `true` | 官方支持 | 配 `false` 则结构化输出场景降级为文本解析 |
 
@@ -86,29 +88,24 @@ ZCode 的模型级配置写在 `provider_config.json` 的 `modelConfigRules.prov
 │ ZCode 3.17.1                 │
 │ provider: OpenCode-OpenApi   │
 │ api: openai-chat-completions │
-│ baseUrl:                     │
-│  http://127.0.0.1:8765/      │
-│       opencode/v1            │   ← 关键：指向本地代理，不是 opencode.ai
+│ baseUrl: http://127.0.0.1:   │
+│         <端口>/v1             │  ← 指向本地代理，不是 opencode.ai
 └──────────┬───────────────────┘
-           │ HTTP POST /opencode/v1/chat/completions
+           │ POST /v1/chat/completions
            │ （带 ai-sdk 方言字段 max_completion_tokens + thinking 等）
 ┌──────────▼───────────────────┐
-│ cc-linker img-proxy :8765    │
-│ 路由表 ~/.cc-linker/img-proxy/routes.json
-│   alias=opencode             │
-│   upstream=opencode.ai/zen/go│
-│   inject_headers:            │
-│     x-opencode-session: …    │  ← ①补上网关强制的头
-│   request_transform:         │
-│     openai-dialect-normalizer│  ← ②归一化字段方言
-│  + idleTimeout 豁免          │  ← ③长流不被 10s 掐断
+│ 本地代理（任选其一）          │
+│  ① 独立脚本 examples/zcode-  │  ← §4.1（零依赖，拷贝即用）
+│     opencode-go/              │
+│  ② cc-linker img-proxy（可选）│  ← §4.2（我们内部在用）
+│  职责：                      │
+│   - 注入 x-opencode-session   │
+│   - 归一化字段方言            │
+│   - SSE 逐块透传、不设空闲超时│
 └──────────┬───────────────────┘
-           │
            ▼
    https://opencode.ai/zen/go  →  Gemini 4 Argon
 ```
-
-好处：一次改造，**整条 OpenCode Go 通道都活了**（gemini-4-argon / glm-5.3-flash / deepseek-v4.1-flash / mimo 系列），并且白拿 cc-linker 的按 alias token 计量、SSE 透传、client 断开即取消上游、日志轮转、Web Console。
 
 ---
 
@@ -165,7 +162,7 @@ ZCode 实发 body **四方言齐发**（下面这份是**代理改写后**的形
  "max_tokens":1}                     // ← 改写前此处是 max_completion_tokens（审计行证据）
 ```
 
-> 审计行样例（cc-linker `img-proxy.log`）：`"dialect_changed":"max_completion_tokens->max_tokens,drop thinking,drop enable_thinking,drop reasoning"` —— 一行同时证明"ZCode 发了什么"与"归一化器做了什么"。
+> 审计行样例（代理日志）：`"dialect_changed":"max_completion_tokens->max_tokens,drop thinking,drop enable_thinking,drop reasoning"` —— 一行同时证明"ZCode 发了什么"与"代理做了什么"。
 
 逐项隔离实测（每个字段单独加到基线 body 上）：
 
@@ -177,10 +174,10 @@ ZCode 实发 body **四方言齐发**（下面这份是**代理改写后**的形
 | `reasoning_effort:"low"` | **200** ✅ |
 | 三毒齐发 | **503** |
 
-### 障碍 ④（附加）：Bun 默认 10s idleTimeout 会掐断长思考流
+### 障碍 ④（附加）：长思考期的流式静默
 
-Gemini 4 Argon 冷会话/深思考期**首字节实测最长 ~50s**（响应头与首个内容事件一起迟发）。
-Bun.serve 默认 `idleTimeout=10s`——流式响应静默超 10s 即断连。ZCode 原本只对 `POST /v1/messages` 豁免，**chat/completions 路径不豁免** → 长思考会话会被截断。
+Gemini 4 Argon 冷会话/深思考期**首字节实测最长 ~50s**（响应头与首个内容事件一起迟发；独立代理实测 20.5s）。
+Bun.serve 默认 `idleTimeout=10s`、多数 HTTP 客户端默认 10 秒空闲即断连——长思考会话会被截断。
 
 ### 障碍 ⑤：ZCode 内置模板 provider 不可用
 
@@ -194,153 +191,111 @@ Bun.serve 默认 `idleTimeout=10s`——流式响应静默超 10s 即断连。ZC
 
 ---
 
-## 4. 本地代理必须做的三件事（cc-linker 实现清单）
+## 4. 本地代理方案
 
-### 4.1 改动一：路由级 `inject_headers`（补 session 头）
+代理必须做三件事，正好对应 §3 的三个障碍：
 
-**为什么必须放在代理层**：ZCode 配置里**没有**自定义 header 的字段（`customHeaders` / `extraHeaders` 在 `zcode.cjs` 中均零命中），运行时也不允许自定义 provider 走 runtime-headers 通道。代理是唯一能补头的位置。
+| # | 职责 | 为什么 |
+|---|---|---|
+| A | 注入 `x-opencode-session` | ZCode 配置**没有**自定义 header 的字段（`customHeaders`/`extraHeaders` 在 `zcode.cjs` 中零命中），运行时也不允许自定义 provider 走 runtime-headers 通道 → 代理是唯一能补头的位置 |
+| B | 归一化请求体字段方言 | 消除 503；且**只动顶层标量字段**，`messages`（含多模态图片 parts）必须原样透传 |
+| C | SSE 逐块 flush + 不设空闲超时 | 深思考首字节 20–50s 不能被掐断 |
 
-**a) 类型**（`src/img-proxy/types.ts`）：
+### 4.1 方案 A：独立脚本（推荐，不依赖 cc-linker）
 
-```ts
-export interface RouteEntry {
-  // …既有字段…
-  /** 转发上游时附加的请求头(在 sanitizeProxyRequestHeaders 之后注入,
-   *  同名头以路由表为准 —— 客户端无法覆盖/剥除) */
-  inject_headers?: Record<string, string>;
-  /** 命名请求体改写器。目前仅 'openai-dialect-normalizer' */
-  request_transform?: 'openai-dialect-normalizer';
-}
-```
+完整套件在 **`examples/zcode-opencode-go/`**：
 
-**b) 路由读取**（`src/img-proxy/routes.ts`）：新增 `getRouteByAlias()` 返回完整 entry，`getUpstreamByAlias()` 委托它（行为不变，含 `disabled → null` 语义）；`addRoute()` 增加可选 `opts`，**重跑 install 不带 opts 时保留已有选项**（与 `disabled` 保留语义一致，防止静默丢掉手工配置）。
-
-**c) 注入点**（`src/img-proxy/server.ts`）——必须**在请求头清理之后**注入：
-
-```ts
-const headers = sanitizeProxyRequestHeaders(req.headers);
-if (route?.inject_headers) {
-  for (const [k, v] of Object.entries(route.inject_headers)) {
-    const lk = k.toLowerCase();
-    if (lk === 'host' || lk === 'content-length' || HOP_BY_HOP_HEADERS.includes(lk)) {
-      appendLog(`WARN inject_headers 跳过禁入头 ${k} (alias=${alias})`, logPath);
-      continue;
-    }
-    try { headers.set(k, String(v)); }
-    catch (err) { appendLog(`WARN inject_headers 跳过非法头 ${k}: ${(err as Error).message} (alias=${alias})`, logPath); }
-  }
-}
-```
-
-三条加固要点：
-1. **禁入头守卫**：`host` / `content-length` / hop-by-hop 头不能经此通道重新注入（`content-length` 与 fetch 自算值冲突 → 502；hop-by-hop 与传输层冲突）。
-2. **非法头值 try/catch**：`Headers.set` 遇到非 Latin-1 值（如中文、macOS 弯引号）会抛 `TypeError`，裸抛会变成**无日志无统计的 500**。
-3. **客户端不可覆盖**：注入发生在 sanitize 之后，同名头以路由表为准。
-
-### 4.2 改动二：OpenAI 方言归一化器（新文件 `src/img-proxy/openai-dialect.ts`）
-
-```ts
-export function normalizeOpenAIDialectBody(raw: Uint8Array): DialectNormalizeResult {
-  // fail-open：非 JSON / 数组 / 标量 → 原字节透传，绝不阻塞转发
-  const o = JSON.parse(text);
-  // 1) 先剔 max_tokens:null —— 必须在别名搬运之前
-  //    （否则 {max_tokens:null, max_output_tokens:128} 会吞掉 128）
-  if ('max_tokens' in o && o.max_tokens === null) { delete o.max_tokens; changed.push('drop max_tokens:null'); }
-  // 2) 别名全剥 + 值单次搬运（标准字段缺席且值非 null 时）
-  let moved = false;
-  for (const src of ['max_output_tokens', 'max_completion_tokens']) {
-    if (src in o) {
-      const v = o[src];
-      if (!moved && !('max_tokens' in o) && v !== null && v !== undefined) {
-        o.max_tokens = v; moved = true; changed.push(`${src}->max_tokens`);
-      } else { changed.push(`drop ${src}`); }
-      delete o[src];   // ← 别名必须无条件删除，它本身就是 503 触发器
-    }
-  }
-  // 3) 剥思考方言，保留 reasoning_effort
-  for (const bad of ['thinking', 'enable_thinking', 'reasoning']) {
-    if (bad in o) { delete o[bad]; changed.push(`drop ${bad}`); }
-  }
-  if (changed.length === 0) return { body: raw, changed: [] };  // 幂等：不重序列化
-  return { body: new TextEncoder().encode(JSON.stringify(o)), changed };
-}
-```
-
-**五个必须遵守的边界**（每一条都是实战踩出来的）：
-
-| 边界 | 原因 |
+| 文件 | 用途 |
 |---|---|
-| 别名**无条件删除**，不只是"搬走" | `max_output_tokens` 单独存在即 503；与标准字段并存也 503 |
-| 值搬运**只做一次**且**不覆盖**标准字段 | 双别名场景第二个残留出体仍 503（首审 P1-1） |
-| `max_tokens:null` 剔除**必须在搬运之前** | 否则 null"在场"阻断有效值搬运（K3 P2-1） |
-| 只动**顶层标量字段**，绝不碰 `messages` | 多模态 `image_url` parts 必须原样透传 |
-| **fail-open** + **幂等** | 非 JSON 原字节透传；已是标准形态则不重序列化（保持字节级不变） |
+| `opencode_relay.py` | 代理本体（Python 3.8+，**零第三方依赖**） |
+| `install-macos.sh` | macOS 安装：复制脚本 + 写 LaunchAgent（开机自启、崩溃拉起）+ 自检 |
+| `uninstall-macos.sh` | 卸载（`--purge` 连文件与日志一起删） |
+| `verify.sh` | 五项链路自检（每项带对照） |
+| `README.md` | 该套件自己的说明（面向使用者） |
 
-**接入点**（`server.ts`）：与既有剥图分支**互斥**（`else if`），且只作用于 `POST …/chat/completions`：
+**三步安装**：
 
-```ts
-const isChatCompletionsPost = req.method === 'POST' && /\/chat\/completions(\/|$|\?)/.test(url.pathname);
-…
-} else if (route?.request_transform === 'openai-dialect-normalizer' && isChatCompletionsPost) {
-  const rawBytes = new Uint8Array(await req.arrayBuffer());
-  const r = normalizeOpenAIDialectBody(rawBytes);
-  outBody = new Uint8Array(r.body);
-  dialectChanged = r.changed;
-}
+```bash
+# 1) 安装（默认端口 8787；可传端口参数）
+cd examples/zcode-opencode-go
+bash install-macos.sh
+
+# 2) 验证（需要你的 OpenCode Go key）
+OPENCODE_API_KEY=<你的 key> bash verify.sh
+#    期望 5 项全 PASS
+
+# 3) ZCode 里改 Base URL → http://127.0.0.1:8787/v1（见 §5）
 ```
 
-> 故意**不覆盖** `/v1/responses`：Responses API 里 `max_output_tokens` 本就是原生字段名，套用 chat 归一化反而改错。
+**Linux**：用 systemd unit（`ExecStart` 指向脚本、`Restart=always`）或 `nohup python3 opencode_relay.py --port 8787 &`。
+**Windows**：`py -3 opencode_relay.py --port 8787`（需自行常驻或用 nssm 注册服务）。
 
-### 4.3 改动三：流式 POST 的 idleTimeout 豁免面扩展
+代理参数：
 
-```ts
-// 原：仅 /v1/messages
-const isStreamApiPost = req.method === 'POST'
-  && /\/(v1\/)?(messages|chat\/completions|responses)(\/|$|\?)/.test(url.pathname);
-if (isStreamApiPost) server.timeout(req, 0);   // 0 = 禁用此请求的 idle timeout
+```
+--port 8787                 监听端口（仅 127.0.0.1）
+--session <id>              x-opencode-session 的值（默认按主机名派生；固定值利于服务端 prompt 缓存）
+--upstream-host opencode.ai
+--upstream-prefix /zen/go
+--timeout 600               上游读超时秒数（别调小：深思考首字节可达 50s）
+--log-file <path>           额外落盘日志
 ```
 
-要点：
-- `v1/` 前缀**可选**——必须与 `isChatCompletionsPost` 的口径一致，否则 upstream 自带版本前缀时豁免漏网（K3 P2-2）。
-- 这是**对所有路由生效的全局行为改进**（此前非 messages 路径的长思考流会被 10s 掐断），不是 opt-in。
+**已实测（2026-10-30，独立脚本实例）**：
 
-### 4.4 手工路由注册
+| 项 | 结果 |
+|---|---|
+| `GET /healthz` | 200 `{"status":"ok",…}` |
+| `GET /v1`（裸路径，避免上游 404 HTML 干扰可达性判断） | 200 JSON |
+| `GET /v1/models` | 200，28 个模型，含 `gemini-4-argon` |
+| ZCode 四方言 body（`max_completion_tokens` + 三思考方言） | **200** |
+| 标准 body（对照组） | 200 且内容正确 |
+| 缺 `Authorization` | **401**（证明凭证确实透传给网关） |
+| 深思考（`reasoning_effort=high`） | 首字节 20.5s、61 个 SSE 事件、思考内容可见、**未被掐断** |
+| 工具调用 | 200，`tool_calls=[get_weather({"city":"Beijing"})]` |
+| 多模态（1×1 红像素） | 200，模型答 `"Red"` |
+| 8 路并发 | 8/8 全 200 且回显正确 |
+| `install-macos.sh` → LaunchAgent → `verify.sh` | 5/5 PASS |
+| `uninstall-macos.sh` | 正常停止并移除开机自启 |
 
-`img-proxy install` 是面向 Anthropic provider 的发现流程；OpenCode 这种手工路由用库函数写一次即可（带 proper-lockfile 锁）：
+### 4.2 方案 B：cc-linker img-proxy（可选，我们内部在用）
+
+如果你已经在用 cc-linker，同等能力由它的"路由级能力"提供（本仓库 commit `30ec748`），要点：
+
+1. **路由级 `inject_headers`**（`src/img-proxy/types.ts` / `routes.ts` / `server.ts`）：在请求头清理**之后**注入，同名头以路由表为准（客户端不可覆盖）；`host`/`content-length`/hop-by-hop 为禁入项（跳过并 WARN）；非法头值 try/catch（否则裸抛 500）。
+2. **方言归一化器**（`src/img-proxy/openai-dialect.ts`）：与 §4.3 同一套规则，挂在 `request_transform: "openai-dialect-normalizer"`，只作用于 POST `…/chat/completions`，改写清单记入 INFO 日志的 `dialect_changed` 字段。
+3. **idleTimeout 豁免面扩展**：`/\/(v1\/)?(messages|chat\/completions|responses)(\/|$|\?)/`（`v1/` 前缀可选，务必与改写分支口径一致）。
+
+手工路由注册（`addRoute` 带锁写 `routes.json`）：
 
 ```ts
-import { addRoute } from '/path/to/cc-linker/src/img-proxy/routes';
-import { IMG_PROXY_ROUTES_PATH } from '/path/to/cc-linker/src/utils/paths';
-
 await addRoute(IMG_PROXY_ROUTES_PATH, 'opencode', 'https://opencode.ai/zen/go', '/manual/opencode', {
   inject_headers: { 'x-opencode-session': 'zcode-relay-<固定会话标识>' },
   request_transform: 'openai-dialect-normalizer',
 });
 ```
 
-落盘形态（`~/.cc-linker/img-proxy/routes.json`，由 `IMG_PROXY_ROUTES_PATH` 定义）：
+此时 ZCode 的 baseUrl 为 `http://127.0.0.1:8765/opencode/v1`（**多一段 alias**，与独立脚本不同）。
+细节见 `docs/img-proxy.md` 的"路由级能力"一节。
 
-```json
-{"version":1,"routes":{"opencode":{
-  "alias":"opencode","upstream":"https://opencode.ai/zen/go",
-  "provider_path":"/manual/opencode","original_base_url":"https://opencode.ai/zen/go",
-  "installed_at":"2026-10-30T…",
-  "inject_headers":{"x-opencode-session":"zcode-relay-<主机名>"},
-  "request_transform":"openai-dialect-normalizer"}}}
-```
+### 4.3 自建代理的等价最小实现（不抄脚本也能写）
 
-配套：`img-proxy update` 的**孤儿路由扫描**要跳过 `/manual/` 虚拟路径（手工路由本就不指向磁盘文件，不是 cc-switch 残留）。
-
-### 4.5 如果不用 cc-linker：自建代理的等价最小实现
-
-任何本地代理（Python/Node）只要做到以下 4 条即可，**约 80 行代码**：
+任何本地代理（Python/Node/Go 均可）只要做到以下 4 条即可，**约 80 行代码**：
 
 1. 监听回环地址，把 `/v1/*` 转发到 `https://opencode.ai/zen/go/v1/*`；
 2. **注入** `x-opencode-session: <固定值>`（会话标识稳定，便于服务端路由与 prompt 缓存）；
-3. 对 `POST …/chat/completions` 的 JSON body 做 §4.2 的字段归一化（解析失败则原样转发）；
-4. **流式响应逐块 flush**（不要缓冲），且**不设置**响应超时（长思考首字节可达 50s+）。
+3. 对 `POST …/chat/completions` 的 JSON body 做下面的字段归一化（解析失败则原样转发）；
+4. **流式响应逐块 flush**（不要缓冲），且**不设置**响应空闲超时（长思考首字节可达 50s）。
 
-cc-linker 的优势是这些之外还白拿：SSE 透传与 client 断开即取消上游、按 alias 的 token 计量、请求头/缓存目录清理、日志轮转、Web Console、可观测的 `dialect_changed` 审计。
+**字段归一化的五条边界**（每条都是实战踩出来的，漏一条就 503 或吞参数）：
+
+| 边界 | 原因 |
+|---|---|
+| 别名（`max_output_tokens`/`max_completion_tokens`）**无条件删除**，不只是"搬走" | 别名单独存在即 503；与标准字段并存也 503 |
+| 值搬运**只做一次**且**不覆盖**标准字段 | 双别名场景第二个残留出体仍 503 |
+| `max_tokens:null` 剔除**必须在搬运之前** | 否则 null"在场"阻断有效值搬运，`{"max_tokens":null,"max_completion_tokens":128}` 会把 128 吞掉 |
+| 只动**顶层标量字段**，绝不碰 `messages` | 多模态 `image_url` parts 必须原样透传 |
+| **fail-open** + **幂等** | 非 JSON / 数组 / 标量原字节透传；已是标准形态则不重序列化（字节级不变） |
 
 ---
 
@@ -364,7 +319,7 @@ Provider 条目（`provider_config.json` → `config.providerConfigRules.provide
     "access": { "type": "api-key", "apiKey": "<OpenCode Go API Key>" },
     "api": {
       "type": "openai-chat-completions",
-      "baseUrl": "http://127.0.0.1:8765/opencode/v1"   // ← 指向本地代理；alias 段与路由表(~/.cc-linker/img-proxy/routes.json)里的 alias 对应
+      "baseUrl": "http://127.0.0.1:8787/v1"   // ← 独立脚本；用 cc-linker 则为 http://127.0.0.1:8765/opencode/v1
     },
     "personalModelIds": ["gemini-4-argon"],
     "modelOrder": ["gemini-4-argon"]
@@ -374,9 +329,11 @@ Provider 条目（`provider_config.json` → `config.providerConfigRules.provide
 
 要点：
 - `api.type` 必须是 `openai-chat-completions`（网关的 OpenAI 兼容端点）。
-- `baseUrl` 的**路径必须包含 alias 段**（`/opencode/v1`），否则代理的路由表匹配不到 alias → 502 "未知 provider alias"。
+- 用 cc-linker 时 `baseUrl` 的**路径必须包含 alias 段**（`/opencode/v1`），否则代理的路由表匹配不到 alias → 502 "未知 provider alias"。
 - 模型条目（§1.2）挂在**同一个 providerId** 下。
 - 改前先备份：`provider_config.json.bak-<时间戳>`。
+
+面板党也可以直接在"设置 → 模型供应商"里新建（接口类型选 OpenAI 兼容、Base URL 填代理地址、填 key、添加模型）。
 
 ### 5.2 agent 引用
 
@@ -403,25 +360,25 @@ pc['config']['modelConfigRules']['providerModelRules'] = [
 
 ## 6. 验证与验收清单
 
-按顺序做，**每步都要看到期望输出再进下一步**：
+用独立脚本的话直接跑 `bash verify.sh`（5 项）；用 cc-linker 或手写代理则按下面的顺序做，**每步都要看到期望输出再进下一步**：
 
 | # | 验证项 | 命令 / 操作 | 期望 |
 |---|---|---|---|
-| 1 | 代理存活 | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/` | `200`（console 首页） |
-| 2 | 上游可达 + 头正确 | `curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8765/opencode/v1/models` | `200`，28 个模型，含 `gemini-4-argon` |
-| 3 | 代理确实补了头 | 同上加 `-H "x-opencode-session: whatever"` | 仍 `200`（说明路由表的头生效，未被客户端覆盖） |
+| 1 | 代理存活 | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/healthz` | `200` |
+| 2 | 上游可达 + 头正确 | `curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8787/v1/models` | `200`，28 个模型，含 `gemini-4-argon` |
+| 3 | 代理确实补了头 | 同上加 `-H "x-opencode-session: whatever"` | 仍 `200`（说明代理注入的头生效，未被客户端覆盖） |
 | 4 | 方言归一化生效 | 见下方可复制命令（四方言 body） | `200`（修复前必 `503`）——**必须带 `Authorization`**，否则网关回 401 `Go requires a credential` |
-| 5 | 归一化审计 | `tail -3 ~/.cc-linker/img-proxy/img-proxy.log` | 含 `dialect_changed`，且剥除清单齐全（`drop thinking`、`drop enable_thinking`、`drop reasoning`）；**别名前缀两形态任一皆可**（`max_output_tokens->max_tokens` 或 `max_completion_tokens->max_tokens`）——取决于 ZCode 侧 AI SDK 版本 |
-| 6 | 端到端（面板） | ZCode 面板里对该模型点「测试」/ 发一句话 | 绿；日志 `upstream_status:200` |
+| 5 | 归一化审计 | `tail -3 ~/.zcode/opencode-relay/relay.log`（cc-linker：`~/.cc-linker/img-proxy/img-proxy.log`） | 独立脚本看 `REWRITE … changed=…`；cc-linker 看 `dialect_changed`；剥除清单齐全（`drop thinking`、`drop enable_thinking`、`drop reasoning`）；**别名前缀两形态任一皆可**（`max_output_tokens->max_tokens` 或 `max_completion_tokens->max_tokens`）——取决于 ZCode 侧 AI SDK 版本 |
+| 6 | 端到端（面板） | ZCode 面板里对该模型点「测试」/ 发一句话 | 绿；代理日志 `UPSTREAM … -> 200` |
 | 7 | 多模态 | 发一张图，问颜色 | 模型能描述图片内容（`image_url` parts 未被剥） |
 
 **步骤 4 的可复制命令**（四方言 body，最易复现 503 的姿势）：
 
 ```bash
 KEY="<OpenCode Go API Key>"
-curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
+curl -sS -m 90 http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gemini-4-argon","max_output_tokens":50,"max_completion_tokens":50,
+  -d '{"model":"gemini-4-argon","max_completion_tokens":50,"max_output_tokens":50,
        "thinking":{"type":"enabled"},"enable_thinking":true,
        "reasoning_effort":"low","reasoning":{"effort":"low"},
        "messages":[{"role":"user","content":"Reply with exactly: OK"}]}' \
@@ -431,7 +388,7 @@ curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
 
 **判据的严谨性**（避免假绿）：
 
-- 不要用"子代理回复了预期字符串"当连通性证据——**提示词里含期望串时，任何模型（含回落的默认模型）都会照抄**。可靠判据是 **代理日志里出现该请求且 `upstream_status=200`**，或 ZCode 侧 `ttft` 记录里 `provider`/`model` 字段正确。
+- 不要用"子代理回复了预期字符串"当连通性证据——**提示词里含期望串时，任何模型（含回落的默认模型）都会照抄**。可靠判据是 **代理日志里出现该请求且 `UPSTREAM … -> 200`**，或 ZCode 侧 `ttft` 记录里 `provider`/`model` 字段正确。
 - 不要用 `GET /models` 的成功判断连通性——该接口**不校验** session 头。
 
 ---
@@ -440,18 +397,18 @@ curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
 
 | 症状 | 根因 | 处置 |
 |---|---|---|
-| 会话发消息一直转圈，按停止才停；日志有 `retry_wait` 循环但无 HTTP 错误 | **缺 `x-opencode-session`**（直连 opencode.ai） | baseUrl 改指本地代理；见 §4.1 |
-| 面板测试报"连接失败"，代理日志 `upstream_status=503` | **字段方言**（`max_output_tokens` / `max_completion_tokens` / 三种思考方言任一） | 开 `request_transform`；见 §4.2 |
-| 面板测试 503 且日志 `dialect_changed` 为空 | 改写器没挂上路由 | 检查 `~/.cc-linker/img-proxy/routes.json` 里该 alias 的 `request_transform` 字段；重装 install 注意保留 opts |
-| 长思考会话中途断开 / "Connection closed mid-response" | **10s idleTimeout** | 扩豁免面；见 §4.3 |
+| 会话发消息一直转圈，按停止才停；日志有 `retry_wait` 循环但无 HTTP 错误 | **缺 `x-opencode-session`**（直连 opencode.ai） | baseUrl 改指本地代理；见 §4 |
+| 面板测试报"连接失败"，代理日志 `UPSTREAM … -> 503` | **字段方言**（`max_completion_tokens` / `max_output_tokens` / 三种思考方言任一） | 开字段归一化；见 §4.3 |
+| 面板测试 503 且日志**没有**改写记录 | 改写分支没生效（路径不是 `…/completions`、或跑的不是归一化版本） | 确认 baseUrl 以 `/v1` 结尾、接口类型是 OpenAI 兼容 |
+| 长思考会话中途断开 / "Connection closed mid-response" | 空闲超时 | 代理不设空闲超时；确认没有别的中间层 |
 | 模型能回话但**内容为空**、`finish_reason: length` | **思考 token 吃光 `max_output_tokens`**（模型特性，非代理故障） | 提高输出上限（≤65536）；降低思考档位 |
 | 模型选择器出现两个同名 Gemini、参数不同 | provider 已删但**模型规则残留** | 清理悬空 `providerModelRules`；见 §5.3 |
 | 面板里找不到该 provider 的模型 / 提示不支持 | 挂到了**内置模板 provider**（`opencode-go-chat`） | 改挂自定义 provider；见 §3 障碍 ⑤ |
 | 改完配置不生效 | 只改了 `config.json` 没改 `provider_config.json`（或反之） | **双写**；权威是 `provider_config.json` |
-| 代理日志出现 `unresolved` 告警 | baseUrl 少了 alias 段 | baseUrl 必须是 `http://127.0.0.1:8765/<alias>/v1` |
-| `uninstall --all` 之后 OpenCode 路由也没了 | `--all` 是"清空全部"语义，**包含手工路由** | 重新 `addRoute` 注册 |
+| 代理日志出现 `unresolved` 告警（cc-linker） | baseUrl 少了 alias 段 | baseUrl 必须是 `http://127.0.0.1:8765/<alias>/v1` |
+| `uninstall --all` 之后路由也没了（cc-linker） | `--all` 是"清空全部"语义，**包含手工路由** | 重新注册 |
 | 账单突然翻倍 | **2026-12-01** OpenCode Go 恢复原价（$4/$20） | 提前调整用量；注意 allowance 按未折价计费 |
-| 多模态"图片看不见" | 若走 **Anthropic 协议**（`/v1/messages`），cc-linker 的剥图逻辑会把图片替换成 `[img: 路径]` 文本 | OpenCode 路径走 chat/completions 不受影响；若将来接 Anthropic 协议的多模态，需给 RouteEntry 加 `strip_images: false` 开关 |
+| 多模态"图片看不见" | 若走 **Anthropic 协议**（`/v1/messages`），cc-linker 的剥图逻辑会把图片替换成 `[img: 路径]` 文本 | OpenCode 路径走 chat/completions 不受影响；若将来接 Anthropic 协议的多模态，需给路由加 `strip_images: false` 开关 |
 
 ---
 
@@ -460,13 +417,16 @@ curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
 | 层 | 回滚动作 |
 |---|---|
 | ZCode provider 配置 | 恢复 `~/.zcode/v2/provider_config.json.bak-<ts>` 与 `config.json.bak-<ts>`（两份都要） |
+| 独立代理 | `bash uninstall-macos.sh`（`--purge` 连文件一起删）；Linux/Windows 停掉对应进程/服务 |
 | cc-linker 全局安装 | `cp /usr/local/lib/node_modules/cc-linker/dist/cli.js.bak-<ts> .../dist/cli.js` 后 `launchctl kickstart -k gui/$(id -u)/com.cclinker.img-proxy` |
-| 路由表 | 手工路由直接 `addRoute` 重注册；或从 `~/.cc-linker/img-proxy/routes.json` 删对应 alias |
-| 临时兜底（不想用 cc-linker） | 用任意本地代理实现 §4.5 的 4 条；或直接用 `opencode.ai` 的其他兼容入口（需自行解决 session 头） |
+| 路由表（cc-linker） | 手工路由直接 `addRoute` 重注册；或从 `~/.cc-linker/img-proxy/routes.json` 删对应 alias |
+| 临时兜底 | 任何实现了 §4.3 四条的本地代理都能顶上 |
 
 ---
 
-## 附录 A：当天实测矩阵（每行都有对照组）
+## 附录 A：实测矩阵（每行都有对照组）
+
+### 网关与 ZCode 侧（2026-10-30）
 
 | 场景 | 结果 | 对照 |
 |---|---|---|
@@ -474,28 +434,41 @@ curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
 | 直连 `zen/go/v1`（ZCode 真实会话） | 卡死 → cancelled（24.1s / 14.9s / 20.7s） | 经代理同模型 → success（6.8s / 7.2s / 13.0s） |
 | `max_tokens` 标准字段 | 200 | 别名字段 → 503 |
 | `reasoning_effort` | 200（low/high 均通过，high 回传 reasoning_tokens） | 三种思考方言 → 503 |
-| 冷会话首字节 | 最长 ~50s（响应头与首内容一起） | → 必须豁免 idleTimeout |
+| 冷会话首字节 | 最长 ~50s（响应头与首内容一起） | → 必须豁免空闲超时 |
 | 冷 28K token 载荷 | 首字节 5.5s（cache 读写均为 0） | 大载荷不必然慢 |
-| 冷 40K token 载荷 | 预填 5.5s | — |
 | 16KB system + 12 工具 | 首字节 8.1s | — |
 | UA 换成 ZCode 原版 | 200（**网关不按 UA 拦截**） | — |
 | temperature / top_p / stream_options | 兼容（官方明示采样参数被忽略） | — |
-| 多模态（1×1 红像素） | 200，模型答 "Red" | — |
-| 代理侧实测长流 | 82.6s / 110.2s 请求全 200 | idleTimeout 豁免生效 |
+| 代理侧实测长流 | 82.6s / 110.2s 请求全 200 | 空闲豁免生效 |
+
+### 独立代理（`examples/zcode-opencode-go/`，2026-10-30 实测）
+
+| 项 | 结果 |
+|---|---|
+| `GET /healthz` / `GET /v1` | 200 / 200 JSON |
+| `GET /v1/models` | 200，28 个模型，含 gemini-4-argon |
+| 四方言 body（`max_completion_tokens` + 三思考方言） | 200 |
+| 标准 body（对照组） | 200 且内容正确 |
+| 缺 Authorization | 401 |
+| 深思考 `reasoning_effort=high` | 首字节 20.5s、61 事件、思考可见、未被掐断 |
+| 工具调用 | 200，`get_weather({"city":"Beijing"})` |
+| 多模态（1×1 红像素） | 200，答 `"Red"` |
+| 8 路并发 | 8/8 全 200 且回显正确 |
+| 归一化边界自测 | 12/12 断言全过 |
+| `install-macos.sh` → `verify.sh` | 5/5 PASS |
+| `uninstall-macos.sh` | 正常停止并移除自启（过程中修掉 2 个脚本 bug：`$PORT` 未定义、plist 端口解析带 XML 标签） |
 
 ## 附录 B：证据索引
 
 | 内容 | 位置 |
 |---|---|
-| 代理实现（本次新增） | `src/img-proxy/openai-dialect.ts`、`src/img-proxy/{types,routes,server}.ts`、`src/img-proxy/console/types.ts`、`src/cli/commands/img-proxy.ts` |
-| 实现 commit | `30ec748`（分支 `multi-model-review-engine-final`） |
-| 单测 / 集成测试 | `tests/unit/img-proxy/{openai-dialect,routes-options}.test.ts`、`tests/integration/img-proxy-route-options.test.ts` |
-| 路由注册 | `~/.cc-linker/img-proxy/routes.json`（alias=`opencode`） |
-| 代理请求日志（含 `dialect_changed` 审计） | `~/.cc-linker/img-proxy/img-proxy.log` |
-| ZCode 实发 body 抓取（转发器已退役但日志留存）：**321 字节 = 改写前原始捕获**（body 按 100 字符截断，尾部字段名读不到）；**310 字节 = 改写后形态** | `~/.zcode/logs/opencode-relay.log` |
-| 别名/方言改写的权威审计行（每条含 `dialect_changed`，直接给出"ZCode 发了什么 → 归一化成什么"） | `~/.cc-linker/img-proxy/img-proxy.log` |
-| ZCode 权威 provider 配置 | `~/.zcode/v2/provider_config.json` |
+| **独立代理套件（主方案）** | `examples/zcode-opencode-go/`（`opencode_relay.py` + `install-macos.sh` + `uninstall-macos.sh` + `verify.sh` + `README.md`） |
+| cc-linker 实现（可选方案） | `src/img-proxy/openai-dialect.ts`、`src/img-proxy/{types,routes,server}.ts`、`src/img-proxy/console/types.ts`、`src/cli/commands/img-proxy.ts`（commit `30ec748`） |
+| cc-linker 路由注册 | `~/.cc-linker/img-proxy/routes.json`（alias=`opencode`） |
+| 代理请求日志（改写审计） | cc-linker：`~/.cc-linker/img-proxy/img-proxy.log`（`dialect_changed`）；独立脚本：`~/.zcode/opencode-relay/relay.log`（`REWRITE … changed=`） |
+| ZCode 实发 body 抓取（改写前 321 字节 / 改写后 310 字节） | `~/.zcode/logs/opencode-relay.log` |
+| ZCode 权威 provider 配置 | `~/.zcode/v2/provider_config.json`（镜像 `config.json`） |
 | ZCode 运行日志（ttft/重试特征） | `~/.zcode/v2/logs/2026-10-30.log` |
 | 官方模型规格 | Google《What's new in Gemini 4 Argon》/ Vertex AI 模型页；OpenCode `GET /inference/go/v1/models` |
 | 网关行为 | OpenCode Go 文档 `opencode.ai/v2/docs/console/go/`（"Where can I use it" 一节要求 session 头与专用 UA） |
-| 审查报告（首审/修复审/K3/delta 四份） | `~/.zcode/review-reports/cc-linker-opencode-route-*.md` |
+| 审查报告（实现链四份 + 文档三轮） | `~/.zcode/review-reports/cc-linker-opencode-route-*.md`、`~/.zcode/review-reports/cc-linker-doc-zcode-opencode-*.md` |
