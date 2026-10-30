@@ -140,7 +140,8 @@ ZCode 的模型级配置写在 `provider_config.json` 的 `modelConfigRules.prov
 
 ### 障碍 ②：字段方言——网关只认 `max_tokens`
 
-ZCode 用 Vercel AI SDK（provider-utils 4.0.x）发请求，字段名与 OpenAI 规范不同，且**随版本变化**（当天两种都出现过：18:26 捕获的是 `max_output_tokens`，22:21 捕获的是 `max_completion_tokens`）。
+ZCode 用 Vercel AI SDK（provider-utils 4.0.x）发请求，字段名与 OpenAI 规范不同：**用 `max_completion_tokens`**（而非标准的 `max_tokens`）。
+> 溯源：代理审计行 `dialect_changed` 的统计——**ZCode 形态请求（含 `drop thinking`）共 73 条，别名前缀全部是 `max_completion_tokens->max_tokens`**；`max_output_tokens` 只出现在 ai-sdk 的另一变体与手工复现请求里。归一化器对两种别名都无条件剥除，所以接入结论不受影响。
 
 实测矩阵（同一 body，只改一个字段，其余不变）：
 
@@ -153,7 +154,7 @@ ZCode 用 Vercel AI SDK（provider-utils 4.0.x）发请求，字段名与 OpenAI
 
 ### 障碍 ③：思考参数方言——三个字段各是一个独立的雷
 
-ZCode 实发 body（当天实录，310 字节）**四方言齐发**：
+ZCode 实发 body **四方言齐发**（下面这份是**代理改写后**的形态，`max_tokens` 已归一化；改写前的原始捕获为 321 字节，日志按 100 字符截断，尾部字段名以审计行为准）：
 
 ```json
 {"model":"gemini-4-argon","messages":[…],"stream":true,"stream_options":{"include_usage":true},
@@ -161,8 +162,10 @@ ZCode 实发 body（当天实录，310 字节）**四方言齐发**：
  "enable_thinking":true,             // vLLM / Qwen 方言
  "reasoning_effort":"low",           // OpenAI 标准 ✅ 唯一合法
  "reasoning":{"effort":"low"},       // 又一种对象方言
- "max_output_tokens":1}
+ "max_tokens":1}                     // ← 改写前此处是 max_completion_tokens（审计行证据）
 ```
+
+> 审计行样例（cc-linker `img-proxy.log`）：`"dialect_changed":"max_completion_tokens->max_tokens,drop thinking,drop enable_thinking,drop reasoning"` —— 一行同时证明"ZCode 发了什么"与"归一化器做了什么"。
 
 逐项隔离实测（每个字段单独加到基线 body 上）：
 
@@ -489,7 +492,8 @@ curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
 | 单测 / 集成测试 | `tests/unit/img-proxy/{openai-dialect,routes-options}.test.ts`、`tests/integration/img-proxy-route-options.test.ts` |
 | 路由注册 | `~/.cc-linker/img-proxy/routes.json`（alias=`opencode`） |
 | 代理请求日志（含 `dialect_changed` 审计） | `~/.cc-linker/img-proxy/img-proxy.log` |
-| ZCode 实发 body 原件（310 字节四方言实录，转发期抓取；转发器已退役但日志留存） | `~/.zcode/logs/opencode-relay.log` |
+| ZCode 实发 body 抓取（转发器已退役但日志留存）：**321 字节 = 改写前原始捕获**（body 按 100 字符截断，尾部字段名读不到）；**310 字节 = 改写后形态** | `~/.zcode/logs/opencode-relay.log` |
+| 别名/方言改写的权威审计行（每条含 `dialect_changed`，直接给出"ZCode 发了什么 → 归一化成什么"） | `~/.cc-linker/img-proxy/img-proxy.log` |
 | ZCode 权威 provider 配置 | `~/.zcode/v2/provider_config.json` |
 | ZCode 运行日志（ttft/重试特征） | `~/.zcode/v2/logs/2026-10-30.log` |
 | 官方模型规格 | Google《What's new in Gemini 4 Argon》/ Vertex AI 模型页；OpenCode `GET /inference/go/v1/models` |
