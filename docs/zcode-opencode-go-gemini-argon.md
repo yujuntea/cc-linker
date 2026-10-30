@@ -94,7 +94,7 @@ ZCode 的模型级配置写在 `provider_config.json` 的 `modelConfigRules.prov
            │ （带 ai-sdk 方言字段 max_completion_tokens + thinking 等）
 ┌──────────▼───────────────────┐
 │ cc-linker img-proxy :8765    │
-│ 路由表 ~/.cc-linker/routes.json
+│ 路由表 ~/.cc-linker/img-proxy/routes.json
 │   alias=opencode             │
 │   upstream=opencode.ai/zen/go│
 │   inject_headers:            │
@@ -128,12 +128,12 @@ ZCode 的模型级配置写在 `provider_config.json` 的 `modelConfigRules.prov
 
 - 注头逻辑存在：`isOpenCodeGoBaseUrl()` 判定 hostname=`opencode.ai` 且 path 精确=`/zen/go/v1` 时，在构造请求头时加入 `"x-opencode-session"`。
 - **但它挂在 "provider runtime headers" 机制上**——该机制是**账号凭证刷新通道**，CLI 只会为 `account:` 开头的订阅型 provider 去 host 申请运行时请求头。
-- 当天日志实证：**runtime-headers 交换 1768 次，providerId 全部是 `account:bigmodel-individual-coding-plan`，自定义 provider 0 次**。
+- 当天日志实证：**runtime-headers 交换 1768 次（当日快照计数，随会话持续增长；commit 时已 1782），providerId 全部是 `account:bigmodel-individual-coding-plan`，自定义 provider 0 次**。
 
 结论：即便你把 baseUrl 写成完全正确的 `https://opencode.ai/zen/go/v1`，**自定义 api-key provider 也拿不到这个头**。
 
 **症状（务必记住）**：面板/会话里发消息后转圈不止，按停止按钮才停；日志特征是
-`ttft.phase attempt(≈1s) → ttft.phase retry_wait(≈6s) → attempt …` 的**退避重试循环**，且**全程无 HTTP 错误日志**（因为 400 被 SDK 吞成重试）。
+`ttft.phase attempt(≈1s) → ttft.phase retry_wait(1.2–9.0s) → attempt …` 的**退避重试循环**，且**全程无 HTTP 错误日志**（因为 400 被 SDK 吞成重试）。
 当天三次直连尝试（17:42 / 17:45 / 17:58）全部 `outcome=cancelled`（用户手动停止），切到本地代理后同模型请求 `outcome=success`。
 
 > 📌 排查口诀：**"卡死 + 无错误日志 + 有退避重试" = 缺 session 头**，不是网络慢。
@@ -315,7 +315,7 @@ await addRoute(IMG_PROXY_ROUTES_PATH, 'opencode', 'https://opencode.ai/zen/go', 
 });
 ```
 
-落盘形态（`~/.cc-linker/routes.json`）：
+落盘形态（`~/.cc-linker/img-proxy/routes.json`，由 `IMG_PROXY_ROUTES_PATH` 定义）：
 
 ```json
 {"version":1,"routes":{"opencode":{
@@ -407,10 +407,24 @@ pc['config']['modelConfigRules']['providerModelRules'] = [
 | 1 | 代理存活 | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/` | `200`（console 首页） |
 | 2 | 上游可达 + 头正确 | `curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8765/opencode/v1/models` | `200`，28 个模型，含 `gemini-4-argon` |
 | 3 | 代理确实补了头 | 同上加 `-H "x-opencode-session: whatever"` | 仍 `200`（说明路由表的头生效，未被客户端覆盖） |
-| 4 | 方言归一化生效 | 用**四方言 body**（`thinking`/`enable_thinking`/`reasoning`/`max_output_tokens`）打 `/opencode/v1/chat/completions` | `200`（修复前必 `503`） |
-| 5 | 归一化审计 | `tail -3 ~/.cc-linker/img-proxy/img-proxy.log` | 含 `"dialect_changed":"max_output_tokens->max_tokens,drop thinking,drop enable_thinking,drop reasoning"` |
+| 4 | 方言归一化生效 | 见下方可复制命令（四方言 body） | `200`（修复前必 `503`）——**必须带 `Authorization`**，否则网关回 401 `Go requires a credential` |
+| 5 | 归一化审计 | `tail -3 ~/.cc-linker/img-proxy/img-proxy.log` | 含 `dialect_changed`，且剥除清单齐全（`drop thinking`、`drop enable_thinking`、`drop reasoning`）；**别名前缀两形态任一皆可**（`max_output_tokens->max_tokens` 或 `max_completion_tokens->max_tokens`）——取决于 ZCode 侧 AI SDK 版本 |
 | 6 | 端到端（面板） | ZCode 面板里对该模型点「测试」/ 发一句话 | 绿；日志 `upstream_status:200` |
 | 7 | 多模态 | 发一张图，问颜色 | 模型能描述图片内容（`image_url` parts 未被剥） |
+
+**步骤 4 的可复制命令**（四方言 body，最易复现 503 的姿势）：
+
+```bash
+KEY="<OpenCode Go API Key>"
+curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"gemini-4-argon","max_output_tokens":50,"max_completion_tokens":50,
+       "thinking":{"type":"enabled"},"enable_thinking":true,
+       "reasoning_effort":"low","reasoning":{"effort":"low"},
+       "messages":[{"role":"user","content":"Reply with exactly: OK"}]}' \
+  -w '\nHTTP %{http_code}\n'
+# 期望：HTTP 200；修复前必 503
+```
 
 **判据的严谨性**（避免假绿）：
 
@@ -473,8 +487,9 @@ pc['config']['modelConfigRules']['providerModelRules'] = [
 | 代理实现（本次新增） | `src/img-proxy/openai-dialect.ts`、`src/img-proxy/{types,routes,server}.ts`、`src/img-proxy/console/types.ts`、`src/cli/commands/img-proxy.ts` |
 | 实现 commit | `30ec748`（分支 `multi-model-review-engine-final`） |
 | 单测 / 集成测试 | `tests/unit/img-proxy/{openai-dialect,routes-options}.test.ts`、`tests/integration/img-proxy-route-options.test.ts` |
-| 路由注册 | `~/.cc-linker/routes.json`（alias=`opencode`） |
+| 路由注册 | `~/.cc-linker/img-proxy/routes.json`（alias=`opencode`） |
 | 代理请求日志（含 `dialect_changed` 审计） | `~/.cc-linker/img-proxy/img-proxy.log` |
+| ZCode 实发 body 原件（310 字节四方言实录，转发期抓取；转发器已退役但日志留存） | `~/.zcode/logs/opencode-relay.log` |
 | ZCode 权威 provider 配置 | `~/.zcode/v2/provider_config.json` |
 | ZCode 运行日志（ttft/重试特征） | `~/.zcode/v2/logs/2026-10-30.log` |
 | 官方模型规格 | Google《What's new in Gemini 4 Argon》/ Vertex AI 模型页；OpenCode `GET /inference/go/v1/models` |
