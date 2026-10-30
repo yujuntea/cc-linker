@@ -956,6 +956,9 @@ curl -s -X POST http://127.0.0.1:$PORT/admin/api/cache/clear  # {ok:true, remove
 
 ## 路由级能力（inject_headers / request_transform）
 
+> 完整落地案例（含 ZCode 接入 OpenCode Go 的 Gemini 4 Argon、网关三项强制的实测矩阵、防踩坑清单）：见 [`zcode-opencode-go-gemini-argon.md`](./zcode-opencode-go-gemini-argon.md)。
+
+
 `routes.json` 的条目支持两个可选字段（2026-10-30 加入；缺省时不注入、不改写 body，除下述 idleTimeout 全局改进外行为与旧版一致）：
 
 ```json
