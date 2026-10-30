@@ -361,7 +361,7 @@ Provider 条目（`provider_config.json` → `config.providerConfigRules.provide
     "access": { "type": "api-key", "apiKey": "<OpenCode Go API Key>" },
     "api": {
       "type": "openai-chat-completions",
-      "baseUrl": "http://127.0.0.1:8765/opencode/v1"   // ← 指向本地代理；alias 段与 routes.json 的 alias 对应
+      "baseUrl": "http://127.0.0.1:8765/opencode/v1"   // ← 指向本地代理；alias 段与路由表(~/.cc-linker/img-proxy/routes.json)里的 alias 对应
     },
     "personalModelIds": ["gemini-4-argon"],
     "modelOrder": ["gemini-4-argon"]
@@ -439,7 +439,7 @@ curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
 |---|---|---|
 | 会话发消息一直转圈，按停止才停；日志有 `retry_wait` 循环但无 HTTP 错误 | **缺 `x-opencode-session`**（直连 opencode.ai） | baseUrl 改指本地代理；见 §4.1 |
 | 面板测试报"连接失败"，代理日志 `upstream_status=503` | **字段方言**（`max_output_tokens` / `max_completion_tokens` / 三种思考方言任一） | 开 `request_transform`；见 §4.2 |
-| 面板测试 503 且日志 `dialect_changed` 为空 | 改写器没挂上路由 | 检查 `routes.json` 里该 alias 的 `request_transform` 字段；重装 install 注意保留 opts |
+| 面板测试 503 且日志 `dialect_changed` 为空 | 改写器没挂上路由 | 检查 `~/.cc-linker/img-proxy/routes.json` 里该 alias 的 `request_transform` 字段；重装 install 注意保留 opts |
 | 长思考会话中途断开 / "Connection closed mid-response" | **10s idleTimeout** | 扩豁免面；见 §4.3 |
 | 模型能回话但**内容为空**、`finish_reason: length` | **思考 token 吃光 `max_output_tokens`**（模型特性，非代理故障） | 提高输出上限（≤65536）；降低思考档位 |
 | 模型选择器出现两个同名 Gemini、参数不同 | provider 已删但**模型规则残留** | 清理悬空 `providerModelRules`；见 §5.3 |
@@ -458,7 +458,7 @@ curl -sS -m 90 http://127.0.0.1:8765/opencode/v1/chat/completions \
 |---|---|
 | ZCode provider 配置 | 恢复 `~/.zcode/v2/provider_config.json.bak-<ts>` 与 `config.json.bak-<ts>`（两份都要） |
 | cc-linker 全局安装 | `cp /usr/local/lib/node_modules/cc-linker/dist/cli.js.bak-<ts> .../dist/cli.js` 后 `launchctl kickstart -k gui/$(id -u)/com.cclinker.img-proxy` |
-| 路由表 | 手工路由直接 `addRoute` 重注册；或从 `routes.json` 删对应 alias |
+| 路由表 | 手工路由直接 `addRoute` 重注册；或从 `~/.cc-linker/img-proxy/routes.json` 删对应 alias |
 | 临时兜底（不想用 cc-linker） | 用任意本地代理实现 §4.5 的 4 条；或直接用 `opencode.ai` 的其他兼容入口（需自行解决 session 头） |
 
 ---
