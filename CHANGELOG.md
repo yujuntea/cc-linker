@@ -4,6 +4,16 @@ All notable changes to cc-linker are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/), version numbers follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- img-proxy 路由级能力（`routes.json` 条目可选字段，缺省时不注入、不改写 body）：
+  - `inject_headers`：转发上游时附加请求头（在请求头清理之后注入，同名头以路由表为准、客户端不可覆盖）。用途：OpenCode Go 网关（2026-10 起强制）要求的 `x-opencode-session`，缺失即 400 `MissingSessionID`。
+  - `request_transform: "openai-dialect-normalizer"`：POST `…/chat/completions` 请求体方言归一化 —— `max_output_tokens`/`max_completion_tokens` → `max_tokens`，剥 `thinking`/`enable_thinking`/`reasoning` 对象方言（OpenCode Go 网关对任一方言字段返回 503 "Endpoint is unavailable"，2026-10-30 逐项实测；`reasoning_effort` 保留）。fail-open：非 JSON body 原字节透传。改写动作记入 INFO log 的 `dialect_changed` 字段。
+  - 流式 POST 的 idleTimeout 豁免面从 `/v1/messages` 扩展到 `/v1/(messages|chat/completions|responses)`：OpenCode Go 上 gemini-4-argon 冷会话/深思考期首字节实测可达 ~50s，Bun 默认 10s idleTimeout 会掐断流。**注意这是对所有路由生效的全局行为改进**（此前非 messages 路径的长思考流会被 10s 掐断），并非 opt-in。
+  - `inject_headers` 禁入头守卫：`host` / `content-length` / hop-by-hop 头不允许经 inject 通道注入（配了会跳过并写 WARN 日志）。
+  - `addRoute()` 增加可选 `opts` 参数；重跑 install 不带 opts 时保留已有选项（与 `disabled` 保留语义一致）。新增 `getRouteByAlias()`；`getUpstreamByAlias()` 委托之，行为不变。
+
 ## [0.8.2] - 2026-07-11
 
 ### Fixed

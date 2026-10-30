@@ -28,8 +28,9 @@
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
-import { getUpstreamByAlias } from './routes';
+import { getRouteByAlias } from './routes';
 import { stripImagesToPaths } from './transform';
+import { normalizeOpenAIDialectBody } from './openai-dialect';
 import { handleConsoleRequest } from './console/api';
 import { updateByAlias, pushRecent } from './console/stats-helpers';
 import type { AliasStats, RecentEntry } from './console/types';
@@ -425,10 +426,13 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       if (!alias) {
         return new Response('cc-linker img-proxy: missing provider alias in path', { status: 502 });
       }
-      // alias gate is `getUpstreamByAlias` only — no hardcoded reserved-prefix denylist.
+      // alias gate is `getRouteByAlias` only — no hardcoded reserved-prefix denylist.
       // 上游的 /v1/*, /health, /metrics 等路径若真存在,只需 install 对应的 provider
       // (alias = 文件名 stem);没 install 就 502 提示,而不是 blanket 拒绝整个段。
-      const upstream = getUpstreamByAlias(routesPath, alias);
+      // 2026-10-30:改用 getRouteByAlias 拿完整 entry(disabled → null 等价旧语义),
+      // 供下方读路由级 inject_headers / request_transform。
+      const route = getRouteByAlias(routesPath, alias);
+      const upstream = route?.upstream ?? null;
       if (!upstream) {
         appendLog(`WARN alias=${alias} path=${url.pathname} unresolved`, logPath);
         return new Response(
@@ -448,15 +452,24 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       // 超过 10s 没有数据发送,Bun 会直接关闭 client TCP 连接(connection reset)。
       // LLM API 的 SSE 流式响应在 extended thinking / tool execution / 长 token 生成
       // 期间很容易超过 10s 静默期 → client 看到 "Connection closed mid-response"。
-      // 对 POST /v1/messages 禁用 idleTimeout(Bun 官方推荐做法)。
-      // 其他请求(502 / console / HEAD 健康检查)保持默认 10s 保护。
-      if (isMessagesPost) {
+      // 2026-10-30 扩展豁免面: /v1/messages(Anthropic)之外, /v1/chat/completions
+      // (OpenAI 兼容)与 /v1/responses 同样是思考型 SSE —— OpenCode Go 网关上的
+      // gemini-4-argon 冷会话/深思考期首字节实测可达 ~50s(响应头也压到首内容
+      // 一起发),10s idleTimeout 必掐。其余请求(502 / console / HEAD)保持默认保护。
+      // (K3 终审 P2-2:v1 前缀改为可选 —— isChatCompletionsPost 不要求 /v1/,
+      // upstream 自带版本前缀时两判定必须口径一致,否则豁免漏网)
+      const isStreamApiPost = req.method === 'POST'
+        && /\/(v1\/)?(messages|chat\/completions|responses)(\/|$|\?)/.test(url.pathname);
+      if (isStreamApiPost) {
         server.timeout(req, 0);  // 0 = 禁用此请求的 idle timeout
       }
 
       // 决定转发 body
       let outBody: BodyInit | null | undefined;
       let stripped = 0;
+      // 路由级方言改写(request_transform)的变更清单,进 piping.finally 的 INFO log
+      let dialectChanged: string[] = [];
+      const isChatCompletionsPost = req.method === 'POST' && /\/chat\/completions(\/|$|\?)/.test(url.pathname);
       if (isMessagesPost) {
         // 先 buffer 原始字节,再 parse;失败用原始字节透传(req.arrayBuffer 只能调一次)
         const rawBytes = new Uint8Array(await req.arrayBuffer());
@@ -470,6 +483,20 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         } catch {
           outBody = rawBytes;  // 原始字节透传,绝不阻塞
         }
+      } else if (route?.request_transform === 'openai-dialect-normalizer' && isChatCompletionsPost) {
+        // 2026-10-30: 路由级 OpenAI 方言归一化(fail-open,见 openai-dialect.ts)。
+        // (glm 首审 P2-4)只覆盖 chat/completions,故意不含 /v1/responses ——
+        // Responses API 里 max_output_tokens 本就是原生字段名,套用 chat 方言
+        // 归一化反而会改错;真要支持 responses 待该形态有实测证据再加。
+        // 与 isMessagesPost 分支同款 buffer-改写-重序列化模式;content-length 由
+        // fetch 按 outBody 重算(sanitizeProxyRequestHeaders 已删原值)。
+        const rawBytes = new Uint8Array(await req.arrayBuffer());
+        const r = normalizeOpenAIDialectBody(rawBytes);
+        // new Uint8Array(...) 拷贝一次以获得 Uint8Array<ArrayBuffer> 类型(BodyInit
+        // 要求;TextEncoder 输出的泛型 Uint8Array 不被 TS 收窄)。body 仅几 KB,
+        // 拷贝开销可忽略。
+        outBody = new Uint8Array(r.body);
+        dialectChanged = r.changed;
       } else if (req.method === 'GET' || req.method === 'HEAD') {
         outBody = undefined;
       } else {
@@ -479,6 +506,28 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
       // 转发:清理后的请求头(详见 sanitizeProxyRequestHeaders)。
       // 关键:accept-encoding 收口 + 删 host/content-length/hop-by-hop。
       const headers = sanitizeProxyRequestHeaders(req.headers);
+      // 2026-10-30: 路由级 inject_headers 在 sanitize 之后注入 —— 同名头以路由表
+      // 为准(客户端不可覆盖/剥除)。典型用途: OpenCode Go 网关强制要求的
+      // x-opencode-session 头(缺失即 400 MissingSessionID)。
+      // (glm 首审 P2-1)禁入头守卫: hop-by-hop / host / content-length 不能经此
+      // 通道重新注入 —— content-length 会与 fetch 自算值冲突致 502,hop-by-hop
+      // 与 Bun 传输层冲突。配了就跳过 + 日志留痕,不静默吞。
+      if (route?.inject_headers) {
+        for (const [k, v] of Object.entries(route.inject_headers)) {
+          const lk = k.toLowerCase();
+          if (lk === 'host' || lk === 'content-length' || (HOP_BY_HOP_HEADERS as readonly string[]).includes(lk)) {
+            appendLog(`WARN inject_headers 跳过禁入头 ${k} (alias=${alias})`, logPath);
+            continue;
+          }
+          // (K3 终审 P2-3)Headers.set 对非 Latin1 值/非法头名会 throw,裸抛会
+          // 变成无日志无统计的 500 —— try/catch + WARN + 跳过,单个坏配置不炸路由
+          try {
+            headers.set(k, String(v));
+          } catch (err) {
+            appendLog(`WARN inject_headers 跳过非法头 ${k}: ${(err as Error).message} (alias=${alias})`, logPath);
+          }
+        }
+      }
 
       // === 改动 #2: 转发 req.signal + 可选 upstream_timeout ===
       // req.signal 让 client 断开能 cancel upstream 工作(不浪费 token / 不挂死 socket)
@@ -520,6 +569,7 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         appendLog(`INFO ${JSON.stringify({
           time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
           stripped, upstream_status: 0,
+          ...(dialectChanged.length > 0 ? { dialect_changed: dialectChanged.join(',') } : {}),
           duration_ms: errDuration,
           chunks: 0, bytes: 0,
           stream_status: finalStatus,
@@ -551,6 +601,7 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
         appendLog(`INFO ${JSON.stringify({
           time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
           stripped, upstream_status: upstreamResp.status,
+          ...(dialectChanged.length > 0 ? { dialect_changed: dialectChanged.join(',') } : {}),
           duration_ms: headersToFirstChunk, chunks: 0, bytes: 0,
           stream_status: 'no_body',
         })}`, logPath);
@@ -671,6 +722,7 @@ export async function startProxyServer(opts: ProxyServerOptions): Promise<ProxyS
           appendLog(`INFO ${JSON.stringify({
             time: new Date().toISOString(), alias, method: req.method, path: url.pathname,
             stripped, upstream_status: upstreamResp.status,
+            ...(dialectChanged.length > 0 ? { dialect_changed: dialectChanged.join(',') } : {}),
             duration_ms: duration,
             headers_to_first_chunk_ms: headersToFirstChunk,
             chunks, bytes,

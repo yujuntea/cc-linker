@@ -924,6 +924,9 @@ export async function imgProxyUpdate(opts: {
   const routes = loadRoutes(IMG_PROXY_ROUTES_PATH).routes;
   let orphanCount = 0;
   for (const [alias, entry] of Object.entries(routes)) {
+    // (K3 终审 P2-4)手工路由(provider_path 为 /manual/ 虚拟路径或缺失)不参与
+    // orphan 扫描 —— 它本来就不指向磁盘文件,不是 cc-switch 移除的残留
+    if (!entry.provider_path || entry.provider_path.startsWith('/manual/')) continue;
     if (!existsSync(entry.provider_path)) {
       console.log(chalk.yellow(`  ⚠ ${alias}  provider 文件已删 (cc-switch 移除?), 建议 cc-linker img-proxy uninstall --providers ${alias}`));
       orphanCount++;

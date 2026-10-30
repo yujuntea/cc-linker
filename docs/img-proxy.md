@@ -954,6 +954,28 @@ curl -s -X POST http://127.0.0.1:$PORT/admin/api/cache/clear  # {ok:true, remove
 
 ***
 
+## 路由级能力（inject_headers / request_transform）
+
+`routes.json` 的条目支持两个可选字段（2026-10-30 加入；缺省时不注入、不改写 body，除下述 idleTimeout 全局改进外行为与旧版一致）：
+
+```json
+{
+  "alias": "opencode",
+  "upstream": "https://opencode.ai/zen/go",
+  "provider_path": "/manual/opencode",
+  "original_base_url": "https://opencode.ai/zen/go",
+  "installed_at": "2026-10-30T00:00:00.000Z",
+  "inject_headers": { "x-opencode-session": "zcode-relay-<hostname>" },
+  "request_transform": "openai-dialect-normalizer"
+}
+```
+
+- **`inject_headers`**：转发上游时附加请求头，在请求头清理之后注入（同名头以路由表为准，客户端不可覆盖/剥除）。`host` / `content-length` / hop-by-hop 头为禁入项（配置了会被跳过并写 WARN 日志）。典型用途：OpenCode Go 网关强制的 `x-opencode-session`（2026-10 起缺失即 400 `MissingSessionID`）。
+- **`request_transform: "openai-dialect-normalizer"`**：POST `…/chat/completions` 请求体方言归一化——`max_output_tokens` / `max_completion_tokens` → `max_tokens`（全部剥除，值仅在标准字段缺席时搬运一次），剥 `thinking` / `enable_thinking` / `reasoning` 对象方言，保留 `reasoning_effort`。OpenCode Go 网关对上述方言字段返回 503 "Endpoint is unavailable"（2026-10-30 逐项实测）。fail-open：非 JSON / 数组 / 标量 body 原字节透传。改写动作记入 INFO 日志的 `dialect_changed` 字段。**只覆盖 chat/completions**：Responses API 里 `max_output_tokens` 是原生字段名，不适用此归一化。
+- **手工添加路由**：正常流程走 `img-proxy install`（面向 Anthropic provider 发现）；手工路由（如 opencode）用库函数 `addRoute(routesPath, alias, upstream, providerPath, opts)` 一次脚本写入，带 proper-lockfile 锁。`provider_path` 为必填字段，手工路由约定写 `/manual/<alias>` 虚拟路径——`img-proxy update` 的孤立路由扫描会跳过它（不指向磁盘文件，不误报 uninstall）。**注意**：`img-proxy uninstall --all` 仍会列出手工路由并一并移除（它是"清空全部"语义），手工路由请单独重建。
+
+> 多模态说明：剥图（stripImagesToPaths）只作用于 `/v1/messages`（Anthropic 协议）路径；chat/completions 的 `messages`（含 `image_url` 多模态 parts）在归一化下原样透传，已实测（红像素图经代理后 Gemini 正确识别颜色）。
+
 ## 故障排除
 
 ### 装完不工作

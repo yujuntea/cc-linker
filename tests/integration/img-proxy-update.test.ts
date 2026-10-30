@@ -142,4 +142,24 @@ describe('img-proxy update (e2e)', () => {
 
     // X.json.bak 是孤儿 (sync 不清 .bak); routes.json 里 X route 还在 (orphan 扫描建议 uninstall 清)
   });
+
+  // K3 P2-4 守护(delta N2): /manual/ 虚拟 provider_path 的手工路由不参与
+  // orphan 扫描 —— 文件不存在是常态,不误报 uninstall 提示。
+  test('manual route (/manual/) 不触发 orphan 扫描误报', () => {
+    writeAutoProvider('Y', 'http://127.0.0.1:8765/Y');
+    writeFileSync(routesPath, JSON.stringify({
+      version: 1,
+      routes: {
+        'opencode': { alias: 'opencode', upstream: 'https://opencode.ai/zen/go', provider_path: '/manual/opencode', original_base_url: 'https://opencode.ai/zen/go', installed_at: '2026-10-30T00:00:00.000Z' },
+        'Y': { alias: 'Y', upstream: 'https://y-original.com', provider_path: join(autoProvidersDir, 'Y.json'), original_base_url: 'https://y-original.com', installed_at: '2026-01-01T00:00:00.000Z' },
+      },
+    }));
+    setupDb([{ id: 'id-y', name: 'Y', settings_config: { env: { ANTHROPIC_BASE_URL: 'https://y.com', ANTHROPIC_AUTH_TOKEN: 'y-new-token' } } }]);
+
+    const { stdout, exitCode } = runUpdate();
+    expect(exitCode).toBe(0);
+    // 手工路由不出现 uninstall 提示,也不计入孤立 route
+    expect(stdout).not.toContain('uninstall --providers opencode');
+    expect(stdout).not.toContain('孤立 route');
+  });
 });

@@ -65,7 +65,13 @@ export async function saveRoutes(path: string, table: RouteTable): Promise<void>
   });
 }
 
-export async function addRoute(path: string, alias: string, upstream: string, providerPath: string): Promise<void> {
+export async function addRoute(
+  path: string,
+  alias: string,
+  upstream: string,
+  providerPath: string,
+  opts?: Pick<RouteEntry, 'inject_headers' | 'request_transform'>,
+): Promise<void> {
   await withRoutesLock(path, async () => {
     const table = loadRoutes(path);
     const existing = table.routes[alias];
@@ -75,6 +81,10 @@ export async function addRoute(path: string, alias: string, upstream: string, pr
       installed_at: existing?.installed_at ?? new Date().toISOString(),
       // 保留 disable 标记(避免重跑 install 时丢状态)
       ...(existing?.disabled ? { disabled: true } : {}),
+      // 2026-10-30 路由级能力:显式传入则覆盖;未传时保留已有值(与 disabled
+      // 保留语义一致 —— 重跑 install 不应静默丢掉手工配的 inject_headers)
+      ...(opts?.inject_headers ? { inject_headers: opts.inject_headers } : existing?.inject_headers ? { inject_headers: existing.inject_headers } : {}),
+      ...(opts?.request_transform ? { request_transform: opts.request_transform } : existing?.request_transform ? { request_transform: existing.request_transform } : {}),
     };
     mkdirSync(dirname(path), { recursive: true });
     const tmp = path + '.tmp';
@@ -124,10 +134,17 @@ export async function setRouteDisabled(
 // disable=true 时返 null,proxy 调用方就会把请求 passthrough 给原 upstream
 // (而不是把请求改写到 current alias 的 upstream 上,后者会被 disable 误
 // 路由到一个用户并不期望的目标)。
-export function getUpstreamByAlias(path: string, alias: string): string | null {
+//
+// 2026-10-30:新增 getRouteByAlias(返回完整 RouteEntry,server 侧读路由级
+// inject_headers / request_transform 用);getUpstreamByAlias 委托之,行为不变。
+export function getRouteByAlias(path: string, alias: string): RouteEntry | null {
   const entry = loadRoutes(path).routes[alias];
   if (!entry || entry.disabled) return null;
-  return entry.upstream ?? null;
+  return entry;
+}
+
+export function getUpstreamByAlias(path: string, alias: string): string | null {
+  return getRouteByAlias(path, alias)?.upstream ?? null;
 }
 
 // 新加:按 upstream 查 proxy URL(wrapper 调用)。比较前先规范化:

@@ -50,6 +50,10 @@ export interface ParsedLogEntry {
   output_tokens?: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
+  // 2026-10-30 路由级 request_transform 的改写动作(如 "max_output_tokens->max_tokens,drop thinking")
+  // (glm 修复审 P2-R2:此前误加到 RecentEntry(零填充点死字段),移到本接口 ——
+  //  log-parser.ts:15 的 cast 才是 log 数据实际流向)
+  dialect_changed?: string;
 }
 
 export interface LogEntry {
