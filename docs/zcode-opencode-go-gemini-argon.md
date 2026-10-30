@@ -141,7 +141,7 @@ ZCode 的模型级配置写在 `provider_config.json` 的 `modelConfigRules.prov
 ### 障碍 ②：字段方言——网关只认 `max_tokens`
 
 ZCode 用 Vercel AI SDK（provider-utils 4.0.x）发请求，字段名与 OpenAI 规范不同：**用 `max_completion_tokens`**（而非标准的 `max_tokens`）。
-> 溯源：代理审计行 `dialect_changed` 的统计——**ZCode 形态请求（含 `drop thinking`）共 73 条，别名前缀全部是 `max_completion_tokens->max_tokens`**；`max_output_tokens` 只出现在 ai-sdk 的另一变体与手工复现请求里。归一化器对两种别名都无条件剥除，所以接入结论不受影响。
+> 溯源：代理审计行 `dialect_changed` 的统计——**ZCode 形态请求（含 `drop thinking`）全部为 `max_completion_tokens->max_tokens`**（统计截至 2026-10-30 22:37，共 70+ 条并随使用增长）；`max_output_tokens` 只出现在 ai-sdk 的另一变体与手工复现请求里。归一化器对两种别名都无条件剥除，所以接入结论不受影响。
 
 实测矩阵（同一 body，只改一个字段，其余不变）：
 
